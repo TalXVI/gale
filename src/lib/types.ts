@@ -274,6 +274,85 @@ export type ExportCode = {
 	backend: Backend;
 };
 
+export type DedicatedServerInfo = {
+	platforms: Platform[];
+	defaultPort: number;
+};
+
+export type ServerLocation = 'local' | 'remote';
+export type RemoteAuthentication = 'password' | 'privateKey' | 'agent';
+export type RemoteProtocol = 'sftp' | 'ftp' | 'ftps';
+
+export type RemoteServerSettings = {
+	protocol: RemoteProtocol;
+	host: string;
+	port: number;
+	username: string;
+	serverDirectory: string;
+	authentication: RemoteAuthentication;
+	privateKeyPath: string;
+	trustedHostKey: string | null;
+	trustedInvalidCertificateHost: string | null;
+};
+
+export type ProfileServerSettings = {
+	location: ServerLocation;
+	serverName: string;
+	world: string;
+	port: number;
+	publicServer: boolean;
+	crossplay: boolean;
+	extraArgs: string;
+	remote: RemoteServerSettings;
+};
+
+export type RemoteConnectionTestResult =
+	| { status: 'connected'; fingerprint: string | null; encrypted: boolean }
+	| { status: 'hostKeyUntrusted'; fingerprint: string }
+	| { status: 'certificateUntrusted' };
+
+export type RemoteDeploymentResult =
+	| { status: 'hostKeyUntrusted'; fingerprint: string }
+	| { status: 'certificateUntrusted' }
+	| {
+			status: 'deployed';
+			fingerprint: string | null;
+			uploadedFiles: number;
+			uploadedBytes: number;
+			removedFiles: number;
+			unchangedFiles: number;
+			cleanupWarnings: string[];
+	  };
+
+export type RemoteDeploymentPreviewResult =
+	| { status: 'hostKeyUntrusted'; fingerprint: string }
+	| { status: 'certificateUntrusted' }
+	| {
+			status: 'preview';
+			fingerprint: string | null;
+			uploadFiles: string[];
+			uploadBytes: number;
+			removeFiles: string[];
+			unchangedFiles: number;
+	  };
+
+export type RemoteDeploymentProgress = {
+	completed: number;
+	total: number;
+	path: string;
+	operation: 'upload' | 'remove';
+};
+
+export type DedicatedServerStatus =
+	| { state: 'stopped' }
+	| {
+			state: 'running';
+			profileId: number;
+			gameSlug: string;
+			pid: number;
+			serverDir: string;
+	  };
+
 export type Game = {
 	name: string;
 	slug: string;
@@ -282,6 +361,7 @@ export type Game = {
 	modLoader: ModLoader;
 	popular: boolean;
 	backends: Backend[];
+	dedicatedServer: DedicatedServerInfo | null;
 };
 
 export enum ModLoader {
