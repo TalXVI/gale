@@ -36,7 +36,7 @@
 	let status = $state<ServerSyncStatus | null>(null);
 	let preview = $state<ServerSyncPreview | null>(null);
 	let result = $state<ServerSyncResult | null>(null);
-	/// Whether the selection changed after the last preview — the approved
+	/// Whether the selection changed after the last preview. The approved
 	/// plan hash only binds the previewed selection, so Deploy requires a
 	/// fresh preview first.
 	let dirty = $state(true);
@@ -135,8 +135,8 @@
 		previewing = true;
 		result = null;
 		try {
-			// The restart policy is bound into the plan hash — the approval is
-			// only valid while this selection stands.
+			// The restart policy is bound into the plan hash, so the approval
+			// is only valid while this selection stands.
 			preview = await api.profile.server.previewSync(
 				selection(),
 				restartPolicy,
@@ -156,7 +156,7 @@
 		dirty = true;
 	}
 
-	/// A persistent per-file policy for *future* revisions — distinct from
+	/// A persistent per-file policy for *future* revisions, distinct from
 	/// the one-time Apply/Decline decision for the current conflict.
 	async function setPolicy(path: string, policy: SyncConfigUpdatePolicy) {
 		await api.profile.server.setConfigPolicy(path, policy, remotePassword, workerToken);

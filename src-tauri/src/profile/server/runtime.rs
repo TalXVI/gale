@@ -24,8 +24,8 @@ pub struct RunningServer {
     pid: u32,
     child: SharedChild,
     /// Termination was requested but not yet confirmed. The entry stays
-    /// registered the whole time — the profile must remain locked while
-    /// the process may still be alive.
+    /// registered because the profile must remain locked while the
+    /// process may still be alive.
     stopping: bool,
 }
 
@@ -43,7 +43,8 @@ pub enum ServerStatus {
         game_slug: String,
         pid: u32,
         server_dir: PathBuf,
-        /// The process is being terminated — still running until confirmed.
+        /// A stop was requested. The process still counts as running
+        /// until its exit is confirmed.
         stopping: bool,
     },
 }
@@ -116,10 +117,10 @@ impl ServerRuntime {
 
     /// Marks the tracked server as terminating and returns its pid and
     /// process handle. The registration stays in place for the whole
-    /// termination: the profile stays locked and `is_running` keeps
+    /// termination. The profile stays locked and `is_running` keeps
     /// blocking new launches until the process is confirmed dead, so a
     /// failed or slow kill cannot expose the profile or let a replacement
-    /// conceal the still-live process.
+    /// hide the still-live process.
     ///
     /// Returns `None` when nothing is running or a stop is already in
     /// flight.
@@ -132,9 +133,9 @@ impl ServerRuntime {
         Some((running.pid, running.child.clone()))
     }
 
-    /// Reverts `begin_stop` after a failed termination — the process is
-    /// still alive, so it goes back to reporting as running (not stopping)
-    /// while keeping the profile lock.
+    /// Reverts `begin_stop` after a failed termination. The process is
+    /// still alive, so the entry reports `Running` again instead of
+    /// `stopping`, and the profile stays locked.
     pub fn cancel_stop(&mut self, pid: u32) {
         if let Some(running) = self.running.as_mut()
             && running.pid == pid
@@ -146,8 +147,8 @@ impl ServerRuntime {
 
 /// Watches the server process and updates the runtime when it exits.
 ///
-/// Runs as a tokio task instead of a std thread: the lock is only held for
-/// the non-blocking `try_wait` call, so `take`/`kill` can still proceed.
+/// Runs as a tokio task instead of a std thread. The child lock is only
+/// held for the non-blocking `try_wait` call, so `kill` can still proceed.
 pub fn watch(app: AppHandle, child: SharedChild, pid: u32) {
     tauri::async_runtime::spawn(async move {
         let result = loop {
@@ -178,11 +179,11 @@ pub fn watch(app: AppHandle, child: SharedChild, pid: u32) {
 /// Kills the process identified by `pid`/`child` and reports the resulting
 /// status.
 ///
-/// The runtime entry must have been marked via [`ServerRuntime::begin_stop`]
-/// — it stays registered (and keeps the profile locked) for the entire
-/// await. On success the entry is cleared; on failure [`cancel_stop`]
-/// returns it to the running state, because reporting a live process as
-/// stopped would silently unlock its profile.
+/// The runtime entry must have been marked via [`ServerRuntime::begin_stop`].
+/// It stays registered and keeps the profile locked for the whole kill.
+/// On success the entry is cleared; on failure [`cancel_stop`] returns it
+/// to the running state, because reporting a live process as stopped would
+/// silently unlock its profile.
 pub async fn kill(app: AppHandle, pid: u32, child: SharedChild) -> Result<()> {
     let result = {
         let mut child = child.lock().await;
@@ -234,9 +235,9 @@ mod tests {
         assert_eq!(value["stopping"], true);
     }
 
-    /// A real long-running child for the runtime state tests — the
-    /// lifecycle guarantees being exercised don't depend on what the
-    /// process actually is.
+    /// A real long-running child process for the runtime state tests.
+    /// The tests only need a process that stays alive; what it does is
+    /// irrelevant.
     #[cfg(windows)]
     fn sleeper() -> super::SharedChild {
         let child = tokio::process::Command::new("cmd")
@@ -309,8 +310,8 @@ mod tests {
     #[test]
     fn failed_termination_restores_the_running_entry() {
         // cancel_stop simulates a failed kill: the process is still alive,
-        // so the runtime goes back to plain Running — never a phantom
-        // stopped state.
+        // so the runtime goes back to plain Running. It must never report
+        // a live process as stopped.
         let (mut runtime, pid) = runtime_with_child();
         runtime.begin_stop().unwrap();
 
@@ -326,7 +327,7 @@ mod tests {
         assert!(runtime.is_profile_locked(7));
         // A retry can stop it again.
         assert!(runtime.begin_stop().is_some());
-        // Termination confirmed — the lock releases.
+        // Termination is confirmed and the lock releases.
         assert!(runtime.clear_if_pid(pid));
         assert!(!runtime.is_running());
         assert!(!runtime.is_profile_locked(7));

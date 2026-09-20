@@ -1,10 +1,11 @@
-//! Materializes a canonical publication into a deployable file set.
+//! Turns a canonical publication into a deployable set of files.
 //!
-//! Published mods are downloaded by their exact `VersionIdent` and extracted
-//! with the game's package installers into a staging directory — the same
-//! machinery the install queue uses, so the deployed tree is byte-identical
-//! to what a subscriber's profile contains. Nothing is ever resolved to a
-//! newer version: the publication's exact versions are authoritative.
+//! This module downloads published mods by their exact `VersionIdent` and
+//! extracts them with the game's package installers into a staging
+//! directory. The install queue uses the same machinery, so the staged
+//! tree is byte-identical to what a subscriber's profile contains. No mod
+//! is ever resolved to a newer version; the publication's exact versions
+//! are authoritative.
 
 use std::{
     io::Cursor,
@@ -43,7 +44,7 @@ pub trait PayloadSource: Send + Sync {
 
 /// A payload source backed by a plain directory plus a reqwest client.
 ///
-/// Layout: `<root>/<full_name>/<version>/` — identical to Gale's install
+/// Layout: `<root>/<full_name>/<version>/`, identical to Gale's install
 /// cache so Local mode can share `prefs.cache_dir()` directly.
 pub struct CachePayloadSource {
     pub root: PathBuf,
@@ -131,9 +132,9 @@ fn is_staged(dir: &Path) -> bool {
             .is_ok_and(|mut entries| entries.next().is_some())
 }
 
-/// Walks staged package trees into the desired deployment maps. Only enabled
-/// mods contribute files — a disabled mod's files leave the server entirely,
-/// matching how a subscriber's profile handles it.
+/// Reads the staged package trees and builds the desired deployment file
+/// maps. Only enabled mods contribute files. A disabled mod's files leave
+/// the server entirely, matching how a subscriber's profile handles it.
 ///
 /// `progress` receives `(completed, total, mod_name)` for reporting.
 pub async fn stage_publication(
@@ -262,8 +263,9 @@ mod tests {
         thunderstore::{Backend, PackageIdent, VersionIdent},
     };
 
-    /// A payload source that must never be touched — any access is a test
-    /// failure, proving configs-only operations never stage mod packages.
+    /// A payload source that must never be touched. Any call to it fails
+    /// the test, which proves configs-only operations never stage mod
+    /// packages.
     struct FailSource;
 
     impl PayloadSource for FailSource {

@@ -1,11 +1,10 @@
-//! The authoritative deployment planner shared by Local and Worker
-//! execution. Given one canonical publication, a remote snapshot, and the
-//! user's selection it produces the exact same plan regardless of which
-//! executor computed it — plan equivalence is what keeps the two modes
-//! interchangeable.
+//! The deployment planner shared by Local and Worker execution. Given one
+//! canonical publication, a remote snapshot, and the user's selection, it
+//! produces the exact same plan no matter which executor computed it.
+//! Producing the same plan is what keeps the two modes interchangeable.
 //!
-//! Everything here is pure: no I/O happens in this module, which is what
-//! makes the semantics unit-testable and the plan hash deterministic.
+//! Nothing in this module does I/O, which is what makes the semantics
+//! unit-testable and the plan hash deterministic.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -36,7 +35,7 @@ pub struct DeploySelection {
     #[serde(default)]
     pub apply_configs: Vec<ConfigPath>,
     /// Selected configs whose remote file was deleted after Gale deployed
-    /// it — recreating them needs this explicit authorization.
+    /// it. Recreating them needs this explicit authorization.
     #[serde(default)]
     pub restore_configs: Vec<ConfigPath>,
     /// Published config revisions to decline.
@@ -74,8 +73,9 @@ impl DeploySelection {
     }
 }
 
-/// A canonical publication the server deploys — the same artifact friends'
-/// clients consume. Local unpublished profile changes are never part of it.
+/// A canonical publication the server deploys. It is the same artifact
+/// friends' clients install. Local unpublished profile changes are never
+/// part of it.
 pub struct Publication<'a> {
     /// Remote `updatedAt`, identifying this exact revision.
     pub revision: DateTime<Utc>,
@@ -86,9 +86,9 @@ pub struct Publication<'a> {
 }
 
 impl<'a> Publication<'a> {
-    /// Views a fetched canonical publication through the planner's lens —
-    /// the single conversion both executors use, so "the publication" means
-    /// the same artifact on both sides.
+    /// Converts a fetched canonical publication into the view the planner
+    /// works with. Both executors use this same conversion, so "the
+    /// publication" means the same artifact on both sides.
     pub fn from_fetched(publication: &'a crate::profile::sync::FetchedPublication) -> Self {
         Self {
             revision: publication.revision,
@@ -127,8 +127,8 @@ pub struct DesiredDeployment {
 }
 
 /// Identity and behavior options the plan hash binds. An approval is
-/// specific to exactly one profile, server target, and restart policy —
-/// changing any of them after preview must not reuse the approval.
+/// specific to exactly one profile, server target, and restart policy.
+/// Changing any of them after preview must not reuse the approval.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlanContext {
@@ -149,10 +149,11 @@ pub struct RemoteSnapshot {
     /// Files and dirs inside the payload dirs, deploy-path → remote size.
     pub payload_files: BTreeMap<DeployPathBuf, u64>,
     pub payload_dirs: BTreeSet<DeployPathBuf>,
-    /// Remote content hash for every *Gale-owned* payload file that is also
-    /// desired by the publication and size-matched — the integrity check
-    /// that catches remote modification of managed mods. Never populated
-    /// for unowned files: hashing foreign content buys nothing.
+    /// Remote content hash for every *Gale-owned* payload file that is
+    /// also desired by the publication and size-matched. This is the
+    /// integrity check that catches remote modification of managed mods.
+    /// Never populated for unowned files: hashing foreign content gains
+    /// nothing.
     pub payload_hashes: BTreeMap<DeployPathBuf, ContentHash>,
     /// Remote content hash for every config path a decision is needed on
     /// (published ∪ recorded ∪ seeded); `None` = absent remotely.
@@ -211,7 +212,7 @@ pub enum ConfigAction {
     /// The remote file stays untouched (already applied, server-customized
     /// after apply, or AlwaysKeep policy).
     Keep,
-    /// Awaits a decision — applying would clobber a remote change or
+    /// Awaits a decision. Applying would clobber a remote change or
     /// recreate a remote deletion.
     Pending { reason: PendingConfigReason },
     /// Never deployed and not selected; simply stays absent.
@@ -239,8 +240,9 @@ pub struct PlanConflict {
     pub seed: bool,
 }
 
-/// The complete, approved description of one deployment. Executed exactly —
-/// the plan hash binds preview approval to execution.
+/// The complete, approved description of one deployment. It runs exactly
+/// as written, because the plan hash binds the preview approval to the
+/// execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeploymentPlan {
@@ -273,15 +275,16 @@ pub struct DeploymentPlan {
     /// Payload changes require a server restart to take effect.
     pub requires_restart: bool,
     /// Remote payload files that are neither published nor recorded as
-    /// Gale-owned — manually installed mods, leftovers from other tools.
-    /// Surfaced for visibility; never removed automatically.
+    /// Gale-owned, like manually installed mods or leftovers from other
+    /// tools. Shown in the preview for visibility; never removed
+    /// automatically.
     pub unmanaged: Vec<DeployPathBuf>,
     /// The published mod set, recorded as `deployed_mods` on success.
     pub deployed_mods: Vec<R2Mod>,
 }
 
 /// Computes the deployment plan. This is the only place sync semantics are
-/// decided — Local and Worker modes call the same function, so identical
+/// decided. Local and Worker modes call the same function, so identical
 /// inputs always produce identical plans.
 pub fn build_plan(
     publication: &Publication<'_>,
@@ -326,10 +329,10 @@ pub fn build_plan(
 
         // Removal authority comes from ownership records alone: only
         // files a completed deployment recorded as Gale-owned may be
-        // deleted. Remote files that were never recorded — manually
-        // installed mods, other tools' output — are not ours to remove,
+        // deleted. Remote files that were never recorded, like manually
+        // installed mods or other tools' output, are not ours to remove,
         // no matter how much they resemble published content. They are
-        // surfaced as unmanaged instead so the user sees what else lives
+        // reported as unmanaged instead, so the user sees what else lives
         // in the payload directories.
         let desired_paths: BTreeSet<&DeployPath> =
             desired.payload.keys().map(DeployPathBuf::as_path).collect();
@@ -497,13 +500,14 @@ pub fn build_plan(
     Ok(plan)
 }
 
-/// Whether the remote copy of a payload file provably still matches the
-/// staged bytes. Inside mirrored dirs the engine hashes the remote content
-/// of every owned, size-matched file — a same-size remote edit is detected
-/// and re-uploaded. A file that cannot be verified (missing hash, size
-/// mismatch, unreadable) counts as diverged and is re-uploaded
-/// conservatively. Outside mirrored dirs (loader payloads at the root)
-/// remote drift is not observable and the state record is trusted.
+/// Whether the remote copy of a payload file still matches the staged
+/// bytes. Inside mirrored dirs the engine hashes the remote content of
+/// every owned, size-matched file, so a same-size remote edit is detected
+/// and re-uploaded. A file that cannot be verified, for example a missing
+/// hash, a size mismatch, or an unreadable file, counts as diverged and
+/// is re-uploaded to be safe. Outside mirrored dirs, like loader payloads
+/// at the root, remote drift is not observable and the state record is
+/// trusted.
 fn remote_intact(
     path: &DeployPath,
     staged: &StagedFile,
@@ -520,10 +524,10 @@ fn remote_intact(
         .is_some_and(|remote| remote.as_str() == staged.hash)
 }
 
-/// The server-side config decision, mirroring the client's `decide` plus the
-/// server's explicit selection/restore gates. `remote` is the actual remote
-/// content hash — never the state record — so remote customization is always
-/// detected.
+/// The server-side config decision. It mirrors the client's `decide` and
+/// adds the server's explicit selection and restore gates. `remote` is
+/// the actual remote content hash, never the state record, so remote
+/// customization is always detected.
 fn decide_config(
     published: &ContentHash,
     remote: Option<&ContentHash>,
@@ -602,9 +606,9 @@ fn decide_config(
 /// from: publication identity, the approving context (profile, game,
 /// target, restart policy), the authoritative state revision, and the
 /// remote content preconditions (config hashes and owned-payload hashes).
-/// A remote byte changing between preview and deploy — even when the
-/// planned action stays `Write` — produces a different hash, so a stale
-/// approval is rejected rather than silently executing a different plan.
+/// A remote byte changing between preview and deploy produces a different
+/// hash, even when the planned action stays `Write`, so a stale approval
+/// gets rejected instead of silently running a different plan.
 fn plan_hash(
     plan: &DeploymentPlan,
     snapshot: &RemoteSnapshot,
@@ -808,7 +812,7 @@ mod tests {
     fn configs_only_selection_never_touches_payload() {
         let fixture = fixture();
         let mut snapshot = empty_snapshot();
-        // A stale payload file the mods phase would remove — the configs
+        // A stale payload file the mods phase would remove. The configs
         // phase must leave the whole payload alone.
         snapshot.state.files.insert(
             deploy("BepInEx/plugins/Old/Old.dll"),
@@ -927,8 +931,8 @@ mod tests {
                 size: 1,
             },
         );
-        // A stray file inside a mirrored dir is NOT ours to remove —
-        // ownership comes from records, not directory membership. It is
+        // A stray file inside a mirrored dir is NOT ours to remove.
+        // Ownership comes from records, not directory membership. It is
         // surfaced as unmanaged instead.
         snapshot
             .payload_files
@@ -1002,7 +1006,7 @@ mod tests {
                 size: staged_file.size,
             },
         );
-        // Same size, different bytes — a remote edit that size comparison
+        // Same size, different bytes. A remote edit that size comparison
         // alone would miss.
         snapshot
             .payload_files
@@ -1039,8 +1043,8 @@ mod tests {
                 size: staged_file.size,
             },
         );
-        // Size matches but the remote read produced no hash — when content
-        // cannot be verified, the canonical bytes are re-uploaded.
+        // Size matches but the remote read produced no hash. When content
+        // cannot be verified, the plan re-uploads the canonical bytes.
         snapshot
             .payload_files
             .insert(deploy("BepInEx/plugins/ModA/ModA.dll"), staged_file.size);
@@ -1071,7 +1075,7 @@ mod tests {
                 size: staged_file.size,
             },
         );
-        // Remote file exists but its size drifted — upload again.
+        // Remote file exists but its size drifted, so upload again.
         snapshot
             .payload_files
             .insert(deploy("BepInEx/plugins/ModA/ModA.dll"), 999);
@@ -1171,7 +1175,7 @@ mod tests {
         );
 
         // Unselected: the remote deletion of a file applied at the
-        // published revision is honored — the file stays absent (Keep),
+        // published revision stands. The file stays absent (Keep) and is
         // never silently recreated.
         let plan = build_plan(
             &fixture.publication(),
@@ -1243,8 +1247,8 @@ mod tests {
                 .any(|u| u.kind == UploadKind::ConfigSeed)
         );
 
-        // Present remotely with different content: nothing is uploaded —
-        // the server's customization is never clobbered by a default.
+        // Present remotely with different content: nothing is uploaded,
+        // so the server's customization is never clobbered by a default.
         let mut snapshot = empty_snapshot();
         snapshot.config_remote.insert(
             config_path("BepInEx/config/seeded.cfg"),
@@ -1344,7 +1348,7 @@ mod tests {
         .unwrap();
         assert_ne!(first.hash, other.hash);
 
-        // So does a newer remote state sequence — a plan approved before
+        // So does a newer remote state sequence. A plan approved before
         // another operation cannot be replayed.
         let mut newer = empty_snapshot();
         newer.state.operation_seq = snapshot.state.operation_seq + 1;
@@ -1360,7 +1364,7 @@ mod tests {
         assert_ne!(first.hash, third.hash);
 
         // A different restart policy or target identity also binds the
-        // approval — changing behavior-relevant options after preview must
+        // approval. Changing behavior-relevant options after preview must
         // not reuse it.
         let mut context = context();
         context.restart_policy = crate::profile::server::settings::RestartPolicy::Immediate;
@@ -1422,9 +1426,10 @@ mod tests {
                 .any(|u| u.kind == UploadKind::Config)
         );
 
-        // ...then the remote file changes underneath the approval. The
-        // planned action is still `Write`, but the precondition differs —
-        // the hash must change so the stale approval is rejected.
+        // ...then the remote file changes after the approval was given.
+        // The planned action is still `Write`, but the approved content
+        // no longer matches, so the hash must change and the stale
+        // approval is rejected.
         snapshot
             .config_remote
             .insert(path, Some(hash_of(b"server-v2-edited")));
@@ -1464,7 +1469,7 @@ mod tests {
         .unwrap();
         assert!(plan.requires_restart);
 
-        // But a declined/unselected config writes nothing — no restart.
+        // But a declined/unselected config writes nothing, so no restart.
         let mut decline = selection(false, true);
         decline.decline_configs.push(path);
         let plan = build_plan(

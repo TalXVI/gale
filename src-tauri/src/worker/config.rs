@@ -2,11 +2,11 @@
 //!
 //! Secrets are kept out of this file and taken from the environment:
 //!
-//! - `GALE_WORKER_TOKEN` — bearer token the API requires.
-//! - `GALE_WORKER_REMOTE_PASSWORD` — FTP/SFTP password or key passphrase.
-//! - `GALE_WORKER_REFRESH_TOKEN` — initial Gale sync refresh token; the
+//! - `GALE_WORKER_TOKEN`: bearer token the API requires.
+//! - `GALE_WORKER_REMOTE_PASSWORD`: FTP/SFTP password or key passphrase.
+//! - `GALE_WORKER_REFRESH_TOKEN`: initial Gale sync refresh token. The
 //!   rotated token is then kept in the journal, so this is only a seed.
-//! - `GALE_WORKER_DATHOST_PASSWORD` — DatHost API password, when the host
+//! - `GALE_WORKER_DATHOST_PASSWORD`: DatHost API password, when the host
 //!   provider is DatHost.
 //!
 //! Example:
@@ -58,10 +58,11 @@ pub struct WorkerConfig {
     /// Address the HTTP API binds to.
     pub listen: String,
     /// The sync profile this worker is bound to. Requests cannot redirect
-    /// it to another profile — this is the worker's authorization scope.
+    /// it to another profile; this binding is the security boundary.
     pub profile_id: String,
-    /// Expected game slug from the publication manifest. Mismatched
-    /// publications are rejected instead of deploying the wrong modpack.
+    /// Expected game slug from the publication manifest. The worker
+    /// rejects mismatched publications instead of deploying the wrong
+    /// modpack.
     pub game: String,
     /// Sync API base URL; defaults to Gale's production service.
     pub sync_url: Option<String>,

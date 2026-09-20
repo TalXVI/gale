@@ -19,13 +19,13 @@ use crate::profile::{
 
 pub const API_BASE: &str = "/v1";
 
-/// `POST /v1/preview` — compute a plan for the given selection against the
+/// `POST /v1/preview` computes a plan for the given selection against the
 /// worker's view of the canonical publication and the remote server.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreviewRequest {
     pub selection: DeploySelection,
-    /// The restart policy the subsequent deploy will use — bound into the
+    /// The restart policy the subsequent deploy will use. Bound into the
     /// plan hash so a policy change after preview invalidates the approval.
     /// `None` uses the worker's configured policy.
     #[serde(default)]
@@ -42,7 +42,7 @@ pub struct PreviewResponse {
     pub warnings: Vec<String>,
 }
 
-/// `POST /v1/deploy` — execute a previously previewed plan. `plan_hash`
+/// `POST /v1/deploy` executes a previously previewed plan. `plan_hash`
 /// binds the request to the approved preview exactly like Local mode.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,7 +52,7 @@ pub struct DeployRequest {
     /// Restart behavior for this operation. `None` uses the worker's
     /// configured policy.
     pub restart_policy: Option<RestartPolicy>,
-    /// Take over a *stale foreign* lease — the documented recovery after
+    /// Take over a *stale foreign* lease, the documented recovery after
     /// the old executor is confirmed stopped. Live leases always win.
     #[serde(default)]
     pub force: bool,
@@ -69,8 +69,8 @@ pub struct DeployResponse {
     pub state: ServerDeploymentState,
 }
 
-/// `GET /v1/status` — journal state plus, when `refresh` is set, a live
-/// read of the remote deployment state.
+/// `GET /v1/status` returns journal state plus, when `refresh` is set, a
+/// live read of the remote deployment state.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusResponse {
@@ -81,8 +81,8 @@ pub struct StatusResponse {
     pub auto_sync: bool,
     pub auto_mods: bool,
     pub restart_policy: RestartPolicy,
-    /// The newest publication revision the worker has observed —
-    /// observation alone is not deployment.
+    /// The newest publication revision the worker has observed.
+    /// Observation alone is not deployment.
     pub observed_revision: Option<DateTime<Utc>>,
     /// A publication revision awaiting successful deployment, if any.
     pub pending_revision: Option<DateTime<Utc>>,
@@ -119,9 +119,9 @@ pub struct ServerStateSummary {
     pub lease: Option<LeaseRecord>,
 }
 
-/// `POST /v1/policy` — set a persistent per-file config update policy in
-/// the remote deployment state. The policy pin is derived server-side
-/// from the canonical publication — clients cannot supply it.
+/// `POST /v1/policy` sets a persistent per-file config update policy in
+/// the remote deployment state. The worker resolves the policy pin from
+/// the canonical publication, so clients cannot supply it.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PolicyRequest {
@@ -129,7 +129,7 @@ pub struct PolicyRequest {
     pub policy: ConfigUpdatePolicy,
 }
 
-/// `POST /v1/config` — update the worker's automation toggles. Manual
+/// `POST /v1/config` updates the worker's automation toggles. Manual
 /// Deploy Now requests are unaffected by `auto_sync`.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

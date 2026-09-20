@@ -1,8 +1,8 @@
 //! The desktop's client for an independently running `gale-worker`.
 //!
-//! Thin and symmetric with `worker::api`: the worker is bound to one
-//! profile and one remote at startup, so requests carry selections and
-//! approvals — never target identity.
+//! A thin mirror of `worker::api`. The worker is bound to one profile and
+//! one remote at startup, so requests carry selections and approvals, and
+//! never need to say which profile or server they target.
 
 use eyre::{Context, Result, bail, ensure};
 use reqwest::StatusCode;
@@ -41,10 +41,10 @@ impl WorkerClient {
             "worker address must not embed credentials"
         );
         if url.scheme() == "http" {
-            // Plaintext http carries the bearer token unencrypted, so it is
+            // Plaintext http sends the bearer token unencrypted, so it is
             // only acceptable when the worker runs on this same machine.
             // Remote workers need https:// or a secure tunnel/reverse
-            // proxy — a LAN is not a trusted transport.
+            // proxy. A LAN is not a trusted transport.
             ensure!(
                 is_loopback_host(url.host_str().unwrap_or_default()),
                 "plaintext http:// is only allowed for a worker on this machine; \
@@ -138,7 +138,7 @@ impl WorkerClient {
 
     /// Sets a persistent per-file config update policy on the remote
     /// deployment state, through the worker. The worker derives the
-    /// publication pin itself — clients never supply it.
+    /// publication pin itself, so clients never supply it.
     pub async fn set_policy(&self, path: &ConfigPath, policy: ConfigUpdatePolicy) -> Result<()> {
         self.send::<serde_json::Value>(
             self.http
@@ -204,8 +204,8 @@ mod tests {
 
     #[test]
     fn rejects_non_loopback_plaintext_http() {
-        // A LAN or internet address over http would send the bearer token
-        // in cleartext — not a trusted transport.
+        // Over http, a LAN or internet address would send the bearer token
+        // in cleartext. Neither network counts as a trusted transport.
         for address in [
             "http://192.168.1.10:8472",
             "http://worker.local:8472",

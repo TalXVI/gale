@@ -115,11 +115,10 @@ pub struct ProfileServerSettings {
 
 /// Settings used when launching a dedicated server on this machine.
 ///
-/// Which fields a game actually consumes is decided by the game's launch-arg
-/// builder; not every field is meaningful for every game. Defaults are
-/// intentionally neutral — the frontend constructs initial values with real
-/// game context (default port, game name) instead of relying on a `Default`
-/// impl.
+/// The game's launch-arg builder decides which fields it uses; not every
+/// field is meaningful for every game. Defaults are intentionally neutral.
+/// The frontend builds initial values with real game context, like the
+/// default port and game name, instead of relying on a `Default` impl.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct LocalServerSettings {
@@ -253,8 +252,8 @@ impl RemoteServerSettings {
             .map_err(|_| eyre::eyre!("remote server directory is not a valid remote path"))
     }
 
-    /// A normalized "protocol://host:port/directory" identity string —
-    /// what the plan hash binds an approval to, so a settings change that
+    /// A normalized "protocol://host:port/directory" identity string.
+    /// The plan hash binds an approval to it, so a settings change that
     /// retargets the server invalidates pending approvals.
     pub fn describe_target(&self) -> String {
         let protocol = match self.protocol {

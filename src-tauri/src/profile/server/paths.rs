@@ -278,10 +278,9 @@ impl DeployPath {
         self.value.split('/')
     }
 
-    /// Path segments plus the full path itself — i.e. every ancestor of the
-    /// path and the path itself, shortest first.
+    /// Every ancestor of the path plus the path itself, shortest first.
     ///
-    /// Used to let directory walks descend into a mirrored tree.
+    /// Directory walks use this to descend into a mirrored tree.
     pub fn self_and_ancestors(&self) -> impl Iterator<Item = DeployPathBuf> {
         self.segments().scan(String::new(), |current, segment| {
             if !current.is_empty() {

@@ -6,8 +6,8 @@
 //!   persists settings and credentials.
 //! - **Routine synchronization** (`get_server_sync_status`,
 //!   `preview_server_sync`, `deploy_server_sync`, `set_server_config_policy`,
-//!   `configure_worker`) uses the stored settings plus stored credentials —
-//!   no settings dialog needed on every deploy.
+//!   `configure_worker`) uses the stored settings plus stored credentials,
+//!   so no settings dialog is needed on every deploy.
 //!
 //! Both execution modes share the wire shapes in `worker::api`, so the
 //! frontend handles Local and Worker results identically.
@@ -95,7 +95,7 @@ pub struct RemoteServerRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ServerSyncRequest {
     pub selection: DeploySelection,
-    /// The restart policy the deploy will use — preview binds it into the
+    /// The restart policy the deploy will use. Preview binds it into the
     /// plan hash so changing it afterwards invalidates the approval.
     /// `None` uses the stored policy.
     #[serde(default)]
@@ -116,8 +116,8 @@ pub struct ServerSyncDeployRequest {
     /// Overrides the stored restart policy for this operation.
     #[serde(default)]
     pub restart_policy: Option<RestartPolicy>,
-    /// Take over a stale foreign lease — recovery after the old executor
-    /// is confirmed stopped. Live leases always win.
+    /// Take over a stale foreign lease, the recovery path after the old
+    /// executor is confirmed stopped. Live leases always win.
     #[serde(default)]
     pub force: bool,
     #[serde(default)]
@@ -262,9 +262,9 @@ pub async fn launch_dedicated_server(
     let secrets = ServerSecrets::for_profile(profile_id)?;
     let password = secrets.resolve(ServerSecret::GamePassword, &request.password)?;
 
-    // Resolve by the captured id — `pull_profile` awaited, so the active
-    // profile may have switched underneath us. Never combine profile A's
-    // credentials with profile B's settings or launch context.
+    // Resolve by the captured id. The `pull_profile` call awaited, so the
+    // active profile may have changed since then. Never combine profile
+    // A's credentials with profile B's settings or launch context.
     let (game, stored_settings) = {
         let manager = app.lock_manager();
         let (game, profile) = manager.profile_by_id(profile_id)?;
@@ -359,7 +359,7 @@ pub async fn force_stop_dedicated_server(app: AppHandle) -> Result<()> {
         let mut runtime = app.lock_server_runtime();
         match runtime.begin_stop() {
             Some(pair) => pair,
-            // Already stopped, or a stop is already in flight — still
+            // Already stopped, or a stop is already in flight. Still
             // report the status so the UI stays in sync.
             None => {
                 runtime::emit_status(&app, &runtime.status());
@@ -393,7 +393,7 @@ pub async fn test_remote_server_connection(
         .map_err(|err| eyre::eyre!("remote connection worker failed: {err}"))??;
 
     if matches!(result, ConnectionTestResult::Connected { .. }) {
-        // Save into the profile the test was started for — the network
+        // Save into the profile the test was started for. The network
         // call awaited, so the active profile may have changed.
         save_remote_request_for(&app, profile_id, &secrets, &request, &credential)?;
     }
@@ -411,7 +411,7 @@ pub async fn test_worker_connection(
     request.settings.validate()?;
 
     let secrets = ServerSecrets::for_profile(profile_id)?;
-    // The profile's sync identity is captured before the await — an
+    // The profile's sync identity is captured before the await, since an
     // active-profile switch must not mix identities or redirect the save.
     let sync_id = sync_id_for(&app, profile_id);
     let client = worker_client(&secrets, &request.settings, &request.worker_token)?;
@@ -450,8 +450,9 @@ pub async fn get_server_sync_status(
     let target = sync_target(&app)?;
     let mut warnings = Vec::new();
 
-    // The latest publication revision the desktop knows about — cheap
-    // metadata, non-fatal when sync isn't configured or unreachable.
+    // The latest publication revision the desktop knows about. This is
+    // cheap metadata, and a failure is non-fatal when sync isn't
+    // configured or unreachable.
     let publication_revision = match &target.sync_id {
         Some(id) => match sync::fetch_publication_meta(id, &app).await {
             Ok(Some(meta)) => Some(meta.updated_at()),
@@ -572,8 +573,8 @@ pub async fn set_server_config_policy(
             client.set_policy(&request.path, request.policy).await?;
         }
         Executor::Local(credential) => {
-            // The policy pin is derived from the canonical publication on
-            // the trusted side — a client-supplied value could pin the
+            // The policy pin comes from the canonical publication on the
+            // trusted side, because a client-supplied value could pin the
             // policy at the wrong revision.
             let pinned_at = match &target.sync_id {
                 Some(id) => sync::fetch_publication(id, &app)
@@ -650,7 +651,7 @@ pub async fn configure_worker(request: ConfigureWorkerRequest, app: AppHandle) -
 /// any await so an active-profile switch cannot redirect it (R03).
 struct SyncTarget {
     profile_id: i64,
-    /// The profile's game slug — captured so plan approvals stay bound to
+    /// The profile's game slug, captured so plan approvals stay bound to
     /// the originating game across an active-profile switch.
     game: String,
     sync_id: Option<String>,
@@ -678,8 +679,8 @@ fn sync_target(app: &AppHandle) -> eyre::Result<SyncTarget> {
     })
 }
 
-/// The sync id of a specific profile — the profile-switch-safe variant of
-/// `sync_id_of` for operations that already pinned their target.
+/// The sync id of a specific profile, looked up by id rather than through
+/// the active profile, so an active-profile switch cannot redirect it.
 fn sync_id_for(app: &AppHandle, profile_id: i64) -> Option<String> {
     app.lock_manager()
         .profile_by_id(profile_id)
@@ -772,7 +773,7 @@ async fn open_remote_session(
         .map_err(|err| eyre::eyre!("remote session worker failed: {err}"))?
 }
 
-/// Fetches the canonical publication and stages its payload — the same two
+/// Fetches the canonical publication and stages its payload, the same two
 /// steps the worker performs, so both executors see identical content.
 async fn fetch_and_stage(
     app: &AppHandle,
@@ -818,8 +819,8 @@ async fn fetch_and_stage(
     Ok((publication, desired))
 }
 
-/// The approval-binding context for this target — profile, game, remote
-/// identity, and the restart policy the operation will actually apply.
+/// The context the plan hash binds an approval to: the profile, game,
+/// remote identity, and the restart policy the operation will apply.
 fn plan_context(target: &SyncTarget, restart_policy: Option<RestartPolicy>) -> plan::PlanContext {
     plan::PlanContext {
         profile_id: target.profile_id.to_string(),
@@ -932,7 +933,7 @@ async fn local_deploy(
         .restart_policy
         .unwrap_or(target.settings.restart_policy);
     // A restart is owed when this plan changed content *or* an earlier
-    // deployment left one pending — a failed restart must not be lost.
+    // deployment left one pending, since a failed restart must not be lost.
     let requires_restart = deployment.plan.requires_restart || session.state.restart_required;
     let restart = engine::apply_restart_policy(host.as_ref(), policy, requires_restart).await;
 
@@ -972,7 +973,7 @@ fn active_profile_id(app: &AppHandle) -> i64 {
 
 /// Persists a tested remote configuration into the profile the operation
 /// started on. After an awaited network call the active profile may have
-/// changed — writing through `active_profile_mut` here would combine one
+/// changed, and writing through `active_profile_mut` here would combine one
 /// profile's credentials with another's settings (R03).
 fn save_remote_request_for(
     app: &AppHandle,

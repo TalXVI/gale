@@ -90,7 +90,7 @@ pub struct SyncProfileData {
 #[serde(rename_all = "camelCase")]
 pub struct PublishedState {
     /// The remote `updated_at` revision this publication snapshot represents.
-    /// `None` for records written before revision tracking — treated as stale.
+    /// `None` for records written before revision tracking, treated as stale.
     #[serde(default)]
     pub revision: Option<DateTime<Utc>>,
     pub manifest: ProfileManifest,
@@ -183,8 +183,8 @@ impl From<SyncProfileMetadata> for SyncProfileData {
 }
 
 impl SyncProfileData {
-    /// The sync-service profile id — what dedicated-server synchronization
-    /// fetches the canonical publication for.
+    /// The sync-service profile id. Dedicated-server synchronization
+    /// fetches the canonical publication for this id.
     pub fn id(&self) -> &str {
         &self.id
     }
@@ -342,14 +342,15 @@ fn preseed_migration(state: &mut AppliedState, latest: &SyncManifest) {
 }
 
 /// Config snapshots taken around the mod install: `before` the update and
-/// `after` it, so installer-written files can be told apart from user edits.
+/// `after` it, so the sync logic can tell installer-written files apart
+/// from user edits.
 type InstallSnapshots<'a> = (
     &'a BTreeMap<ConfigPath, ContentHash>,
     &'a BTreeMap<ConfigPath, ContentHash>,
 );
 
-/// Applies the config side of a sync archive to `applied`, mutating the state
-/// and the profile's config files together.
+/// Applies the config side of a sync archive to `applied`, updating the
+/// state and the profile's config files together.
 ///
 /// `install` carries the config snapshots taken around a mod install.
 /// `migrate_existing` seeds empty records for a profile that predates
@@ -1023,8 +1024,8 @@ pub async fn read_profile(id: &str, app: &AppHandle) -> Result<SyncProfileMetada
 }
 
 /// The canonical published state of a sync profile, validated and
-/// normalized — the exact artifact subscriber clients consume through
-/// `pull_profile` and dedicated servers deploy from.
+/// normalized. This is the exact artifact subscriber clients consume
+/// through `pull_profile` and dedicated servers deploy from.
 pub struct FetchedPublication {
     /// Remote `updated_at`, identifying this exact publication revision.
     pub revision: DateTime<Utc>,
@@ -1058,7 +1059,7 @@ pub async fn fetch_publication(id: &str, app: &AppHandle) -> Result<FetchedPubli
     publication_from_archive(&metadata, &bytes)
 }
 
-/// Fetches only the publication metadata — the cheap way to check whether
+/// Fetches only the publication metadata, the cheap way to check whether
 /// a new revision exists without downloading the archive.
 pub async fn fetch_publication_meta(
     id: &str,

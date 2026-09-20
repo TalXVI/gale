@@ -1,9 +1,9 @@
 //! The worker's HTTP server and automatic-sync poll loop.
 //!
 //! Authentication is a single bearer token (`GALE_WORKER_TOKEN`). The API
-//! deliberately has no profile/server parameters: the worker is bound to
-//! one profile and one remote at startup, so a remote caller can trigger a
-//! deployment but can never redirect it at another target.
+//! has no profile/server parameters on purpose: the worker is bound to
+//! one profile and one remote at startup, so a remote caller can trigger
+//! a deployment but can never redirect it at another target.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -108,8 +108,9 @@ impl WorkerContext {
         OperationMeta::worker(&self.config.worker_id, kind)
     }
 
-    /// The approval-binding context for this worker: identity comes from
-    /// the config it was started with, never from request parameters.
+    /// The context the plan hash binds an approval to. The identity comes
+    /// from the config the worker was started with, never from request
+    /// parameters.
     fn plan_context(&self, restart_policy: RestartPolicy) -> plan::PlanContext {
         plan::PlanContext {
             profile_id: self.config.profile_id.clone(),
@@ -128,7 +129,7 @@ impl WorkerContext {
 
     /// Fetches the latest canonical publication and stages its mod payload
     /// into `DesiredDeployment`. `include_mods` gates staging exactly like
-    /// Local mode — a configs-only operation never touches mod sources.
+    /// Local mode: a configs-only operation never touches mod sources.
     async fn publication(
         &self,
         include_mods: bool,
@@ -136,8 +137,9 @@ impl WorkerContext {
         let publication = match self.sync.poll(&self.journal, None).await? {
             PublicationProbe::New(publication) => publication,
             PublicationProbe::Unchanged(metadata) => {
-                // `since = None` should never produce Unchanged, but a
-                // defensive fetch keeps behavior sane if it ever does.
+                // `since = None` should never produce Unchanged. If it
+                // ever does, bail rather than pretend a publication
+                // exists.
                 let _ = metadata;
                 bail!("sync service reported no new publication")
             }
@@ -349,8 +351,8 @@ async fn deploy(
 }
 
 /// Shared deployment path for manual API requests and the automatic poll
-/// loop: identical fetch → plan → lease → execute → restart → persist
-/// semantics in both cases.
+/// loop. Both run the same fetch, plan, lease, execute, restart, and
+/// persist steps.
 async fn run_deployment(
     ctx: &Arc<WorkerContext>,
     selection: DeploySelection,
@@ -400,13 +402,13 @@ async fn run_deployment(
         match &result {
             Ok(response) => {
                 // Any completed deployment acknowledges pending work it
-                // covered — manual or automatic, the server is now at that
+                // covered. Manual or automatic, the server is now at that
                 // revision.
                 state.acknowledge_deployed(response.plan.publication_revision);
             }
             Err(_) => {
-                // `record_operation` clears the marker on success; on
-                // failure it must be cleared explicitly so status doesn't
+                // `record_operation` clears the marker on success. On
+                // failure it must be cleared here, so status doesn't
                 // report a stale in-flight operation and the next startup
                 // doesn't warn about an interruption that was handled.
                 state.interrupted_operation = None;
@@ -420,9 +422,9 @@ async fn run_deployment(
     result
 }
 
-/// The blocking half of [`run_deployment`]: deploy under the lease, decide
-/// the restart, then persist and record. Separated so the caller can clear
-/// the in-flight marker on every exit path.
+/// The blocking half of [`run_deployment`]. Deploys under the lease,
+/// decides the restart, then persists and records. Kept separate so the
+/// caller can clear the in-flight marker on every exit path.
 #[allow(clippy::too_many_arguments)]
 async fn execute_deployment(
     ctx: &Arc<WorkerContext>,
@@ -463,7 +465,7 @@ async fn execute_deployment(
     .context("deployment task panicked")??;
 
     // A restart is owed when this plan changed content *or* an earlier
-    // deployment left one pending — a failed restart must not be lost.
+    // deployment left one pending, since a failed restart must not be lost.
     let requires_restart = deployment.plan.requires_restart || session.state.restart_required;
     let restart =
         engine::apply_restart_policy(ctx.host().as_ref(), restart_policy, requires_restart).await;
@@ -507,9 +509,8 @@ async fn set_policy(
         return busy_response("this worker");
     };
 
-    // The policy pin is derived from the canonical publication — the
-    // trusted backend resolves it, the client cannot supply an arbitrary
-    // one.
+    // The worker resolves the policy pin from the canonical publication,
+    // so the client cannot supply an arbitrary one.
     let pinned_at = match ctx.publication(false).await {
         Ok((publication, _)) => publication
             .config
@@ -557,8 +558,8 @@ async fn configure(
     state.auto_sync = request.auto_sync;
     state.auto_mods = request.auto_mods;
     state.restart_policy = request.restart_policy;
-    // Re-enabling automation re-evaluates outstanding work immediately —
-    // a revision observed while disabled is not left to sit in backoff.
+    // Re-enabling automation re-evaluates outstanding work immediately,
+    // so a revision observed while disabled does not sit in backoff.
     if request.auto_sync
         && let Some(work) = state.pending.as_mut()
     {
@@ -581,8 +582,9 @@ async fn configure(
 async fn poll_loop(ctx: Arc<WorkerContext>) {
     let interval = Duration::from_secs(ctx.config.poll_interval_secs);
 
-    // Poll once immediately — a publication pushed while the worker was
-    // down shouldn't wait a full interval — then on the fixed cadence.
+    // Poll once immediately, since a publication pushed while the worker
+    // was down should not wait a full interval, then repeat on the fixed
+    // cadence.
     loop {
         poll_once(&ctx).await;
         tokio::time::sleep(interval).await;
@@ -594,7 +596,7 @@ async fn poll_loop(ctx: Arc<WorkerContext>) {
 enum AutoAction {
     /// Nothing is waiting.
     Idle,
-    /// Work is pending but `autoSync` is off — kept for later, not dropped.
+    /// Work is pending but `autoSync` is off. Kept for later, not dropped.
     Disabled,
     /// Backoff from the last failure is still running.
     Waiting,
@@ -628,7 +630,8 @@ fn retry_delay(attempts: u32) -> Duration {
         .min(CAP)
 }
 
-/// One poll cycle: observe the newest publication, then drive pending work.
+/// One poll cycle. Observes the newest publication, then drives pending
+/// work.
 async fn poll_once(ctx: &Arc<WorkerContext>) {
     let last_seen = ctx.journal.state.lock().await.last_seen_revision;
     match ctx.sync.poll(&ctx.journal, last_seen).await {
@@ -637,9 +640,9 @@ async fn poll_once(ctx: &Arc<WorkerContext>) {
             info!(%revision, "observed new publication");
             let mut state = ctx.journal.state.lock().await;
             state.last_seen_revision = Some(revision);
-            // A newer publication supersedes whatever was pending — the
-            // worker converges on the latest, never mid-applies an older
-            // one after a restart.
+            // A newer publication supersedes whatever was pending. The
+            // worker always moves to the latest revision and never
+            // finishes applying an older one after a restart.
             state.pending = Some(PendingWork::new(revision));
             if let Err(err) = ctx.journal.save(&state) {
                 warn!(%err, "failed to persist observed revision");
@@ -669,15 +672,16 @@ async fn poll_once(ctx: &Arc<WorkerContext>) {
         AutoAction::Waiting => {}
         AutoAction::Deploy => {
             let Ok(guard) = ctx.operation_lock.try_lock() else {
-                // A manual operation is running — the pending work is
-                // retained and retried next tick.
+                // A manual operation is running, so the pending work
+                // stays in the journal and retries next tick.
                 info!("automatic deploy deferred: another operation is running");
                 return;
             };
 
-            // Automatic selection: mods follow auto_mods; configs are
-            // always evaluated so per-file persistent policies apply.
-            // `Ask`-policy conflicts become pending decisions, not errors.
+            // Automatic selection follows auto_mods for mods. Configs are
+            // always evaluated so per-file persistent policies apply, and
+            // `Ask`-policy conflicts become pending decisions, not
+            // errors.
             let selection = DeploySelection {
                 include_mods: ctx.journal.state.lock().await.auto_mods,
                 include_configs: true,
@@ -786,7 +790,7 @@ mod tests {
     fn pending_work_deploys_only_when_enabled_and_due() {
         let mut state = journal();
 
-        // Nothing pending — the loop is idle, not deploying.
+        // Nothing pending, so the loop is idle, not deploying.
         assert_eq!(automatic_action(&state, Utc::now()), AutoAction::Idle);
 
         state.pending = Some(PendingWork::new(Utc::now()));
@@ -798,12 +802,12 @@ mod tests {
         assert_eq!(automatic_action(&state, Utc::now()), AutoAction::Disabled);
 
         state.auto_sync = true;
-        // A failed attempt scheduled a retry in the future — wait.
+        // A failed attempt scheduled a retry in the future, so wait.
         state.pending.as_mut().unwrap().next_attempt_at =
             Some(Utc::now() + ChronoDuration::minutes(5));
         assert_eq!(automatic_action(&state, Utc::now()), AutoAction::Waiting);
 
-        // The backoff timestamp arriving means try again.
+        // Once the backoff time passes, the work is due again.
         state.pending.as_mut().unwrap().next_attempt_at =
             Some(Utc::now() - ChronoDuration::seconds(1));
         assert_eq!(automatic_action(&state, Utc::now()), AutoAction::Deploy);
@@ -814,7 +818,7 @@ mod tests {
         assert_eq!(retry_delay(0), std::time::Duration::from_secs(60));
         assert_eq!(retry_delay(1), std::time::Duration::from_secs(120));
         assert_eq!(retry_delay(4), std::time::Duration::from_secs(60 * 16));
-        // The cap holds for arbitrarily many attempts — retries continue
+        // The cap holds for arbitrarily many attempts. Retries continue
         // but stay spread out.
         assert_eq!(retry_delay(30), std::time::Duration::from_secs(30 * 60));
     }

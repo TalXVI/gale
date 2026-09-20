@@ -22,7 +22,7 @@ const DATHOST_API: &str = "https://dathost.net/api/0.1";
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// The observable state needed for restart policy decisions. Every field
-/// is optional — an absent value means "unknown", never "empty"/"stopped".
+/// is optional. An absent value means "unknown", never "empty"/"stopped".
 #[derive(Debug, Clone, Default)]
 pub struct HostStatus {
     pub running: Option<bool>,
@@ -74,11 +74,11 @@ impl HostControl for NoHostControl {
 
 /// DatHost game-server API adapter.
 ///
-/// - `GET  /api/0.1/game-servers/{id}` — status including `on`.
-/// - `GET  /api/0.1/game-servers/{id}/metrics` — player count where the
-///   game supports it.
-/// - `POST /api/0.1/game-servers/{id}/start` — documented to *restart* an
-///   already-running server; used for both start and restart.
+/// - `GET  /api/0.1/game-servers/{id}` returns status including `on`.
+/// - `GET  /api/0.1/game-servers/{id}/metrics` returns the player count
+///   where the game supports it.
+/// - `POST /api/0.1/game-servers/{id}/start` is documented to *restart* an
+///   already-running server, so Gale uses it for both start and restart.
 pub struct DatHostControl {
     client: reqwest::Client,
     base: String,
@@ -180,9 +180,9 @@ impl HostControl for DatHostControl {
 
 /// Builds a host controller from settings and credentials.
 ///
-/// Credentials come from the caller — the desktop passes keyring secrets,
-/// the worker passes config secrets. `None` yields [`NoHostControl`],
-/// which is a supported configuration, not an error.
+/// Credentials come from the caller. The desktop passes keyring secrets,
+/// the worker passes config secrets. A `None` password gives
+/// [`NoHostControl`], which is a supported configuration, not an error.
 pub fn from_settings(settings: &HostSettings, password: Option<&str>) -> Box<dyn HostControl> {
     match settings.provider {
         HostProvider::None => Box::new(NoHostControl),

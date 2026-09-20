@@ -1,10 +1,10 @@
 //! Cross-process deployment coordination.
 //!
-//! Two executors — a desktop in Local mode and a worker — can run on
+//! Two executors, a desktop in Local mode and a worker, can run on
 //! separate machines, so a process-local mutex cannot prevent overlapping
 //! deployments. The lease is a directory claimed atomically on the remote
 //! server itself: `MKD`/mkdir either creates the directory or fails, which
-//! gives both FTP and SFTP a genuine mutual-exclusion primitive.
+//! gives both FTP and SFTP a genuine mutual-exclusion mechanism.
 //!
 //! The holder heartbeats a `lease.json` inside the directory through a
 //! second connection. Ownership is explicit: heartbeat and release verify
@@ -15,8 +15,8 @@
 //! expired is broken automatically only when it belongs to the *same*
 //! owner (a restarted executor recovering its own crash); a foreign stale
 //! lease requires an explicit `force` decision, because an expired
-//! heartbeat does not prove the old executor stopped writing — FTP/SFTP
-//! have no fencing primitive that can revoke an in-flight write. This is
+//! heartbeat does not prove the old executor stopped writing. FTP/SFTP
+//! have no fencing mechanism that can revoke an in-flight write. This is
 //! the strongest guarantee the transports provide; the documented recovery
 //! path is to stop the old executor and retry with `force`.
 
@@ -86,7 +86,7 @@ pub struct Lease {
     stop: StopSignal,
     heartbeat: Option<JoinHandle<()>>,
     /// Set by the heartbeat when the stored lease was replaced by another
-    /// owner — this executor must stop mutating.
+    /// owner, meaning this executor must stop mutating.
     lost: Arc<AtomicBool>,
 }
 
@@ -95,8 +95,8 @@ pub struct Lease {
 #[serde(rename_all = "camelCase")]
 pub struct LeaseBusy {
     pub record: LeaseRecord,
-    /// Whether the blocking lease's heartbeat has expired — the caller can
-    /// offer `force` takeover only when it is.
+    /// Whether the blocking lease's heartbeat has expired. The caller can
+    /// offer `force` takeover only when it has.
     pub stale: bool,
 }
 
@@ -122,8 +122,8 @@ impl std::error::Error for LeaseBusy {}
 
 impl Lease {
     /// Whether the stored lease still belongs to this holder. Read fresh
-    /// from the remote — the cheap ownership check the engine runs before
-    /// each mutation phase.
+    /// from the remote, this is the cheap ownership check the engine runs
+    /// before each mutation phase.
     pub fn still_ours(&self, ops: &mut dyn RemoteOps) -> bool {
         match read_lease(ops, &self.file) {
             Ok(Some(record)) => record.operation_id == self.record.operation_id,
@@ -131,17 +131,18 @@ impl Lease {
         }
     }
 
-    /// Whether the heartbeat observed a different owner — the executor
-    /// should treat the deployment as compromised and stop mutating.
+    /// Whether the heartbeat observed a different owner. If so, the
+    /// executor should treat the deployment as compromised and stop
+    /// mutating.
     pub fn is_lost(&self) -> bool {
         self.lost.load(Ordering::SeqCst)
     }
 
-    /// Stops the heartbeat and removes the lease — but only while the
+    /// Stops the heartbeat and removes the lease, but only while the
     /// stored record still names this holder. If another executor took
-    /// over, its lease is left untouched: release must never delete a
-    /// foreign lock. Best-effort: remaining failures only mean the lease
-    /// expires on its own.
+    /// over, its lease stays untouched, because release must never delete
+    /// a foreign lock. The whole operation is best-effort. A failure here
+    /// only means the lease expires on its own.
     pub fn release(mut self, ops: &mut dyn RemoteOps) {
         signal_stop(&self.stop);
         if let Some(heartbeat) = self.heartbeat.take() {
@@ -159,7 +160,7 @@ impl Lease {
                 info!(owner = %self.record.owner, "released deployment lease");
             }
             Ok(_) => {
-                // Another owner holds the lease now — theirs stays.
+                // Another owner holds the lease now, so theirs stays.
                 warn!(
                     owner = %self.record.owner,
                     "lease ownership changed; leaving the new holder's lease in place"
@@ -185,7 +186,7 @@ impl Drop for Lease {
 ///
 /// A live foreign lease yields [`LeaseBusy`]. A stale lease is broken
 /// automatically only when it belongs to the same owner (a crashed
-/// executor recovering); a stale foreign lease requires `force` — the
+/// executor recovering); a stale foreign lease requires `force`, the
 /// documented recovery once the old executor is confirmed stopped. An
 /// empty lease directory is a claim interrupted mid-write: it gets one
 /// grace observation before being treated as a crash remnant.
@@ -235,7 +236,8 @@ pub fn acquire(
                 Some(record) => {
                     if record.owner == owner {
                         // Our own stale lease: this executor crashed
-                        // mid-operation and restarted — safe to recover.
+                        // mid-operation and restarted, so it is safe to
+                        // recover.
                         info!(owner, "recovering own stale deployment lease");
                         break_lease(ops, lease_dir, &lease_file)?;
                     } else if force {
@@ -252,9 +254,10 @@ pub fn acquire(
                         .into());
                     }
                 }
-                // An empty husk or an unreadable record: a live holder
-                // writes its file right after mkdir, so a husk that
-                // persists past the grace window is a crash remnant.
+                // An empty husk or an unreadable record means the claim
+                // never finished. A live holder writes its file right
+                // after mkdir, so a husk that persists past the grace
+                // window is a crash remnant.
                 None if !husk_observed => {
                     husk_observed = true;
                     thread::sleep(HUSK_GRACE);
@@ -272,8 +275,8 @@ pub fn acquire(
 }
 
 /// Starts a heartbeat that keeps the lease alive through a second
-/// connection at [`HEARTBEAT_INTERVAL`]. Each beat first re-reads the
-/// stored record: if another owner has taken over, the heartbeat stops and
+/// connection at [`HEARTBEAT_INTERVAL`]. Each beat re-reads the stored
+/// record first. If another owner has taken over, the heartbeat stops and
 /// flags `lost` instead of overwriting the foreign lease. Write failures
 /// only mean the lease can go stale, which is safe.
 pub fn start_heartbeat(
@@ -327,8 +330,8 @@ fn start_heartbeat_every(
                     return;
                 }
                 Err(_) => {
-                    // Cannot verify ownership — skip this beat rather than
-                    // risk overwriting a foreign lease.
+                    // Cannot verify ownership, so skip this beat rather
+                    // than risk overwriting a foreign lease.
                     continue;
                 }
             }
@@ -345,7 +348,8 @@ fn start_heartbeat_every(
     }));
 }
 
-/// Reads the current lease record, if present and parseable.
+/// Reads the current lease record. Returns `None` when the file is
+/// missing or its contents do not parse.
 pub fn read_lease(
     ops: &mut dyn RemoteOps,
     lease_file: &RemotePathBuf,
@@ -506,8 +510,8 @@ mod tests {
     #[test]
     fn own_stale_lease_recovers_automatically() {
         let mut remote = MemoryRemote::new();
-        // A crashed executor restarting finds its own stale lease — the
-        // same owner may safely break it without a force decision.
+        // A crashed executor restarting finds its own stale lease, and
+        // the same owner may safely break it without a force decision.
         plant_lease_as(&mut remote, "local:1", "op-crashed", expired());
 
         let lease = acquire(&mut remote).unwrap();
@@ -546,7 +550,7 @@ mod tests {
 
         lease.release(&mut remote);
 
-        // The foreign lease survives — the old owner must not delete it.
+        // The foreign lease survives; the old owner must not delete it.
         let stored: LeaseRecord =
             serde_json::from_slice(remote.contents(LEASE_FILE).unwrap()).unwrap();
         assert_eq!(stored.owner, "worker:vps");

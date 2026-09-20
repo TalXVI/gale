@@ -77,7 +77,7 @@ export const getSyncStatus = (refresh: boolean, password = '', workerToken = '')
 		request: { refresh, password, workerToken }
 	});
 
-/// The restart policy is bound into the plan hash — a preview only stays
+/// The restart policy is bound into the plan hash. A preview only stays
 /// deployable while the selected policy is unchanged.
 export const previewSync = (
 	selection: DeploySelection,
@@ -90,8 +90,8 @@ export const previewSync = (
 	});
 
 /// `force` takes over a *stale* foreign lease after the old executor is
-/// confirmed stopped — the recovery path surfaced by the preview's busy
-/// state. Live leases always win.
+/// confirmed stopped, the recovery path the preview's busy state shows.
+/// Live leases always win.
 export const deploySync = (
 	selection: DeploySelection,
 	planHash: string,
@@ -104,8 +104,8 @@ export const deploySync = (
 		request: { selection, planHash, restartPolicy, force, password, workerToken }
 	});
 
-/// The backend derives the publication pin itself — callers never supply
-/// it, so a policy can't be anchored to the wrong revision.
+/// The backend derives the publication pin itself, so callers never
+/// supply it and a policy can't be anchored to the wrong revision.
 export const setConfigPolicy = (
 	path: string,
 	policy: SyncConfigUpdatePolicy,

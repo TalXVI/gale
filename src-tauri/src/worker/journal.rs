@@ -25,7 +25,7 @@ pub const JOURNAL_FILE: &str = "gale-worker-state.json";
 #[serde(default, rename_all = "camelCase")]
 pub struct WorkerJournal {
     /// The newest publication `updated_at` the worker has observed.
-    /// Observation only advances this marker — it never acknowledges
+    /// Observation only advances this marker; it never acknowledges
     /// deployment, so a failed or skipped revision stays recoverable.
     pub last_seen_revision: Option<DateTime<Utc>>,
     /// Work observed but not yet completed successfully. Retained across
@@ -44,7 +44,7 @@ pub struct WorkerJournal {
     /// the source of truth so runtime changes survive restarts.
     pub automation_seeded: bool,
     pub last_operation: Option<OperationRecord>,
-    /// The last poll/deploy error, surfaced through the status endpoint.
+    /// The last poll/deploy error, reported through the status endpoint.
     pub last_error: Option<String>,
     /// An operation that was in flight when the worker stopped. The remote
     /// lease is the real lock; this marker is diagnostic only.
@@ -70,7 +70,8 @@ impl Default for WorkerJournal {
 }
 
 /// A publication revision awaiting successful completion. Kept separate
-/// from `last_seen_revision`: observing a publication is not deploying it.
+/// from `last_seen_revision`, because observing a publication is not
+/// deploying it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingWork {
@@ -99,9 +100,10 @@ impl PendingWork {
 }
 
 impl WorkerJournal {
-    /// Records that `deployed` fully landed: pending work it covered is
-    /// cleared (a newer pending publication survives — the deploy didn't
-    /// reach it), and `last_deployed_revision` advances monotonically.
+    /// Records that `deployed` fully landed. Clears pending work the
+    /// deployment covered and advances `last_deployed_revision`
+    /// monotonically. A newer pending publication survives, since the
+    /// deploy did not reach it.
     pub fn acknowledge_deployed(&mut self, deployed: DateTime<Utc>) {
         if self
             .pending
@@ -117,8 +119,8 @@ impl WorkerJournal {
     }
 }
 
-/// Journal plus its persistence path, guarded so concurrent operations and
-/// the poll loop serialize on it.
+/// The journal state plus the file path it persists to. The mutex makes
+/// the API handlers and the poll loop take turns on the state.
 pub struct Journal {
     path: PathBuf,
     pub state: Mutex<WorkerJournal>,
@@ -141,10 +143,10 @@ impl Journal {
         })
     }
 
-    /// Persists the current journal state through temp + rename. The
-    /// journal holds a rotated refresh token, so the file is created
-    /// owner-only; the permission is re-applied after the rename so atomic
-    /// replacement cannot widen it.
+    /// Persists the current journal state through temp file + rename. The
+    /// journal holds a rotated refresh token, so the file gets owner-only
+    /// permissions, re-applied after the rename so atomic replacement
+    /// cannot widen them.
     pub fn save(&self, state: &WorkerJournal) -> Result<()> {
         let bytes = serde_json::to_vec_pretty(state)?;
         let tmp = self.path.with_extension("json.tmp");
@@ -196,8 +198,8 @@ impl Journal {
     }
 }
 
-/// What kind of work the poll loop wants to start, used to record the
-/// in-flight marker before the operation runs.
+/// The in-flight marker recorded before an operation starts. `kind` says
+/// whether the poll loop or an API request started it.
 pub fn busy_marker(id: String, kind: OperationKind) -> BusyOperation {
     BusyOperation {
         id,
@@ -283,8 +285,8 @@ mod tests {
         assert_eq!(state.last_operation.as_ref().unwrap().id, "op-1");
         drop(state);
 
-        // The cleared marker survives reload — a restarted worker doesn't
-        // report a phantom in-flight operation.
+        // The cleared marker survives reload, so a restarted worker
+        // doesn't report a phantom in-flight operation.
         let journal = Journal::load(dir.path()).unwrap();
         let state = journal.state.lock().await;
         assert!(state.interrupted_operation.is_none());
@@ -324,8 +326,8 @@ mod tests {
         assert!(state.pending.is_none());
         assert_eq!(state.last_deployed_revision, Some(deployed));
 
-        // A newer pending publication survives — the deployment didn't
-        // reach it.
+        // A newer pending publication survives, since the deployment
+        // didn't reach it.
         state.pending = Some(PendingWork::new(newer));
         state.acknowledge_deployed(deployed);
         assert_eq!(state.pending.as_ref().unwrap().revision, newer);

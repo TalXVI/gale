@@ -52,9 +52,10 @@ pub enum OperationKind {
 #[serde(rename_all = "camelCase")]
 pub enum OperationStatus {
     Succeeded,
-    /// The operation ran to completion but part of the selected work did
-    /// not land — e.g. a config write failed. Per-file records describe
-    /// exactly what succeeded; the outstanding work stays retryable.
+    /// The operation ran to completion, but part of the selected work
+    /// failed, for example a config write that could not be applied.
+    /// Per-file records describe exactly what succeeded; the remaining
+    /// work stays retryable.
     Partial,
     /// The deployment did not finish cleanly; applied-file records still
     /// reflect exactly what succeeded.
@@ -278,8 +279,9 @@ impl ServerDeploymentState {
 /// Reads and validates the remote deployment state.
 ///
 /// A missing state file falls back to the legacy deployment manifest and
-/// adopts its ownership records. An unparsable state file is an error —
-/// deploying without knowing Gale's ownership could delete foreign files.
+/// adopts its ownership records. A state file that fails to parse is an
+/// error, because deploying without knowing Gale's ownership could delete
+/// foreign files.
 pub fn read_state(
     ops: &mut dyn RemoteOps,
     spec: &DeploymentSpec,

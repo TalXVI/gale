@@ -386,7 +386,7 @@ export type DeploymentPlan = {
 	unchangedFiles: number;
 	configEntries: PlanConfigEntry[];
 	conflicts: PlanConflict[];
-	/// Remote payload files Gale has never owned — surfaced for review,
+	/// Remote payload files Gale has never owned. Shown for review,
 	/// never deleted by the deployment.
 	unmanaged: string[];
 	requiresRestart: boolean;
@@ -436,7 +436,7 @@ export type LeaseRecord = {
 };
 
 /// A preview that found another live executor holding the deployment
-/// lease. `stale` marks a lease whose heartbeat expired — the only case
+/// lease. `stale` marks a lease whose heartbeat expired, the only case
 /// where a forced takeover is offered.
 export type LeaseBusy = {
 	record: LeaseRecord;
@@ -488,8 +488,8 @@ export type WorkerStatus = {
 	autoSync: boolean;
 	autoMods: boolean;
 	restartPolicy: RestartPolicy;
-	/// The newest publication revision the worker has observed —
-	/// observation alone is not deployment.
+	/// The newest publication revision the worker has observed.
+	/// Observation alone is not deployment.
 	observedRevision: string | null;
 	/// A publication revision awaiting successful deployment, if any.
 	pendingRevision: string | null;

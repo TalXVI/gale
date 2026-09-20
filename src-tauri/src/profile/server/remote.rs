@@ -89,9 +89,9 @@ pub trait RemoteOps: Send {
     fn delete_dir(&mut self, path: &RemotePath) -> Result<()>;
     /// Creates `path` and any missing parents it can create.
     fn ensure_dir(&mut self, path: &RemotePath) -> Result<()>;
-    /// Atomically creates `path` as a directory: `true` when created, `false`
-    /// when it already existed. Used as the deployment-lease primitive because
-    /// `MKD`/mkdir is atomic on both FTP and SFTP servers.
+    /// Atomically creates `path` as a directory: `true` when created,
+    /// `false` when it already existed. The deployment lease uses it
+    /// because `MKD`/mkdir is atomic on both FTP and SFTP servers.
     fn claim_dir(&mut self, path: &RemotePath) -> Result<bool>;
     /// Re-establishes the underlying transport after an error.
     fn reconnect(&mut self) -> Result<()>;
@@ -117,16 +117,17 @@ enum RemoteClient {
     Ftp(RustlsFtpStream),
 }
 
-/// FTPS certificate verification. A configured fingerprint pin is an
-/// exact-match requirement: the observed end-entity certificate must match
-/// it whether or not normal CA validation would have succeeded, so a
-/// CA-valid *replacement* certificate cannot silently satisfy the pin.
-/// Without a pin, normal CA validation decides; on failure the observed
-/// fingerprint is recorded so the caller can surface it for an explicit
-/// trust decision.
+/// FTPS certificate verification. When a fingerprint pin is configured it
+/// is an exact-match requirement: the certificate the server presents
+/// must match it whether or not normal CA validation would have
+/// succeeded, so a CA-valid *replacement* certificate cannot silently
+/// satisfy the pin. Without a pin, normal CA validation decides. When
+/// that fails, the observed fingerprint is recorded so the caller can
+/// show it and ask the user to trust it explicitly.
 ///
-/// Handshake-signature verification always delegates to webpki — trusting
-/// a certificate must never bypass proof of possession of its private key.
+/// Handshake-signature verification always goes through webpki. Trusting
+/// a certificate must never skip checking that the server holds its
+/// private key.
 #[derive(Debug)]
 struct FtpsCertVerifier {
     webpki: Arc<suppaftp::rustls::client::WebPkiServerVerifier>,
@@ -225,8 +226,9 @@ impl ServerCertVerifier for FtpsCertVerifier {
     }
 }
 
-/// Fingerprint of an end-entity certificate for pin comparison. blake3 is
-/// already a dependency and yields a stable 256-bit digest.
+/// Fingerprint of the certificate the server presents, used for pin
+/// comparison. blake3 is already a dependency and gives a stable 256-bit
+/// digest.
 fn certificate_fingerprint(cert: &CertificateDer<'_>) -> String {
     blake3::hash(cert.as_ref()).to_hex().to_string()
 }
@@ -816,7 +818,7 @@ pub(crate) mod memory {
             }
         }
 
-        /// Convenience: place a file, registering its parent directories.
+        /// Places a file and registers its parent directories.
         pub fn put_file(&mut self, path: &str, bytes: &[u8]) {
             self.files.insert(path.to_owned(), bytes.to_vec());
             self.register_parents(path);
@@ -828,7 +830,7 @@ pub(crate) mod memory {
 
         fn register_parents(&mut self, path: &str) {
             let mut prefix = path.rmatch_indices('/');
-            // Skip the file itself: take all directory prefixes.
+            // Skip the file itself, then take all directory prefixes.
             prefix.next();
             for (idx, _) in prefix {
                 if idx > 0 {
@@ -1070,7 +1072,7 @@ mod tests {
         rcgen::generate_simple_self_signed(vec![name.to_owned()]).unwrap()
     }
 
-    /// A CA plus a leaf it signed — webpki accepts the leaf when the CA is
+    /// A CA plus a leaf it signed. webpki accepts the leaf when the CA is
     /// in the root store.
     fn ca_signed_leaf(name: &str) -> (RootCertStore, rcgen::CertifiedKey) {
         let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -1099,7 +1101,7 @@ mod tests {
         pinned: Option<String>,
     ) -> (FtpsCertVerifier, Arc<std::sync::Mutex<Option<String>>>) {
         // WebPkiServerVerifier requires at least one trust anchor even
-        // when a pin bypasses it — add a throwaway CA to satisfy it.
+        // when a pin bypasses it, so add a throwaway CA to satisfy it.
         let ca_key = rcgen::KeyPair::generate().unwrap();
         let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -1139,7 +1141,7 @@ mod tests {
     #[test]
     fn ca_valid_replacement_cannot_satisfy_a_pin() {
         // The certificate chains to a trusted CA, but it is not the pinned
-        // one — a pin is exact-match, not "any CA-valid cert".
+        // one. A pin is exact-match, not "any CA-valid cert".
         let (roots, certified) = ca_signed_leaf("ftps.example.com");
         let other = self_signed("other");
         let (verifier, _) = verifier(roots, Some(certificate_fingerprint(other.cert.der())));
@@ -1228,8 +1230,8 @@ mod tests {
         )
     }
 
-    /// A signing key that produces well-formed but wrong ECDSA signatures —
-    /// the server presents a valid certificate but cannot prove possession
+    /// A signing key that produces well-formed but wrong ECDSA signatures.
+    /// The server presents a valid certificate but cannot prove possession
     /// of its private key.
     #[derive(Debug)]
     struct ForgedKey;
@@ -1349,7 +1351,7 @@ mod tests {
     fn forged_handshake_signature_fails_even_when_cert_is_pinned() {
         // The Codex regression: a pin must not turn into
         // `HandshakeSignatureValid::assertion()`. The certificate is
-        // pinned, but the server signs with garbage — the handshake must
+        // pinned, but the server signs with garbage. The handshake must
         // fail, proving verify_tls1x_signature still does real crypto.
         for config in [client_config, client_config_tls12] {
             let certified = self_signed("ftps.local");

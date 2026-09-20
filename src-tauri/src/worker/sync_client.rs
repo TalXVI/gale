@@ -1,11 +1,11 @@
 //! The worker's standalone Gale sync client.
 //!
-//! Mirrors the desktop's `profile::sync` transport but sources credentials
-//! from the journal/environment rather than `AppHandle`/keyring, so it can
-//! run unattended. Token rotation is persisted to the journal; archive
-//! validation goes through the same `publication_from_archive` path the
-//! desktop uses, so a "canonical publication" means the identical artifact
-//! on both sides.
+//! Mirrors the desktop's `profile::sync` transport but takes credentials
+//! from the journal and environment rather than `AppHandle`/keyring, so
+//! it can run unattended. Token rotation is persisted to the journal.
+//! Archive validation goes through the same `publication_from_archive`
+//! path the desktop uses, so a "canonical publication" is the identical
+//! artifact on both sides.
 
 use std::sync::LazyLock;
 
@@ -180,10 +180,11 @@ impl SyncClient {
         Ok(bytes)
     }
 
-    /// Polls for the canonical publication. When `since` is `Some`, only
-    /// downloads the archive if the remote revision advanced past it. One
-    /// token grant serves both requests — a refresh rotates the refresh
-    /// token, so doubling it per poll is pure waste.
+    /// Polls for the canonical publication. When `since` is `Some`, the
+    /// archive is only downloaded if the remote revision advanced past
+    /// it. One token grant serves both requests. A refresh rotates the
+    /// refresh token, so requesting a second grant per poll would be
+    /// wasted work.
     pub async fn poll(
         &self,
         journal: &Journal,

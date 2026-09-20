@@ -2,13 +2,13 @@
 //!
 //! One deployment is three phases:
 //!
-//! 1. **Plan** — snapshot the remote and run the pure planner ([`preview`],
+//! 1. **Plan.** Snapshot the remote and run the pure planner ([`preview`],
 //!    or the re-plan inside [`deploy`]). The plan hash binds user approval
 //!    to exactly the actions that will run.
-//! 2. **Files** — under the remote lease, apply removals, uploads, and
+//! 2. **Files.** Under the remote lease, apply removals, uploads, and
 //!    config writes; record every success in the deployment state and
 //!    persist it before touching the game process.
-//! 3. **Restart** — the async [`apply_restart_policy`] consults the host
+//! 3. **Restart.** The async [`apply_restart_policy`] consults the host
 //!    provider, then [`finish`] records the operation and releases the
 //!    lease.
 //!
@@ -152,9 +152,9 @@ pub struct Session<'a> {
     pub layout: RemoteLayout,
     pub host_managed: bool,
     pub state: ServerDeploymentState,
-    /// The `operation_seq` the in-memory `state` was loaded from. Persisting
-    /// refuses to write when the remote sequence has moved past it — a stale
-    /// writer must never overwrite newer deployment state.
+    /// The `operation_seq` the in-memory `state` was loaded with. Writing
+    /// is refused when the remote sequence has moved past it, because a
+    /// stale writer must never overwrite newer deployment state.
     base_seq: u64,
     /// A live lease held by another executor, if one was observed.
     pub lease: Option<LeaseRecord>,
@@ -330,15 +330,16 @@ pub struct Deployment {
 
 /// Executes an approved plan under the deployment lease.
 ///
-/// The lease is acquired *before* the authoritative snapshot so the state
-/// the plan executes against cannot be replaced underneath the approval.
-/// The plan is then computed from that fresh snapshot and must hash
-/// identically to `expected_plan_hash` — approval of a different plan is
-/// never reused. On a mid-deployment failure the state still describes
-/// exactly which files succeeded, the failed operation is recorded, and
-/// the lease is released.
+/// This function takes the lease *before* reading the authoritative
+/// snapshot, so the state the plan runs against cannot be swapped out
+/// after approval. It then computes the plan from that fresh snapshot,
+/// and the plan must hash identically to `expected_plan_hash`. An
+/// approval for a different plan is never reused. If the deployment fails
+/// partway through, the state still describes exactly which files
+/// succeeded, the operation is recorded as failed, and the lease is
+/// released.
 ///
-/// `force` breaks a *stale foreign* lease — the documented recovery once
+/// `force` breaks a *stale foreign* lease, the documented recovery once
 /// the old executor is confirmed stopped. Live foreign leases always win.
 #[allow(clippy::too_many_arguments)]
 pub fn deploy(
@@ -363,7 +364,7 @@ pub fn deploy(
     )?;
     lease::start_heartbeat(&mut lease, connect);
 
-    // Under the lease, re-read the authoritative state and re-plan — the
+    // Under the lease, re-read the authoritative state and re-plan. The
     // approval must match what the remote looks like now.
     let plan = (|| -> Result<DeploymentPlan> {
         let snapshot = take_snapshot(session, publication, desired, selection)?;
@@ -404,10 +405,11 @@ pub fn deploy(
                         .to_owned(),
                 );
             }
-            // Persist the accurate post-files state before the caller
-            // decides on a restart — a crash now still leaves correct
-            // ownership and revision records. Both guards are fail-closed:
-            // losing the lease or observing a newer remote state aborts.
+            // Persist the deployment state after the file phase, before
+            // the caller decides on a restart. A crash here still leaves
+            // correct ownership and revision records. Both guards fail
+            // closed: losing the lease or seeing a newer remote state
+            // aborts the operation.
             if let Err(err) = ensure_ownership(&lease, session).and_then(|_| persist_state(session))
             {
                 let _ = fail_operation(session, meta, &plan, &err);
@@ -435,8 +437,9 @@ pub fn deploy(
 }
 
 /// Fails the operation when the lease no longer belongs to this executor.
-/// A foreign owner means another deployment may be mutating the server —
-/// this one must stop before its next phase rather than interleave writes.
+/// A foreign owner means another deployment may be mutating the server,
+/// so this one must stop before its next phase rather than interleave its
+/// writes with the new owner's.
 fn ensure_ownership(lease: &Lease, session: &mut Session) -> Result<()> {
     eyre::ensure!(
         !lease.is_lost() && lease.still_ours(session.ops.as_mut()),
@@ -595,10 +598,11 @@ fn take_snapshot(
         }
 
         // Verify the actual remote bytes of every Gale-owned file the
-        // publication still wants — size equality alone cannot detect a
-        // same-length remote modification. Only owned ∩ desired paths are
-        // read: hashing foreign files buys nothing, and an owned file that
-        // is no longer desired is being removed anyway.
+        // publication still wants. Two different contents can have the
+        // same size, so size equality alone cannot detect a remote edit.
+        // Only files that are both owned and desired are read: hashing
+        // foreign files gains nothing, and an owned file that is no longer
+        // desired is being removed anyway.
         for (path, staged) in &desired.payload {
             let owned = session.state.files.contains_key(path);
             if !owned || payload_files.get(path) != Some(&staged.size) {
@@ -820,8 +824,8 @@ fn execute(
         session.state.retain_published(&published);
     }
 
-    // ---- Revision advancement: reaching this point means the whole
-    // payload phase succeeded — a failure returns early above.
+    // ---- Advance the recorded revision: reaching this point means the
+    // whole payload phase succeeded, since a failure returns early above.
     if plan.mods_phase {
         session.state.mods_revision = Some(plan.mods_revision.clone());
         session.state.deployed_mods = plan.deployed_mods.clone();
@@ -968,11 +972,11 @@ fn replace_remote(
 
 /// Writes the deployment state through a temporary file + rename.
 ///
-/// Before writing, the remote state's `operation_seq` is re-read: it must
-/// still equal the sequence this session loaded under the lease. A newer
-/// (or diverged) remote sequence means another writer slipped past the
-/// lease — this session's stale view must never overwrite it, so the write
-/// fails closed instead.
+/// Before writing, this re-reads the remote state's `operation_seq`: it
+/// must still equal the sequence this session loaded under the lease. A
+/// newer or diverged remote sequence means another writer slipped past
+/// the lease. This session's stale view must never overwrite it, so the
+/// write fails closed instead.
 pub fn persist_state(session: &mut Session) -> Result<()> {
     let target = session.mapper.remote_path(&session.mapper.spec.state_path);
     let legacy = session
@@ -1007,11 +1011,11 @@ pub fn persist_state(session: &mut Session) -> Result<()> {
 }
 
 /// Sets a persistent per-file update policy in the remote deployment
-/// state. Policy writes mutate the authoritative state, so they take the
-/// same deployment lease as a sync and re-read state under it — a policy
-/// write can never race or overwrite a concurrent deployment.
-/// `pinned_at` is the currently published hash the policy was set
-/// against — mirroring the client's `policy_set_at` semantics.
+/// state. A policy write mutates the authoritative state, so it takes the
+/// same deployment lease as a sync and re-reads the state under it. That
+/// way a policy write can never race or overwrite a concurrent
+/// deployment. `pinned_at` is the published hash the policy was set
+/// against, matching the client's `policy_set_at` behavior.
 pub fn set_config_policy(
     session: &mut Session,
     path: &ConfigPath,
@@ -1099,8 +1103,8 @@ fn detect_layout(
 }
 
 /// Whether the host manages the mod loader itself. Restricted hosts always
-/// do; on standard layouts the loader markers decide unless Gale recorded a
-/// loader deployment — files Gale uploaded stay Gale's.
+/// do. On standard layouts the loader marker files decide, unless Gale
+/// recorded a loader deployment, because files Gale uploaded stay Gale's.
 fn detect_host_managed(
     ops: &mut dyn RemoteOps,
     mapper: &RemoteMapper,
@@ -1525,8 +1529,8 @@ mod tests {
                 .any(|w| w.contains("could not remove"))
         );
 
-        // The remote file remains and so does the ownership record — the
-        // next deployment will retry the removal instead of forgetting it.
+        // The remote file remains, and so does the ownership record. The
+        // next deployment retries the removal instead of forgetting it.
         assert!(remote_contents(&memory, &format!("{BASE}/{stale}")).is_some());
         let state = finish(
             &mut session,
@@ -1825,7 +1829,7 @@ mod tests {
         .unwrap();
 
         // The remote file is then edited to different bytes of the same
-        // length — size comparison alone cannot see this.
+        // length. A size comparison alone cannot see the change.
         memory
             .lock()
             .unwrap()
@@ -1891,8 +1895,8 @@ mod tests {
         .unwrap();
         let approved = preview.plan.hash;
 
-        // The remote file changes underneath the approval — the planned
-        // action is still Write, but the precondition moved.
+        // The remote file changes after the approval was given. The planned action is still Write,
+        // but the approved content no longer matches what is actually there.
         memory
             .lock()
             .unwrap()
@@ -1982,8 +1986,9 @@ mod tests {
             Ok(()) => panic!("a policy update must not bypass the deployment lease"),
         }
 
-        // Once it frees, the write lands. The record goes first — a
-        // directory can't be deleted while it still holds the file.
+        // Once the lease frees up, the policy write goes through. The
+        // record file is deleted first because a directory can't be
+        // removed while it still holds the file.
         memory
             .lock()
             .unwrap()
@@ -2014,7 +2019,8 @@ mod tests {
         let mut session = open(memory.clone()).unwrap();
 
         // A rogue writer advanced the remote sequence since this session
-        // loaded its state — persisting must fail closed.
+        // loaded its state, so persisting must fail rather than overwrite
+        // the newer state.
         let mut newer = ServerDeploymentState {
             version: state::VERSION,
             ..Default::default()
@@ -2079,8 +2085,8 @@ mod tests {
         )
         .unwrap();
 
-        // One config landed and was recorded applied; the other stays
-        // retryable, and the operation is Partial — not Succeeded.
+        // One config was written and recorded as applied. The other stays
+        // retryable, and the operation is Partial, not Succeeded.
         let record = state.last_operation.unwrap();
         assert_eq!(record.status, OperationStatus::Partial);
         assert_eq!(

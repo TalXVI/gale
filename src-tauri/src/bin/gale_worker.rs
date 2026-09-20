@@ -1,4 +1,4 @@
-//! `gale-worker` — the standalone dedicated-server sync worker.
+//! `gale-worker`: the standalone dedicated-server sync worker.
 //!
 //! Usage:
 //!
