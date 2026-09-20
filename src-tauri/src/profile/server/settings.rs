@@ -253,6 +253,23 @@ impl RemoteServerSettings {
             .map_err(|_| eyre::eyre!("remote server directory is not a valid remote path"))
     }
 
+    /// A normalized "protocol://host:port/directory" identity string —
+    /// what the plan hash binds an approval to, so a settings change that
+    /// retargets the server invalidates pending approvals.
+    pub fn describe_target(&self) -> String {
+        let protocol = match self.protocol {
+            RemoteProtocol::Sftp => "sftp",
+            RemoteProtocol::Ftp => "ftp",
+            RemoteProtocol::Ftps => "ftps",
+        };
+        format!(
+            "{protocol}://{}:{}{}",
+            self.host.trim().to_lowercase(),
+            self.port,
+            self.server_directory.trim()
+        )
+    }
+
     pub fn trust_host_key(&mut self, fingerprint: String) {
         self.trusted_host_key = Some(fingerprint);
     }

@@ -33,7 +33,7 @@ use super::{
     paths::{DeployPath, DeployPathBuf, RemotePath, RemotePathBuf},
     plan::{
         self, ConfigAction, DeploySelection, DeploymentPlan, DesiredDeployment, FileSource,
-        Publication, RemoteLayout, RemoteSnapshot, UploadKind,
+        PlanContext, Publication, RemoteLayout, RemoteSnapshot, UploadKind,
     },
     remote::RemoteOps,
     settings::RestartPolicy,
@@ -152,6 +152,10 @@ pub struct Session<'a> {
     pub layout: RemoteLayout,
     pub host_managed: bool,
     pub state: ServerDeploymentState,
+    /// The `operation_seq` the in-memory `state` was loaded from. Persisting
+    /// refuses to write when the remote sequence has moved past it — a stale
+    /// writer must never overwrite newer deployment state.
+    base_seq: u64,
     /// A live lease held by another executor, if one was observed.
     pub lease: Option<LeaseRecord>,
     pub warnings: Vec<String>,
@@ -196,16 +200,46 @@ pub fn open_session<'a>(
         "opened remote deployment session"
     );
 
+    let base_seq = state.operation_seq;
+
     Ok(Session {
         ops,
         mapper,
         layout,
         host_managed,
         state,
+        base_seq,
         lease,
         warnings,
         migrated,
     })
+}
+
+/// Re-reads the authoritative deployment state from the remote. Called
+/// under the deployment lease so planning, policy updates, and the
+/// persistence sequence guard all work on fresh state rather than what
+/// was loaded when the session opened.
+fn refresh_state(session: &mut Session) -> Result<()> {
+    let spec = session.mapper.spec;
+    let LoadedState {
+        state,
+        warnings,
+        migrated,
+    } = state::read_state(
+        session.ops.as_mut(),
+        spec,
+        &session.mapper.remote_path(&spec.state_path),
+        &session.mapper.remote_path(&spec.legacy_manifest_path),
+    )?;
+    session.base_seq = state.operation_seq;
+    session.state = state;
+    session.migrated = migrated;
+    for warning in warnings {
+        if !session.warnings.contains(&warning) {
+            session.warnings.push(warning);
+        }
+    }
+    Ok(())
 }
 
 /// A preview: the plan plus the context the UI needs to explain it.
@@ -213,31 +247,71 @@ pub fn open_session<'a>(
 #[serde(rename_all = "camelCase")]
 pub struct Preview {
     pub plan: DeploymentPlan,
-    /// The live lease holder, so the UI can warn before Deploy Now fails.
-    pub busy: Option<LeaseRecord>,
+    /// The live lease holder, so the UI can warn before Deploy Now fails
+    /// and offer a takeover when the holder is stale.
+    pub busy: Option<lease::LeaseBusy>,
     pub warnings: Vec<String>,
 }
 
-/// Snapshots the remote and computes the plan. Pure with respect to the
-/// remote: nothing is written.
+/// Snapshots the remote and computes the plan. The snapshot is taken under
+/// the deployment lease so the observed state cannot shift mid-read; when
+/// another executor holds the lease the plan is still computed (unlocked,
+/// advisory only) and the holder is reported through `busy`.
 pub fn preview(
     session: &mut Session,
     publication: &Publication,
     desired: &DesiredDeployment,
     selection: &DeploySelection,
+    context: &PlanContext,
+    meta: &OperationMeta,
 ) -> Result<Preview> {
-    let snapshot = take_snapshot(session, publication, desired, selection)?;
+    let held = match lease::acquire(
+        session.ops.as_mut(),
+        &session.mapper.remote_path(&session.mapper.spec.lease_dir),
+        &meta.owner,
+        meta.executor,
+        &meta.id,
+        false,
+    ) {
+        Ok(lease) => Some(lease),
+        Err(err) => match err.downcast::<lease::LeaseBusy>() {
+            Ok(busy) => {
+                let snapshot = take_snapshot(session, publication, desired, selection)?;
+                let plan = plan::build_plan(
+                    publication,
+                    desired,
+                    &snapshot,
+                    selection,
+                    context,
+                    session.mapper.spec,
+                )?;
+                return Ok(Preview {
+                    plan,
+                    busy: Some(busy),
+                    warnings: session.warnings.clone(),
+                });
+            }
+            Err(err) => return Err(err),
+        },
+    };
+
+    let snapshot = take_snapshot(session, publication, desired, selection);
+    if let Some(lease) = held {
+        lease.release(session.ops.as_mut());
+    }
+
     let plan = plan::build_plan(
         publication,
         desired,
-        &snapshot,
+        &snapshot?,
         selection,
+        context,
         session.mapper.spec,
     )?;
 
     Ok(Preview {
         plan,
-        busy: session.lease.clone(),
+        busy: None,
         warnings: session.warnings.clone(),
     })
 }
@@ -256,10 +330,16 @@ pub struct Deployment {
 
 /// Executes an approved plan under the deployment lease.
 ///
-/// The plan is recomputed against a fresh snapshot and must hash identically
-/// to `expected_plan_hash` — approval of a different plan is never reused.
-/// On a mid-deployment failure the state still describes exactly which files
-/// succeeded, the failed operation is recorded, and the lease is released.
+/// The lease is acquired *before* the authoritative snapshot so the state
+/// the plan executes against cannot be replaced underneath the approval.
+/// The plan is then computed from that fresh snapshot and must hash
+/// identically to `expected_plan_hash` — approval of a different plan is
+/// never reused. On a mid-deployment failure the state still describes
+/// exactly which files succeeded, the failed operation is recorded, and
+/// the lease is released.
+///
+/// `force` breaks a *stale foreign* lease — the documented recovery once
+/// the old executor is confirmed stopped. Live foreign leases always win.
 #[allow(clippy::too_many_arguments)]
 pub fn deploy(
     session: &mut Session,
@@ -267,42 +347,69 @@ pub fn deploy(
     publication: &Publication,
     desired: &DesiredDeployment,
     selection: &DeploySelection,
+    context: &PlanContext,
     meta: &OperationMeta,
     expected_plan_hash: Option<&str>,
+    force: bool,
     mut report: impl FnMut(EngineProgress),
 ) -> Result<Deployment> {
-    let snapshot = take_snapshot(session, publication, desired, selection)?;
-    let plan = plan::build_plan(
-        publication,
-        desired,
-        &snapshot,
-        selection,
-        session.mapper.spec,
-    )?;
-
-    if let Some(expected) = expected_plan_hash
-        && plan.hash != expected
-    {
-        return Err(plan::stale_plan_error());
-    }
-
     let mut lease = lease::acquire(
         session.ops.as_mut(),
         &session.mapper.remote_path(&session.mapper.spec.lease_dir),
         &meta.owner,
         meta.executor,
         &meta.id,
+        force,
     )?;
     lease::start_heartbeat(&mut lease, connect);
 
-    let result = execute(session, &plan, desired, publication, &mut report);
+    // Under the lease, re-read the authoritative state and re-plan — the
+    // approval must match what the remote looks like now.
+    let plan = (|| -> Result<DeploymentPlan> {
+        let snapshot = take_snapshot(session, publication, desired, selection)?;
+        let plan = plan::build_plan(
+            publication,
+            desired,
+            &snapshot,
+            selection,
+            context,
+            session.mapper.spec,
+        )?;
+
+        if let Some(expected) = expected_plan_hash
+            && plan.hash != expected
+        {
+            return Err(plan::stale_plan_error());
+        }
+
+        ensure_ownership(&lease, session)?;
+        Ok(plan)
+    })();
+
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(error) => {
+            lease.release(session.ops.as_mut());
+            return Err(error);
+        }
+    };
+
+    let result = execute(session, &plan, desired, publication, &lease, &mut report);
 
     match result {
-        Ok((summary, warnings, failed_config_writes)) => {
+        Ok((summary, mut warnings, failed_config_writes)) => {
+            if lease.is_lost() {
+                warnings.push(
+                    "the deployment lease was lost during execution; another executor may have modified the server"
+                        .to_owned(),
+                );
+            }
             // Persist the accurate post-files state before the caller
             // decides on a restart — a crash now still leaves correct
-            // ownership and revision records.
-            if let Err(err) = persist_state(session) {
+            // ownership and revision records. Both guards are fail-closed:
+            // losing the lease or observing a newer remote state aborts.
+            if let Err(err) = ensure_ownership(&lease, session).and_then(|_| persist_state(session))
+            {
                 let _ = fail_operation(session, meta, &plan, &err);
                 lease.release(session.ops.as_mut());
                 return Err(err.wrap_err("failed to persist remote deployment state"));
@@ -325,6 +432,17 @@ pub fn deploy(
             Err(error)
         }
     }
+}
+
+/// Fails the operation when the lease no longer belongs to this executor.
+/// A foreign owner means another deployment may be mutating the server —
+/// this one must stop before its next phase rather than interleave writes.
+fn ensure_ownership(lease: &Lease, session: &mut Session) -> Result<()> {
+    eyre::ensure!(
+        !lease.is_lost() && lease.still_ours(session.ops.as_mut()),
+        "the deployment lease was taken over by another executor; aborting this operation"
+    );
+    Ok(())
 }
 
 /// Consults the host provider for the configured restart policy.
@@ -397,7 +515,13 @@ pub fn finish(
             .plan
             .mods_phase
             .then(|| deployment.plan.mods_revision.clone()),
-        status: OperationStatus::Succeeded,
+        // A deployment with failed writes is not a success: it is Partial,
+        // with the per-file records describing exactly what landed.
+        status: if deployment.failed_config_writes.is_empty() {
+            OperationStatus::Succeeded
+        } else {
+            OperationStatus::Partial
+        },
         summary: deployment.summary.clone(),
         restart,
         error: (!deployment.failed_config_writes.is_empty()).then(|| {
@@ -410,7 +534,7 @@ pub fn finish(
         finished_at: Utc::now(),
     });
 
-    let persist = persist_state(session);
+    let persist = ensure_ownership(&deployment.lease, session).and_then(|_| persist_state(session));
     deployment.lease.release(session.ops.as_mut());
     persist?;
 
@@ -442,8 +566,9 @@ fn fail_operation(
     persist_state(session)
 }
 
-/// Gathers everything the planner needs to know about the remote: the
-/// payload listing and the content hashes of every config path a decision
+/// Gathers everything the planner needs to know about the remote: a fresh
+/// authoritative state read, the payload listing, the content hashes of
+/// owned managed payloads, and the hashes of every config path a decision
 /// may touch.
 fn take_snapshot(
     session: &mut Session,
@@ -451,9 +576,12 @@ fn take_snapshot(
     desired: &DesiredDeployment,
     selection: &DeploySelection,
 ) -> Result<RemoteSnapshot> {
+    refresh_state(session)?;
+
     let spec = session.mapper.spec;
     let mut payload_files = BTreeMap::new();
     let mut payload_dirs = BTreeSet::new();
+    let mut payload_hashes = BTreeMap::new();
 
     if selection.include_mods {
         for dir in &spec.payload_dirs {
@@ -464,6 +592,28 @@ fn take_snapshot(
                 &mut payload_files,
                 &mut payload_dirs,
             )?;
+        }
+
+        // Verify the actual remote bytes of every Gale-owned file the
+        // publication still wants — size equality alone cannot detect a
+        // same-length remote modification. Only owned ∩ desired paths are
+        // read: hashing foreign files buys nothing, and an owned file that
+        // is no longer desired is being removed anyway.
+        for (path, staged) in &desired.payload {
+            let owned = session.state.files.contains_key(path);
+            if !owned || payload_files.get(path) != Some(&staged.size) {
+                continue;
+            }
+            let remote = session.mapper.remote_path(path);
+            match session.ops.read(&remote, staged.size) {
+                Ok(Some(bytes)) => {
+                    payload_hashes
+                        .insert(path.clone(), ContentHash::from_hash(blake3::hash(&bytes)));
+                }
+                // Unreadable or resized between list and read: no hash is
+                // recorded and the planner conservatively re-uploads.
+                _ => {}
+            }
         }
     }
 
@@ -501,6 +651,7 @@ fn take_snapshot(
         state: session.state.clone(),
         payload_files,
         payload_dirs,
+        payload_hashes,
         config_remote,
         host_managed: session.host_managed,
         layout: session.layout,
@@ -508,12 +659,15 @@ fn take_snapshot(
 }
 
 /// Applies the plan's file operations and updates `session.state` to
-/// describe exactly what succeeded.
+/// describe exactly what succeeded. Lease ownership is verified between
+/// phases: an executor that loses the lease stops before its next mutation
+/// rather than interleaving writes with the new holder.
 fn execute(
     session: &mut Session,
     plan: &DeploymentPlan,
     desired: &DesiredDeployment,
     publication: &Publication,
+    lease: &Lease,
     report: &mut impl FnMut(EngineProgress),
 ) -> Result<(OperationSummary, Vec<String>, Vec<ConfigPath>)> {
     let total = plan.removals.len() + plan.directory_removals.len() + plan.uploads.len();
@@ -565,6 +719,7 @@ fn execute(
     }
 
     // ---- Uploads: payload, seeds, then published config writes.
+    ensure_ownership(lease, session)?;
     let mut ensured = BTreeSet::new();
 
     for upload in &plan.uploads {
@@ -812,9 +967,25 @@ fn replace_remote(
 }
 
 /// Writes the deployment state through a temporary file + rename.
+///
+/// Before writing, the remote state's `operation_seq` is re-read: it must
+/// still equal the sequence this session loaded under the lease. A newer
+/// (or diverged) remote sequence means another writer slipped past the
+/// lease — this session's stale view must never overwrite it, so the write
+/// fails closed instead.
 pub fn persist_state(session: &mut Session) -> Result<()> {
-    let bytes = state::serialize(&session.state)?;
     let target = session.mapper.remote_path(&session.mapper.spec.state_path);
+    let legacy = session
+        .mapper
+        .remote_path(&session.mapper.spec.legacy_manifest_path);
+    let remote = state::read_state(session.ops.as_mut(), session.mapper.spec, &target, &legacy)
+        .context("failed to verify remote deployment state before writing")?;
+    ensure!(
+        remote.state.operation_seq == session.base_seq,
+        "the remote deployment state changed during this operation; refusing to overwrite newer state"
+    );
+
+    let bytes = state::serialize(&session.state)?;
 
     if let Some(parent) = session.mapper.spec.state_path.parent() {
         let remote = session.mapper.remote_path(&parent);
@@ -829,22 +1000,44 @@ pub fn persist_state(session: &mut Session) -> Result<()> {
         session.ops.write(&temporary, &bytes)?;
         replace_remote(session.ops.as_mut(), &temporary, &target)
     })
-    .context("failed to write remote deployment state")
+    .context("failed to write remote deployment state")?;
+
+    session.base_seq = session.state.operation_seq;
+    Ok(())
 }
 
-/// Sets a persistent per-file update policy in the remote deployment state.
-/// `pinned_at` is the currently published hash the policy was set against —
-/// mirroring the client's `policy_set_at` semantics.
+/// Sets a persistent per-file update policy in the remote deployment
+/// state. Policy writes mutate the authoritative state, so they take the
+/// same deployment lease as a sync and re-read state under it — a policy
+/// write can never race or overwrite a concurrent deployment.
+/// `pinned_at` is the currently published hash the policy was set
+/// against — mirroring the client's `policy_set_at` semantics.
 pub fn set_config_policy(
     session: &mut Session,
     path: &ConfigPath,
     policy: ConfigUpdatePolicy,
     pinned_at: Option<&ContentHash>,
+    meta: &OperationMeta,
 ) -> Result<()> {
-    let record = session.state.config.entry(path.clone()).or_default();
-    record.policy = policy;
-    record.policy_set_at = pinned_at.cloned();
-    persist_state(session)
+    let lease = lease::acquire(
+        session.ops.as_mut(),
+        &session.mapper.remote_path(&session.mapper.spec.lease_dir),
+        &meta.owner,
+        meta.executor,
+        &meta.id,
+        false,
+    )?;
+
+    let result = (|| {
+        refresh_state(session)?;
+        let record = session.state.config.entry(path.clone()).or_default();
+        record.policy = policy;
+        record.policy_set_at = pinned_at.cloned();
+        persist_state(session)
+    })();
+
+    lease.release(session.ops.as_mut());
+    result
 }
 
 /// Lists every remote file/dir inside the payload dirs, as deploy paths.
@@ -1065,6 +1258,15 @@ mod tests {
         open_session(Box::new(remote), spec, RemotePathBuf::new(BASE).unwrap())
     }
 
+    fn context() -> PlanContext {
+        PlanContext {
+            profile_id: "1".to_owned(),
+            game: "valheim".to_owned(),
+            target: "sftp://host:22/srv".to_owned(),
+            restart_policy: RestartPolicy::Manual,
+        }
+    }
+
     /// The heartbeat would only connect after the 60s interval; deployments
     /// in these tests finish first, so the factory is never exercised.
     fn no_connect() -> Result<Box<dyn RemoteOps>> {
@@ -1119,8 +1321,10 @@ mod tests {
             &publication,
             &desired,
             &selection(true, false),
+            &context(),
             &meta(),
             None,
+            false,
             |p| progress.push(p),
         )
         .unwrap();
@@ -1176,8 +1380,10 @@ mod tests {
             &publication,
             &desired,
             &selection(true, false),
+            &context(),
             &meta(),
             Some("bogus-hash"),
+            false,
             |_| {},
         );
 
@@ -1202,9 +1408,11 @@ mod tests {
             &publication,
             &desired,
             &selection(true, false),
+            &context(),
+            &meta(),
         )
         .unwrap();
-        assert_eq!(preview.busy.unwrap().owner, "worker:vps");
+        assert_eq!(preview.busy.unwrap().record.owner, "worker:vps");
 
         let result = deploy(
             &mut session,
@@ -1212,8 +1420,10 @@ mod tests {
             &publication,
             &desired,
             &selection(true, false),
+            &context(),
             &meta(),
             None,
+            false,
             |_| {},
         );
         match result {
@@ -1242,8 +1452,10 @@ mod tests {
             &publication,
             &desired,
             &selection(true, false),
+            &context(),
             &meta(),
             None,
+            false,
             |_| {},
         );
         assert!(result.is_err());
@@ -1299,8 +1511,10 @@ mod tests {
             &publication,
             &desired,
             &selection(true, false),
+            &context(),
             &meta(),
             None,
+            false,
             |_| {},
         )
         .unwrap();
@@ -1349,8 +1563,10 @@ mod tests {
             &publication,
             &DesiredDeployment::default(),
             &sel,
+            &context(),
             &meta(),
             None,
+            false,
             |_| {},
         )
         .unwrap();
@@ -1401,8 +1617,10 @@ mod tests {
             &publication,
             &DesiredDeployment::default(),
             &selection(false, true),
+            &context(),
             &meta(),
             None,
+            false,
             |_| {},
         )
         .unwrap();
@@ -1443,8 +1661,10 @@ mod tests {
             &publication,
             &desired,
             &selection(true, false),
+            &context(),
             &meta(),
             None,
+            false,
             |_| {},
         )
         .unwrap();
@@ -1477,8 +1697,10 @@ mod tests {
             &publication,
             &desired,
             &selection(true, false),
+            &context(),
             &meta(),
             None,
+            false,
             |_| {},
         )
         .unwrap();
@@ -1490,7 +1712,7 @@ mod tests {
     }
 
     #[test]
-    fn removal_is_bounded_to_the_managed_scope() {
+    fn removal_is_bounded_to_owned_files_and_strays_survive() {
         let fixture = mod_fixture();
         let publication = fixture.publication();
         let desired = desired_payload();
@@ -1499,9 +1721,10 @@ mod tests {
         let stale = "BepInEx/plugins/Old/Old.dll";
         {
             let mut remote = memory.lock().unwrap();
-            // Mirrored payload dirs are authoritative: a stray file inside
-            // one is removed even without an ownership record.
-            remote.put_file("/srv/BepInEx/plugins/stray.dll", b"stray");
+            // A manually installed, never-owned plugin inside the payload
+            // dir: removal authority comes from records, not directory
+            // membership, so it must survive and be surfaced as unmanaged.
+            remote.put_file("/srv/BepInEx/plugins/ServerOnly.dll", b"stray");
             remote.put_file(&format!("{BASE}/{stale}"), b"old");
             // Outside the managed scope nothing is ever touched: config
             // files and unrelated server content survive every deploy.
@@ -1531,11 +1754,16 @@ mod tests {
             &publication,
             &desired,
             &selection(true, false),
+            &context(),
             &meta(),
             None,
+            false,
             |_| {},
         )
         .unwrap();
+        // The never-owned server-only plugin is reported as unmanaged.
+        let unmanaged = deployment.plan.unmanaged.clone();
+
         let state = finish(
             &mut session,
             deployment,
@@ -1544,7 +1772,16 @@ mod tests {
         )
         .unwrap();
 
-        assert!(remote_contents(&memory, "/srv/BepInEx/plugins/stray.dll").is_none());
+        // The obsolete Gale-owned plugin was removed; the never-owned
+        // server-only plugin survived.
+        assert_eq!(
+            remote_contents(&memory, "/srv/BepInEx/plugins/ServerOnly.dll"),
+            Some(b"stray".to_vec())
+        );
+        assert_eq!(
+            unmanaged,
+            vec![deploy_path("BepInEx/plugins/ServerOnly.dll")]
+        );
         assert!(remote_contents(&memory, &format!("{BASE}/{stale}")).is_none());
         assert!(!state.files.contains_key(&deploy_path(stale)));
         assert_eq!(
@@ -1555,6 +1792,337 @@ mod tests {
             remote_contents(&memory, "/srv/saves/world.db"),
             Some(b"save".to_vec())
         );
+    }
+
+    #[test]
+    fn same_size_remote_edit_of_owned_payload_is_repaired() {
+        let fixture = mod_fixture();
+        let publication = fixture.publication();
+        let desired = desired_payload();
+        let memory = remote();
+        let mut session = open(memory.clone()).unwrap();
+
+        // First deployment lands ModA.
+        let deployment = deploy(
+            &mut session,
+            no_connect,
+            &publication,
+            &desired,
+            &selection(true, false),
+            &context(),
+            &meta(),
+            None,
+            false,
+            |_| {},
+        )
+        .unwrap();
+        finish(
+            &mut session,
+            deployment,
+            RestartOutcome::NotRequired,
+            &meta(),
+        )
+        .unwrap();
+
+        // The remote file is then edited to different bytes of the same
+        // length — size comparison alone cannot see this.
+        memory
+            .lock()
+            .unwrap()
+            .put_file(MOD_DLL_REMOTE, b"edited-dd");
+
+        let mut session = open(memory.clone()).unwrap();
+        let deployment = deploy(
+            &mut session,
+            no_connect,
+            &publication,
+            &desired,
+            &selection(true, false),
+            &context(),
+            &meta(),
+            None,
+            false,
+            |_| {},
+        )
+        .unwrap();
+
+        // Content hashing detected the divergence and re-uploaded.
+        assert_eq!(deployment.summary.uploaded_files, 1);
+        let state = finish(
+            &mut session,
+            deployment,
+            RestartOutcome::NotRequired,
+            &meta(),
+        )
+        .unwrap();
+        assert_eq!(
+            remote_contents(&memory, MOD_DLL_REMOTE),
+            Some(b"dll-bytes".to_vec())
+        );
+        assert_eq!(state.mods_revision, Some(publication.mods_revision.clone()));
+    }
+
+    #[test]
+    fn deploy_rejects_approval_when_remote_config_changed() {
+        let mut fixture = mod_fixture();
+        fixture
+            .config
+            .insert(config_path("BepInEx/config/mod.cfg"), config_file(b"v2"));
+        let publication = fixture.publication();
+
+        let memory = remote();
+        memory
+            .lock()
+            .unwrap()
+            .put_file("/srv/BepInEx/config/mod.cfg", b"server-v1");
+        let mut session = open(memory.clone()).unwrap();
+
+        let mut sel = selection(false, true);
+        sel.apply_configs = vec![config_path("BepInEx/config/mod.cfg")];
+
+        let preview = preview(
+            &mut session,
+            &publication,
+            &DesiredDeployment::default(),
+            &sel,
+            &context(),
+            &meta(),
+        )
+        .unwrap();
+        let approved = preview.plan.hash;
+
+        // The remote file changes underneath the approval — the planned
+        // action is still Write, but the precondition moved.
+        memory
+            .lock()
+            .unwrap()
+            .put_file("/srv/BepInEx/config/mod.cfg", b"server-v2-edited");
+
+        let result = deploy(
+            &mut session,
+            no_connect,
+            &publication,
+            &DesiredDeployment::default(),
+            &sel,
+            &context(),
+            &meta(),
+            Some(&approved),
+            false,
+            |_| {},
+        );
+        match result {
+            Err(err) => assert!(err.to_string().contains("preview")),
+            Ok(_) => panic!("a stale approval must be rejected"),
+        }
+        assert_eq!(
+            remote_contents(&memory, "/srv/BepInEx/config/mod.cfg"),
+            Some(b"server-v2-edited".to_vec())
+        );
+    }
+
+    #[test]
+    fn deploy_rejects_a_changed_restart_policy() {
+        let fixture = mod_fixture();
+        let publication = fixture.publication();
+        let desired = desired_payload();
+        let memory = remote();
+        let mut session = open(memory.clone()).unwrap();
+
+        let preview = preview(
+            &mut session,
+            &publication,
+            &desired,
+            &selection(true, false),
+            &context(),
+            &meta(),
+        )
+        .unwrap();
+
+        // The approval was given for Manual restarts; deploying with
+        // Immediate must not reuse it.
+        let mut changed = context();
+        changed.restart_policy = RestartPolicy::Immediate;
+        let result = deploy(
+            &mut session,
+            no_connect,
+            &publication,
+            &desired,
+            &selection(true, false),
+            &changed,
+            &meta(),
+            Some(&preview.plan.hash),
+            false,
+            |_| {},
+        );
+        match result {
+            Err(err) => assert!(err.to_string().contains("preview")),
+            Ok(_) => panic!("a restart-policy change must invalidate the approval"),
+        }
+        assert!(remote_contents(&memory, MOD_DLL_REMOTE).is_none());
+    }
+
+    #[test]
+    fn set_config_policy_is_serialized_under_the_lease() {
+        let memory = remote();
+        let mut session = open(memory.clone()).unwrap();
+        let path = config_path("BepInEx/config/mod.cfg");
+        let hash = ContentHash::from_hash(blake3::hash(b"v1"));
+
+        // While another executor holds the lease, the policy write is busy.
+        plant_live_lease(&mut memory.lock().unwrap());
+        let blocked = set_config_policy(
+            &mut session,
+            &path,
+            ConfigUpdatePolicy::AlwaysKeep,
+            Some(&hash),
+            &meta(),
+        );
+        match blocked {
+            Err(err) => assert!(err.downcast_ref::<lease::LeaseBusy>().is_some()),
+            Ok(()) => panic!("a policy update must not bypass the deployment lease"),
+        }
+
+        // Once it frees, the write lands. The record goes first — a
+        // directory can't be deleted while it still holds the file.
+        memory
+            .lock()
+            .unwrap()
+            .delete_file(&RemotePathBuf::new(LEASE_FILE_REMOTE).unwrap())
+            .unwrap();
+        memory
+            .lock()
+            .unwrap()
+            .delete_dir(&RemotePathBuf::new(LEASE_DIR_REMOTE).unwrap())
+            .unwrap();
+        set_config_policy(
+            &mut session,
+            &path,
+            ConfigUpdatePolicy::AlwaysKeep,
+            Some(&hash),
+            &meta(),
+        )
+        .unwrap();
+        assert_eq!(
+            remote_state(&memory).config[&path].policy,
+            ConfigUpdatePolicy::AlwaysKeep
+        );
+    }
+
+    #[test]
+    fn persist_refuses_to_overwrite_newer_remote_state() {
+        let memory = remote();
+        let mut session = open(memory.clone()).unwrap();
+
+        // A rogue writer advanced the remote sequence since this session
+        // loaded its state — persisting must fail closed.
+        let mut newer = ServerDeploymentState {
+            version: state::VERSION,
+            ..Default::default()
+        };
+        newer.operation_seq = 7;
+        memory
+            .lock()
+            .unwrap()
+            .put_file(STATE_REMOTE, &state::serialize(&newer).unwrap());
+
+        assert!(persist_state(&mut session).is_err());
+    }
+
+    #[test]
+    fn failed_config_write_marks_the_operation_partial() {
+        let mut fixture = mod_fixture();
+        fixture
+            .config
+            .insert(config_path("BepInEx/config/one.cfg"), config_file(b"one"));
+        fixture
+            .config
+            .insert(config_path("BepInEx/config/two.cfg"), config_file(b"two"));
+        let publication = fixture.publication();
+
+        let memory = remote();
+        memory
+            .lock()
+            .unwrap()
+            .fail_always
+            .insert("/srv/BepInEx/config/two.cfg.gale-upload".to_owned());
+        let mut session = open(memory.clone()).unwrap();
+
+        let mut sel = selection(false, true);
+        sel.apply_configs = vec![
+            config_path("BepInEx/config/one.cfg"),
+            config_path("BepInEx/config/two.cfg"),
+        ];
+
+        let deployment = deploy(
+            &mut session,
+            no_connect,
+            &publication,
+            &DesiredDeployment::default(),
+            &sel,
+            &context(),
+            &meta(),
+            None,
+            false,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            deployment.failed_config_writes,
+            vec![config_path("BepInEx/config/two.cfg")]
+        );
+
+        let state = finish(
+            &mut session,
+            deployment,
+            RestartOutcome::NotRequired,
+            &meta(),
+        )
+        .unwrap();
+
+        // One config landed and was recorded applied; the other stays
+        // retryable, and the operation is Partial — not Succeeded.
+        let record = state.last_operation.unwrap();
+        assert_eq!(record.status, OperationStatus::Partial);
+        assert_eq!(
+            state.config[&config_path("BepInEx/config/one.cfg")].applied,
+            Some(ContentHash::from_hash(blake3::hash(b"one")))
+        );
+        assert_eq!(
+            remote_contents(&memory, "/srv/BepInEx/config/one.cfg"),
+            Some(b"one".to_vec())
+        );
+        assert!(
+            state
+                .config
+                .get(&config_path("BepInEx/config/two.cfg"))
+                .map_or(true, |record| record.applied.is_none())
+        );
+    }
+
+    #[test]
+    fn config_only_deploy_requires_restart() {
+        let mut fixture = mod_fixture();
+        fixture
+            .config
+            .insert(config_path("BepInEx/config/mod.cfg"), config_file(b"v2"));
+        let publication = fixture.publication();
+
+        let memory = remote();
+        let mut session = open(memory.clone()).unwrap();
+
+        let mut sel = selection(false, true);
+        sel.apply_configs = vec![config_path("BepInEx/config/mod.cfg")];
+
+        let preview = preview(
+            &mut session,
+            &publication,
+            &DesiredDeployment::default(),
+            &sel,
+            &context(),
+            &meta(),
+        )
+        .unwrap();
+        assert!(preview.plan.requires_restart);
     }
 
     #[test]
@@ -1571,8 +2139,10 @@ mod tests {
             &publication,
             &desired,
             &selection(true, false),
+            &context(),
             &meta(),
             None,
+            false,
             |_| {},
         )
         .unwrap();
@@ -1602,6 +2172,7 @@ mod tests {
             &path,
             ConfigUpdatePolicy::AlwaysKeep,
             Some(&hash),
+            &meta(),
         )
         .unwrap();
 

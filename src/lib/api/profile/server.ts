@@ -77,31 +77,43 @@ export const getSyncStatus = (refresh: boolean, password = '', workerToken = '')
 		request: { refresh, password, workerToken }
 	});
 
-export const previewSync = (selection: DeploySelection, password = '', workerToken = '') =>
-	invoke<ServerSyncPreview>('preview_server_sync', {
-		request: { selection, password, workerToken }
-	});
-
-export const deploySync = (
+/// The restart policy is bound into the plan hash — a preview only stays
+/// deployable while the selected policy is unchanged.
+export const previewSync = (
 	selection: DeploySelection,
-	planHash: string,
 	restartPolicy: RestartPolicy | null,
 	password = '',
 	workerToken = ''
 ) =>
-	invoke<ServerSyncResult>('deploy_server_sync', {
-		request: { selection, planHash, restartPolicy, password, workerToken }
+	invoke<ServerSyncPreview>('preview_server_sync', {
+		request: { selection, restartPolicy, password, workerToken }
 	});
 
+/// `force` takes over a *stale* foreign lease after the old executor is
+/// confirmed stopped — the recovery path surfaced by the preview's busy
+/// state. Live leases always win.
+export const deploySync = (
+	selection: DeploySelection,
+	planHash: string,
+	restartPolicy: RestartPolicy | null,
+	force: boolean,
+	password = '',
+	workerToken = ''
+) =>
+	invoke<ServerSyncResult>('deploy_server_sync', {
+		request: { selection, planHash, restartPolicy, force, password, workerToken }
+	});
+
+/// The backend derives the publication pin itself — callers never supply
+/// it, so a policy can't be anchored to the wrong revision.
 export const setConfigPolicy = (
 	path: string,
 	policy: SyncConfigUpdatePolicy,
-	pinnedAt: string | null,
 	password = '',
 	workerToken = ''
 ) =>
 	invoke('set_server_config_policy', {
-		request: { path, policy, pinnedAt, password, workerToken }
+		request: { path, policy, password, workerToken }
 	});
 
 export const configureWorker = (

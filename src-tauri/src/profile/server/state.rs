@@ -52,6 +52,10 @@ pub enum OperationKind {
 #[serde(rename_all = "camelCase")]
 pub enum OperationStatus {
     Succeeded,
+    /// The operation ran to completion but part of the selected work did
+    /// not land — e.g. a config write failed. Per-file records describe
+    /// exactly what succeeded; the outstanding work stays retryable.
+    Partial,
     /// The deployment did not finish cleanly; applied-file records still
     /// reflect exactly what succeeded.
     Failed,

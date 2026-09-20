@@ -25,13 +25,20 @@ pub const API_BASE: &str = "/v1";
 #[serde(rename_all = "camelCase")]
 pub struct PreviewRequest {
     pub selection: DeploySelection,
+    /// The restart policy the subsequent deploy will use — bound into the
+    /// plan hash so a policy change after preview invalidates the approval.
+    /// `None` uses the worker's configured policy.
+    #[serde(default)]
+    pub restart_policy: Option<RestartPolicy>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreviewResponse {
     pub plan: DeploymentPlan,
-    pub busy: Option<LeaseRecord>,
+    /// The live lease holder and whether it is stale, so the UI can warn
+    /// before Deploy Now fails and offer a takeover when it is.
+    pub busy: Option<crate::profile::server::lease::LeaseBusy>,
     pub warnings: Vec<String>,
 }
 
@@ -45,6 +52,10 @@ pub struct DeployRequest {
     /// Restart behavior for this operation. `None` uses the worker's
     /// configured policy.
     pub restart_policy: Option<RestartPolicy>,
+    /// Take over a *stale foreign* lease — the documented recovery after
+    /// the old executor is confirmed stopped. Live leases always win.
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -70,8 +81,15 @@ pub struct StatusResponse {
     pub auto_sync: bool,
     pub auto_mods: bool,
     pub restart_policy: RestartPolicy,
-    /// The newest publication revision the worker has observed.
-    pub last_seen_revision: Option<DateTime<Utc>>,
+    /// The newest publication revision the worker has observed —
+    /// observation alone is not deployment.
+    pub observed_revision: Option<DateTime<Utc>>,
+    /// A publication revision awaiting successful deployment, if any.
+    pub pending_revision: Option<DateTime<Utc>>,
+    /// When the pending work becomes eligible for its next attempt.
+    pub next_attempt_at: Option<DateTime<Utc>>,
+    /// The newest publication revision that fully deployed successfully.
+    pub last_deployed_revision: Option<DateTime<Utc>>,
     /// The operation currently in flight, if any.
     pub busy: Option<BusyOperation>,
     pub last_operation: Option<OperationRecord>,
@@ -102,14 +120,13 @@ pub struct ServerStateSummary {
 }
 
 /// `POST /v1/policy` — set a persistent per-file config update policy in
-/// the remote deployment state.
+/// the remote deployment state. The policy pin is derived server-side
+/// from the canonical publication — clients cannot supply it.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PolicyRequest {
     pub path: ConfigPath,
     pub policy: ConfigUpdatePolicy,
-    /// The published hash the policy is pinned at.
-    pub pinned_at: Option<crate::profile::export::ContentHash>,
 }
 
 /// `POST /v1/config` — update the worker's automation toggles. Manual

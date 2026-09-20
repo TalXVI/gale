@@ -126,6 +126,22 @@ pub struct DesiredDeployment {
     pub package_defaults: BTreeMap<DeployPathBuf, StagedFile>,
 }
 
+/// Identity and behavior options the plan hash binds. An approval is
+/// specific to exactly one profile, server target, and restart policy —
+/// changing any of them after preview must not reuse the approval.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanContext {
+    /// The profile the operation was issued for.
+    pub profile_id: String,
+    /// The game the profile belongs to.
+    pub game: String,
+    /// Normalized description of the remote target (protocol, host, path).
+    pub target: String,
+    /// The restart behavior the operation will apply.
+    pub restart_policy: crate::profile::server::settings::RestartPolicy,
+}
+
 /// What the remote actually looks like, gathered fresh for every plan.
 pub struct RemoteSnapshot {
     /// Validated remote deployment state (ownership + config records).
@@ -133,6 +149,11 @@ pub struct RemoteSnapshot {
     /// Files and dirs inside the payload dirs, deploy-path → remote size.
     pub payload_files: BTreeMap<DeployPathBuf, u64>,
     pub payload_dirs: BTreeSet<DeployPathBuf>,
+    /// Remote content hash for every *Gale-owned* payload file that is also
+    /// desired by the publication and size-matched — the integrity check
+    /// that catches remote modification of managed mods. Never populated
+    /// for unowned files: hashing foreign content buys nothing.
+    pub payload_hashes: BTreeMap<DeployPathBuf, ContentHash>,
     /// Remote content hash for every config path a decision is needed on
     /// (published ∪ recorded ∪ seeded); `None` = absent remotely.
     pub config_remote: BTreeMap<ConfigPath, Option<ContentHash>>,
@@ -251,6 +272,10 @@ pub struct DeploymentPlan {
     pub conflicts: Vec<PlanConflict>,
     /// Payload changes require a server restart to take effect.
     pub requires_restart: bool,
+    /// Remote payload files that are neither published nor recorded as
+    /// Gale-owned — manually installed mods, leftovers from other tools.
+    /// Surfaced for visibility; never removed automatically.
+    pub unmanaged: Vec<DeployPathBuf>,
     /// The published mod set, recorded as `deployed_mods` on success.
     pub deployed_mods: Vec<R2Mod>,
 }
@@ -263,6 +288,7 @@ pub fn build_plan(
     desired: &DesiredDeployment,
     snapshot: &RemoteSnapshot,
     selection: &DeploySelection,
+    context: &PlanContext,
     spec: &DeploymentSpec,
 ) -> Result<DeploymentPlan> {
     selection.validate(publication.config)?;
@@ -271,6 +297,7 @@ pub fn build_plan(
     let mut uploads: Vec<PlanUpload> = Vec::new();
     let mut removals: Vec<DeployPathBuf> = Vec::new();
     let mut directory_removals: Vec<DeployPathBuf> = Vec::new();
+    let mut unmanaged: Vec<DeployPathBuf> = Vec::new();
     let mut unchanged_files = 0usize;
     let mut conflicts: Vec<PlanConflict> = Vec::new();
 
@@ -297,11 +324,16 @@ pub fn build_plan(
             }
         }
 
-        // Removal is bounded to Gale-owned paths: recorded files plus
-        // mirrored extras that are no longer part of the publication.
+        // Removal authority comes from ownership records alone: only
+        // files a completed deployment recorded as Gale-owned may be
+        // deleted. Remote files that were never recorded — manually
+        // installed mods, other tools' output — are not ours to remove,
+        // no matter how much they resemble published content. They are
+        // surfaced as unmanaged instead so the user sees what else lives
+        // in the payload directories.
         let desired_paths: BTreeSet<&DeployPath> =
             desired.payload.keys().map(DeployPathBuf::as_path).collect();
-        for path in state.files.keys().chain(snapshot.payload_files.keys()) {
+        for path in state.files.keys() {
             if desired_paths.contains(path.as_path())
                 || !spec.owns_for_removal(path, snapshot.host_managed)
             {
@@ -311,6 +343,16 @@ pub fn build_plan(
         }
         removals.sort();
         removals.dedup();
+
+        for path in snapshot.payload_files.keys() {
+            if !desired_paths.contains(path.as_path())
+                && !state.files.contains_key(path)
+                && spec.valid_owned_path(path)
+            {
+                unmanaged.push(path.clone());
+            }
+        }
+        unmanaged.sort();
 
         // Payload dirs left with no surviving remote files after removals
         // can go, deepest first. The payload roots themselves are kept so a
@@ -424,11 +466,10 @@ pub fn build_plan(
         }
     }
 
-    let requires_restart = selection.include_mods
-        && (uploads
-            .iter()
-            .any(|upload| upload.kind == UploadKind::Payload)
-            || !removals.is_empty());
+    // Any write or removal changes server content: the running server only
+    // picks it up after a restart. Pending/declined/unselected configs plan
+    // no upload and never force one.
+    let requires_restart = !uploads.is_empty() || !removals.is_empty();
 
     let mut plan = DeploymentPlan {
         hash: String::new(),
@@ -448,17 +489,21 @@ pub fn build_plan(
         config_entries,
         conflicts,
         requires_restart,
+        unmanaged,
         deployed_mods: publication.mods.to_vec(),
     };
-    plan.hash = plan_hash(&plan, selection);
+    plan.hash = plan_hash(&plan, snapshot, selection, context);
 
     Ok(plan)
 }
 
-/// Whether the remote copy of a payload file provably still matches. Inside
-/// mirrored dirs the remote listing is authoritative — a missing remote file
-/// or a size mismatch means re-upload. Outside them (loader payloads at the
-/// root) remote drift is not observable and the state record is trusted.
+/// Whether the remote copy of a payload file provably still matches the
+/// staged bytes. Inside mirrored dirs the engine hashes the remote content
+/// of every owned, size-matched file — a same-size remote edit is detected
+/// and re-uploaded. A file that cannot be verified (missing hash, size
+/// mismatch, unreadable) counts as diverged and is re-uploaded
+/// conservatively. Outside mirrored dirs (loader payloads at the root)
+/// remote drift is not observable and the state record is trusted.
 fn remote_intact(
     path: &DeployPath,
     staged: &StagedFile,
@@ -469,7 +514,10 @@ fn remote_intact(
         return true;
     }
 
-    snapshot.payload_files.get(path) == Some(&staged.size)
+    snapshot
+        .payload_hashes
+        .get(path)
+        .is_some_and(|remote| remote.as_str() == staged.hash)
 }
 
 /// The server-side config decision, mirroring the client's `decide` plus the
@@ -550,12 +598,23 @@ fn decide_config(
     }
 }
 
-/// Fingerprint of the plan's actions and the inputs they were derived from.
-/// Compared between preview and execution to reject stale approvals.
-fn plan_hash(plan: &DeploymentPlan, selection: &DeploySelection) -> String {
+/// Fingerprint of the plan's actions and every input they were derived
+/// from: publication identity, the approving context (profile, game,
+/// target, restart policy), the authoritative state revision, and the
+/// remote content preconditions (config hashes and owned-payload hashes).
+/// A remote byte changing between preview and deploy — even when the
+/// planned action stays `Write` — produces a different hash, so a stale
+/// approval is rejected rather than silently executing a different plan.
+fn plan_hash(
+    plan: &DeploymentPlan,
+    snapshot: &RemoteSnapshot,
+    selection: &DeploySelection,
+    context: &PlanContext,
+) -> String {
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
     struct Signature<'a> {
+        context: &'a PlanContext,
         publication_revision: DateTime<Utc>,
         mods_revision: &'a ModRevision,
         state_seq: u64,
@@ -566,9 +625,13 @@ fn plan_hash(plan: &DeploymentPlan, selection: &DeploySelection) -> String {
         removals: &'a [DeployPathBuf],
         directory_removals: &'a [DeployPathBuf],
         config_entries: &'a [PlanConfigEntry],
+        /// Remote content preconditions the plan was computed against.
+        config_remote: &'a BTreeMap<ConfigPath, Option<ContentHash>>,
+        payload_hashes: &'a BTreeMap<DeployPathBuf, ContentHash>,
     }
 
     let signature = Signature {
+        context,
         publication_revision: plan.publication_revision,
         mods_revision: &plan.mods_revision,
         state_seq: plan.state_seq,
@@ -579,6 +642,8 @@ fn plan_hash(plan: &DeploymentPlan, selection: &DeploySelection) -> String {
         removals: &plan.removals,
         directory_removals: &plan.directory_removals,
         config_entries: &plan.config_entries,
+        config_remote: &snapshot.config_remote,
+        payload_hashes: &snapshot.payload_hashes,
     };
 
     let bytes = serde_json::to_vec(&signature).expect("plan signature serializes");
@@ -689,11 +754,21 @@ mod tests {
         }
     }
 
+    fn context() -> PlanContext {
+        PlanContext {
+            profile_id: "1".to_owned(),
+            game: "valheim".to_owned(),
+            target: "sftp://host:22/srv".to_owned(),
+            restart_policy: crate::profile::server::settings::RestartPolicy::Manual,
+        }
+    }
+
     fn empty_snapshot() -> RemoteSnapshot {
         RemoteSnapshot {
             state: ServerDeploymentState::default(),
             payload_files: BTreeMap::new(),
             payload_dirs: BTreeSet::new(),
+            payload_hashes: BTreeMap::new(),
             config_remote: BTreeMap::new(),
             host_managed: false,
             layout: RemoteLayout::Standard,
@@ -717,6 +792,7 @@ mod tests {
             &payload(b"dll-bytes"),
             &empty_snapshot(),
             &selection(true, false),
+            &context(),
             &spec(),
         )
         .unwrap();
@@ -747,6 +823,7 @@ mod tests {
             &payload(b"dll"),
             &snapshot,
             &selection(false, true),
+            &context(),
             &spec(),
         )
         .unwrap();
@@ -765,6 +842,7 @@ mod tests {
             &DesiredDeployment::default(),
             &empty_snapshot(),
             &selection(true, true),
+            &context(),
             &spec(),
         )
         .unwrap();
@@ -785,6 +863,7 @@ mod tests {
                 &DesiredDeployment::default(),
                 &empty_snapshot(),
                 &sel,
+                &context(),
                 &spec(),
             )
             .is_err()
@@ -807,6 +886,7 @@ mod tests {
                 &DesiredDeployment::default(),
                 &empty_snapshot(),
                 &sel,
+                &context(),
                 &spec(),
             )
             .is_err()
@@ -828,6 +908,7 @@ mod tests {
                 &DesiredDeployment::default(),
                 &empty_snapshot(),
                 &sel,
+                &context(),
                 &spec(),
             )
             .is_err()
@@ -835,7 +916,7 @@ mod tests {
     }
 
     #[test]
-    fn only_owned_and_mirrored_files_are_removed() {
+    fn only_owned_files_are_removed_and_strays_are_surfaced() {
         let fixture = fixture();
         let mut snapshot = empty_snapshot();
         // Gale owns this recorded file, absent from the new publication.
@@ -846,11 +927,13 @@ mod tests {
                 size: 1,
             },
         );
-        // A stray file inside a mirrored dir is removed (the dir is
-        // authoritative); a file outside the managed scope is never touched.
+        // A stray file inside a mirrored dir is NOT ours to remove —
+        // ownership comes from records, not directory membership. It is
+        // surfaced as unmanaged instead.
         snapshot
             .payload_files
-            .insert(deploy("BepInEx/plugins/stray.dll"), 5);
+            .insert(deploy("BepInEx/plugins/ServerOnly.dll"), 5);
+        // Outside the managed scope nothing is touched or even surfaced.
         snapshot.payload_files.insert(deploy("saves/world.db"), 99);
 
         let plan = build_plan(
@@ -858,16 +941,15 @@ mod tests {
             &payload(b"dll"),
             &snapshot,
             &selection(true, false),
+            &context(),
             &spec(),
         )
         .unwrap();
 
+        assert_eq!(plan.removals, vec![deploy("BepInEx/plugins/Old/Old.dll")]);
         assert_eq!(
-            plan.removals,
-            vec![
-                deploy("BepInEx/plugins/Old/Old.dll"),
-                deploy("BepInEx/plugins/stray.dll"),
-            ]
+            plan.unmanaged,
+            vec![deploy("BepInEx/plugins/ServerOnly.dll")]
         );
     }
 
@@ -887,12 +969,17 @@ mod tests {
         snapshot
             .payload_files
             .insert(deploy("BepInEx/plugins/ModA/ModA.dll"), staged_file.size);
+        // The remote content was verified to match the staged bytes.
+        snapshot
+            .payload_hashes
+            .insert(deploy("BepInEx/plugins/ModA/ModA.dll"), hash_of(bytes));
 
         let plan = build_plan(
             &fixture.publication(),
             &payload(bytes),
             &snapshot,
             &selection(true, false),
+            &context(),
             &spec(),
         )
         .unwrap();
@@ -900,6 +987,75 @@ mod tests {
         assert!(plan.uploads.is_empty());
         assert_eq!(plan.unchanged_files, 1);
         assert!(!plan.requires_restart);
+    }
+
+    #[test]
+    fn same_size_remote_modification_of_owned_file_reuploads() {
+        let fixture = fixture();
+        let bytes = b"dll-bytes";
+        let staged_file = staged(bytes);
+        let mut snapshot = empty_snapshot();
+        snapshot.state.files.insert(
+            deploy("BepInEx/plugins/ModA/ModA.dll"),
+            crate::profile::server::state::OwnedFile {
+                hash: staged_file.hash.clone(),
+                size: staged_file.size,
+            },
+        );
+        // Same size, different bytes — a remote edit that size comparison
+        // alone would miss.
+        snapshot
+            .payload_files
+            .insert(deploy("BepInEx/plugins/ModA/ModA.dll"), staged_file.size);
+        snapshot.payload_hashes.insert(
+            deploy("BepInEx/plugins/ModA/ModA.dll"),
+            hash_of(b"tampered!"),
+        );
+
+        let plan = build_plan(
+            &fixture.publication(),
+            &payload(bytes),
+            &snapshot,
+            &selection(true, false),
+            &context(),
+            &spec(),
+        )
+        .unwrap();
+
+        assert_eq!(plan.uploads.len(), 1);
+        assert_eq!(plan.uploads[0].kind, UploadKind::Payload);
+    }
+
+    #[test]
+    fn unverifiable_owned_file_is_reuploaded_conservatively() {
+        let fixture = fixture();
+        let bytes = b"dll-bytes";
+        let staged_file = staged(bytes);
+        let mut snapshot = empty_snapshot();
+        snapshot.state.files.insert(
+            deploy("BepInEx/plugins/ModA/ModA.dll"),
+            crate::profile::server::state::OwnedFile {
+                hash: staged_file.hash.clone(),
+                size: staged_file.size,
+            },
+        );
+        // Size matches but the remote read produced no hash — when content
+        // cannot be verified, the canonical bytes are re-uploaded.
+        snapshot
+            .payload_files
+            .insert(deploy("BepInEx/plugins/ModA/ModA.dll"), staged_file.size);
+
+        let plan = build_plan(
+            &fixture.publication(),
+            &payload(bytes),
+            &snapshot,
+            &selection(true, false),
+            &context(),
+            &spec(),
+        )
+        .unwrap();
+
+        assert_eq!(plan.uploads.len(), 1);
     }
 
     #[test]
@@ -925,6 +1081,7 @@ mod tests {
             &payload(bytes),
             &snapshot,
             &selection(true, false),
+            &context(),
             &spec(),
         )
         .unwrap();
@@ -949,6 +1106,7 @@ mod tests {
             &DesiredDeployment::default(),
             &snapshot,
             &selection(false, true),
+            &context(),
             &spec(),
         )
         .unwrap();
@@ -970,6 +1128,7 @@ mod tests {
             &DesiredDeployment::default(),
             &snapshot,
             &apply,
+            &context(),
             &spec(),
         )
         .unwrap();
@@ -984,6 +1143,7 @@ mod tests {
             &DesiredDeployment::default(),
             &snapshot,
             &decline,
+            &context(),
             &spec(),
         )
         .unwrap();
@@ -1018,6 +1178,7 @@ mod tests {
             &DesiredDeployment::default(),
             &snapshot,
             &selection(false, true),
+            &context(),
             &spec(),
         )
         .unwrap();
@@ -1032,6 +1193,7 @@ mod tests {
             &DesiredDeployment::default(),
             &snapshot,
             &apply_only,
+            &context(),
             &spec(),
         )
         .unwrap();
@@ -1048,6 +1210,7 @@ mod tests {
             &DesiredDeployment::default(),
             &snapshot,
             &restore,
+            &context(),
             &spec(),
         )
         .unwrap();
@@ -1070,6 +1233,7 @@ mod tests {
             &desired,
             &empty_snapshot(),
             &selection(true, false),
+            &context(),
             &spec(),
         )
         .unwrap();
@@ -1091,6 +1255,7 @@ mod tests {
             &desired,
             &snapshot,
             &selection(true, false),
+            &context(),
             &spec(),
         )
         .unwrap();
@@ -1132,6 +1297,7 @@ mod tests {
             &DesiredDeployment::default(),
             &snapshot,
             &selection(false, true),
+            &context(),
             &spec(),
         )
         .unwrap();
@@ -1145,9 +1311,24 @@ mod tests {
         let snapshot = empty_snapshot();
         let sel = selection(true, true);
 
-        let first = build_plan(&fixture.publication(), &desired, &snapshot, &sel, &spec()).unwrap();
-        let second =
-            build_plan(&fixture.publication(), &desired, &snapshot, &sel, &spec()).unwrap();
+        let first = build_plan(
+            &fixture.publication(),
+            &desired,
+            &snapshot,
+            &sel,
+            &context(),
+            &spec(),
+        )
+        .unwrap();
+        let second = build_plan(
+            &fixture.publication(),
+            &desired,
+            &snapshot,
+            &sel,
+            &context(),
+            &spec(),
+        )
+        .unwrap();
         assert_eq!(first.hash, second.hash);
         assert!(!first.hash.is_empty());
 
@@ -1157,6 +1338,7 @@ mod tests {
             &desired,
             &snapshot,
             &selection(true, false),
+            &context(),
             &spec(),
         )
         .unwrap();
@@ -1166,26 +1348,131 @@ mod tests {
         // another operation cannot be replayed.
         let mut newer = empty_snapshot();
         newer.state.operation_seq = snapshot.state.operation_seq + 1;
-        let third = build_plan(&fixture.publication(), &desired, &newer, &sel, &spec()).unwrap();
+        let third = build_plan(
+            &fixture.publication(),
+            &desired,
+            &newer,
+            &sel,
+            &context(),
+            &spec(),
+        )
+        .unwrap();
         assert_ne!(first.hash, third.hash);
+
+        // A different restart policy or target identity also binds the
+        // approval — changing behavior-relevant options after preview must
+        // not reuse it.
+        let mut context = context();
+        context.restart_policy = crate::profile::server::settings::RestartPolicy::Immediate;
+        let restarted = build_plan(
+            &fixture.publication(),
+            &desired,
+            &snapshot,
+            &sel,
+            &context,
+            &spec(),
+        )
+        .unwrap();
+        assert_ne!(first.hash, restarted.hash);
+
+        context.restart_policy = crate::profile::server::settings::RestartPolicy::Manual;
+        context.profile_id = "2".to_owned();
+        let other_profile = build_plan(
+            &fixture.publication(),
+            &desired,
+            &snapshot,
+            &sel,
+            &context,
+            &spec(),
+        )
+        .unwrap();
+        assert_ne!(first.hash, other_profile.hash);
     }
 
     #[test]
-    fn restart_is_required_only_for_payload_changes() {
+    fn plan_hash_binds_remote_config_preconditions() {
         let mut fixture = fixture();
         let path = config_path("BepInEx/config/mod.cfg");
         fixture
             .config
             .insert(path.clone(), config_file(b"published"));
 
-        // Config-only write: no restart needed.
+        // The user approves applying this config while the remote holds
+        // one version of the file...
         let mut apply = selection(false, true);
-        apply.apply_configs.push(path);
+        apply.apply_configs.push(path.clone());
+        let mut snapshot = empty_snapshot();
+        snapshot
+            .config_remote
+            .insert(path.clone(), Some(hash_of(b"server-v1")));
+
+        let approved = build_plan(
+            &fixture.publication(),
+            &DesiredDeployment::default(),
+            &snapshot,
+            &apply,
+            &context(),
+            &spec(),
+        )
+        .unwrap();
+        assert!(
+            approved
+                .uploads
+                .iter()
+                .any(|u| u.kind == UploadKind::Config)
+        );
+
+        // ...then the remote file changes underneath the approval. The
+        // planned action is still `Write`, but the precondition differs —
+        // the hash must change so the stale approval is rejected.
+        snapshot
+            .config_remote
+            .insert(path, Some(hash_of(b"server-v2-edited")));
+        let replanned = build_plan(
+            &fixture.publication(),
+            &DesiredDeployment::default(),
+            &snapshot,
+            &apply,
+            &context(),
+            &spec(),
+        )
+        .unwrap();
+        assert_eq!(replanned.uploads, approved.uploads);
+        assert_ne!(approved.hash, replanned.hash);
+    }
+
+    #[test]
+    fn restart_is_required_for_any_write_or_removal() {
+        let mut fixture = fixture();
+        let path = config_path("BepInEx/config/mod.cfg");
+        fixture
+            .config
+            .insert(path.clone(), config_file(b"published"));
+
+        // A config-only write still changes server content: the running
+        // game only picks it up after a restart.
+        let mut apply = selection(false, true);
+        apply.apply_configs.push(path.clone());
         let plan = build_plan(
             &fixture.publication(),
             &DesiredDeployment::default(),
             &empty_snapshot(),
             &apply,
+            &context(),
+            &spec(),
+        )
+        .unwrap();
+        assert!(plan.requires_restart);
+
+        // But a declined/unselected config writes nothing — no restart.
+        let mut decline = selection(false, true);
+        decline.decline_configs.push(path);
+        let plan = build_plan(
+            &fixture.publication(),
+            &DesiredDeployment::default(),
+            &empty_snapshot(),
+            &decline,
+            &context(),
             &spec(),
         )
         .unwrap();
@@ -1197,6 +1484,7 @@ mod tests {
             &payload(b"dll"),
             &empty_snapshot(),
             &selection(true, false),
+            &context(),
             &spec(),
         )
         .unwrap();

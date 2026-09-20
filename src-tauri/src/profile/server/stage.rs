@@ -243,3 +243,74 @@ fn deploy_path(path: &Path) -> Result<DeployPathBuf> {
     );
     Ok(path)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use chrono::Utc;
+    use futures_util::future::BoxFuture;
+
+    use super::{PayloadSource, stage_publication};
+    use crate::{
+        game::mod_loader::{ModLoader, ModLoaderKind},
+        profile::{
+            export::{ConfigPath, ModRevision, R2Mod},
+            server::{plan::Publication, spec::DeploymentSpec},
+            sync::archive::ValidatedConfigFile,
+        },
+        thunderstore::{Backend, PackageIdent, VersionIdent},
+    };
+
+    /// A payload source that must never be touched — any access is a test
+    /// failure, proving configs-only operations never stage mod packages.
+    struct FailSource;
+
+    impl PayloadSource for FailSource {
+        fn stage<'a>(
+            &'a self,
+            ident: &'a VersionIdent,
+            _backend: Backend,
+        ) -> BoxFuture<'a, eyre::Result<std::path::PathBuf>> {
+            panic!("mod payload source was requested for {}", ident.full_name());
+        }
+    }
+
+    fn spec() -> DeploymentSpec {
+        DeploymentSpec::for_loader(&ModLoader {
+            package_name: None,
+            file_target: None,
+            kind: ModLoaderKind::BepInEx {
+                extra_subdirs: Vec::new(),
+            },
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn configs_only_staging_never_touches_the_mod_source() {
+        // Local/Worker parity regression: a configs-only operation must
+        // not require downloading or extracting any mod package, even
+        // when the publication contains enabled mods.
+        let mods = [R2Mod {
+            ident: PackageIdent::from(("Author", "SomeMod")),
+            version: semver::Version::new(1, 0, 0).into(),
+            enabled: true,
+            source: Backend::Thunderstore,
+        }];
+        let config: BTreeMap<ConfigPath, ValidatedConfigFile> = BTreeMap::new();
+        let publication = Publication {
+            revision: Utc::now(),
+            mods_revision: ModRevision::from_hash(blake3::hash(b"rev")),
+            mods: &mods,
+            config: &config,
+        };
+
+        let desired = stage_publication(&publication, &FailSource, &spec(), false, |_, _, _| {})
+            .await
+            .unwrap();
+
+        assert!(desired.payload.is_empty());
+        assert!(desired.package_defaults.is_empty());
+    }
+}

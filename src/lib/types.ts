@@ -386,12 +386,15 @@ export type DeploymentPlan = {
 	unchangedFiles: number;
 	configEntries: PlanConfigEntry[];
 	conflicts: PlanConflict[];
+	/// Remote payload files Gale has never owned — surfaced for review,
+	/// never deleted by the deployment.
+	unmanaged: string[];
 	requiresRestart: boolean;
 };
 
 export type ExecutorKind = 'local' | 'worker';
 export type OperationKind = 'manual' | 'automatic';
-export type OperationStatus = 'succeeded' | 'failed';
+export type OperationStatus = 'succeeded' | 'partial' | 'failed';
 export type RestartOutcome =
 	| 'notRequired'
 	| 'awaitingManual'
@@ -432,6 +435,14 @@ export type LeaseRecord = {
 	ttlSecs: number;
 };
 
+/// A preview that found another live executor holding the deployment
+/// lease. `stale` marks a lease whose heartbeat expired — the only case
+/// where a forced takeover is offered.
+export type LeaseBusy = {
+	record: LeaseRecord;
+	stale: boolean;
+};
+
 /// The subset of the remote deployment state the UI displays.
 export type ServerDeploymentState = {
 	version: number;
@@ -444,7 +455,7 @@ export type ServerDeploymentState = {
 
 export type ServerSyncPreview = {
 	plan: DeploymentPlan;
-	busy: LeaseRecord | null;
+	busy: LeaseBusy | null;
 	warnings: string[];
 };
 
@@ -477,7 +488,15 @@ export type WorkerStatus = {
 	autoSync: boolean;
 	autoMods: boolean;
 	restartPolicy: RestartPolicy;
-	lastSeenRevision: string | null;
+	/// The newest publication revision the worker has observed —
+	/// observation alone is not deployment.
+	observedRevision: string | null;
+	/// A publication revision awaiting successful deployment, if any.
+	pendingRevision: string | null;
+	/// When the pending work becomes eligible for its next attempt.
+	nextAttemptAt: string | null;
+	/// The newest publication revision that fully deployed successfully.
+	lastDeployedRevision: string | null;
 	busy: BusyOperation | null;
 	lastOperation: OperationRecord | null;
 	lastError: string | null;

@@ -135,7 +135,14 @@
 		previewing = true;
 		result = null;
 		try {
-			preview = await api.profile.server.previewSync(selection(), remotePassword, workerToken);
+			// The restart policy is bound into the plan hash — the approval is
+			// only valid while this selection stands.
+			preview = await api.profile.server.previewSync(
+				selection(),
+				restartPolicy,
+				remotePassword,
+				workerToken
+			);
 			dirty = false;
 		} finally {
 			previewing = false;
@@ -149,12 +156,14 @@
 		dirty = true;
 	}
 
+	/// A persistent per-file policy for *future* revisions — distinct from
+	/// the one-time Apply/Decline decision for the current conflict.
 	async function setPolicy(path: string, policy: SyncConfigUpdatePolicy) {
-		await api.profile.server.setConfigPolicy(path, policy, null, remotePassword, workerToken);
+		await api.profile.server.setConfigPolicy(path, policy, remotePassword, workerToken);
 		dirty = true;
 	}
 
-	async function deploy() {
+	async function deploy(force = false) {
 		if (!preview) return;
 		deploying = true;
 		progress = null;
@@ -163,6 +172,7 @@
 				selection(),
 				preview.plan.hash,
 				restartPolicy,
+				force,
 				remotePassword,
 				workerToken
 			);
@@ -282,6 +292,13 @@
 						{m.serverSync_workerBusy()}
 					</span>
 				{/if}
+				{#if status.worker?.pendingRevision}
+					<span class="text-orange-600 dark:text-orange-400">
+						{m.serverSync_pendingRevision({
+							revision: new Date(status.worker.pendingRevision).toLocaleString()
+						})}
+					</span>
+				{/if}
 				{#if status.worker?.lastError}
 					<span class="text-red-600 dark:text-red-400">{status.worker.lastError}</span>
 				{/if}
@@ -373,12 +390,22 @@
 
 			{#if preview.busy}
 				<InfoBox type="warning" class="mt-3">
-					{m.serverSync_leaseHeld({ owner: preview.busy.owner })}
+					{m.serverSync_leaseHeld({ owner: preview.busy.record.owner })}
 				</InfoBox>
 			{/if}
 			{#each preview.warnings as warning}
 				<InfoBox type="warning" class="mt-3">{warning}</InfoBox>
 			{/each}
+			{#if preview.plan.unmanaged.length > 0}
+				<InfoBox type="info" class="mt-3">
+					{m.serverSync_unmanaged({ count: preview.plan.unmanaged.length })}
+					<details class="mt-1">
+						{#each preview.plan.unmanaged as path}
+							<div class="font-mono wrap-anywhere">{path}</div>
+						{/each}
+					</details>
+				</InfoBox>
+			{/if}
 			{#if preview.plan.requiresRestart}
 				<InfoBox type="info" class="mt-3">{m.serverSync_willRestart()}</InfoBox>
 			{/if}
@@ -397,6 +424,17 @@
 									{entry.path}
 								</span>
 								<span class="text-primary-500 shrink-0">{actionLabel(entry)}</span>
+								<Select
+									type="single"
+									triggerClass="w-44 shrink-0"
+									value={entry.policy}
+									onValueChange={(value) => setPolicy(entry.path, value as SyncConfigUpdatePolicy)}
+									items={[
+										{ value: 'ask', label: m.serverSync_policyAsk() },
+										{ value: 'alwaysApply', label: m.serverSync_policyAlwaysApply() },
+										{ value: 'alwaysKeep', label: m.serverSync_policyAlwaysKeep() }
+									]}
+								/>
 								{#if entry.action === 'pending'}
 									<Button onclick={() => decide(entry.path, 'apply')}>
 										{entry.reason === 'deletedLocally'
@@ -471,7 +509,11 @@
 
 	{#if result}
 		<div class="mt-4">
-			<InfoBox type="info">{m.serverSync_deployed_done()}</InfoBox>
+			{#if result.state.lastOperation?.status === 'partial' || result.failedConfigWrites.length > 0}
+				<InfoBox type="warning">{m.serverSync_partialDone()}</InfoBox>
+			{:else}
+				<InfoBox type="info">{m.serverSync_deployed_done()}</InfoBox>
+			{/if}
 			<DeploymentStats
 				uploaded={result.summary.uploadedFiles}
 				bytes={result.summary.uploadedBytes}
@@ -503,6 +545,7 @@
 				type="single"
 				triggerClass="w-40"
 				bind:value={restartPolicy}
+				onValueChange={() => (dirty = true)}
 				items={[
 					{ value: 'manual', label: m.serverSync_restartManual() },
 					{ value: 'immediate', label: m.serverSync_restartImmediate() },
@@ -513,13 +556,24 @@
 		<Button icon="mdi:cloud-search" loading={previewing} onclick={previewSync}>
 			{m.serverSync_preview()}
 		</Button>
-		<Button
-			icon="mdi:cloud-upload"
-			loading={deploying}
-			disabled={!preview || dirty || !!preview.busy}
-			onclick={deploy}
-		>
-			{m.serverSync_deploy()}
-		</Button>
+		{#if preview?.busy?.stale}
+			<Button
+				icon="mdi:cloud-upload"
+				loading={deploying}
+				disabled={dirty}
+				onclick={() => deploy(true)}
+			>
+				{m.serverSync_takeover()}
+			</Button>
+		{:else}
+			<Button
+				icon="mdi:cloud-upload"
+				loading={deploying}
+				disabled={!preview || dirty || !!preview.busy}
+				onclick={() => deploy()}
+			>
+				{m.serverSync_deploy()}
+			</Button>
+		{/if}
 	</div>
 </Dialog>

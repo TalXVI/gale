@@ -23,12 +23,10 @@ pub struct RunningServer {
     server_dir: PathBuf,
     pid: u32,
     child: SharedChild,
-}
-
-impl RunningServer {
-    pub fn child(&self) -> SharedChild {
-        self.child.clone()
-    }
+    /// Termination was requested but not yet confirmed. The entry stays
+    /// registered the whole time — the profile must remain locked while
+    /// the process may still be alive.
+    stopping: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -45,6 +43,8 @@ pub enum ServerStatus {
         game_slug: String,
         pid: u32,
         server_dir: PathBuf,
+        /// The process is being terminated — still running until confirmed.
+        stopping: bool,
     },
 }
 
@@ -66,6 +66,7 @@ impl ServerRuntime {
                 game_slug: running.game.slug.to_string(),
                 pid: running.pid,
                 server_dir: running.server_dir.clone(),
+                stopping: running.stopping,
             },
 
             None => ServerStatus::Stopped,
@@ -97,6 +98,7 @@ impl ServerRuntime {
             server_dir,
             pid,
             child,
+            stopping: false,
         });
 
         Ok(self.status())
@@ -112,17 +114,32 @@ impl ServerRuntime {
         matches && self.running.take().is_some()
     }
 
-    /// Takes ownership of the running server so the caller can kill it
-    /// without holding the runtime lock across an await.
-    pub fn take(&mut self) -> Option<RunningServer> {
-        self.running.take()
+    /// Marks the tracked server as terminating and returns its pid and
+    /// process handle. The registration stays in place for the whole
+    /// termination: the profile stays locked and `is_running` keeps
+    /// blocking new launches until the process is confirmed dead, so a
+    /// failed or slow kill cannot expose the profile or let a replacement
+    /// conceal the still-live process.
+    ///
+    /// Returns `None` when nothing is running or a stop is already in
+    /// flight.
+    pub fn begin_stop(&mut self) -> Option<(u32, SharedChild)> {
+        let running = self.running.as_mut()?;
+        if running.stopping {
+            return None;
+        }
+        running.stopping = true;
+        Some((running.pid, running.child.clone()))
     }
 
-    /// Puts a taken server back — used when stopping it failed, so the
-    /// profile stays locked and the status stays accurate.
-    pub fn restore(&mut self, running: RunningServer) {
-        if self.running.is_none() {
-            self.running = Some(running);
+    /// Reverts `begin_stop` after a failed termination — the process is
+    /// still alive, so it goes back to reporting as running (not stopping)
+    /// while keeping the profile lock.
+    pub fn cancel_stop(&mut self, pid: u32) {
+        if let Some(running) = self.running.as_mut()
+            && running.pid == pid
+        {
+            running.stopping = false;
         }
     }
 }
@@ -158,28 +175,30 @@ pub fn watch(app: AppHandle, child: SharedChild, pid: u32) {
     });
 }
 
-/// Kills the process behind `running` and reports the resulting status.
+/// Kills the process identified by `pid`/`child` and reports the resulting
+/// status.
 ///
-/// Expects the runtime entry to have been removed already via
-/// [`ServerRuntime::take`]. When termination fails the entry is restored —
-/// reporting a live process as stopped would silently unlock its profile.
-pub async fn kill(app: AppHandle, running: RunningServer) -> Result<()> {
-    let child = running.child();
+/// The runtime entry must have been marked via [`ServerRuntime::begin_stop`]
+/// — it stays registered (and keeps the profile locked) for the entire
+/// await. On success the entry is cleared; on failure [`cancel_stop`]
+/// returns it to the running state, because reporting a live process as
+/// stopped would silently unlock its profile.
+pub async fn kill(app: AppHandle, pid: u32, child: SharedChild) -> Result<()> {
     let result = {
         let mut child = child.lock().await;
         child.kill().await
     };
 
+    let mut runtime = app.lock_server_runtime();
     match result {
         Ok(()) => {
-            let status = app.lock_server_runtime().status();
-            emit_status(&app, &status);
+            runtime.clear_if_pid(pid);
+            emit_status(&app, &runtime.status());
             Ok(())
         }
         Err(err) => {
             warn!(?err, "failed to kill dedicated server process");
-            let mut runtime = app.lock_server_runtime();
-            runtime.restore(running);
+            runtime.cancel_stop(pid);
             emit_status(&app, &runtime.status());
             Err(eyre::eyre!("failed to stop the dedicated server: {err}"))
         }
@@ -205,11 +224,136 @@ mod tests {
             game_slug: "valheim".to_owned(),
             pid: 123,
             server_dir: PathBuf::from("server"),
+            stopping: true,
         })
         .unwrap();
 
         assert_eq!(value["profileId"], 7);
         assert_eq!(value["gameSlug"], "valheim");
         assert_eq!(value["serverDir"], "server");
+        assert_eq!(value["stopping"], true);
+    }
+
+    /// A real long-running child for the runtime state tests — the
+    /// lifecycle guarantees being exercised don't depend on what the
+    /// process actually is.
+    #[cfg(windows)]
+    fn sleeper() -> super::SharedChild {
+        let child = tokio::process::Command::new("cmd")
+            .args(["/c", "ping", "-n", "60", "127.0.0.1"])
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        std::sync::Arc::new(tokio::sync::Mutex::new(child))
+    }
+
+    #[cfg(not(windows))]
+    fn sleeper() -> super::SharedChild {
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        std::sync::Arc::new(tokio::sync::Mutex::new(child))
+    }
+
+    fn runtime_with_child() -> (super::ServerRuntime, u32) {
+        let child = sleeper();
+        let pid = child.blocking_lock().id().unwrap();
+        let mut runtime = super::ServerRuntime::default();
+        runtime
+            .register(
+                7,
+                crate::game::list().next().unwrap(),
+                PathBuf::from("server"),
+                pid,
+                child,
+            )
+            .unwrap();
+        (runtime, pid)
+    }
+
+    #[test]
+    fn stopping_keeps_the_profile_locked_and_blocks_launch() {
+        // The 8.2 contract: while termination is pending the process may
+        // still be alive, so it keeps counting as running.
+        let (mut runtime, pid) = runtime_with_child();
+        assert!(runtime.is_profile_locked(7));
+
+        let (stopped_pid, _child) = runtime.begin_stop().unwrap();
+        assert_eq!(stopped_pid, pid);
+        assert!(runtime.is_running(), "a stopping server is still running");
+        assert!(runtime.is_profile_locked(7));
+        assert!(matches!(
+            runtime.status(),
+            super::ServerStatus::Running { stopping: true, .. }
+        ));
+
+        // A second stop attempt does not produce a second kill on a
+        // possibly-different process view.
+        assert!(runtime.begin_stop().is_none());
+        // Registering a replacement is refused while the original lives.
+        assert!(
+            runtime
+                .register(
+                    9,
+                    crate::game::list().next().unwrap(),
+                    PathBuf::from("x"),
+                    1,
+                    sleeper()
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn failed_termination_restores_the_running_entry() {
+        // cancel_stop simulates a failed kill: the process is still alive,
+        // so the runtime goes back to plain Running — never a phantom
+        // stopped state.
+        let (mut runtime, pid) = runtime_with_child();
+        runtime.begin_stop().unwrap();
+
+        runtime.cancel_stop(pid);
+
+        assert!(matches!(
+            runtime.status(),
+            super::ServerStatus::Running {
+                stopping: false,
+                ..
+            }
+        ));
+        assert!(runtime.is_profile_locked(7));
+        // A retry can stop it again.
+        assert!(runtime.begin_stop().is_some());
+        // Termination confirmed — the lock releases.
+        assert!(runtime.clear_if_pid(pid));
+        assert!(!runtime.is_running());
+        assert!(!runtime.is_profile_locked(7));
+    }
+
+    #[test]
+    fn stale_watcher_cannot_clear_a_replacement() {
+        // clear_if_pid is pid-scoped: an old watcher reporting death must
+        // not remove a newer registration.
+        let (mut runtime, pid) = runtime_with_child();
+        runtime.begin_stop().unwrap();
+        runtime.clear_if_pid(pid);
+
+        let child = sleeper();
+        let new_pid = child.blocking_lock().id().unwrap();
+        runtime
+            .register(
+                7,
+                crate::game::list().next().unwrap(),
+                PathBuf::from("server"),
+                new_pid,
+                child,
+            )
+            .unwrap();
+
+        assert!(!runtime.clear_if_pid(pid), "stale pid cleared a new server");
+        assert!(runtime.is_running());
+        assert!(runtime.is_profile_locked(7));
     }
 }
