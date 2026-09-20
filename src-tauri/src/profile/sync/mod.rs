@@ -27,7 +27,7 @@ use crate::{
 };
 
 mod apply;
-pub(super) mod archive;
+pub(crate) mod archive;
 pub mod auth;
 pub mod commands;
 mod publish;
@@ -64,11 +64,11 @@ struct CreateSyncProfileResponse {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncProfileMetadata {
-    id: String,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-    owner: auth::User,
-    manifest: ProfileManifest,
+    pub(crate) id: String,
+    pub(crate) created_at: DateTime<Utc>,
+    pub(crate) updated_at: DateTime<Utc>,
+    pub(crate) owner: auth::User,
+    pub(crate) manifest: ProfileManifest,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -179,6 +179,29 @@ impl From<SyncProfileMetadata> for SyncProfileData {
             published: None,
             applied: None,
         }
+    }
+}
+
+impl SyncProfileData {
+    /// The sync-service profile id — what dedicated-server synchronization
+    /// fetches the canonical publication for.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The remote `updated_at` identifying the currently known publication.
+    pub fn updated_at(&self) -> DateTime<Utc> {
+        self.updated_at
+    }
+}
+
+impl SyncProfileMetadata {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn updated_at(&self) -> DateTime<Utc> {
+        self.updated_at
     }
 }
 
@@ -997,6 +1020,51 @@ pub async fn read_profile(id: &str, app: &AppHandle) -> Result<SyncProfileMetada
     get_profile_meta(id, app)
         .await?
         .ok_or_eyre("profile not found")
+}
+
+/// The canonical published state of a sync profile, validated and
+/// normalized — the exact artifact subscriber clients consume through
+/// `pull_profile` and dedicated servers deploy from.
+pub struct FetchedPublication {
+    /// Remote `updated_at`, identifying this exact publication revision.
+    pub revision: DateTime<Utc>,
+    pub manifest: ProfileManifest,
+    pub mods_revision: ModRevision,
+    pub config: BTreeMap<ConfigPath, archive::ValidatedConfigFile>,
+}
+
+/// Builds a publication from already-fetched metadata and archive bytes.
+/// Shared by the desktop and the standalone worker so both validate and
+/// normalize archives identically.
+pub fn publication_from_archive(
+    metadata: &SyncProfileMetadata,
+    bytes: &[u8],
+) -> Result<FetchedPublication> {
+    let validated = archive::validate(bytes).context("sync archive failed validation")?;
+    let normalized = normalize_archive(&validated)?;
+
+    Ok(FetchedPublication {
+        revision: metadata.updated_at,
+        manifest: normalized.manifest.clone(),
+        mods_revision: normalized.latest.mods_revision.clone(),
+        config: normalized.config.into_owned(),
+    })
+}
+
+/// Fetches the canonical publication for `id` from the sync service.
+pub async fn fetch_publication(id: &str, app: &AppHandle) -> Result<FetchedPublication> {
+    let metadata = read_profile(id, app).await?;
+    let bytes = download_profile_bytes(id, app).await?;
+    publication_from_archive(&metadata, &bytes)
+}
+
+/// Fetches only the publication metadata — the cheap way to check whether
+/// a new revision exists without downloading the archive.
+pub async fn fetch_publication_meta(
+    id: &str,
+    app: &AppHandle,
+) -> Result<Option<SyncProfileMetadata>> {
+    get_profile_meta(id, app).await
 }
 
 async fn get_owned_profiles(app: &AppHandle) -> Result<Vec<ListedSyncProfile>> {

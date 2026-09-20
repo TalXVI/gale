@@ -18,6 +18,7 @@ mod profile;
 mod state;
 mod thunderstore;
 mod util;
+pub mod worker;
 
 fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     info!(
@@ -163,8 +164,12 @@ pub fn run() {
             profile::server::commands::get_dedicated_server_settings,
             profile::server::commands::set_dedicated_server_settings,
             profile::server::commands::test_remote_server_connection,
-            profile::server::commands::deploy_remote_server,
-            profile::server::commands::preview_remote_server_deployment,
+            profile::server::commands::test_worker_connection,
+            profile::server::commands::get_server_sync_status,
+            profile::server::commands::preview_server_sync,
+            profile::server::commands::deploy_server_sync,
+            profile::server::commands::set_server_config_policy,
+            profile::server::commands::configure_worker,
             profile::server::commands::get_dedicated_server_status,
             profile::server::commands::open_dedicated_server_dir,
             profile::server::commands::force_stop_dedicated_server,

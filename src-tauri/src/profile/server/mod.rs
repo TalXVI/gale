@@ -6,15 +6,20 @@ use crate::state::ManagerExt;
 pub mod commands;
 
 pub(crate) mod args;
-pub(crate) mod deploy;
+pub(crate) mod engine;
+pub(crate) mod host;
+pub(crate) mod lease;
 pub(crate) mod local;
-pub(crate) mod manifest;
 pub(crate) mod paths;
+pub(crate) mod plan;
 pub(crate) mod remote;
 pub(crate) mod runtime;
 pub(crate) mod secrets;
 pub(crate) mod settings;
 pub(crate) mod spec;
+pub(crate) mod stage;
+pub(crate) mod state;
+pub(crate) mod worker_client;
 
 pub(crate) fn ensure_profile_unlocked(app: &AppHandle, profile_id: i64) -> Result<()> {
     let runtime = app.lock_server_runtime();

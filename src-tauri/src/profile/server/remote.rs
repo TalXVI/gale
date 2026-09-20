@@ -1,8 +1,9 @@
 use std::{
+    fs::File,
     io::{Cursor, Read, Write},
     net::{TcpStream, ToSocketAddrs},
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -25,9 +26,15 @@ use super::{
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SSH_TIMEOUT: Duration = Duration::from_millis(15_000);
 const SFTP_NO_SUCH_FILE: i32 = 2;
+/// FTP servers do not always implement `SIZE` for directories.
+const FTP_SIZE_UNAVAILABLE: &[Status] = &[Status::FileUnavailable, Status::BadCommand];
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(tag = "status", rename_all = "camelCase")]
+#[serde(
+    tag = "status",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum ConnectionTestResult {
     Connected {
         fingerprint: Option<String>,
@@ -36,17 +43,64 @@ pub enum ConnectionTestResult {
     HostKeyUntrusted {
         fingerprint: String,
     },
-    CertificateUntrusted,
+    CertificateUntrusted {
+        fingerprint: String,
+    },
 }
 
 pub enum ConnectionAttempt {
     Connected(RemoteConnection),
     HostKeyUntrusted { fingerprint: String },
-    CertificateUntrusted,
+    CertificateUntrusted { fingerprint: String },
+}
+
+/// The transport-level operations the deployment engine needs, abstracted so
+/// the engine can run against a real FTP/SFTP connection or an in-memory
+/// remote in tests.
+///
+/// All paths are absolute remote paths; deploy-path mapping happens in the
+/// engine. Every method takes `&mut self` because real transports are
+/// single-stream stateful protocols.
+///
+/// `Send` is required so sessions and heartbeat connections can move
+/// across `spawn_blocking`/thread boundaries.
+pub trait RemoteOps: Send {
+    /// Whether `path` exists and is a directory.
+    fn is_dir(&mut self, path: &RemotePath) -> Result<bool>;
+    /// Whether `path` exists and is not a directory.
+    fn is_file(&mut self, path: &RemotePath) -> Result<bool>;
+    /// Size of the remote file, or `None` when absent or not a file.
+    fn file_size(&mut self, path: &RemotePath) -> Result<Option<u64>>;
+    /// Entries of a directory. Missing directories yield an empty list.
+    fn list(&mut self, dir: &RemotePath) -> Result<Vec<RemoteEntry>>;
+    /// File contents, bounded to `max` bytes. Implementations must refuse to
+    /// download files larger than `max` instead of truncating them.
+    fn read(&mut self, path: &RemotePath, max: u64) -> Result<Option<Vec<u8>>>;
+    /// Writes bytes to `path`, creating or truncating it.
+    fn write(&mut self, path: &RemotePath, bytes: &[u8]) -> Result<()>;
+    /// Uploads a local file to `path`, streaming its contents.
+    fn upload(&mut self, local: &Path, remote: &RemotePath) -> Result<()>;
+    /// Renames `from` to `to`, replacing `to` when it exists where the
+    /// protocol supports it.
+    fn rename(&mut self, from: &RemotePath, to: &RemotePath) -> Result<()>;
+    /// Deletes a file. Returns whether anything was removed.
+    fn delete_file(&mut self, path: &RemotePath) -> Result<bool>;
+    /// Removes an empty directory.
+    fn delete_dir(&mut self, path: &RemotePath) -> Result<()>;
+    /// Creates `path` and any missing parents it can create.
+    fn ensure_dir(&mut self, path: &RemotePath) -> Result<()>;
+    /// Atomically creates `path` as a directory: `true` when created, `false`
+    /// when it already existed. Used as the deployment-lease primitive because
+    /// `MKD`/mkdir is atomic on both FTP and SFTP servers.
+    fn claim_dir(&mut self, path: &RemotePath) -> Result<bool>;
+    /// Re-establishes the underlying transport after an error.
+    fn reconnect(&mut self) -> Result<()>;
 }
 
 pub struct RemoteConnection {
     client: RemoteClient,
+    settings: RemoteServerSettings,
+    password: String,
     pub fingerprint: Option<String>,
     pub encrypted: bool,
 }
@@ -54,6 +108,8 @@ pub struct RemoteConnection {
 pub struct RemoteEntry {
     pub name: String,
     pub is_directory: bool,
+    /// File size where the listing reports it (always present for SFTP).
+    pub size: Option<u64>,
 }
 
 enum RemoteClient {
@@ -61,44 +117,102 @@ enum RemoteClient {
     Ftp(RustlsFtpStream),
 }
 
+/// FTPS certificate verification: normal CA validation first, then an exact
+/// certificate fingerprint pin as the only fallback trust. When validation
+/// fails the observed fingerprint is recorded so the caller can surface it
+/// for a trust decision — subsequent arbitrary certificates for the same
+/// host stay rejected.
 #[derive(Debug)]
-struct TrustAnyCertificate;
+struct FtpsCertVerifier {
+    webpki: Arc<suppaftp::rustls::client::WebPkiServerVerifier>,
+    pinned: Option<String>,
+    observed: Arc<Mutex<Option<String>>>,
+}
 
-impl ServerCertVerifier for TrustAnyCertificate {
+impl FtpsCertVerifier {
+    fn new(pinned: Option<String>) -> Result<(Self, Arc<Mutex<Option<String>>>)> {
+        let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let webpki = suppaftp::rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+            .build()
+            .context("failed to build certificate verifier")?;
+        let observed = Arc::new(Mutex::new(None));
+
+        Ok((
+            Self {
+                webpki,
+                pinned,
+                observed: observed.clone(),
+            },
+            observed,
+        ))
+    }
+}
+
+impl ServerCertVerifier for FtpsCertVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
     ) -> std::result::Result<ServerCertVerified, TlsError> {
-        Ok(ServerCertVerified::assertion())
+        match self.webpki.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        ) {
+            Ok(verified) => return Ok(verified),
+            Err(error) => {
+                let fingerprint = certificate_fingerprint(end_entity);
+                *self.observed.lock().unwrap() = Some(fingerprint.clone());
+
+                if self.pinned.as_deref() == Some(fingerprint.as_str()) {
+                    return Ok(ServerCertVerified::assertion());
+                }
+
+                Err(error)
+            }
+        }
     }
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, TlsError> {
-        Ok(HandshakeSignatureValid::assertion())
+        if self.pinned.is_some() {
+            return Ok(HandshakeSignatureValid::assertion());
+        }
+
+        self.webpki.verify_tls12_signature(message, cert, dss)
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, TlsError> {
-        Ok(HandshakeSignatureValid::assertion())
+        if self.pinned.is_some() {
+            return Ok(HandshakeSignatureValid::assertion());
+        }
+
+        self.webpki.verify_tls13_signature(message, cert, dss)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        suppaftp::rustls::crypto::aws_lc_rs::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
+        self.webpki.supported_verify_schemes()
     }
+}
+
+/// Fingerprint of an end-entity certificate for pin comparison. blake3 is
+/// already a dependency and yields a stable 256-bit digest.
+fn certificate_fingerprint(cert: &CertificateDer<'_>) -> String {
+    blake3::hash(cert.as_ref()).to_hex().to_string()
 }
 
 pub fn test_connection(
@@ -123,7 +237,9 @@ pub fn test_connection(
         ConnectionAttempt::HostKeyUntrusted { fingerprint } => {
             Ok(ConnectionTestResult::HostKeyUntrusted { fingerprint })
         }
-        ConnectionAttempt::CertificateUntrusted => Ok(ConnectionTestResult::CertificateUntrusted),
+        ConnectionAttempt::CertificateUntrusted { fingerprint } => {
+            Ok(ConnectionTestResult::CertificateUntrusted { fingerprint })
+        }
     }
 }
 
@@ -136,15 +252,13 @@ impl RemoteConnection {
     pub fn connect(settings: &RemoteServerSettings, password: &str) -> Result<ConnectionAttempt> {
         if settings.protocol != RemoteProtocol::Sftp {
             return match Self::connect_ftp(settings, password) {
-                Ok(connection) => Ok(ConnectionAttempt::Connected(connection)),
-                Err(error)
-                    if settings.trusted_invalid_certificate_host.as_deref()
-                        != Some(settings.host.trim())
-                        && is_untrusted_certificate_error(&error) =>
-                {
-                    Ok(ConnectionAttempt::CertificateUntrusted)
+                Ok((client, encrypted)) => Ok(ConnectionAttempt::Connected(Self::new(
+                    client, settings, password, None, encrypted,
+                ))),
+                Err(FtpConnectError::Untrusted { fingerprint }) => {
+                    Ok(ConnectionAttempt::CertificateUntrusted { fingerprint })
                 }
-                Err(error) => Err(error),
+                Err(FtpConnectError::Other(error)) => Err(error),
             };
         }
 
@@ -167,93 +281,88 @@ impl RemoteConnection {
             .sftp()
             .context("connected over SSH, but the server did not provide an SFTP subsystem")?;
 
-        Ok(ConnectionAttempt::Connected(RemoteConnection {
-            client: RemoteClient::Sftp {
+        Ok(ConnectionAttempt::Connected(Self::new(
+            RemoteClient::Sftp {
                 sftp,
                 _session: session,
             },
-            fingerprint: Some(fingerprint),
-            encrypted: true,
-        }))
+            settings,
+            password,
+            Some(fingerprint),
+            true,
+        )))
     }
 
-    fn connect_ftp(settings: &RemoteServerSettings, password: &str) -> Result<RemoteConnection> {
-        ensure!(!password.is_empty(), "FTP password is required");
+    fn new(
+        client: RemoteClient,
+        settings: &RemoteServerSettings,
+        password: &str,
+        fingerprint: Option<String>,
+        encrypted: bool,
+    ) -> Self {
+        Self {
+            client,
+            settings: settings.clone(),
+            password: password.to_owned(),
+            fingerprint,
+            encrypted,
+        }
+    }
+
+    fn connect_ftp(
+        settings: &RemoteServerSettings,
+        password: &str,
+    ) -> std::result::Result<(RemoteClient, bool), FtpConnectError> {
+        if password.is_empty() {
+            return Err(FtpConnectError::Other(eyre::eyre!(
+                "FTP password is required"
+            )));
+        }
 
         let address = format!("{}:{}", settings.host.trim(), settings.port);
         let stream = RustlsFtpStream::connect(address.as_str())
-            .with_context(|| format!("failed to connect to {}", settings.host))?;
+            .with_context(|| format!("failed to connect to {}", settings.host))
+            .map_err(FtpConnectError::Other)?;
 
-        let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let mut connector = ClientConfig::builder()
-            .with_root_certificates(roots)
+        let (verifier, observed) = FtpsCertVerifier::new(settings.trusted_certificate.clone())
+            .map_err(FtpConnectError::Other)?;
+        let connector = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(verifier))
             .with_no_client_auth();
-
-        // The user may choose to trust a host whose certificate cannot be
-        // verified (self-signed certs are common on game hosts).
-        let trust_invalid =
-            settings.trusted_invalid_certificate_host.as_deref() == Some(settings.host.trim());
-        if trust_invalid {
-            connector
-                .dangerous()
-                .set_certificate_verifier(Arc::new(TrustAnyCertificate));
-        }
 
         let (mut stream, encrypted) = match stream.into_secure(
             RustlsConnector::from(Arc::new(connector)),
             settings.host.trim(),
         ) {
             Ok(stream) => (stream, true),
-            // Plain FTP servers reject AUTH TLS entirely; reconnect and stay
-            // unencrypted instead of failing.
-            Err(error)
-                if settings.protocol == RemoteProtocol::Ftp && is_ftp_tls_unsupported(&error) =>
-            {
-                (
-                    RustlsFtpStream::connect(address.as_str())
-                        .with_context(|| format!("failed to reconnect to {}", settings.host))?,
-                    false,
-                )
+            Err(error) => {
+                if let Some(fingerprint) = observed.lock().unwrap().take() {
+                    return Err(FtpConnectError::Untrusted { fingerprint });
+                }
+                // Plain FTP servers reject AUTH TLS entirely; reconnect and
+                // stay unencrypted instead of failing.
+                if settings.protocol == RemoteProtocol::Ftp && is_ftp_tls_unsupported(&error) {
+                    (
+                        RustlsFtpStream::connect(address.as_str())
+                            .with_context(|| format!("failed to reconnect to {}", settings.host))
+                            .map_err(FtpConnectError::Other)?,
+                        false,
+                    )
+                } else {
+                    return Err(FtpConnectError::Other(eyre::eyre!(
+                        "FTPS TLS negotiation failed: {error}"
+                    )));
+                }
             }
-            Err(error) => return Err(error).context("FTPS TLS negotiation failed"),
         };
 
         stream
             .login(settings.username.trim(), password)
-            .context("FTP authentication failed")?;
+            .context("FTP authentication failed")
+            .map_err(FtpConnectError::Other)?;
 
-        Ok(RemoteConnection {
-            client: RemoteClient::Ftp(stream),
-            fingerprint: None,
-            encrypted,
-        })
-    }
-
-    pub fn supports_atomic_replace(&self) -> bool {
-        matches!(self.client, RemoteClient::Sftp { .. })
-    }
-
-    pub fn list_directory_entries(&mut self, path: &RemotePath) -> Result<Vec<RemoteEntry>> {
-        match &mut self.client {
-            RemoteClient::Sftp { sftp, .. } => match sftp.readdir(Path::new(path.as_str())) {
-                Ok(entries) => Ok(entries
-                    .into_iter()
-                    .filter_map(|(path, stat)| {
-                        Some(RemoteEntry {
-                            name: path.file_name()?.to_str()?.to_owned(),
-                            is_directory: stat.is_dir(),
-                        })
-                    })
-                    .collect()),
-                Err(err) if is_sftp_not_found(&err) => Ok(Vec::new()),
-                Err(err) => Err(err.into()),
-            },
-            RemoteClient::Ftp(ftp) => match ftp.list(Some(path.as_str())) {
-                Ok(entries) => ftp_list_entries(entries),
-                Err(err) if is_ftp_not_found(&err) => Ok(Vec::new()),
-                Err(err) => Err(err.into()),
-            },
-        }
+        Ok((RemoteClient::Ftp(stream), encrypted))
     }
 
     pub fn check_directory(&mut self, path: &RemotePath) -> Result<()> {
@@ -270,8 +379,15 @@ impl RemoteConnection {
             }
         }
     }
+}
 
-    pub fn directory_exists(&mut self, path: &RemotePath) -> Result<bool> {
+enum FtpConnectError {
+    Untrusted { fingerprint: String },
+    Other(eyre::Report),
+}
+
+impl RemoteOps for RemoteConnection {
+    fn is_dir(&mut self, path: &RemotePath) -> Result<bool> {
         match &mut self.client {
             RemoteClient::Sftp { sftp, .. } => match sftp.stat(Path::new(path.as_str())) {
                 Ok(stat) => Ok(stat.is_dir()),
@@ -295,26 +411,105 @@ impl RemoteConnection {
         }
     }
 
-    pub fn read_file(&mut self, path: &RemotePath) -> Result<Option<Vec<u8>>> {
+    fn file_size(&mut self, path: &RemotePath) -> Result<Option<u64>> {
+        match &mut self.client {
+            RemoteClient::Sftp { sftp, .. } => match sftp.stat(Path::new(path.as_str())) {
+                Ok(stat) if stat.is_dir() => Ok(None),
+                Ok(stat) => Ok(stat.size),
+                Err(err) if is_sftp_not_found(&err) => Ok(None),
+                Err(err) => Err(err.into()),
+            },
+            RemoteClient::Ftp(ftp) => match ftp.size(path.as_str()) {
+                Ok(size) => Ok(Some(size as u64)),
+                Err(err) if is_ftp_not_found(&err) || is_ftp_size_unsupported(&err) => Ok(None),
+                Err(err) => Err(err.into()),
+            },
+        }
+    }
+
+    fn list(&mut self, dir: &RemotePath) -> Result<Vec<RemoteEntry>> {
+        match &mut self.client {
+            RemoteClient::Sftp { sftp, .. } => match sftp.readdir(Path::new(dir.as_str())) {
+                Ok(entries) => Ok(entries
+                    .into_iter()
+                    .filter_map(|(path, stat)| {
+                        Some(RemoteEntry {
+                            name: path.file_name()?.to_str()?.to_owned(),
+                            is_directory: stat.is_dir(),
+                            size: stat.size,
+                        })
+                    })
+                    .collect()),
+                Err(err) if is_sftp_not_found(&err) => Ok(Vec::new()),
+                Err(err) => Err(err.into()),
+            },
+            RemoteClient::Ftp(ftp) => match ftp.list(Some(dir.as_str())) {
+                Ok(entries) => ftp_list_entries(entries),
+                Err(err) if is_ftp_not_found(&err) => Ok(Vec::new()),
+                Err(err) => Err(err.into()),
+            },
+        }
+    }
+
+    fn read(&mut self, path: &RemotePath, max: u64) -> Result<Option<Vec<u8>>> {
+        // Check the size first so oversized files are never downloaded.
+        match self.file_size(path)? {
+            Some(size) if size > max => {
+                bail!("remote file {path} is {size} bytes, exceeding the {max}-byte limit")
+            }
+            Some(_) => {}
+            None => {
+                if !self.is_file(path)? {
+                    return Ok(None);
+                }
+            }
+        }
+
         match &mut self.client {
             RemoteClient::Sftp { sftp, .. } => match sftp.open(Path::new(path.as_str())) {
-                Ok(mut file) => {
+                Ok(file) => {
                     let mut bytes = Vec::new();
-                    file.read_to_end(&mut bytes)?;
+                    file.take(max + 1).read_to_end(&mut bytes)?;
+                    ensure!(
+                        bytes.len() as u64 <= max,
+                        "remote file {path} exceeds the {max}-byte limit"
+                    );
                     Ok(Some(bytes))
                 }
                 Err(err) if is_sftp_not_found(&err) => Ok(None),
                 Err(err) => Err(err.into()),
             },
             RemoteClient::Ftp(ftp) => match ftp.retr_as_buffer(path.as_str()) {
-                Ok(bytes) => Ok(Some(bytes.into_inner())),
+                Ok(bytes) => {
+                    let bytes = bytes.into_inner();
+                    ensure!(
+                        bytes.len() as u64 <= max,
+                        "remote file {path} exceeds the {max}-byte limit"
+                    );
+                    Ok(Some(bytes))
+                }
                 Err(err) if is_ftp_not_found(&err) => Ok(None),
                 Err(err) => Err(err.into()),
             },
         }
     }
 
-    pub fn write_file(&mut self, path: &RemotePath, bytes: &[u8]) -> Result<()> {
+    fn is_file(&mut self, path: &RemotePath) -> Result<bool> {
+        match &mut self.client {
+            RemoteClient::Sftp { sftp, .. } => match sftp.stat(Path::new(path.as_str())) {
+                Ok(stat) => Ok(!stat.is_dir()),
+                Err(err) if is_sftp_not_found(&err) => Ok(false),
+                Err(err) => Err(err.into()),
+            },
+            RemoteClient::Ftp(ftp) => match ftp.size(path.as_str()) {
+                Ok(_) => Ok(true),
+                Err(err) if is_ftp_not_found(&err) || is_ftp_size_unsupported(&err) => Ok(false),
+                Err(err) => Err(err.into()),
+            },
+        }
+    }
+
+    fn write(&mut self, path: &RemotePath, bytes: &[u8]) -> Result<()> {
         match &mut self.client {
             RemoteClient::Sftp { sftp, .. } => {
                 let mut file = sftp.create(Path::new(path.as_str()))?;
@@ -329,7 +524,42 @@ impl RemoteConnection {
         }
     }
 
-    pub fn remove_file(&mut self, path: &RemotePath) -> Result<bool> {
+    fn upload(&mut self, local: &Path, remote: &RemotePath) -> Result<()> {
+        let mut file = File::open(local)
+            .with_context(|| format!("failed to read staged file {}", local.display()))?;
+
+        match &mut self.client {
+            RemoteClient::Sftp { sftp, .. } => {
+                let mut remote_file = sftp.create(Path::new(remote.as_str()))?;
+                std::io::copy(&mut file, &mut remote_file)?;
+                remote_file.flush()?;
+                Ok(())
+            }
+            RemoteClient::Ftp(ftp) => {
+                ftp.put_file(remote.as_str(), &mut file)?;
+                Ok(())
+            }
+        }
+    }
+
+    fn rename(&mut self, from: &RemotePath, to: &RemotePath) -> Result<()> {
+        match &mut self.client {
+            RemoteClient::Sftp { sftp, .. } => {
+                sftp.rename(
+                    Path::new(from.as_str()),
+                    Path::new(to.as_str()),
+                    Some(RenameFlags::ATOMIC | RenameFlags::OVERWRITE | RenameFlags::NATIVE),
+                )?;
+                Ok(())
+            }
+            RemoteClient::Ftp(ftp) => {
+                ftp.rename(from.as_str(), to.as_str())?;
+                Ok(())
+            }
+        }
+    }
+
+    fn delete_file(&mut self, path: &RemotePath) -> Result<bool> {
         match &mut self.client {
             RemoteClient::Sftp { sftp, .. } => match sftp.unlink(Path::new(path.as_str())) {
                 Ok(()) => Ok(true),
@@ -338,22 +568,28 @@ impl RemoteConnection {
             },
             RemoteClient::Ftp(ftp) => match ftp.rm(path.as_str()) {
                 Ok(()) => Ok(true),
+                Err(err) if is_ftp_not_found(&err) => Ok(false),
                 Err(err) => Err(err.into()),
             },
         }
     }
 
-    pub fn remove_directory(&mut self, path: &RemotePath) -> Result<()> {
+    fn delete_dir(&mut self, path: &RemotePath) -> Result<()> {
         match &mut self.client {
-            RemoteClient::Sftp { sftp, .. } => {
-                sftp.rmdir(Path::new(path.as_str()))?;
-                Ok(())
-            }
-            RemoteClient::Ftp(ftp) => ftp.rmdir(path.as_str()).map_err(Into::into),
+            RemoteClient::Sftp { sftp, .. } => match sftp.rmdir(Path::new(path.as_str())) {
+                Ok(()) => Ok(()),
+                Err(err) if is_sftp_not_found(&err) => Ok(()),
+                Err(err) => Err(err.into()),
+            },
+            RemoteClient::Ftp(ftp) => match ftp.rmdir(path.as_str()) {
+                Ok(()) => Ok(()),
+                Err(err) if is_ftp_not_found(&err) => Ok(()),
+                Err(err) => Err(err.into()),
+            },
         }
     }
 
-    pub fn ensure_directory(&mut self, path: &RemotePath) -> Result<()> {
+    fn ensure_dir(&mut self, path: &RemotePath) -> Result<()> {
         match &mut self.client {
             RemoteClient::Sftp { sftp, .. } => match sftp.stat(Path::new(path.as_str())) {
                 Ok(_) => Ok(()),
@@ -376,45 +612,47 @@ impl RemoteConnection {
         }
     }
 
-    pub fn rename_file(
-        &mut self,
-        from: &RemotePath,
-        to: &RemotePath,
-        overwrite: bool,
-    ) -> Result<()> {
+    fn claim_dir(&mut self, path: &RemotePath) -> Result<bool> {
         match &mut self.client {
-            RemoteClient::Sftp { sftp, .. } => {
-                let flags = if overwrite {
-                    RenameFlags::ATOMIC | RenameFlags::OVERWRITE | RenameFlags::NATIVE
-                } else {
-                    RenameFlags::empty()
-                };
-                sftp.rename(
-                    Path::new(from.as_str()),
-                    Path::new(to.as_str()),
-                    Some(flags),
-                )?;
-                Ok(())
-            }
-            RemoteClient::Ftp(ftp) => {
-                ftp.rename(from.as_str(), to.as_str())?;
-                Ok(())
-            }
+            RemoteClient::Sftp { sftp, .. } => match sftp.mkdir(Path::new(path.as_str()), 0o755) {
+                Ok(()) => Ok(true),
+                Err(error) => match sftp.stat(Path::new(path.as_str())) {
+                    Ok(stat) if stat.is_dir() => Ok(false),
+                    _ => Err(error.into()),
+                },
+            },
+            RemoteClient::Ftp(ftp) => match ftp.mkdir(path.as_str()) {
+                Ok(()) => Ok(true),
+                Err(error) => {
+                    let original = ftp.pwd()?;
+                    match ftp.cwd(path.as_str()) {
+                        Ok(()) => {
+                            ftp.cwd(original)?;
+                            Ok(false)
+                        }
+                        Err(_) => {
+                            ftp.cwd(&original).ok();
+                            Err(error.into())
+                        }
+                    }
+                }
+            },
         }
     }
 
-    pub fn file_exists(&mut self, path: &RemotePath) -> Result<bool> {
-        match &mut self.client {
-            RemoteClient::Sftp { sftp, .. } => match sftp.stat(Path::new(path.as_str())) {
-                Ok(_) => Ok(true),
-                Err(err) if is_sftp_not_found(&err) => Ok(false),
-                Err(err) => Err(err.into()),
-            },
-            RemoteClient::Ftp(ftp) => match ftp.size(path.as_str()) {
-                Ok(_) => Ok(true),
-                Err(err) if is_ftp_not_found(&err) => Ok(false),
-                Err(err) => Err(err.into()),
-            },
+    fn reconnect(&mut self) -> Result<()> {
+        let attempt = Self::connect(&self.settings, &self.password)?;
+        match attempt {
+            ConnectionAttempt::Connected(connection) => {
+                self.client = connection.client;
+                self.fingerprint = connection.fingerprint;
+                self.encrypted = connection.encrypted;
+                Ok(())
+            }
+            ConnectionAttempt::HostKeyUntrusted { .. }
+            | ConnectionAttempt::CertificateUntrusted { .. } => {
+                bail!("server trust verification failed while reconnecting")
+            }
         }
     }
 }
@@ -505,23 +743,12 @@ fn is_ftp_not_found(error: &FtpError) -> bool {
     matches!(error, FtpError::UnexpectedResponse(response) if response.status == Status::FileUnavailable)
 }
 
-fn is_ftp_tls_unsupported(error: &FtpError) -> bool {
-    matches!(error, FtpError::UnexpectedResponse(response) if matches!(response.status, Status::NotImplemented | Status::BadCommand))
+fn is_ftp_size_unsupported(error: &FtpError) -> bool {
+    matches!(error, FtpError::UnexpectedResponse(response) if FTP_SIZE_UNAVAILABLE.contains(&response.status))
 }
 
-fn is_untrusted_certificate_error(error: &eyre::Report) -> bool {
-    error.chain().any(|cause| {
-        if cause
-            .downcast_ref::<FtpError>()
-            .is_some_and(|error| matches!(error, FtpError::SecureError(_)))
-        {
-            return true;
-        }
-        let message = cause.to_string().to_ascii_lowercase();
-        message.contains("invalid peer certificate")
-            || message.contains("unknownissuer")
-            || message.contains("unknown issuer")
-    })
+fn is_ftp_tls_unsupported(error: &FtpError) -> bool {
+    matches!(error, FtpError::UnexpectedResponse(response) if matches!(response.status, Status::NotImplemented | Status::BadCommand))
 }
 
 fn ftp_list_entries(entries: Vec<String>) -> Result<Vec<RemoteEntry>> {
@@ -533,6 +760,7 @@ fn ftp_list_entries(entries: Vec<String>) -> Result<Vec<RemoteEntry>> {
                 .map(|file| RemoteEntry {
                     name: file.name().to_owned(),
                     is_directory: file.is_directory(),
+                    size: Some(file.size() as u64),
                 })
                 .with_context(|| format!("failed to parse FTP LIST entry: {entry}"))
         })
@@ -540,12 +768,245 @@ fn ftp_list_entries(entries: Vec<String>) -> Result<Vec<RemoteEntry>> {
 }
 
 #[cfg(test)]
+pub(crate) mod memory {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::Path;
+
+    use eyre::{Context, Result, bail};
+
+    use super::{RemoteEntry, RemoteOps};
+    use crate::profile::server::paths::RemotePath;
+
+    /// In-memory `RemoteOps` for engine/state/lease tests. Supplies remote
+    /// filesystem state; contains no deployment logic of its own.
+    pub(crate) struct MemoryRemote {
+        pub files: BTreeMap<String, Vec<u8>>,
+        pub dirs: BTreeSet<String>,
+        /// Paths whose next write/upload/delete fails once, then clears.
+        pub fail_once: BTreeSet<String>,
+        /// Paths whose write/upload/delete always fails.
+        pub fail_always: BTreeSet<String>,
+    }
+
+    impl MemoryRemote {
+        pub fn new() -> Self {
+            let mut dirs = BTreeSet::new();
+            dirs.insert("/".to_owned());
+            Self {
+                files: BTreeMap::new(),
+                dirs,
+                fail_once: BTreeSet::new(),
+                fail_always: BTreeSet::new(),
+            }
+        }
+
+        /// Convenience: place a file, registering its parent directories.
+        pub fn put_file(&mut self, path: &str, bytes: &[u8]) {
+            self.files.insert(path.to_owned(), bytes.to_vec());
+            self.register_parents(path);
+        }
+
+        pub fn contents(&self, path: &str) -> Option<&[u8]> {
+            self.files.get(path).map(Vec::as_slice)
+        }
+
+        fn register_parents(&mut self, path: &str) {
+            let mut prefix = path.rmatch_indices('/');
+            // Skip the file itself: take all directory prefixes.
+            prefix.next();
+            for (idx, _) in prefix {
+                if idx > 0 {
+                    self.dirs.insert(path[..idx].to_owned());
+                }
+            }
+        }
+
+        fn maybe_fail(&mut self, path: &RemotePath) -> Result<()> {
+            if self.fail_always.contains(path.as_str()) || self.fail_once.remove(path.as_str()) {
+                bail!("injected remote failure on {}", path.as_str());
+            }
+            Ok(())
+        }
+    }
+
+    impl RemoteOps for MemoryRemote {
+        fn is_dir(&mut self, path: &RemotePath) -> Result<bool> {
+            Ok(self.dirs.contains(path.as_str()))
+        }
+
+        fn is_file(&mut self, path: &RemotePath) -> Result<bool> {
+            Ok(self.files.contains_key(path.as_str()))
+        }
+
+        fn file_size(&mut self, path: &RemotePath) -> Result<Option<u64>> {
+            Ok(self.files.get(path.as_str()).map(|b| b.len() as u64))
+        }
+
+        fn list(&mut self, dir: &RemotePath) -> Result<Vec<RemoteEntry>> {
+            let base = dir.as_str().trim_end_matches('/');
+            let mut entries = Vec::new();
+            let mut seen = BTreeSet::new();
+
+            for (path, bytes) in &self.files {
+                if let Some(rest) = path.strip_prefix(&format!("{base}/")) {
+                    let name = rest.split('/').next().unwrap().to_owned();
+                    if seen.insert(name.clone()) {
+                        entries.push(RemoteEntry {
+                            is_directory: rest.contains('/'),
+                            name,
+                            size: Some(bytes.len() as u64),
+                        });
+                    }
+                }
+            }
+            for dir_path in &self.dirs {
+                if let Some(rest) = dir_path.strip_prefix(&format!("{base}/")) {
+                    let name = rest.split('/').next().unwrap().to_owned();
+                    if !name.is_empty() && seen.insert(name.clone()) {
+                        entries.push(RemoteEntry {
+                            name,
+                            is_directory: true,
+                            size: None,
+                        });
+                    }
+                }
+            }
+            Ok(entries)
+        }
+
+        fn read(&mut self, path: &RemotePath, max: u64) -> Result<Option<Vec<u8>>> {
+            let Some(bytes) = self.files.get(path.as_str()) else {
+                return Ok(None);
+            };
+            if bytes.len() as u64 > max {
+                bail!(
+                    "remote file {} exceeds the {}-byte read bound",
+                    path.as_str(),
+                    max
+                );
+            }
+            Ok(Some(bytes.clone()))
+        }
+
+        fn write(&mut self, path: &RemotePath, bytes: &[u8]) -> Result<()> {
+            self.maybe_fail(path)?;
+            self.put_file(path.as_str(), bytes);
+            Ok(())
+        }
+
+        fn upload(&mut self, local: &Path, remote: &RemotePath) -> Result<()> {
+            self.maybe_fail(remote)?;
+            let bytes =
+                std::fs::read(local).with_context(|| format!("failed to read {local:?}"))?;
+            self.put_file(remote.as_str(), &bytes);
+            Ok(())
+        }
+
+        fn rename(&mut self, from: &RemotePath, to: &RemotePath) -> Result<()> {
+            let bytes = self
+                .files
+                .remove(from.as_str())
+                .ok_or_else(|| eyre::eyre!("rename source {} missing", from.as_str()))?;
+            self.put_file(to.as_str(), &bytes);
+            Ok(())
+        }
+
+        fn delete_file(&mut self, path: &RemotePath) -> Result<bool> {
+            self.maybe_fail(path)?;
+            Ok(self.files.remove(path.as_str()).is_some())
+        }
+
+        fn delete_dir(&mut self, path: &RemotePath) -> Result<()> {
+            let base = format!("{}/", path.as_str().trim_end_matches('/'));
+            if self.files.keys().any(|f| f.starts_with(&base))
+                || self
+                    .dirs
+                    .iter()
+                    .any(|d| d != path.as_str() && d.starts_with(&base))
+            {
+                bail!("directory {} is not empty", path.as_str());
+            }
+            self.dirs.remove(path.as_str());
+            Ok(())
+        }
+
+        fn ensure_dir(&mut self, path: &RemotePath) -> Result<()> {
+            self.dirs.insert(path.as_str().to_owned());
+            self.register_parents(&format!("{}/x", path.as_str().trim_end_matches('/')));
+            Ok(())
+        }
+
+        fn claim_dir(&mut self, path: &RemotePath) -> Result<bool> {
+            Ok(self.dirs.insert(path.as_str().to_owned()))
+        }
+
+        fn reconnect(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A shared handle so tests can keep observing the remote after it is
+    /// boxed into a [`crate::profile::server::engine::Session`].
+    impl RemoteOps for std::sync::Arc<std::sync::Mutex<MemoryRemote>> {
+        fn is_dir(&mut self, path: &RemotePath) -> Result<bool> {
+            self.lock().unwrap().is_dir(path)
+        }
+
+        fn is_file(&mut self, path: &RemotePath) -> Result<bool> {
+            self.lock().unwrap().is_file(path)
+        }
+
+        fn file_size(&mut self, path: &RemotePath) -> Result<Option<u64>> {
+            self.lock().unwrap().file_size(path)
+        }
+
+        fn list(&mut self, dir: &RemotePath) -> Result<Vec<RemoteEntry>> {
+            self.lock().unwrap().list(dir)
+        }
+
+        fn read(&mut self, path: &RemotePath, max: u64) -> Result<Option<Vec<u8>>> {
+            self.lock().unwrap().read(path, max)
+        }
+
+        fn write(&mut self, path: &RemotePath, bytes: &[u8]) -> Result<()> {
+            self.lock().unwrap().write(path, bytes)
+        }
+
+        fn upload(&mut self, local: &Path, remote: &RemotePath) -> Result<()> {
+            self.lock().unwrap().upload(local, remote)
+        }
+
+        fn rename(&mut self, from: &RemotePath, to: &RemotePath) -> Result<()> {
+            self.lock().unwrap().rename(from, to)
+        }
+
+        fn delete_file(&mut self, path: &RemotePath) -> Result<bool> {
+            self.lock().unwrap().delete_file(path)
+        }
+
+        fn delete_dir(&mut self, path: &RemotePath) -> Result<()> {
+            self.lock().unwrap().delete_dir(path)
+        }
+
+        fn ensure_dir(&mut self, path: &RemotePath) -> Result<()> {
+            self.lock().unwrap().ensure_dir(path)
+        }
+
+        fn claim_dir(&mut self, path: &RemotePath) -> Result<bool> {
+            self.lock().unwrap().claim_dir(path)
+        }
+
+        fn reconnect(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use suppaftp::{FtpError, Status, types::Response};
 
-    use super::{
-        ftp_list_entries, is_ftp_not_found, is_ftp_tls_unsupported, is_untrusted_certificate_error,
-    };
+    use super::{ftp_list_entries, is_ftp_not_found, is_ftp_tls_unsupported};
 
     #[test]
     fn parses_ftp_directory_responses() {
@@ -555,6 +1016,7 @@ mod tests {
         .unwrap();
         assert_eq!(entries[0].name, "File name.dll.old");
         assert!(!entries[0].is_directory);
+        assert_eq!(entries[0].size, Some(42));
     }
 
     #[test]
@@ -574,12 +1036,5 @@ mod tests {
         ));
 
         assert!(is_ftp_tls_unsupported(&unsupported));
-    }
-
-    #[test]
-    fn recognizes_rustls_unknown_issuers() {
-        let error = eyre::eyre!("Connection error: invalid peer certificate: UnknownIssuer");
-
-        assert!(is_untrusted_certificate_error(&error));
     }
 }

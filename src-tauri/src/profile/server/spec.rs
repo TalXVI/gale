@@ -2,8 +2,8 @@ use eyre::Result;
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 
 use super::{
-    manifest,
     paths::{DeployPath, DeployPathBuf},
+    state,
 };
 use crate::game::mod_loader::ModLoader;
 
@@ -11,34 +11,58 @@ use crate::game::mod_loader::ModLoader;
 /// are never deployed.
 const PROFILE_INTERNAL_NAMES: &[&str] = &["profile.json", "mods.yml", "snapshots", "_state"];
 
+/// Remote names managed by Gale inside config directories. They are not
+/// configs and are never treated as managed config files.
+const GALE_INTERNAL_NAMES: &[&str] = &[
+    state::FILE_NAME,
+    state::LEGACY_FILE_NAME,
+    state::LEASE_DIR_NAME,
+];
+
 /// How a profile should be laid out on a dedicated server, derived from the
 /// game's mod loader. This is the single place where mod-loader-specific
 /// deployment policy lives; the rest of the deployment pipeline is generic.
+///
+/// Two distinct areas are described:
+///
+/// - [`Self::payload_dirs`] hold the mod payload. Their remote contents are
+///   kept in exact sync with the published mod set: files missing from the
+///   publication are removed, but only within Gale's recorded ownership.
+/// - [`Self::config_dirs`] hold server configuration. They are
+///   policy-governed: nothing inside them is ever removed by a deployment,
+///   and writes happen only through config synchronization rules.
 pub struct DeploymentSpec {
     /// The top-level directory the mod loader installs into inside the
     /// profile, e.g. `BepInEx`. Managed hosts may expose this directory
     /// directly at the remote root instead of the profile root.
     pub mirror_root: DeployPathBuf,
 
-    /// Directories whose remote contents are kept in sync with the profile.
-    /// Remote files inside them that are not in the deployment manifest are
-    /// removed. Everything outside them is upload-only: the host may keep its
-    /// own files there, and Gale only ever touches paths it recorded in the
-    /// manifest.
-    pub mirror_dirs: Vec<DeployPathBuf>,
+    /// Mod payload directories synchronized exactly with the publication.
+    pub payload_dirs: Vec<DeployPathBuf>,
+
+    /// Config directories governed by selective config synchronization.
+    /// Their contents are never removed and only written through config
+    /// apply rules (selected/policies) or package-default seeding.
+    pub config_dirs: Vec<DeployPathBuf>,
 
     /// Deploy paths that identify the mod loader's own payload in the
-    /// profile. A manifest containing any of these means Gale deployed the
-    /// loader itself on a previous run, so it keeps managing it.
+    /// profile. Gale-owned files matching these are the loader deployment.
     loader_owned_globs: GlobSet,
 
     /// Deploy paths whose remote presence marks the loader installation as
     /// managed by the host rather than by Gale.
     pub loader_markers: Vec<DeployPathBuf>,
 
-    /// Where the deployment manifest lives, inside a mirror directory so
-    /// restricted hosts can store it too.
-    pub manifest_path: DeployPathBuf,
+    /// Where the deployment state record lives, inside a config directory
+    /// so restricted hosts can store it too.
+    pub state_path: DeployPathBuf,
+
+    /// Where the lease directory is created to coordinate executors.
+    pub lease_dir: DeployPathBuf,
+
+    /// The previous deployment manifest's location, read once to adopt its
+    /// ownership records into the new state format.
+    pub legacy_manifest_path: DeployPathBuf,
 
     /// Deploy paths that are never uploaded: generated caches, logs and
     /// package metadata that is only meaningful locally.
@@ -67,11 +91,25 @@ impl DeploymentSpec {
             .map(DeployPathBuf::new)
             .ok_or_else(|| eyre::eyre!("mod loader has no mirror directories"))??;
 
-        let config_dir = mod_loader
+        let config_dirs = mod_loader
             .mod_config_dirs()
+            .iter()
+            .map(DeployPathBuf::new)
+            .collect::<Result<Vec<_>>>()?;
+
+        let config_dir = config_dirs
             .first()
-            .ok_or_else(|| eyre::eyre!("mod loader has no config directory"))?;
-        let manifest_path = DeployPathBuf::new(config_dir)?.join(manifest::FILE_NAME)?;
+            .ok_or_else(|| eyre::eyre!("mod loader has no config directory"))?
+            .clone();
+
+        let payload_dirs = mirror_dirs
+            .into_iter()
+            .filter(|dir| {
+                !config_dirs
+                    .iter()
+                    .any(|config| dir.is_within(config) || config.is_within(dir))
+            })
+            .collect::<Vec<_>>();
 
         let loader_owned_globs = build_globs(&[
             // Loader payload installed at the profile root. Restricted to
@@ -100,67 +138,97 @@ impl DeploymentSpec {
             // deliberately not excluded: some mods read it at runtime.
             "bepinex/plugins/*/{readme.md,changelog.md,icon.png}",
             "renderer/bepinex/plugins/*/{readme.md,changelog.md,icon.png}",
-            &format!(
-                "**/{MANIFEST}",
-                MANIFEST = manifest::FILE_NAME.to_lowercase()
-            ),
         ])?;
 
         Ok(Self {
             mirror_root,
-            mirror_dirs,
+            payload_dirs,
+            config_dirs,
             loader_owned_globs,
             loader_markers,
-            manifest_path,
+            state_path: config_dir.join(state::FILE_NAME)?,
+            lease_dir: config_dir.join(state::LEASE_DIR_NAME)?,
+            legacy_manifest_path: config_dir.join(state::LEGACY_FILE_NAME)?,
             exclude_globs,
         })
     }
 
     /// Strips the mirror root prefix from `path`, e.g. `BepInEx/plugins/x`
-    /// becomes `plugins/x` on a restricted host.
+    /// becomes `plugins/x` on a restricted host. The mirror root itself maps
+    /// to the remote root.
     pub fn strip_mirror_root(&self, path: &DeployPath) -> Option<DeployPathBuf> {
         path.strip_prefix(self.mirror_root.as_str())
     }
 
-    /// Whether the manifest recorded a loader deployment, meaning Gale (and
-    /// not the host) owns the loader files on the server.
-    pub fn owns_loader(&self, manifest: &manifest::DeploymentManifest) -> bool {
-        manifest.files.keys().any(|path| {
-            self.loader_owned_globs
-                .is_match(path.as_str().to_lowercase())
-        })
+    /// Whether recorded Gale-owned files include a loader deployment,
+    /// meaning Gale (and not the host) owns the loader files on the server.
+    pub fn owns_loader<'a>(&self, mut paths: impl Iterator<Item = &'a DeployPath>) -> bool {
+        paths.any(|path| self.is_loader_owned(path))
     }
 
-    /// Whether `path` is covered by the mirrored directories.
+    /// Whether `path` is part of the mod loader's own payload.
+    pub fn is_loader_owned(&self, path: &DeployPath) -> bool {
+        self.loader_owned_globs
+            .is_match(path.as_str().to_lowercase())
+    }
+
+    /// Whether `path` is covered by the synchronized payload directories.
     pub fn is_mirrored(&self, path: &DeployPath) -> bool {
-        self.mirror_dirs.iter().any(|dir| dir.is_ancestor_of(path))
+        self.payload_dirs.iter().any(|dir| dir.is_ancestor_of(path))
     }
 
-    /// Whether a local file should be deployed. `host_managed` means the
-    /// remote host provides the loader itself, in which case only mirror dirs
-    /// are writable and everything else is left alone.
+    /// Whether `path` sits inside a policy-governed config directory.
+    pub fn is_config(&self, path: &DeployPath) -> bool {
+        self.config_dirs.iter().any(|dir| path.is_within(dir))
+    }
+
+    /// Whether `path` is one of Gale's own bookkeeping files.
+    pub fn is_gale_internal(&self, path: &DeployPath) -> bool {
+        GALE_INTERNAL_NAMES.contains(&path.file_name())
+            || path.is_within(&self.lease_dir)
+            || self.is_internal(path)
+    }
+
+    /// Whether a file from the published mod set may be deployed to `path`.
+    ///
+    /// `host_managed` means the remote host provides the loader itself, in
+    /// which case loader-owned paths outside the payload dirs are left
+    /// alone. Config-directory paths are never payload-deployed: they are
+    /// written through config rules instead.
     pub fn deploys(&self, path: &DeployPath, host_managed: bool) -> bool {
-        if self.is_internal(path) || self.is_excluded(path) {
+        if self.is_internal(path) || self.is_excluded(path) || self.is_config(path) {
             return false;
         }
 
-        !host_managed || self.is_mirrored(path)
-    }
-
-    /// Whether a directory walk should descend into `path`.
-    pub fn descends(&self, path: &DeployPath, host_managed: bool) -> bool {
-        if self.is_internal(path) || self.is_excluded(path) {
-            return false;
-        }
-
-        if !host_managed {
+        if self.is_mirrored(path) {
             return true;
         }
 
-        // Only descend into mirror dirs, their ancestors and their contents.
-        self.mirror_dirs.iter().any(|dir| {
-            dir.as_path() == path || dir.is_ancestor_of(path) || path.is_ancestor_of(dir)
-        })
+        self.is_loader_owned(path) && !host_managed
+    }
+
+    /// Whether a package-bundled file under a config dir may seed a server
+    /// config when absent (never overwriting existing content).
+    pub fn is_config_seed(&self, path: &DeployPath) -> bool {
+        self.is_config(path) && !self.is_gale_internal(path) && !self.is_excluded(path)
+    }
+
+    /// Whether a recorded state entry may authorize deleting the remote file
+    /// at `path`. This is the boundary that keeps a tampered state file from
+    /// widening deletion authority: only payload-scope paths qualify.
+    pub fn valid_owned_path(&self, path: &DeployPath) -> bool {
+        if self.is_internal(path) || self.is_excluded(path) || self.is_config(path) {
+            return false;
+        }
+
+        self.is_mirrored(path) || self.is_loader_owned(path)
+    }
+
+    /// Whether `path` may be removed during deployment given loader
+    /// ownership. Deletion is bounded to payload scope; under a host-managed
+    /// loader only mirrored payload paths are eligible.
+    pub fn owns_for_removal(&self, path: &DeployPath, host_managed: bool) -> bool {
+        self.valid_owned_path(path) && (!host_managed || self.is_mirrored(path))
     }
 
     fn is_internal(&self, path: &DeployPath) -> bool {
@@ -202,17 +270,20 @@ mod tests {
     }
 
     #[test]
-    fn mirror_dirs_cover_mod_and_config_dirs() {
+    fn payload_dirs_exclude_config_dirs() {
         let spec = bepinex();
 
         assert!(spec.is_mirrored(&path("BepInEx/plugins/Mod/Mod.dll")));
-        assert!(spec.is_mirrored(&path("BepInEx/config/mod.cfg")));
+        assert!(spec.is_mirrored(&path("BepInEx/patchers/x.dll")));
+        assert!(spec.is_mirrored(&path("BepInEx/monomod/x.mm.dll")));
+        assert!(!spec.is_mirrored(&path("BepInEx/config/mod.cfg")));
         assert!(!spec.is_mirrored(&path("BepInEx/core/bepinex.dll")));
         assert!(!spec.is_mirrored(&path("doorstop_config.ini")));
+        assert!(spec.is_config(&path("BepInEx/config/mod.cfg")));
         assert_eq!(spec.mirror_root.as_str(), "BepInEx");
         assert_eq!(
-            spec.manifest_path.as_str(),
-            "BepInEx/config/.gale-server-manifest.json"
+            spec.state_path.as_str(),
+            "BepInEx/config/.gale-server-state.json"
         );
     }
 
@@ -230,14 +301,16 @@ mod tests {
             "profile.json",
             "mods.yml",
             "_state/Author-Mod.json",
+            "BepInEx/config/.gale-server-state.json",
+            "BepInEx/config/.gale-server-manifest.json",
         ] {
             assert!(!spec.deploys(&path(excluded), false), "deployed {excluded}");
+            assert!(!spec.valid_owned_path(&path(excluded)), "owned {excluded}");
         }
 
         for deployed in [
             "BepInEx/plugins/Mod/Mod.dll",
             "BepInEx/plugins/Mod/manifest.json",
-            "BepInEx/config/mod.cfg",
             "doorstop_config.ini",
             "BepInEx/core/bepinex.dll",
         ] {
@@ -246,29 +319,34 @@ mod tests {
     }
 
     #[test]
-    fn managed_hosts_only_receive_mirror_dirs() {
+    fn config_paths_are_never_payload_owned() {
+        let spec = bepinex();
+
+        // A state file claiming ownership of a config path must not authorize
+        // its deletion: configs live under policy, not payload mirroring.
+        assert!(!spec.valid_owned_path(&path("BepInEx/config/mod.cfg")));
+        assert!(!spec.deploys(&path("BepInEx/config/mod.cfg"), false));
+        assert!(spec.is_config_seed(&path("BepInEx/config/mod.cfg")));
+    }
+
+    #[test]
+    fn managed_hosts_only_receive_mirrored_payload() {
         let spec = bepinex();
 
         assert!(spec.deploys(&path("BepInEx/plugins/Mod/Mod.dll"), true));
         assert!(!spec.deploys(&path("BepInEx/core/bepinex.dll"), true));
         assert!(!spec.deploys(&path("doorstop_config.ini"), true));
+        assert!(!spec.owns_for_removal(&path("BepInEx/core/bepinex.dll"), true));
+        assert!(spec.owns_for_removal(&path("BepInEx/core/bepinex.dll"), false));
     }
 
     #[test]
-    fn detects_loader_ownership_from_manifest() {
+    fn detects_loader_ownership_from_state_files() {
         let spec = bepinex();
-        let mut manifest = manifest::DeploymentManifest::default();
+        let files = [path("BepInEx/core/bepinex.dll")];
 
-        assert!(!spec.owns_loader(&manifest));
-
-        manifest.files.insert(
-            path("BepInEx/core/bepinex.dll"),
-            manifest::ManifestEntry {
-                hash: "x".into(),
-                size: 1,
-            },
-        );
-        assert!(spec.owns_loader(&manifest));
+        assert!(spec.owns_loader(files.iter().map(|p| p.as_path())));
+        assert!(!spec.owns_loader(std::iter::empty()));
     }
 
     #[test]

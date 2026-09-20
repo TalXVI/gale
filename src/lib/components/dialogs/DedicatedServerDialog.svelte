@@ -9,25 +9,21 @@
 	import Info from '$lib/components/ui/Info.svelte';
 	import InfoBox from '$lib/components/ui/InfoBox.svelte';
 	import PathField from '$lib/components/ui/PathField.svelte';
-	import DeploymentPreviewDialog from './DeploymentPreviewDialog.svelte';
-	import DeploymentResultDialog from './DeploymentResultDialog.svelte';
+	import ServerSyncDialog from './ServerSyncDialog.svelte';
 	import * as api from '$lib/api';
 	import type {
+		HostProvider,
 		ProfileServerSettings,
 		RemoteAuthentication,
-		RemoteConnectionTestResult,
-		RemoteDeploymentPreviewResult,
-		RemoteDeploymentProgress,
-		RemoteDeploymentResult,
 		RemoteProtocol,
 		RemoteServerSettings,
-		ServerLocation
+		RestartPolicy,
+		ServerLocation,
+		SyncMode
 	} from '$lib/types';
 	import games from '$lib/state/game.svelte';
-	import { Progress, Tabs } from 'bits-ui';
+	import { Tabs } from 'bits-ui';
 	import { confirm, message, open as openDialog } from '@tauri-apps/plugin-dialog';
-	import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-	import { onDestroy, onMount } from 'svelte';
 	import { m } from '$lib/paraglide/messages';
 	import { pushInfoToast } from '$lib/toast';
 
@@ -56,36 +52,34 @@
 	let remoteAuthentication = $state<RemoteAuthentication>('password');
 	let privateKeyPath = $state('');
 	let trustedHostKey = $state<string | null>(null);
-	let trustedInvalidCertificateHost = $state<string | null>(null);
+	let trustedCertificate = $state<string | null>(null);
 	let remotePassword = $state('');
+	let syncMode = $state<SyncMode>('local');
+	let workerAddress = $state('');
+	let workerToken = $state('');
+	let workerAutoSync = $state(false);
+	let workerAutoMods = $state(false);
+	let hostProvider = $state<HostProvider>('none');
+	let datHostServerId = $state('');
+	let datHostUsername = $state('');
+	let datHostPassword = $state('');
+	let restartPolicy = $state<RestartPolicy>('manual');
 	let rememberRemotePassword = $state(true);
 	let initialized = $state(false);
 	let loadingSettings = $state(false);
 	let saving = $state(false);
 	let launching = $state(false);
 	let testing = $state(false);
-	let deploying = $state(false);
-	let deploymentProgress = $state<RemoteDeploymentProgress | null>(null);
-	let unlistenProgress: UnlistenFn | null = null;
-	let deploymentPreviewDialog: DeploymentPreviewDialog;
-	let deploymentResultDialog: DeploymentResultDialog;
-
-	onMount(async () => {
-		unlistenProgress = await listen<RemoteDeploymentProgress>(
-			'server_deployment_progress',
-			(event) => {
-				if (deploying) deploymentProgress = event.payload;
-			}
-		);
-	});
-
-	onDestroy(() => unlistenProgress?.());
+	let testingWorker = $state(false);
+	let syncDialogOpen = $state(false);
 
 	$effect(() => {
 		if (!open) {
 			initialized = false;
 			gamePassword = '';
 			remotePassword = '';
+			workerToken = '';
+			datHostPassword = '';
 			return;
 		}
 		if (!initialized) void loadSettings();
@@ -112,7 +106,11 @@
 				authentication: 'password',
 				privateKeyPath: '',
 				trustedHostKey: null,
-				trustedInvalidCertificateHost: null
+				trustedCertificate: null,
+				syncMode: 'local',
+				worker: { address: '', autoSync: false, autoMods: false },
+				hostControl: { provider: 'none', datHostServerId: '', datHostUsername: '' },
+				restartPolicy: 'manual'
 			}
 		};
 	}
@@ -141,7 +139,15 @@
 			remoteAuthentication = value.remote.authentication;
 			privateKeyPath = value.remote.privateKeyPath;
 			trustedHostKey = value.remote.trustedHostKey;
-			trustedInvalidCertificateHost = value.remote.trustedInvalidCertificateHost;
+			trustedCertificate = value.remote.trustedCertificate;
+			syncMode = value.remote.syncMode;
+			workerAddress = value.remote.worker.address;
+			workerAutoSync = value.remote.worker.autoSync;
+			workerAutoMods = value.remote.worker.autoMods;
+			hostProvider = value.remote.hostControl.provider;
+			datHostServerId = value.remote.hostControl.datHostServerId;
+			datHostUsername = value.remote.hostControl.datHostUsername;
+			restartPolicy = value.remote.restartPolicy;
 		} finally {
 			loadingSettings = false;
 		}
@@ -169,7 +175,19 @@
 			authentication: remoteAuthentication,
 			privateKeyPath: privateKeyPath.trim(),
 			trustedHostKey,
-			trustedInvalidCertificateHost
+			trustedCertificate,
+			syncMode,
+			worker: {
+				address: workerAddress.trim(),
+				autoSync: workerAutoSync,
+				autoMods: workerAutoMods
+			},
+			hostControl: {
+				provider: hostProvider,
+				datHostServerId: datHostServerId.trim(),
+				datHostUsername: datHostUsername.trim()
+			},
+			restartPolicy
 		};
 	}
 
@@ -182,7 +200,7 @@
 		}
 		remoteProtocol = value;
 		trustedHostKey = null;
-		trustedInvalidCertificateHost = null;
+		trustedCertificate = null;
 	}
 
 	async function choosePrivateKey() {
@@ -225,37 +243,88 @@
 		return accepted;
 	}
 
-	async function trustInvalidCertificate() {
-		const host = remoteHost.trim();
-		const accepted = await confirm(m.dedicatedServerDialog_certificateMessage({ host }), {
-			title: m.dedicatedServerDialog_certificateTitle(),
-			kind: 'warning'
-		});
-		if (accepted) trustedInvalidCertificateHost = host;
+	async function trustInvalidCertificate(fingerprint: string) {
+		const accepted = await confirm(
+			m.dedicatedServerDialog_certificateMessage({ host: remoteHost.trim() }),
+			{
+				title: m.dedicatedServerDialog_certificateTitle(),
+				kind: 'warning'
+			}
+		);
+		if (accepted) trustedCertificate = fingerprint;
 		return accepted;
 	}
 
-	type TrustableResult =
-		| RemoteConnectionTestResult
-		| RemoteDeploymentPreviewResult
-		| RemoteDeploymentResult;
+	async function testConnection() {
+		const current = await checkedSettings();
+		if (!current) return;
+		testing = true;
+		try {
+			let result = await api.profile.server.testRemoteConnection(
+				current.remote,
+				remotePassword,
+				datHostPassword,
+				rememberRemotePassword
+			);
+			if (result.status === 'hostKeyUntrusted') {
+				if (!(await trustHost(result.fingerprint))) return;
+				current.remote.trustedHostKey = trustedHostKey;
+				result = await api.profile.server.testRemoteConnection(
+					current.remote,
+					remotePassword,
+					datHostPassword,
+					rememberRemotePassword
+				);
+			}
+			if (result.status === 'certificateUntrusted') {
+				if (!(await trustInvalidCertificate(result.fingerprint))) return;
+				current.remote.trustedCertificate = trustedCertificate;
+				result = await api.profile.server.testRemoteConnection(
+					current.remote,
+					remotePassword,
+					datHostPassword,
+					rememberRemotePassword
+				);
+			}
+			if (result.status !== 'connected') return;
+			await message(
+				!result.encrypted
+					? m.dedicatedServerDialog_connectionPlain({ host: remoteHost })
+					: remoteProtocol === 'ftp' && trustedCertificate
+						? m.dedicatedServerDialog_connectionEncrypted({ host: remoteHost })
+						: m.dedicatedServerDialog_connectionSecure({ host: remoteHost }),
+				{
+					title: m.dedicatedServerDialog_connectionTitle(),
+					kind: 'info'
+				}
+			);
+		} finally {
+			testing = false;
+		}
+	}
 
-	async function requestWithTrust<T extends TrustableResult>(
-		settings: RemoteServerSettings,
-		request: () => Promise<T>
-	) {
-		const result = await request();
-		if (result.status === 'hostKeyUntrusted') {
-			if (!(await trustHost(result.fingerprint))) return null;
-			settings.trustedHostKey = trustedHostKey;
-			return request();
+	async function testWorker() {
+		const current = await checkedSettings();
+		if (!current) return;
+		testingWorker = true;
+		try {
+			const status = await api.profile.server.testWorkerConnection(
+				current.remote,
+				workerToken,
+				rememberRemotePassword
+			);
+			await message(
+				m.dedicatedServerDialog_workerConnected({
+					workerId: status.workerId,
+					autoSync: status.autoSync
+						? m.dedicatedServerDialog_workerAutoOn()
+						: m.dedicatedServerDialog_workerAutoOff()
+				}),
+				{ title: m.dedicatedServerDialog_connectionTitle(), kind: 'info' }
+			);
+		} finally {
+			testingWorker = false;
 		}
-		if (result.status === 'certificateUntrusted') {
-			if (!(await trustInvalidCertificate())) return null;
-			settings.trustedInvalidCertificateHost = trustedInvalidCertificateHost;
-			return request();
-		}
-		return result;
 	}
 
 	async function save() {
@@ -263,7 +332,13 @@
 		if (!current) return;
 		saving = true;
 		try {
-			await api.profile.server.setSettings(current);
+			await api.profile.server.setSettings(
+				current,
+				remotePassword,
+				workerToken,
+				datHostPassword,
+				rememberRemotePassword
+			);
 			pushInfoToast({ message: m.dedicatedServerDialog_saved() });
 		} finally {
 			saving = false;
@@ -282,67 +357,17 @@
 		}
 	}
 
-	async function testConnection() {
+	async function syncServer() {
 		const current = await checkedSettings();
 		if (!current) return;
-		testing = true;
-		try {
-			const result = await requestWithTrust(current.remote, () =>
-				api.profile.server.testRemoteConnection(
-					current.remote,
-					remotePassword,
-					rememberRemotePassword
-				)
-			);
-			if (!result || result.status !== 'connected') return;
-			await message(
-				!result.encrypted
-					? m.dedicatedServerDialog_connectionPlain({ host: remoteHost })
-					: remoteProtocol === 'ftp' && trustedInvalidCertificateHost === remoteHost.trim()
-						? m.dedicatedServerDialog_connectionEncrypted({ host: remoteHost })
-						: m.dedicatedServerDialog_connectionSecure({ host: remoteHost }),
-				{
-					title: m.dedicatedServerDialog_connectionTitle(),
-					kind: 'info'
-				}
-			);
-		} finally {
-			testing = false;
-		}
-	}
-
-	async function deploy() {
-		const current = await checkedSettings();
-		if (!current) return;
-		deploying = true;
-		deploymentProgress = null;
-		try {
-			const preview = await requestWithTrust(current.remote, () =>
-				api.profile.server.previewRemoteDeployment(
-					current.remote,
-					remotePassword,
-					rememberRemotePassword
-				)
-			);
-			if (!preview || preview.status !== 'preview') return;
-			if (preview.uploadFiles.length === 0 && preview.removeFiles.length === 0) {
-				await message(m.dedicatedServerDialog_nothingMessage({ count: preview.unchangedFiles }), {
-					title: m.dedicatedServerDialog_nothingTitle(),
-					kind: 'info'
-				});
-				return;
-			}
-			if (!(await deploymentPreviewDialog.openFor(preview))) return;
-
-			const result = await requestWithTrust(current.remote, () =>
-				api.profile.server.deployRemote(current.remote, remotePassword, rememberRemotePassword)
-			);
-			if (!result) return;
-			if (result.status === 'deployed') deploymentResultDialog.openFor(result);
-		} finally {
-			deploying = false;
-			deploymentProgress = null;
-		}
+		await api.profile.server.setSettings(
+			current,
+			remotePassword,
+			workerToken,
+			datHostPassword,
+			rememberRemotePassword
+		);
+		syncDialogOpen = true;
 	}
 </script>
 
@@ -491,15 +516,6 @@
 									: m.dedicatedServerDialog_remoteSavedPassphrase()}
 							</p>
 						</div>
-						<div class="flex items-center">
-							<Label
-								>{remoteProtocol !== 'sftp' || remoteAuthentication === 'password'
-									? m.dedicatedServerDialog_rememberPassword()
-									: m.dedicatedServerDialog_rememberPassphrase()}</Label
-							>
-							<Info>{m.dedicatedServerDialog_credentialInfo()}</Info>
-							<Checkbox bind:checked={rememberRemotePassword} />
-						</div>
 					{/if}
 					<div>
 						<Label>{m.dedicatedServerDialog_directory()}</Label><InputField
@@ -516,32 +532,124 @@
 							onclick={testConnection}>{m.dedicatedServerDialog_test()}</Button
 						>
 					</div>
-					{#if deploying && deploymentProgress}
-						<div class="flex flex-col gap-1">
-							<div
-								class="text-primary-600 dark:text-primary-300 flex justify-between gap-3 text-sm"
+
+					<div class="border-primary-300 dark:border-primary-600 mt-2 border-t pt-3">
+						<Label>{m.dedicatedServerDialog_syncMode()}</Label>
+						<Select
+							type="single"
+							triggerClass="mt-1 w-full"
+							bind:value={syncMode}
+							items={[
+								{ value: 'local', label: m.dedicatedServerDialog_syncModeLocal() },
+								{ value: 'worker', label: m.dedicatedServerDialog_syncModeWorker() }
+							]}
+						/>
+						<p class="text-primary-500 mt-1 text-sm">
+							{syncMode === 'worker'
+								? m.dedicatedServerDialog_syncModeWorkerInfo()
+								: m.dedicatedServerDialog_syncModeLocalInfo()}
+						</p>
+					</div>
+
+					{#if syncMode === 'worker'}
+						<div>
+							<Label>{m.dedicatedServerDialog_workerAddress()}</Label><InputField
+								class="mt-1 w-full"
+								bind:value={workerAddress}
+								placeholder="http://192.168.1.10:8472"
+							/>
+						</div>
+						<div>
+							<Label>{m.dedicatedServerDialog_workerToken()}</Label><InputField
+								class="mt-1 w-full"
+								bind:value={workerToken}
+								type="password"
+							/>
+							<p class="text-primary-500 mt-1 text-sm">
+								{m.dedicatedServerDialog_savedPassword()}
+							</p>
+						</div>
+						<div class="flex items-center">
+							<Label>{m.dedicatedServerDialog_workerAutoSync()}</Label><Info
+								>{m.dedicatedServerDialog_workerAutoSyncInfo()}</Info
+							><Checkbox bind:checked={workerAutoSync} />
+						</div>
+						<div class="flex items-center">
+							<Label>{m.dedicatedServerDialog_workerAutoMods()}</Label><Info
+								>{m.dedicatedServerDialog_workerAutoModsInfo()}</Info
+							><Checkbox bind:checked={workerAutoMods} />
+						</div>
+						<div>
+							<Button
+								color="primary"
+								icon="mdi:lan-connect"
+								loading={testingWorker}
+								onclick={testWorker}>{m.dedicatedServerDialog_testWorker()}</Button
 							>
-								<span class="truncate">
-									{deploymentProgress.operation === 'upload'
-										? m.dedicatedServerDialog_progressUpload({ path: deploymentProgress.path })
-										: m.dedicatedServerDialog_progressRemove({ path: deploymentProgress.path })}
-								</span>
-								<span class="shrink-0"
-									>{deploymentProgress.completed}/{deploymentProgress.total}</span
-								>
-							</div>
-							<Progress.Root
-								class="bg-primary-200 dark:bg-primary-700 h-2 overflow-hidden rounded-full"
-								value={deploymentProgress.completed}
-								max={deploymentProgress.total}
-							>
-								<div
-									class="bg-accent-600 dark:bg-accent-500 h-full transition-[width]"
-									style="width: {(deploymentProgress.completed / deploymentProgress.total) * 100}%"
-								></div>
-							</Progress.Root>
 						</div>
 					{/if}
+
+					<div>
+						<Label>{m.dedicatedServerDialog_hostProvider()}</Label>
+						<Select
+							type="single"
+							triggerClass="mt-1 w-full"
+							bind:value={hostProvider}
+							items={[
+								{ value: 'none', label: m.dedicatedServerDialog_hostProviderNone() },
+								{ value: 'datHost', label: 'DatHost' }
+							]}
+						/>
+						<p class="text-primary-500 mt-1 text-sm">
+							{m.dedicatedServerDialog_hostProviderInfo()}
+						</p>
+					</div>
+					{#if hostProvider === 'datHost'}
+						<div>
+							<Label>{m.dedicatedServerDialog_datHostServerId()}</Label><InputField
+								class="mt-1 w-full"
+								bind:value={datHostServerId}
+							/>
+						</div>
+						<div>
+							<Label>{m.dedicatedServerDialog_datHostUsername()}</Label><InputField
+								class="mt-1 w-full"
+								bind:value={datHostUsername}
+								placeholder="you@example.com"
+							/>
+						</div>
+						<div>
+							<Label>{m.dedicatedServerDialog_datHostPassword()}</Label><InputField
+								class="mt-1 w-full"
+								bind:value={datHostPassword}
+								type="password"
+							/>
+							<p class="text-primary-500 mt-1 text-sm">
+								{m.dedicatedServerDialog_savedPassword()}
+							</p>
+						</div>
+					{/if}
+					<div>
+						<Label>{m.dedicatedServerDialog_restartPolicy()}</Label>
+						<Select
+							type="single"
+							triggerClass="mt-1 w-full"
+							bind:value={restartPolicy}
+							items={[
+								{ value: 'manual', label: m.dedicatedServerDialog_restartManual() },
+								{ value: 'immediate', label: m.dedicatedServerDialog_restartImmediate() },
+								{ value: 'whenEmpty', label: m.dedicatedServerDialog_restartWhenEmpty() }
+							]}
+						/>
+						<p class="text-primary-500 mt-1 text-sm">
+							{m.dedicatedServerDialog_restartPolicyInfo()}
+						</p>
+					</div>
+					<div class="flex items-center">
+						<Label>{m.dedicatedServerDialog_rememberPassword()}</Label>
+						<Info>{m.dedicatedServerDialog_credentialInfo()}</Info>
+						<Checkbox bind:checked={rememberRemotePassword} />
+					</div>
 				</div>
 			</Tabs.Content>
 		</TabsMenu>
@@ -572,12 +680,9 @@
 				>{m.dedicatedServerDialog_launch()}</Button
 			>
 		{:else}
-			<Button icon="mdi:cloud-upload" loading={deploying} onclick={deploy}
-				>{m.dedicatedServerDialog_deploy()}</Button
-			>
+			<Button icon="mdi:sync" onclick={syncServer}>{m.dedicatedServerDialog_sync()}</Button>
 		{/if}
 	</div>
 </Dialog>
 
-<DeploymentPreviewDialog bind:this={deploymentPreviewDialog} />
-<DeploymentResultDialog bind:this={deploymentResultDialog} />
+<ServerSyncDialog bind:open={syncDialogOpen} />

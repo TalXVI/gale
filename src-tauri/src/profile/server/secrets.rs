@@ -11,6 +11,8 @@ pub enum ServerSecret {
     SftpPassword,
     FtpPassword,
     SshKeyPassphrase,
+    DatHostPassword,
+    WorkerToken,
 }
 
 /// Access to a profile's server credentials in the OS credential store.
@@ -21,6 +23,8 @@ pub struct ServerSecrets {
     sftp_password: Entry,
     ftp_password: Entry,
     ssh_key_passphrase: Entry,
+    dat_host_password: Entry,
+    worker_token: Entry,
 }
 
 impl ServerSecret {
@@ -45,6 +49,8 @@ impl ServerSecret {
             Self::SftpPassword => "sftp-password",
             Self::FtpPassword => "ftp-password",
             Self::SshKeyPassphrase => "ssh-key-passphrase",
+            Self::DatHostPassword => "dathost-password",
+            Self::WorkerToken => "worker-token",
         }
     }
 
@@ -61,6 +67,8 @@ impl ServerSecrets {
             sftp_password: ServerSecret::SftpPassword.entry(profile_id)?,
             ftp_password: ServerSecret::FtpPassword.entry(profile_id)?,
             ssh_key_passphrase: ServerSecret::SshKeyPassphrase.entry(profile_id)?,
+            dat_host_password: ServerSecret::DatHostPassword.entry(profile_id)?,
+            worker_token: ServerSecret::WorkerToken.entry(profile_id)?,
         })
     }
 
@@ -70,6 +78,8 @@ impl ServerSecrets {
             ServerSecret::SftpPassword => &self.sftp_password,
             ServerSecret::FtpPassword => &self.ftp_password,
             ServerSecret::SshKeyPassphrase => &self.ssh_key_passphrase,
+            ServerSecret::DatHostPassword => &self.dat_host_password,
+            ServerSecret::WorkerToken => &self.worker_token,
         }
     }
 

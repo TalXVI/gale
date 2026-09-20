@@ -17,12 +17,18 @@ pub struct ServerRuntime {
     running: Option<RunningServer>,
 }
 
-struct RunningServer {
+pub struct RunningServer {
     profile_id: i64,
     game: Game,
     server_dir: PathBuf,
     pid: u32,
     child: SharedChild,
+}
+
+impl RunningServer {
+    pub fn child(&self) -> SharedChild {
+        self.child.clone()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -106,10 +112,18 @@ impl ServerRuntime {
         matches && self.running.take().is_some()
     }
 
-    /// Takes ownership of the running child so the caller can kill it without
-    /// holding the runtime lock across an await.
-    pub fn take(&mut self) -> Option<SharedChild> {
-        self.running.take().map(|running| running.child)
+    /// Takes ownership of the running server so the caller can kill it
+    /// without holding the runtime lock across an await.
+    pub fn take(&mut self) -> Option<RunningServer> {
+        self.running.take()
+    }
+
+    /// Puts a taken server back — used when stopping it failed, so the
+    /// profile stays locked and the status stays accurate.
+    pub fn restore(&mut self, running: RunningServer) {
+        if self.running.is_none() {
+            self.running = Some(running);
+        }
     }
 }
 
@@ -144,23 +158,32 @@ pub fn watch(app: AppHandle, child: SharedChild, pid: u32) {
     });
 }
 
-/// Kills the process behind `child` and reports the stopped status.
+/// Kills the process behind `running` and reports the resulting status.
 ///
-/// Expects the runtime entry to have been removed already via [`ServerRuntime::take`].
-pub async fn kill(app: AppHandle, child: SharedChild) -> Result<()> {
-    let status = {
+/// Expects the runtime entry to have been removed already via
+/// [`ServerRuntime::take`]. When termination fails the entry is restored —
+/// reporting a live process as stopped would silently unlock its profile.
+pub async fn kill(app: AppHandle, running: RunningServer) -> Result<()> {
+    let child = running.child();
+    let result = {
         let mut child = child.lock().await;
         child.kill().await
     };
 
-    if let Err(err) = status {
-        warn!(?err, "failed to kill dedicated server process");
+    match result {
+        Ok(()) => {
+            let status = app.lock_server_runtime().status();
+            emit_status(&app, &status);
+            Ok(())
+        }
+        Err(err) => {
+            warn!(?err, "failed to kill dedicated server process");
+            let mut runtime = app.lock_server_runtime();
+            runtime.restore(running);
+            emit_status(&app, &runtime.status());
+            Err(eyre::eyre!("failed to stop the dedicated server: {err}"))
+        }
     }
-
-    let status = app.lock_server_runtime().status();
-    emit_status(&app, &status);
-
-    Ok(())
 }
 
 pub fn emit_status(app: &AppHandle, status: &ServerStatus) {

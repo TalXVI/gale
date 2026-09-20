@@ -256,7 +256,9 @@ pub fn create_profile(name: String, override_path: Option<PathBuf>, app: AppHand
 
 #[command]
 pub fn delete_profile(id: i64, app: AppHandle) -> Result<()> {
-    server::ensure_active_profile_unlocked(&app)?;
+    // The lock belongs to the profile being deleted, not whichever profile
+    // happens to be active.
+    server::ensure_profile_unlocked(&app, id)?;
 
     let mut manager = app.lock_manager();
     let game = manager.active_game_mut();

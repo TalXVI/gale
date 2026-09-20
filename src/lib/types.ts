@@ -282,6 +282,21 @@ export type DedicatedServerInfo = {
 export type ServerLocation = 'local' | 'remote';
 export type RemoteAuthentication = 'password' | 'privateKey' | 'agent';
 export type RemoteProtocol = 'sftp' | 'ftp' | 'ftps';
+export type SyncMode = 'local' | 'worker';
+export type RestartPolicy = 'manual' | 'immediate' | 'whenEmpty';
+export type HostProvider = 'none' | 'datHost';
+
+export type WorkerSettings = {
+	address: string;
+	autoSync: boolean;
+	autoMods: boolean;
+};
+
+export type HostSettings = {
+	provider: HostProvider;
+	datHostServerId: string;
+	datHostUsername: string;
+};
 
 export type RemoteServerSettings = {
 	protocol: RemoteProtocol;
@@ -292,7 +307,11 @@ export type RemoteServerSettings = {
 	authentication: RemoteAuthentication;
 	privateKeyPath: string;
 	trustedHostKey: string | null;
-	trustedInvalidCertificateHost: string | null;
+	trustedCertificate: string | null;
+	syncMode: SyncMode;
+	worker: WorkerSettings;
+	hostControl: HostSettings;
+	restartPolicy: RestartPolicy;
 };
 
 export type ProfileServerSettings = {
@@ -309,38 +328,182 @@ export type ProfileServerSettings = {
 export type RemoteConnectionTestResult =
 	| { status: 'connected'; fingerprint: string | null; encrypted: boolean }
 	| { status: 'hostKeyUntrusted'; fingerprint: string }
-	| { status: 'certificateUntrusted' };
+	| { status: 'certificateUntrusted'; fingerprint: string };
 
-export type RemoteDeploymentResult =
-	| { status: 'hostKeyUntrusted'; fingerprint: string }
-	| { status: 'certificateUntrusted' }
-	| {
-			status: 'deployed';
-			fingerprint: string | null;
-			uploadedFiles: number;
-			uploadedBytes: number;
-			removedFiles: number;
-			unchangedFiles: number;
-			cleanupWarnings: string[];
-	  };
+// ---------- selective server synchronization ----------
 
-export type RemoteDeploymentPreviewResult =
-	| { status: 'hostKeyUntrusted'; fingerprint: string }
-	| { status: 'certificateUntrusted' }
-	| {
-			status: 'preview';
-			fingerprint: string | null;
-			uploadFiles: string[];
-			uploadBytes: number;
-			removeFiles: string[];
-			unchangedFiles: number;
-	  };
+export type DeploySelection = {
+	includeMods: boolean;
+	includeConfigs: boolean;
+	applyConfigs: string[];
+	restoreConfigs: string[];
+	declineConfigs: string[];
+};
 
-export type RemoteDeploymentProgress = {
+export type UploadKind = 'payload' | 'configSeed' | 'config';
+export type RemoteLayout = 'standard' | 'mirrorRoot';
+
+export type PlanUpload = {
+	path: string;
+	size: number;
+	kind: UploadKind;
+};
+
+export type ConfigAction =
+	| { action: 'markApplied' }
+	| { action: 'write' }
+	| { action: 'decline' }
+	| { action: 'keep' }
+	| { action: 'pending'; reason: PendingSyncConfigReason }
+	| { action: 'unapplied' };
+
+export type PlanConfigEntry = {
+	path: string;
+	policy: SyncConfigUpdatePolicy;
+	selected: boolean;
+} & ConfigAction;
+
+export type PlanConflict = {
+	path: string;
+	reason: PendingSyncConfigReason;
+	seed: boolean;
+};
+
+export type DeploymentPlan = {
+	hash: string;
+	publicationRevision: string;
+	modsRevision: string;
+	deployedModsRevision: string | null;
+	stateSeq: number;
+	layout: RemoteLayout;
+	hostManaged: boolean;
+	modsPhase: boolean;
+	configsPhase: boolean;
+	uploads: PlanUpload[];
+	uploadBytes: number;
+	removals: string[];
+	directoryRemovals: string[];
+	unchangedFiles: number;
+	configEntries: PlanConfigEntry[];
+	conflicts: PlanConflict[];
+	requiresRestart: boolean;
+};
+
+export type ExecutorKind = 'local' | 'worker';
+export type OperationKind = 'manual' | 'automatic';
+export type OperationStatus = 'succeeded' | 'failed';
+export type RestartOutcome =
+	| 'notRequired'
+	| 'awaitingManual'
+	| 'awaitingEmpty'
+	| 'restarted'
+	| 'startupUnverified'
+	| 'failed';
+
+export type OperationSummary = {
+	uploadedFiles: number;
+	uploadedBytes: number;
+	removedFiles: number;
+	configWrites: number;
+	unchangedFiles: number;
+};
+
+export type OperationRecord = {
+	id: string;
+	executor: ExecutorKind;
+	kind: OperationKind;
+	workerId: string | null;
+	publicationRevision: string | null;
+	modsRevision: string | null;
+	status: OperationStatus;
+	summary: OperationSummary;
+	restart: RestartOutcome;
+	error: string | null;
+	startedAt: string;
+	finishedAt: string;
+};
+
+export type LeaseRecord = {
+	owner: string;
+	executor: ExecutorKind;
+	operationId: string;
+	acquiredAt: string;
+	heartbeatAt: string;
+	ttlSecs: number;
+};
+
+/// The subset of the remote deployment state the UI displays.
+export type ServerDeploymentState = {
+	version: number;
+	operationSeq: number;
+	modsRevision: string | null;
+	restartRequired: boolean;
+	pending: Record<string, PendingSyncConfigReason>;
+	lastOperation: OperationRecord | null;
+};
+
+export type ServerSyncPreview = {
+	plan: DeploymentPlan;
+	busy: LeaseRecord | null;
+	warnings: string[];
+};
+
+export type ServerSyncResult = {
+	plan: DeploymentPlan;
+	summary: OperationSummary;
+	warnings: string[];
+	failedConfigWrites: string[];
+	restart: RestartOutcome;
+	state: ServerDeploymentState;
+};
+
+export type BusyOperation = {
+	id: string;
+	kind: OperationKind;
+	startedAt: string;
+};
+
+export type ServerStateSummary = {
+	modsRevision: string | null;
+	restartRequired: boolean;
+	pendingConfigs: number;
+	lastOperation: OperationRecord | null;
+	lease: LeaseRecord | null;
+};
+
+export type WorkerStatus = {
+	workerId: string;
+	profileId: string;
+	autoSync: boolean;
+	autoMods: boolean;
+	restartPolicy: RestartPolicy;
+	lastSeenRevision: string | null;
+	busy: BusyOperation | null;
+	lastOperation: OperationRecord | null;
+	lastError: string | null;
+	server: ServerStateSummary | null;
+};
+
+export type ServerSyncStatus = {
+	mode: SyncMode;
+	server: ServerStateSummary | null;
+	publicationRevision: string | null;
+	worker: WorkerStatus | null;
+	credentialRequired: boolean;
+	warnings: string[];
+};
+
+export type ServerSyncProgress = {
 	completed: number;
 	total: number;
 	path: string;
-	operation: 'upload' | 'remove';
+	operation: 'remove' | 'upload' | 'writeConfig';
+};
+
+export type ServerSyncStageProgress = {
+	completed: number;
+	total: number;
+	mod: string;
 };
 
 export type DedicatedServerStatus =

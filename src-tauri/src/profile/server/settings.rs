@@ -29,6 +29,68 @@ pub enum RemoteProtocol {
     Ftps,
 }
 
+/// How remote synchronization is executed.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SyncMode {
+    /// Gale on this device connects to the server and deploys directly.
+    #[default]
+    Local,
+    /// An independently running gale-worker performs the deployment.
+    Worker,
+}
+
+/// What may happen to the game server process after files are deployed.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RestartPolicy {
+    /// Deploy files only; a restart is reported as required but never done.
+    #[default]
+    Manual,
+    /// Restart immediately after a successful deployment.
+    Immediate,
+    /// Restart only when the server reports zero players. Requires a host
+    /// provider that can report player presence; otherwise blocked.
+    WhenEmpty,
+}
+
+/// Hosting provider integration used for restart and presence checks.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum HostProvider {
+    /// No provider integration: restarts stay manual.
+    #[default]
+    None,
+    /// DatHost game-server API (https://dathost.net/api/0.1).
+    DatHost,
+}
+
+/// Connection details for the worker that executes deployments remotely.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WorkerSettings {
+    /// Base URL of the worker's HTTP API, e.g. `http://192.168.1.10:8472`.
+    pub address: String,
+    /// Whether the worker may synchronize new publications on its own.
+    /// Manual Deploy Now requests work regardless of this toggle.
+    pub auto_sync: bool,
+    /// When `auto_sync` is on, whether published mod revisions may deploy
+    /// automatically or always wait for a manual request. Config files keep
+    /// following their per-file policies either way.
+    pub auto_mods: bool,
+}
+
+/// Hosting-provider configuration used for restart/presence operations.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct HostSettings {
+    pub provider: HostProvider,
+    /// DatHost game-server id.
+    pub dat_host_server_id: String,
+    /// DatHost API account name (email). The password is kept in the keyring.
+    pub dat_host_username: String,
+}
+
 /// Server settings stored by a profile.
 ///
 /// `local` and `remote` are kept separate because they describe unrelated
@@ -91,8 +153,23 @@ pub struct RemoteServerSettings {
     pub private_key_path: String,
     /// SHA-256 fingerprint of an SFTP host key the user has trusted.
     pub trusted_host_key: Option<String>,
-    /// Host for which the user accepted an unverifiable FTPS certificate.
-    pub trusted_invalid_certificate_host: Option<String>,
+    /// SHA-256 fingerprint of an FTPS certificate the user has pinned. Unlike
+    /// hostname-wide trust this only accepts the exact certificate seen at
+    /// trust time, so subsequent arbitrary certificates are rejected.
+    #[serde(default)]
+    pub trusted_certificate: Option<String>,
+    /// Which executor performs remote synchronization.
+    #[serde(default)]
+    pub sync_mode: SyncMode,
+    /// Worker connection and automation settings (`syncMode == "worker"`).
+    #[serde(default)]
+    pub worker: WorkerSettings,
+    /// Hosting provider used for restarts and player-presence checks.
+    #[serde(default)]
+    pub host_control: HostSettings,
+    /// What may happen to the server process after deployment.
+    #[serde(default)]
+    pub restart_policy: RestartPolicy,
 }
 
 impl ProfileServerSettings {
@@ -147,6 +224,26 @@ impl RemoteServerSettings {
             );
         }
 
+        if self.sync_mode == SyncMode::Worker {
+            let address = self.worker.address.trim();
+            ensure!(!address.is_empty(), "worker address cannot be empty");
+            ensure!(
+                address.starts_with("http://") || address.starts_with("https://"),
+                "worker address must be an http:// or https:// URL"
+            );
+        }
+
+        if self.host_control.provider == HostProvider::DatHost {
+            ensure!(
+                !self.host_control.dat_host_server_id.trim().is_empty(),
+                "DatHost server id is required"
+            );
+            ensure!(
+                !self.host_control.dat_host_username.trim().is_empty(),
+                "DatHost account email is required"
+            );
+        }
+
         Ok(())
     }
 
@@ -160,8 +257,8 @@ impl RemoteServerSettings {
         self.trusted_host_key = Some(fingerprint);
     }
 
-    pub fn trust_invalid_certificate(&mut self) {
-        self.trusted_invalid_certificate_host = Some(self.host.trim().to_owned());
+    pub fn trust_certificate(&mut self, fingerprint: String) {
+        self.trusted_certificate = Some(fingerprint);
     }
 }
 
