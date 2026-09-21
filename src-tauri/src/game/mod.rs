@@ -2,6 +2,7 @@ use std::{
     borrow::Cow,
     fs,
     hash::{self, Hash},
+    path::Path,
     sync::LazyLock,
 };
 
@@ -66,12 +67,19 @@ struct GamesCache<'a> {
 }
 
 fn get_cached_games() -> Result<GamesCache<'static>> {
-    let path = util::path::default_app_data_dir().join(CACHE_FILE_NAME);
+    read_games_cache(&util::path::default_app_data_dir().join(CACHE_FILE_NAME))
+}
 
+/// Reads the downloaded `games.json` cache. Bundled dedicated-server
+/// definitions are applied over the result, so a cache written by an
+/// older build (or refreshed from upstream, which doesn't carry this
+/// fork's metadata) can't hide dedicated-server support the binary
+/// ships with.
+fn read_games_cache(path: &Path) -> Result<GamesCache<'static>> {
     let str = fs::read_to_string(path)?;
-    let games = serde_json::from_str(str.leak())?;
-
-    Ok(games)
+    let mut cache: GamesCache<'static> = serde_json::from_str(str.leak())?;
+    apply_bundled_dedicated_servers(&mut cache.games);
+    Ok(cache)
 }
 
 pub async fn update_list_task(app: &AppHandle) -> Result<()> {
@@ -89,7 +97,7 @@ pub async fn update_list_task(app: &AppHandle) -> Result<()> {
         .text()
         .await?;
 
-    let games: Vec<GameData<'_>> = serde_json::from_str(&str)?;
+    let games = parse_upstream_games(&str)?;
 
     let date = get_last_commit_date(app).await.unwrap_or_else(|err| {
         warn!("failed to get last commit date: {err}");
@@ -104,6 +112,40 @@ pub async fn update_list_task(app: &AppHandle) -> Result<()> {
     info!("updated games list from github, last commit at {date}");
 
     Ok(())
+}
+
+/// Parses a freshly downloaded upstream `games.json`. The bundled
+/// list's dedicated-server definitions are applied over it before it
+/// is cached, so a refresh can't remove capabilities this build ships.
+fn parse_upstream_games(json: &str) -> Result<Vec<GameData<'_>>> {
+    let mut games: Vec<GameData<'_>> = serde_json::from_str(json)?;
+    apply_bundled_dedicated_servers(&mut games);
+    Ok(games)
+}
+
+/// The `games.json` this binary was built against.
+fn bundled_games() -> &'static [GameData<'static>] {
+    static BUNDLED: LazyLock<Vec<GameData<'static>>> =
+        LazyLock::new(|| serde_json::from_str(BUNDLED_GAMES_JSON).unwrap());
+    BUNDLED.as_slice()
+}
+
+/// Applies the bundled dedicated-server definitions over an externally
+/// sourced game list — a downloaded cache or an upstream refresh.
+/// Bundled metadata is authoritative for dedicated-server support:
+/// upstream still supplies every other field (and can add support for
+/// games the bundle doesn't define), but it cannot remove or redefine
+/// a capability this binary ships with.
+fn apply_bundled_dedicated_servers(games: &mut [GameData<'_>]) {
+    for bundled in bundled_games() {
+        let Some(dedicated_server) = &bundled.dedicated_server else {
+            continue;
+        };
+
+        if let Some(game) = games.iter_mut().find(|game| game.slug == bundled.slug) {
+            game.dedicated_server = Some(*dedicated_server);
+        }
+    }
 }
 
 async fn get_last_commit_date(app: &AppHandle) -> Result<DateTime<Utc>> {
@@ -154,20 +196,19 @@ pub fn from_slug(slug: &str) -> Option<Game> {
 /// downloaded cache. The standalone worker uses this: it may run on a
 /// machine whose cache predates dedicated-server metadata (or was written
 /// by an older app version), and the bundled list is the deterministic
-/// source the binary was built against. The desktop keeps using `list()`/
-/// `from_slug()`, which prefer the fresher cached list.
+/// source the binary was built against. The desktop uses `list()`/
+/// `from_slug()`, which prefer the fresher cached list overlaid with the
+/// bundled dedicated-server definitions.
 #[cfg(feature = "worker")]
 pub fn bundled_from_slug(slug: &str) -> Option<Game> {
-    static BUNDLED: LazyLock<Vec<GameData<'static>>> =
-        LazyLock::new(|| serde_json::from_str(BUNDLED_GAMES_JSON).unwrap());
-    BUNDLED.iter().find(|game| game.slug == slug)
+    bundled_games().iter().find(|game| game.slug == slug)
 }
 
 pub fn last_updated() -> DateTime<Utc> {
     GAMES.0
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 #[serde(rename_all = "camelCase")]
 pub struct DedicatedServer<'a> {
     #[serde(borrow, default)]
@@ -269,5 +310,192 @@ impl Eq for GameData<'_> {}
 impl Hash for GameData<'_> {
     fn hash<H: hash::Hasher>(&self, state: &mut H) {
         self.slug.hash(state);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `games.json` cache written by a build that predates this
+    /// fork's dedicated-server metadata: a legacy `server` flag and no
+    /// `dedicatedServer` object.
+    const LEGACY_CACHE: &str = r#"{
+        "date": "2024-01-01T00:00:00Z",
+        "games": [
+            {
+                "name": "Valheim",
+                "slug": "valheim",
+                "server": true,
+                "modLoader": { "name": "BepInEx" }
+            },
+            {
+                "name": "H3VR",
+                "slug": "h3vr",
+                "modLoader": { "name": "BepInEx" }
+            }
+        ]
+    }"#;
+
+    /// What an upstream refresh looks like to this fork:
+    /// `Kesomannen/gale` carries no `dedicatedServer` on Valheim, but
+    /// may add it for other games.
+    const UPSTREAM_GAMES: &str = r#"[
+        {
+            "name": "Valheim",
+            "slug": "valheim",
+            "server": true,
+            "popular": false,
+            "modLoader": { "name": "BepInEx" }
+        },
+        {
+            "name": "Upstream Server",
+            "slug": "upstream-server",
+            "modLoader": { "name": "BepInEx" },
+            "dedicatedServer": {
+                "platforms": { "steam": { "id": 42 } },
+                "defaultPort": 1234
+            }
+        },
+        {
+            "name": "H3VR",
+            "slug": "h3vr",
+            "modLoader": { "name": "BepInEx" }
+        }
+    ]"#;
+
+    fn bundled_dedicated_server(slug: &str) -> DedicatedServer<'static> {
+        bundled_games()
+            .iter()
+            .find(|game| game.slug == slug)
+            .and_then(|game| game.dedicated_server)
+            .expect("bundled dedicated-server metadata missing")
+    }
+
+    fn find<'a>(games: &'a [GameData<'a>], slug: &str) -> &'a GameData<'a> {
+        games.iter().find(|game| game.slug == slug).unwrap()
+    }
+
+    #[test]
+    fn legacy_cache_load_recovers_dedicated_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CACHE_FILE_NAME);
+        fs::write(&path, LEGACY_CACHE).unwrap();
+
+        let cache = read_games_cache(&path).unwrap();
+        let valheim = find(&cache.games, "valheim");
+
+        assert_eq!(
+            serde_json::to_value(valheim.dedicated_server.unwrap()).unwrap(),
+            serde_json::to_value(bundled_dedicated_server("valheim")).unwrap()
+        );
+        assert!(find(&cache.games, "h3vr").dedicated_server.is_none());
+    }
+
+    #[test]
+    fn upstream_refresh_cannot_remove_dedicated_server() {
+        let games = parse_upstream_games(UPSTREAM_GAMES).unwrap();
+        let valheim = find(&games, "valheim");
+
+        assert_eq!(
+            serde_json::to_value(valheim.dedicated_server.unwrap()).unwrap(),
+            serde_json::to_value(bundled_dedicated_server("valheim")).unwrap()
+        );
+        // Every other field still comes from upstream, even when it
+        // disagrees with the bundle (`popular` is true upstream-side).
+        assert!(!valheim.popular);
+    }
+
+    #[test]
+    fn bundled_dedicated_server_is_authoritative() {
+        let games = parse_upstream_games(
+            r#"[{
+                "name": "Valheim",
+                "slug": "valheim",
+                "modLoader": { "name": "BepInEx" },
+                "dedicatedServer": {
+                    "platforms": { "epicGames": { "identifier": "upstream" } },
+                    "defaultPort": 1
+                }
+            }]"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(games[0].dedicated_server.unwrap()).unwrap(),
+            serde_json::to_value(bundled_dedicated_server("valheim")).unwrap()
+        );
+    }
+
+    #[test]
+    fn upstream_only_dedicated_server_is_preserved() {
+        let games = parse_upstream_games(UPSTREAM_GAMES).unwrap();
+        let game = find(&games, "upstream-server");
+
+        assert_eq!(game.dedicated_server.unwrap().default_port, 1234);
+    }
+
+    #[test]
+    fn unsupported_games_do_not_gain_dedicated_server() {
+        let games = parse_upstream_games(UPSTREAM_GAMES).unwrap();
+        assert!(find(&games, "h3vr").dedicated_server.is_none());
+    }
+
+    /// `update_list_task` caches the merged list; the next launch reads
+    /// it back through the cache path, so the capability survives a
+    /// restart without needing the refresh to run again.
+    #[test]
+    fn refreshed_cache_file_keeps_dedicated_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CACHE_FILE_NAME);
+        let cache = GamesCache {
+            date: Utc::now(),
+            games: parse_upstream_games(UPSTREAM_GAMES).unwrap(),
+        };
+        util::fs::write_json(&path, &cache, JsonStyle::Pretty).unwrap();
+
+        let cache = read_games_cache(&path).unwrap();
+        assert!(find(&cache.games, "valheim").dedicated_server.is_some());
+    }
+
+    /// The real startup path: a legacy cache planted at the default
+    /// data location, loaded through `get_cached_games` exactly as a
+    /// release build does. Restores any pre-existing cache afterwards.
+    #[test]
+    fn real_cache_location_recovers_dedicated_server() {
+        struct CacheGuard {
+            path: std::path::PathBuf,
+            original: Option<Vec<u8>>,
+        }
+
+        impl CacheGuard {
+            fn overwrite(path: std::path::PathBuf, contents: &str) -> Self {
+                let original = fs::read(&path).ok();
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(&path, contents).unwrap();
+                Self { path, original }
+            }
+        }
+
+        impl Drop for CacheGuard {
+            fn drop(&mut self) {
+                let result = match &self.original {
+                    Some(bytes) => fs::write(&self.path, bytes),
+                    None => fs::remove_file(&self.path),
+                };
+                if let Err(err) = result {
+                    warn!("failed to restore games cache: {err}");
+                }
+            }
+        }
+
+        let _guard = CacheGuard::overwrite(
+            util::path::default_app_data_dir().join(CACHE_FILE_NAME),
+            LEGACY_CACHE,
+        );
+
+        let cache = get_cached_games().unwrap();
+        let valheim = find(&cache.games, "valheim");
+        assert!(valheim.dedicated_server.is_some());
     }
 }
