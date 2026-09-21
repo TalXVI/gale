@@ -80,11 +80,14 @@ When to use it: automatic sync, or a host that is only reachable from a fixed lo
 
 Choose **A worker service on this PC** in the sync-mode selector and select **Set up worker**. Gale then:
 
-1. Opens a browser sign-in so the worker gets **its own** Gale sync credentials. Sign-in tokens rotate on every use, so the worker cannot safely share the desktop's token — it needs an independent chain.
-2. Stages a worker config and credentials file, then shows **one UAC elevation prompt** that installs and starts the `GaleWorker` Windows service.
-3. Points this profile's sync mode at the worker's loopback address.
+1. Saves the remote transport settings in Local mode — a fresh profile has no worker address yet, so Worker mode would be rejected before setup could begin.
+2. Opens a browser sign-in so the worker gets **its own** Gale sync credentials. Sign-in tokens rotate on every use, so the worker cannot safely share the desktop's token — it needs an independent chain.
+3. Stages a worker config and credentials file in a permission-restricted temp directory, then shows **one UAC elevation prompt** that installs and starts the `GaleWorker` Windows service.
+4. Points this profile's sync mode at the worker's loopback address and stores its bearer token.
 
-Once installed, the service runs as LocalSystem and is independent of the Gale process: it starts with Windows before any user signs in, restarts automatically after a crash, and resumes queued deployments from its journal. Start, Stop, Restart, Uninstall, and an Update button (when a Gale update ships a newer worker) appear in the dialog; none of them need elevation.
+If setup stops after the service was installed but before the profile was linked — for example the settings save failed — the dialog reports the worker as *setup incomplete* instead of leaving it orphaned. Running **Set up worker** again finishes the link; the installed identity, port, credentials, and journal are reused rather than replaced.
+
+Once installed, the service runs as LocalSystem and is independent of the Gale process: it starts with Windows before any user signs in, restarts automatically after a crash, and resumes queued deployments from its journal. The service only reports `Running` to Windows once its API is bound and serving — a start that fails during initialization ends in `Stopped` with a failure exit, so SCM recovery actions behave correctly. Start, Stop, Restart, Uninstall, and an Update button (when a Gale update ships a newer worker) appear in the dialog; none of them need elevation.
 
 State layout:
 
@@ -105,7 +108,7 @@ Notes and limitations:
 
 - Windows only. On Linux/macOS the dialog does not offer this option; use an externally hosted worker.
 - SSH **agent** authentication cannot run unattended in a service; use a password or a private key. A private key under `%USERPROFILE%` is copied into `private\` at setup, since LocalSystem cannot read your profile directory.
-- One managed worker per machine: the `GaleWorker` service name and the state-directory lock both reject duplicates.
+- One managed worker per machine, bound to one profile: the `GaleWorker` service name and the state-directory lock both reject duplicates, and the worker is permanently bound to the profile it was set up for. Other profiles see it as owned by someone else — they cannot start, stop, update, or uninstall it, and setup will never silently rebind it. To move it, sign in to the owning profile and uninstall first.
 - Gale updates ship a newer `gale-worker.exe` beside the app, but the service keeps running its installed copy so updates never fight a locked executable. The dialog shows **Update worker** when the bundled copy is newer; updating keeps credentials and pending work.
 - `status.json` records why the worker last stopped. If the service is stopped but the report says `running`, the process crashed — SCM failure actions restart it. A `shutdown` report means the machine went down and the service returns on the next boot.
 

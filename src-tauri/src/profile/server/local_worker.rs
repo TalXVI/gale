@@ -28,8 +28,8 @@ use crate::{
     profile::{
         server::{
             commands::{
-                persist_credential, remote_credential, save_remote_settings_for, sync_target,
-                worker_client,
+                persist_credential, remote_credential, save_remote_settings_for, sync_id_for,
+                sync_target, worker_client,
             },
             secrets::{ServerSecret, ServerSecrets},
             settings::{
@@ -70,6 +70,49 @@ pub struct WorkerBinding {
     pub address: String,
 }
 
+/// The installed worker's ownership relative to the profile being viewed.
+/// There is exactly one `GaleWorker` per machine, bound to one sync
+/// profile at install; it must never be silently rebound or controlled
+/// by another profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkerOwnership {
+    /// No worker is installed.
+    None,
+    /// Installed for this profile and fully bound (settings + token).
+    Owned,
+    /// Installed for this profile's sync id, but the desktop binding
+    /// never completed — an earlier provisioning failed after the
+    /// service was already running. Running setup again finishes it.
+    Incomplete,
+    /// Installed for a different profile. All control is refused; the
+    /// owning profile manages (or uninstalls) it.
+    Foreign,
+}
+
+/// Resolves who the installed binding belongs to. `bound` is whether the
+/// profile's settings + keyring actually point at the installed worker.
+/// A binding whose profile id does not match is foreign even when the
+/// profile currently has no sync id — never treat "unknown" as "mine".
+#[cfg(windows)]
+fn ownership_of(
+    binding: Option<&WorkerBinding>,
+    sync_id: Option<&str>,
+    bound: bool,
+) -> WorkerOwnership {
+    let Some(binding) = binding else {
+        return WorkerOwnership::None;
+    };
+    if sync_id != Some(binding.profile_id.as_str()) {
+        return WorkerOwnership::Foreign;
+    }
+    if bound {
+        WorkerOwnership::Owned
+    } else {
+        WorkerOwnership::Incomplete
+    }
+}
+
 /// Everything the dialog needs to render the managed worker.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -79,6 +122,10 @@ pub struct LocalWorkerStatus {
     pub service: ServiceState,
     /// The installed worker's binding, when a config exists.
     pub binding: Option<WorkerBinding>,
+    /// Whether the installed worker belongs to this profile — controls
+    /// must only be offered for `Owned` (or `Incomplete`, to finish
+    /// setup), never for `Foreign`.
+    pub ownership: WorkerOwnership,
     /// The worker's last reported run phase; a `running` report while the
     /// service is stopped means the process died unexpectedly.
     pub run: Option<WorkerRunReport>,
@@ -107,6 +154,7 @@ impl LocalWorkerStatus {
             supported: false,
             service: ServiceState::NotInstalled,
             binding: None,
+            ownership: WorkerOwnership::None,
             run: None,
             worker: None,
             worker_error: None,
@@ -141,36 +189,59 @@ pub async fn status(app: &AppHandle) -> Result<LocalWorkerStatus> {
         let binding = installed_binding();
         let run = read_run_report();
 
+        let profile_id = app.lock_manager().active_profile().id;
+        let ownership = ownership_of(
+            binding.as_ref(),
+            sync_id_for(app, profile_id).as_deref(),
+            binding
+                .as_ref()
+                .is_some_and(|binding| profile_bound_to(app, profile_id, binding)),
+        );
+
         let mut worker = None;
         let mut worker_error = None;
-        if service_state == ServiceState::Running
-            && let Some(binding) = &binding
-        {
-            // The token lives in the active profile's keyring; when this
-            // profile isn't the bound one the lookup may legitimately fail.
-            let secrets = ServerSecrets::for_profile(app.lock_manager().active_profile().id)?;
-            let token = secrets
-                .resolve(ServerSecret::WorkerToken, "")
-                .unwrap_or_default();
-            if token.is_empty() {
-                worker_error = Some("this profile has no stored worker token".to_owned());
-            } else {
-                let mut settings = RemoteServerSettings::default();
-                settings.worker.address = binding.address.clone();
-                match worker_client(&secrets, &settings, &token) {
-                    Ok(client) => match client.status(false).await {
-                        Ok(live) => worker = Some(live),
+        match ownership {
+            // Another profile owns the service — never contact it with
+            // this profile's credentials.
+            WorkerOwnership::Foreign => {
+                worker_error =
+                    Some("the installed worker belongs to a different profile".to_owned());
+            }
+            WorkerOwnership::Incomplete => {
+                worker_error =
+                    Some("setup did not finish — run 'Set up worker' to complete it".to_owned());
+            }
+            WorkerOwnership::Owned if service_state == ServiceState::Running => {
+                let secrets = ServerSecrets::for_profile(profile_id)?;
+                let token = secrets
+                    .resolve(ServerSecret::WorkerToken, "")
+                    .unwrap_or_default();
+                if token.is_empty() {
+                    worker_error = Some("this profile has no stored worker token".to_owned());
+                } else {
+                    let mut settings = RemoteServerSettings::default();
+                    settings.worker.address = binding
+                        .as_ref()
+                        .expect("owned implies binding")
+                        .address
+                        .clone();
+                    match worker_client(&secrets, &settings, &token) {
+                        Ok(client) => match client.status(false).await {
+                            Ok(live) => worker = Some(live),
+                            Err(err) => worker_error = Some(format!("{err:#}")),
+                        },
                         Err(err) => worker_error = Some(format!("{err:#}")),
-                    },
-                    Err(err) => worker_error = Some(format!("{err:#}")),
+                    }
                 }
             }
+            _ => {}
         }
 
         Ok(LocalWorkerStatus {
             supported: true,
             service: service_state,
             binding,
+            ownership,
             stopped_for_shutdown: matches!(
                 run.as_ref().map(|report| report.phase),
                 Some(WorkerRunPhase::Shutdown)
@@ -182,6 +253,30 @@ pub async fn status(app: &AppHandle) -> Result<LocalWorkerStatus> {
             warnings: Vec::new(),
         })
     }
+}
+
+/// Whether the profile's persisted settings and keyring actually point at
+/// the installed worker — the desktop half of the binding. Provisioning
+/// can leave this incomplete if the install succeeded but saving settings
+/// or the bearer token failed.
+#[cfg(windows)]
+fn profile_bound_to(app: &AppHandle, profile_id: i64, binding: &WorkerBinding) -> bool {
+    let bound = {
+        let manager = app.lock_manager();
+        manager
+            .profile_by_id(profile_id)
+            .ok()
+            .and_then(|(_, profile)| profile.server_settings.as_ref())
+            .is_some_and(|settings| {
+                settings.remote.sync_mode == SyncMode::Worker
+                    && settings.remote.worker.hosted
+                    && settings.remote.worker.address == binding.address
+            })
+    };
+    let token = ServerSecrets::for_profile(profile_id)
+        .and_then(|secrets| secrets.resolve(ServerSecret::WorkerToken, ""))
+        .unwrap_or_default();
+    bound && !token.is_empty()
 }
 
 // ---------- provisioning ----------
@@ -221,6 +316,19 @@ async fn provision_windows(
         auth::user_info(app).is_some(),
         "sign in to Gale sync first — the worker gets its own login"
     );
+
+    // Preflight everything that would strand a half-provisioned worker:
+    // without the helper there is nothing to install, so check it before
+    // OAuth or credentials are staged.
+    let exe = worker_exe()?;
+    // The installed worker belongs to one profile forever; refuse to
+    // replace another profile's, and check again after OAuth — the prompt
+    // takes minutes and the dialog could have installed one meanwhile.
+    ensure!(
+        installed_binding().is_none_or(|b| b.profile_id == sync_id),
+        "the installed worker belongs to a different profile — manage it from that profile"
+    );
+    Staging::sweep_stale();
 
     // The embedded remote settings describe the transport; the worker
     // block inside them is meaningless to the worker itself, so the copy
@@ -267,6 +375,10 @@ async fn provision_windows(
     // chain. Sharing the desktop's token is not an option: every grant
     // rotates it, so whichever side refreshed second would be dead.
     let creds = auth::oauth_credentials(app).await?;
+    ensure!(
+        installed_binding().is_none_or(|b| b.profile_id == sync_id),
+        "a worker for a different profile was installed while setup was running — manage it from that profile"
+    );
 
     let config = WorkerConfig {
         worker_id: local::WORKER_ID.to_owned(),
@@ -304,7 +416,7 @@ async fn provision_windows(
     );
     let install_result = {
         // The elevated wait blocks; keep it off the async executor.
-        let exe = worker_exe()?;
+        let exe = exe.clone();
         tokio::task::spawn_blocking(move || run_elevated(&exe, &elevated_args))
             .await
             .context("elevated install task failed")?
@@ -312,27 +424,25 @@ async fn provision_windows(
     let log_text = read_log(&log).unwrap_or_default();
     match install_result {
         Err(err) => {
-            staging.cleanup();
             return Err(err.wrap_err(
                 "failed to launch the elevated worker installer (the UAC prompt may have been declined)",
             ));
         }
         Ok(exit) if exit != 0 => {
-            staging.cleanup();
             bail!(
                 "worker installation failed (exit {exit}): {}",
                 log_text.trim()
             );
         }
         Ok(_) if service_state()? != ServiceState::Running => {
-            staging.cleanup();
             bail!("the worker service did not come up: {}", log_text.trim());
         }
         Ok(_) => {}
     }
-    // The staged payload was consumed by the install; never leave copies
-    // of the secrets lying in temp regardless of what happens next.
-    staging.cleanup();
+    // The staged payload was consumed by the install; drop the staging
+    // dir now rather than leaving secret copies in temp for the rest of
+    // this function. (Drop would catch it anyway; explicit is clearer.)
+    drop(staging);
 
     // The service is installed and running. Point the profile at it.
     let mut remote = target.settings.clone();
@@ -343,8 +453,16 @@ async fn provision_windows(
         auto_sync: remote.worker.auto_sync,
         auto_mods: remote.worker.auto_mods,
     };
-    save_remote_settings_for(app, target.profile_id, remote)?;
-    persist_credential(&secrets, Some(ServerSecret::WorkerToken), &token, true)?;
+    // Persisting the desktop half of the binding can still fail, leaving
+    // a running worker whose profile can't reach it — status reports it
+    // as `incomplete` and retrying provisioning finishes the setup
+    // without replacing anything.
+    save_remote_settings_for(app, target.profile_id, remote).context(
+        "the worker is installed and running, but saving its settings failed — run 'Set up worker' again to finish setup",
+    )?;
+    persist_credential(&secrets, Some(ServerSecret::WorkerToken), &token, true).context(
+        "the worker is installed and running, but storing its token failed — run 'Set up worker' again to finish setup",
+    )?;
 
     let mut worker_status = status(app).await?;
     // If the service enforces one session per user, the worker login may
@@ -369,6 +487,7 @@ pub async fn control(app: &AppHandle, action: LocalWorkerAction) -> Result<Local
     }
     #[cfg(windows)]
     {
+        require_owned(app)?;
         use windows_service::service::ServiceState as ScmState;
         match action {
             LocalWorkerAction::Start => {
@@ -377,6 +496,7 @@ pub async fn control(app: &AppHandle, action: LocalWorkerAction) -> Result<Local
                     .start(&[] as &[&std::ffi::OsStr])
                     .context("failed to start the service")?;
                 wait_for_state(&service, ScmState::Running)?;
+                await_listen_ready()?;
             }
             LocalWorkerAction::Stop => {
                 let service = open_service(Access::Stop)?;
@@ -389,6 +509,7 @@ pub async fn control(app: &AppHandle, action: LocalWorkerAction) -> Result<Local
                     .start(&[] as &[&std::ffi::OsStr])
                     .context("failed to start the service")?;
                 wait_for_state(&service, ScmState::Running)?;
+                await_listen_ready()?;
             }
         }
         status(app).await
@@ -406,6 +527,7 @@ pub async fn update(app: &AppHandle) -> Result<LocalWorkerStatus> {
     }
     #[cfg(windows)]
     {
+        require_owned(app)?;
         let log = std::env::temp_dir().join(format!("gale-worker-update-{}.log", Uuid::new_v4()));
         let args = format!("service reinstall --log \"{}\"", log.display());
         let exit = {
@@ -434,6 +556,11 @@ pub async fn uninstall(app: &AppHandle) -> Result<LocalWorkerStatus> {
     }
     #[cfg(windows)]
     {
+        // Capture the profile before the elevated wait — the settings
+        // revert below must land on the profile that owned the worker
+        // even if the user switches profiles while UAC is open.
+        let profile_id = app.lock_manager().active_profile().id;
+        require_owned(app)?;
         let log =
             std::env::temp_dir().join(format!("gale-worker-uninstall-{}.log", Uuid::new_v4()));
         let args = format!("service uninstall --log \"{}\"", log.display());
@@ -451,7 +578,6 @@ pub async fn uninstall(app: &AppHandle) -> Result<LocalWorkerStatus> {
 
         // Revert the profile's settings only if they still point at the
         // managed worker — a user may have switched modes already.
-        let profile_id = app.lock_manager().active_profile().id;
         let mut remote = {
             let manager = app.lock_manager();
             let (_, profile) = manager.profile_by_id(profile_id)?;
@@ -563,6 +689,46 @@ fn stop_and_wait(service: &windows_service::service::Service) -> Result<()> {
     wait_for_state(service, ScmState::Stopped)
 }
 
+/// Backend ownership gate for every operation that touches the globally
+/// installed `GaleWorker` service: the active profile's sync id must
+/// match the installed binding. A worker bound to another profile is
+/// that profile's to manage — never controllable from here.
+#[cfg(windows)]
+fn require_owned(app: &AppHandle) -> Result<()> {
+    let binding = installed_binding().ok_or_eyre("the managed worker is not installed")?;
+    let profile_id = app.lock_manager().active_profile().id;
+    let sync_id = sync_id_for(app, profile_id);
+    ensure!(
+        sync_id.as_deref() == Some(binding.profile_id.as_str()),
+        "the installed worker belongs to a different profile — switch to that profile to manage it"
+    );
+    Ok(())
+}
+
+/// Confirms the worker's loopback API accepts TCP connections after an
+/// SCM `Running` report — SCM state alone can't prove the listener
+/// survived past it (a crash can linger in Running briefly).
+#[cfg(windows)]
+fn await_listen_ready() -> Result<()> {
+    let binding = installed_binding().ok_or_eyre("the managed worker is not installed")?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut last_err = None;
+    while std::time::Instant::now() < deadline {
+        match std::net::TcpStream::connect(&binding.listen) {
+            Ok(_) => return Ok(()),
+            Err(err) => {
+                last_err = Some(err);
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out")))
+        .context(format!(
+            "the worker service reports running but {} is not answering",
+            binding.listen
+        ))
+}
+
 /// Runs `gale-worker <args>` elevated through the UAC prompt and waits
 /// for it. This is the one privileged step in the lifecycle; everything
 /// else goes through the service's unelevated control rights.
@@ -617,6 +783,10 @@ fn read_log(path: &std::path::Path) -> Option<String> {
 
 /// The directory the staged config + secrets are written to. Temp works
 /// because the elevated helper can read it regardless of ACLs elsewhere.
+///
+/// Cleanup is `Drop`-based so every early return removes the secrets;
+/// dirs abandoned by a killed process are reclaimed by `sweep_stale` on
+/// the next provisioning attempt.
 #[cfg(windows)]
 struct Staging {
     path: PathBuf,
@@ -624,15 +794,33 @@ struct Staging {
 
 #[cfg(windows)]
 impl Staging {
+    /// How old an abandoned staging dir must be before `sweep_stale`
+    /// reclaims it — long enough that a legitimately in-flight provision
+    /// (OAuth + UAC round trips) is never touched.
+    const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
     fn create(
         config: &WorkerConfig,
         secrets: &Secrets,
         ssh_key: Option<&std::path::Path>,
     ) -> Result<Self> {
-        let path = std::env::temp_dir().join(format!("gale-worker-provision-{}", Uuid::new_v4()));
+        Self::create_in(&std::env::temp_dir(), config, secrets, ssh_key)
+    }
+
+    fn create_in(
+        root: &std::path::Path,
+        config: &WorkerConfig,
+        secrets: &Secrets,
+        ssh_key: Option<&std::path::Path>,
+    ) -> Result<Self> {
+        let path = root.join(format!("gale-worker-provision-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&path).context("failed to create the worker staging directory")?;
+        // A bearer token and possibly an SSH private key are about to
+        // land here — restrict the dir to this user (plus SYSTEM/Admins,
+        // who must read it elevated) before writing anything sensitive.
+        restrict_dir(&path)?;
         config.save(&path.join(local::CONFIG_FILE))?;
-        std::fs::write(path.join(local::SECRETS_FILE), secrets.render())
+        std::fs::write(path.join(local::SECRETS_FILE), secrets.render()?)
             .context("failed to write staged secrets")?;
         if let Some(source) = ssh_key {
             std::fs::copy(source, path.join(local::SSH_KEY_FILE))
@@ -645,9 +833,70 @@ impl Staging {
         &self.path
     }
 
-    fn cleanup(self) {
+    /// Removes staging dirs left behind when provisioning died mid-write
+    /// (Drop cannot run on a killed process). Narrowly scoped: only
+    /// `gale-worker-provision-*` dirs in this user's temp dir, only ones
+    /// untouched for `STALE_AFTER`, so a concurrent or in-flight attempt
+    /// is never swept.
+    fn sweep_stale() {
+        Self::sweep_stale_in(&std::env::temp_dir());
+    }
+
+    fn sweep_stale_in(temp: &std::path::Path) {
+        let Ok(entries) = temp.read_dir() else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if !name.to_string_lossy().starts_with("gale-worker-provision-") {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            let fresh = meta
+                .modified()
+                .ok()
+                .and_then(|at| at.elapsed().ok())
+                .is_some_and(|age| age < Self::STALE_AFTER);
+            if meta.is_dir() && !fresh {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Staging {
+    fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
     }
+}
+
+/// Restricts a directory to the current user, SYSTEM, and Administrators
+/// before credentials are written inside it.
+#[cfg(windows)]
+fn restrict_dir(path: &std::path::Path) -> Result<()> {
+    let user = format!(
+        "{}\\{}",
+        std::env::var("USERDOMAIN").unwrap_or_else(|_| String::new()),
+        std::env::var("USERNAME").context("cannot determine the current user for staging ACLs")?,
+    );
+    let status = std::process::Command::new("icacls")
+        .arg(path)
+        .args([
+            "/inheritance:r",
+            "/grant:r",
+            &format!("{user}:(OI)(CI)F"),
+            "*S-1-5-18:(OI)(CI)F",
+            "*S-1-5-32-544:(OI)(CI)F",
+        ])
+        .output()
+        .context("failed to restrict the worker staging directory")?;
+    ensure!(
+        status.status.success(),
+        "failed to restrict the worker staging directory: {}",
+        String::from_utf8_lossy(&status.stdout).trim()
+    );
+    Ok(())
 }
 
 /// The installed worker's binding, read leniently — status must degrade
@@ -752,6 +1001,54 @@ fn worker_exe() -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    fn binding(profile_id: &str) -> WorkerBinding {
+        WorkerBinding {
+            worker_id: "w".to_owned(),
+            profile_id: profile_id.to_owned(),
+            listen: "127.0.0.1:8472".to_owned(),
+            address: "http://127.0.0.1:8472".to_owned(),
+        }
+    }
+
+    /// The single installed `GaleWorker` must only answer to the profile
+    /// it was provisioned for. "Bound" covers the desktop half: settings
+    /// pointing at the address and a stored bearer token.
+    #[test]
+    fn ownership_tracks_the_installed_binding() {
+        let mine = binding("sync-A");
+
+        // No service installed → nothing to own.
+        assert_eq!(
+            ownership_of(None, Some("sync-A"), false),
+            WorkerOwnership::None
+        );
+
+        // Bound to this profile's sync id, fully linked.
+        assert_eq!(
+            ownership_of(Some(&mine), Some("sync-A"), true),
+            WorkerOwnership::Owned
+        );
+
+        // Installed for this profile but the desktop binding never
+        // completed — finish-setup territory, not foreign.
+        assert_eq!(
+            ownership_of(Some(&mine), Some("sync-A"), false),
+            WorkerOwnership::Incomplete
+        );
+
+        // A different sync id owns the service — every operation must be
+        // refused for this profile, whether or not it has synced before.
+        assert_eq!(
+            ownership_of(Some(&mine), Some("sync-B"), true),
+            WorkerOwnership::Foreign
+        );
+        assert_eq!(
+            ownership_of(Some(&mine), None, false),
+            WorkerOwnership::Foreign,
+            "an unknown local sync id must never count as ownership"
+        );
+    }
+
     #[test]
     fn pick_port_prefers_the_existing_install_and_skips_taken_ports() {
         // A free preferred port always wins, so reprovisioning keeps the
@@ -764,5 +1061,80 @@ mod tests {
         assert_ne!(port, local::DEFAULT_PORT);
         assert!(local::PORT_RANGE.contains(&port));
         drop(blocker);
+    }
+
+    /// Ages a directory's modified time so `sweep_stale` sees it as
+    /// abandoned. Needs `FILE_FLAG_BACKUP_SEMANTICS` to open a dir handle.
+    #[cfg(windows)]
+    fn age_dir(path: &std::path::Path) {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        let file = std::fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .unwrap();
+        file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            .unwrap();
+    }
+
+    #[test]
+    fn staging_cleans_up_on_drop_and_sweeps_only_abandoned_dirs() {
+        let root = tempfile::tempdir().unwrap();
+        let secrets = Secrets {
+            token: Some("token".to_owned()),
+            ..Secrets::default()
+        };
+
+        // Dropping the guard removes the dir — every early return path
+        // in provisioning gets this for free.
+        let path;
+        {
+            let staging =
+                Staging::create_in(root.path(), &WorkerConfig::default(), &secrets, None).unwrap();
+            path = staging.path().to_path_buf();
+            assert!(path.join(local::SECRETS_FILE).is_file());
+            assert!(path.join(local::CONFIG_FILE).is_file());
+        }
+        assert!(!path.exists());
+
+        let stale = root.path().join("gale-worker-provision-stale");
+        std::fs::create_dir(&stale).unwrap();
+        age_dir(&stale);
+        let fresh = root.path().join("gale-worker-provision-fresh");
+        std::fs::create_dir(&fresh).unwrap();
+        let unrelated = root.path().join("unrelated-temp-entry");
+        std::fs::create_dir(&unrelated).unwrap();
+
+        Staging::sweep_stale_in(root.path());
+        assert!(!stale.exists(), "abandoned staging dir should be swept");
+        assert!(fresh.exists(), "an in-flight provision must be untouched");
+        assert!(unrelated.exists(), "unrelated temp entries are off-limits");
+    }
+
+    #[test]
+    fn restrict_dir_removes_inherited_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("restricted");
+        std::fs::create_dir(&path).unwrap();
+        restrict_dir(&path).unwrap();
+
+        // icacls reports the effective ACL (names, not SIDs): only the
+        // current user plus SYSTEM/Administrators remain.
+        let output = std::process::Command::new("icacls")
+            .arg(&path)
+            .output()
+            .unwrap();
+        let acl = String::from_utf8_lossy(&output.stdout);
+        assert!(acl.contains("SYSTEM"), "SYSTEM grant missing: {acl}");
+        assert!(
+            acl.contains("Administrators"),
+            "Admins grant missing: {acl}"
+        );
+        assert!(
+            !acl.contains("BUILTIN\\Users") && !acl.contains("Everyone"),
+            "world-readable staging dir: {acl}"
+        );
     }
 }

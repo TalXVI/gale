@@ -547,11 +547,28 @@ export type LocalWorkerRunReport = {
 
 export type LocalWorkerAction = 'start' | 'stop' | 'restart';
 
+/// Who the installed worker belongs to relative to this profile. One
+/// `GaleWorker` service exists per machine and is bound to a single sync
+/// profile at install — `foreign` workers must never be controlled from
+/// here.
+export type LocalWorkerOwnership =
+	/// No worker is installed.
+	| 'none'
+	/// Installed for this profile and fully bound (settings + token).
+	| 'owned'
+	/// Installed for this profile but the desktop binding never completed
+	/// — provisioning can finish it.
+	| 'incomplete'
+	/// Installed for a different profile; controls must not be offered.
+	| 'foreign';
+
 export type LocalWorkerStatus = {
 	/// False off Windows — provisioning is unavailable there.
 	supported: boolean;
 	service: LocalWorkerServiceState;
 	binding: LocalWorkerBinding | null;
+	/// Whether the installed worker belongs to this profile.
+	ownership: LocalWorkerOwnership;
 	run: LocalWorkerRunReport | null;
 	worker: WorkerStatus | null;
 	workerError: string | null;

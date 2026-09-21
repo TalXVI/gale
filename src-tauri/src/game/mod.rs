@@ -150,6 +150,19 @@ pub fn from_slug(slug: &str) -> Option<Game> {
     GAMES.1.iter().find(|game| game.slug == slug)
 }
 
+/// Games parsed strictly from the bundled `games.json`, ignoring the
+/// downloaded cache. The standalone worker uses this: it may run on a
+/// machine whose cache predates dedicated-server metadata (or was written
+/// by an older app version), and the bundled list is the deterministic
+/// source the binary was built against. The desktop keeps using `list()`/
+/// `from_slug()`, which prefer the fresher cached list.
+#[cfg(feature = "worker")]
+pub fn bundled_from_slug(slug: &str) -> Option<Game> {
+    static BUNDLED: LazyLock<Vec<GameData<'static>>> =
+        LazyLock::new(|| serde_json::from_str(BUNDLED_GAMES_JSON).unwrap());
+    BUNDLED.iter().find(|game| game.slug == slug)
+}
+
 pub fn last_updated() -> DateTime<Utc> {
     GAMES.0
 }

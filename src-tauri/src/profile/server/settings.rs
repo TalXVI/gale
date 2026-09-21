@@ -287,8 +287,53 @@ impl RemoteServerSettings {
 mod tests {
     use super::{
         LocalServerSettings, ProfileServerSettings, RemoteProtocol, RemoteServerSettings,
-        ServerLocation,
+        ServerLocation, SyncMode, WorkerSettings,
     };
+
+    /// The fresh-profile provisioning sequence relies on this contract:
+    /// the dialog saves transport settings in `local` mode before the
+    /// worker exists (no address yet), and provisioning itself flips the
+    /// profile to hosted worker mode. Worker mode with no address must
+    /// keep failing — that's how a misconfigured external worker is
+    /// caught — while local mode tolerates the empty address.
+    #[test]
+    fn worker_mode_requires_an_address_but_local_does_not() {
+        let transport = RemoteServerSettings {
+            host: "h".into(),
+            port: 22,
+            username: "u".into(),
+            server_directory: "/srv/valheim".into(),
+            ..Default::default()
+        };
+
+        let unprovisioned = RemoteServerSettings {
+            sync_mode: SyncMode::Worker,
+            worker: WorkerSettings {
+                hosted: true,
+                address: String::new(),
+                ..Default::default()
+            },
+            ..transport.clone()
+        };
+        assert!(unprovisioned.validate().is_err());
+
+        let mut saved_first = transport.clone();
+        assert!(saved_first.validate().is_ok());
+        saved_first.worker.auto_sync = true;
+        saved_first.worker.auto_mods = true;
+        assert!(saved_first.validate().is_ok());
+
+        // An already-configured external worker is untouched.
+        let external = RemoteServerSettings {
+            sync_mode: SyncMode::Worker,
+            worker: WorkerSettings {
+                address: "http://127.0.0.1:8472".into(),
+                ..Default::default()
+            },
+            ..transport
+        };
+        assert!(external.validate().is_ok());
+    }
 
     #[test]
     fn deserializes_legacy_flat_shape() {

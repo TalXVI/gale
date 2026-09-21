@@ -740,7 +740,7 @@ pub(crate) fn sync_target(app: &AppHandle) -> eyre::Result<SyncTarget> {
 
 /// The sync id of a specific profile, looked up by id rather than through
 /// the active profile, so an active-profile switch cannot redirect it.
-fn sync_id_for(app: &AppHandle, profile_id: i64) -> Option<String> {
+pub(crate) fn sync_id_for(app: &AppHandle, profile_id: i64) -> Option<String> {
     app.lock_manager()
         .profile_by_id(profile_id)
         .ok()

@@ -65,22 +65,22 @@ impl Secrets {
     pub fn parse(content: &str) -> Self {
         let mut secrets = Self::default();
         for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
-            let Some((key, value)) = line.split_once('=') else {
+            let Some((key, value)) = trimmed.split_once('=') else {
                 continue;
             };
-            let value = value.trim();
-            if value.is_empty() {
-                continue;
-            }
+            // Values are verbatim — passwords and passphrases may carry
+            // meaningful whitespace or '=' characters, so nothing is
+            // trimmed. `lines()` already guarantees no \n or \r survives.
+            let value = Some(value.to_owned());
             match key.trim() {
-                ENV_TOKEN => secrets.token = Some(value.to_owned()),
-                ENV_REMOTE_PASSWORD => secrets.remote_password = Some(value.to_owned()),
-                ENV_REFRESH_TOKEN => secrets.refresh_token = Some(value.to_owned()),
-                ENV_DATHOST_PASSWORD => secrets.dat_host_password = Some(value.to_owned()),
+                ENV_TOKEN => secrets.token = value,
+                ENV_REMOTE_PASSWORD => secrets.remote_password = value,
+                ENV_REFRESH_TOKEN => secrets.refresh_token = value,
+                ENV_DATHOST_PASSWORD => secrets.dat_host_password = value,
                 _ => {}
             }
         }
@@ -89,23 +89,30 @@ impl Secrets {
 
     /// Renders the file provisioning writes. `None` fields are omitted
     /// rather than written as empty values, so a later overlay cannot
-    /// mistake "stored empty" for "absent".
+    /// mistake "stored empty" for "absent". Values are written verbatim;
+    /// a newline or carriage return cannot be expressed in the
+    /// `KEY=value` line format and is rejected instead of corrupting
+    /// the file's structure.
     #[cfg(windows)]
-    pub fn render(&self) -> String {
+    pub fn render(&self) -> eyre::Result<String> {
         let mut out = String::new();
-        let mut put = |key: &str, value: &Option<String>| {
-            if let Some(value) = value {
-                out.push_str(key);
-                out.push('=');
-                out.push_str(value);
-                out.push('\n');
-            }
-        };
-        put(ENV_TOKEN, &self.token);
-        put(ENV_REMOTE_PASSWORD, &self.remote_password);
-        put(ENV_REFRESH_TOKEN, &self.refresh_token);
-        put(ENV_DATHOST_PASSWORD, &self.dat_host_password);
-        out
+        for (key, value) in [
+            (ENV_TOKEN, &self.token),
+            (ENV_REMOTE_PASSWORD, &self.remote_password),
+            (ENV_REFRESH_TOKEN, &self.refresh_token),
+            (ENV_DATHOST_PASSWORD, &self.dat_host_password),
+        ] {
+            let Some(value) = value else { continue };
+            eyre::ensure!(
+                !value.contains(['\n', '\r']),
+                "{key} cannot contain a newline"
+            );
+            out.push_str(key);
+            out.push('=');
+            out.push_str(value);
+            out.push('\n');
+        }
+        Ok(out)
     }
 
     #[cfg(feature = "worker")]
@@ -126,12 +133,16 @@ impl Secrets {
     }
 
     /// The API bearer token. Required — an unauthenticated worker would
-    /// let any loopback caller drive deployments.
+    /// let any loopback caller drive deployments. An empty stored value
+    /// counts as unset: a zero-length token must never authenticate.
     #[cfg(feature = "worker")]
     pub fn token(&self) -> Result<String> {
-        self.token.clone().ok_or_eyre(format!(
-            "no worker API token; set {ENV_TOKEN} or provide a secretsFile"
-        ))
+        self.token
+            .clone()
+            .filter(|token| !token.is_empty())
+            .ok_or_eyre(format!(
+                "no worker API token; set {ENV_TOKEN} or provide a secretsFile"
+            ))
     }
 
     /// The remote transport credential, empty when the protocol does not
@@ -164,34 +175,70 @@ mod tests {
             "# comment\n\
              GALE_WORKER_TOKEN=abc\n\
              UNKNOWN_KEY=x\n\
-             GALE_WORKER_REMOTE_PASSWORD=\n\
-             GALE_WORKER_REFRESH_TOKEN= seed \n\
+             GALE_WORKER_REFRESH_TOKEN=seed\n\
              not-a-key-value\n",
         );
 
         assert_eq!(secrets.token.as_deref(), Some("abc"));
-        // Empty values parse as absent so they cannot shadow the file
-        // format's "unset" state.
-        assert_eq!(secrets.remote_password, None);
         assert_eq!(secrets.refresh_token.as_deref(), Some("seed"));
+        assert_eq!(secrets.remote_password, None);
         assert_eq!(secrets.dat_host_password, None);
     }
 
     #[test]
-    fn render_omits_absent_values_and_round_trips() {
+    fn values_round_trip_verbatim() {
+        // Passwords and passphrases may legitimately contain whitespace
+        // or '=' — the format must carry them unchanged.
+        let secrets = Secrets {
+            token: Some("  padded  ".to_owned()),
+            remote_password: Some("trailing \t".to_owned()),
+            refresh_token: Some("a=b=c".to_owned()),
+            dat_host_password: Some(String::new()),
+        };
+
+        let parsed = Secrets::parse(&secrets.render().unwrap());
+        assert_eq!(parsed.token.as_deref(), Some("  padded  "));
+        assert_eq!(parsed.remote_password.as_deref(), Some("trailing \t"));
+        assert_eq!(parsed.refresh_token.as_deref(), Some("a=b=c"));
+        // An empty stored value stays empty — distinct from absent.
+        assert_eq!(parsed.dat_host_password.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn render_omits_absent_values() {
         let secrets = Secrets {
             token: Some("t=with=equals".to_owned()),
             refresh_token: Some("r".to_owned()),
             ..Secrets::default()
         };
 
-        let rendered = secrets.render();
+        let rendered = secrets.render().unwrap();
         assert!(!rendered.contains("REMOTE_PASSWORD"));
         assert!(!rendered.contains("DATHOST"));
 
         let parsed = Secrets::parse(&rendered);
         assert_eq!(parsed.token.as_deref(), Some("t=with=equals"));
         assert_eq!(parsed.refresh_token.as_deref(), Some("r"));
+    }
+
+    #[test]
+    fn render_rejects_newlines_that_would_corrupt_the_file() {
+        for bad in ["line\nbreak", "carriage\rreturn", "both\r\n"] {
+            let secrets = Secrets {
+                remote_password: Some(bad.to_owned()),
+                ..Secrets::default()
+            };
+            assert!(secrets.render().is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn an_empty_token_is_rejected_as_unset() {
+        let secrets = Secrets {
+            token: Some(String::new()),
+            ..Secrets::default()
+        };
+        assert!(secrets.token().is_err());
     }
 
     #[test]

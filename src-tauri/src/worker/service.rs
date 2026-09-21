@@ -122,41 +122,95 @@ fn service_main_inner() -> Result<()> {
         }
     })?;
 
-    let set_status = |state: ServiceState, accepted: ServiceControlAccept, code: u32| {
+    let set_status = |state: ServiceState,
+                      accepted: ServiceControlAccept,
+                      code: u32,
+                      checkpoint: u32,
+                      wait_hint: Duration| {
         status_handle.set_service_status(ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,
             current_state: state,
             controls_accepted: accepted,
             exit_code: ServiceExitCode::Win32(code),
-            checkpoint: 0,
-            wait_hint: Duration::default(),
+            checkpoint,
+            wait_hint,
             process_id: None,
         })
     };
 
+    // StartPending covers all of initialization: config and secrets
+    // loading, the instance lock, the journal, and the API bind. The SCM
+    // only sees Running once `server::run` signals readiness, so a failed
+    // start is reported as Stopped with a nonzero code — which the
+    // configured failure actions count like any other failure.
     set_status(
-        ServiceState::Running,
+        ServiceState::StartPending,
         ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
         0,
+        1,
+        Duration::from_secs(15),
     )?;
 
-    let config = WorkerConfig::load(&args.config)?;
-    let secrets = Secrets::resolve(&config)?;
+    let loaded = WorkerConfig::load(&args.config)
+        .and_then(|config| Secrets::resolve(&config).map(|secrets| (config, secrets)));
 
-    let result = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("failed to build worker runtime")?
-        .block_on(server::run(config.clone(), secrets, shutdown));
+    let (config, result) = match loaded {
+        Ok((config, secrets)) => {
+            let result = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("failed to build worker runtime")?
+                .block_on(async {
+                    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+                    let fut =
+                        server::run(config.clone(), secrets, shutdown.clone(), Some(ready_tx));
+                    tokio::pin!(fut);
+                    tokio::select! {
+                        // The run future completing before the ready
+                        // signal means initialization failed; propagate
+                        // its error rather than reporting Running.
+                        res = &mut fut => res,
+                        msg = ready_rx => {
+                            if msg.is_ok() {
+                                set_status(
+                                    ServiceState::Running,
+                                    ServiceControlAccept::STOP
+                                        | ServiceControlAccept::SHUTDOWN,
+                                    0,
+                                    0,
+                                    Duration::ZERO,
+                                )?;
+                            }
+                            fut.await
+                        }
+                    }
+                });
+            (Some(config), result)
+        }
+        Err(err) => (None, Err(err)),
+    };
 
-    // Stopped is written by `server::run` on every exit; overwrite with
-    // the more specific cause when the OS itself is going down.
-    if os_shutdown.load(Ordering::SeqCst) {
-        server::report_run_state(&config, WorkerRunPhase::Shutdown);
+    if let Some(config) = &config {
+        // `server::run` writes Stopped on its own exit path; write the
+        // terminal report here too so init failures don't leave a stale
+        // `running` from a previous crash, and so an OS shutdown is
+        // distinguishable from a requested stop.
+        let phase = if os_shutdown.load(Ordering::SeqCst) {
+            WorkerRunPhase::Shutdown
+        } else {
+            WorkerRunPhase::Stopped
+        };
+        server::report_run_state(config, phase);
     }
 
     let code = if result.is_ok() { 0 } else { 1 };
-    if let Err(err) = set_status(ServiceState::Stopped, ServiceControlAccept::empty(), code) {
+    if let Err(err) = set_status(
+        ServiceState::Stopped,
+        ServiceControlAccept::empty(),
+        code,
+        0,
+        Duration::ZERO,
+    ) {
         warn!(%err, "failed to report stopped status");
     }
     result
@@ -221,7 +275,10 @@ fn install_inner(staging: &Path, log: &Path) -> Result<()> {
     let staged_secrets = Secrets::load_file(&staging.join(local::SECRETS_FILE))
         .context("staged secrets are unreadable")?;
     ensure!(
-        staged_secrets.token.is_some(),
+        staged_secrets
+            .token
+            .as_deref()
+            .is_some_and(|token| !token.is_empty()),
         "staged secrets.env is missing {}",
         super::secrets::ENV_TOKEN
     );
@@ -286,6 +343,10 @@ fn install_inner(staging: &Path, log: &Path) -> Result<()> {
         .start(&[] as &[&OsStr])
         .context("failed to start the service")?;
     wait_for_state(&service, ServiceState::Running)?;
+    // The service reports Running only after the API is bound, but a
+    // crash between the report and now would leave SCM's view stale —
+    // confirm the port actually answers before declaring success.
+    await_listen_ready(&config.listen)?;
     Ok(())
 }
 
@@ -516,7 +577,7 @@ fn reinstall_inner(log: &Path) -> Result<()> {
         root.join(local::CONFIG_FILE).is_file(),
         "the worker is not installed"
     );
-    WorkerConfig::load(&root.join(local::CONFIG_FILE))
+    let config = WorkerConfig::load(&root.join(local::CONFIG_FILE))
         .context("installed worker config is invalid")?;
 
     let manager = open_manager_for_create()?;
@@ -532,7 +593,29 @@ fn reinstall_inner(log: &Path) -> Result<()> {
     service
         .start(&[] as &[&OsStr])
         .context("failed to start the service")?;
-    wait_for_state(&service, ServiceState::Running)
+    wait_for_state(&service, ServiceState::Running)?;
+    await_listen_ready(&config.listen)
+}
+
+/// Confirms the worker's listen address accepts TCP connections. SCM
+/// state alone cannot prove the API survived past the Running report —
+/// a crashed process can linger in Running briefly.
+fn await_listen_ready(listen: &str) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut last_err = None;
+    while Instant::now() < deadline {
+        match std::net::TcpStream::connect(listen) {
+            Ok(_) => return Ok(()),
+            Err(err) => {
+                last_err = Some(err);
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out")))
+        .context(format!(
+            "the worker service reports running but {listen} is not answering"
+        ))
 }
 
 /// SCM-managed crash recovery: restart after 5s, then 15s, then every 60s.
@@ -614,4 +697,26 @@ fn icacls(path: &Path, grants: &[&str]) -> Result<()> {
         String::from_utf8_lossy(&output.stdout)
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::await_listen_ready;
+
+    /// Install/start trust a real probe, not a transient SCM state: a
+    /// bound port passes immediately, a dead one fails rather than
+    /// reporting success.
+    #[test]
+    fn listen_readiness_distinguishes_bound_from_closed_ports() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let ready = listener.local_addr().unwrap().to_string();
+        assert!(await_listen_ready(&ready).is_ok());
+
+        drop(listener);
+        let err = await_listen_ready(&ready).unwrap_err();
+        assert!(
+            err.to_string().contains("not answering"),
+            "unexpected error: {err:#}"
+        );
+    }
 }

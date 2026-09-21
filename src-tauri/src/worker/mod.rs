@@ -51,7 +51,7 @@ pub async fn run(config_path: &std::path::Path) -> eyre::Result<()> {
         }
     });
 
-    let result = server::run(config.clone(), secrets, shutdown).await;
+    let result = server::run(config.clone(), secrets, shutdown, None).await;
     server::report_run_state(&config, api::WorkerRunPhase::Stopped);
     result
 }

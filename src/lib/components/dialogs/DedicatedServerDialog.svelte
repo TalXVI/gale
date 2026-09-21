@@ -93,6 +93,13 @@
 	async function refreshLocalWorker() {
 		try {
 			localWorker = await api.profile.server.getLocalWorkerStatus();
+			// An unfinished setup would otherwise be invisible: the profile
+			// still reads 'local' because linking it is the step that
+			// failed. Show the hosted-worker section so Finish setup is
+			// one click away.
+			if (localWorker?.ownership === 'incomplete' && syncChoice === 'local') {
+				syncChoice = 'hostedWorker';
+			}
 		} catch {
 			localWorker = null;
 		}
@@ -369,9 +376,17 @@
 	/// the worker's config from the *saved* settings, so unsaved edits
 	/// would otherwise leave worker and desktop pointing at different
 	/// remotes.
+	///
+	/// The save uses `local` sync mode on purpose: a fresh profile has no
+	/// worker address yet, so `worker` mode would fail validation before
+	/// provisioning could start. Once the service is installed, the
+	/// backend itself persists hosted-worker mode with the loopback
+	/// address; this dialog then mirrors that state.
 	async function provisionWorker() {
 		const current = await checkedSettings();
 		if (!current) return;
+		current.remote.syncMode = 'local';
+		current.remote.worker.hosted = false;
 		provisioning = true;
 		try {
 			await api.profile.server.setSettings(
@@ -656,7 +671,9 @@
 					</div>
 
 					{#if syncChoice === 'hostedWorker'}
-						{#if localWorker === null || localWorker.service === 'notInstalled'}
+						{#if localWorker?.ownership === 'foreign'}
+							<InfoBox type="warning">{m.dedicatedServerDialog_localWorkerForeign()}</InfoBox>
+						{:else if localWorker === null || localWorker.service === 'notInstalled'}
 							<InfoBox type="info">{m.dedicatedServerDialog_localWorkerProvisionInfo()}</InfoBox>
 							<div>
 								<Button
@@ -681,6 +698,19 @@
 										— {localWorker.binding.address}
 									{/if}
 								</p>
+								{#if localWorker.ownership === 'incomplete'}
+									<InfoBox type="warning">{m.dedicatedServerDialog_localWorkerIncomplete()}</InfoBox
+									>
+									<div>
+										<Button
+											color="primary"
+											icon="mdi:server-plus"
+											loading={provisioning}
+											onclick={provisionWorker}
+											>{m.dedicatedServerDialog_localWorkerFinishSetup()}</Button
+										>
+									</div>
+								{/if}
 								{#if localWorker.stoppedForShutdown}
 									<InfoBox type="info">{m.dedicatedServerDialog_localWorkerShutdown()}</InfoBox>
 								{:else if localWorker.service !== 'running' && localWorker.run?.phase === 'running'}

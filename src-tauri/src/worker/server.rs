@@ -67,7 +67,10 @@ pub struct WorkerContext {
 
 impl WorkerContext {
     fn new(config: WorkerConfig, secrets: Secrets, journal: Journal) -> Result<Self> {
-        let game = game::from_slug(&config.game)
+        // The bundled list is deliberate: a release build's cached
+        // games.json can predate this fork's dedicated-server metadata
+        // and would wrongly reject a supported game.
+        let game = game::bundled_from_slug(&config.game)
             .ok_or_else(|| eyre::eyre!("unknown game slug '{}'", config.game))?;
         ensure!(
             game.dedicated_server.is_some(),
@@ -788,10 +791,16 @@ fn lock_instance(
 /// Serves the HTTP API and runs the poll loop until `shutdown` is
 /// cancelled. The caller writes the terminal status-file report, since it
 /// is the one that knows whether the stop was a request or an OS shutdown.
+///
+/// `ready` fires once the API listener is bound and the poll loop is
+/// armed — the point where the service can truthfully report `Running`
+/// to the SCM. It is never fired when initialization fails, so a service
+/// start that returns early reports `Stopped` instead.
 pub async fn run(
     config: WorkerConfig,
     secrets: Secrets,
     shutdown: CancellationToken,
+    ready: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
     std::fs::create_dir_all(&config.state_dir).with_context(|| {
         format!(
@@ -838,6 +847,10 @@ pub async fn run(
     report_run_state(&ctx.config, WorkerRunPhase::Running);
 
     tokio::spawn(poll_loop(ctx.clone(), shutdown.clone()));
+
+    if let Some(ready) = ready {
+        let _ = ready.send(());
+    }
 
     let result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown.cancelled_owned())
@@ -961,6 +974,168 @@ mod tests {
         let err = super::lock_instance(dir.path()).unwrap_err();
         assert!(
             err.to_string().contains("already running"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    fn worker_config(dir: &std::path::Path, listen: String) -> super::WorkerConfig {
+        super::WorkerConfig {
+            worker_id: "w".to_owned(),
+            profile_id: "p".to_owned(),
+            game: "valheim".to_owned(),
+            listen,
+            status_file: Some(dir.join("status.json")),
+            state_dir: dir.to_path_buf(),
+            ..super::WorkerConfig::default()
+        }
+    }
+
+    fn worker_secrets() -> super::Secrets {
+        super::Secrets {
+            token: Some("token".to_owned()),
+            ..super::Secrets::default()
+        }
+    }
+
+    /// The readiness signal mirrors what the service reports to the SCM:
+    /// it fires only once the API listener is bound — never while init
+    /// is still running, and never when init fails.
+    #[tokio::test]
+    async fn run_signals_ready_only_after_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = worker_config(dir.path(), "127.0.0.1:0".to_owned());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+
+        let task = tokio::spawn(super::run(
+            config,
+            worker_secrets(),
+            shutdown.clone(),
+            Some(ready_tx),
+        ));
+        ready_rx.await.expect("the worker never became ready");
+        shutdown.cancel();
+        task.await.unwrap().unwrap();
+
+        let report: super::WorkerRunReport =
+            serde_json::from_slice(&std::fs::read(dir.path().join("status.json")).unwrap())
+                .unwrap();
+        assert_eq!(report.phase, super::WorkerRunPhase::Stopped);
+    }
+
+    /// An occupied port is an init failure: `run` errors and the ready
+    /// sender drops without firing — the service-side caller observes
+    /// `Err` and must report Stopped, never Running.
+    #[tokio::test]
+    async fn run_fails_when_the_port_is_occupied() {
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listen = blocker.local_addr().unwrap().to_string();
+        let dir = tempfile::tempdir().unwrap();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+
+        let result = super::run(
+            worker_config(dir.path(), listen),
+            worker_secrets(),
+            tokio_util::sync::CancellationToken::new(),
+            Some(ready_tx),
+        )
+        .await;
+        assert!(
+            ready_rx.await.is_err(),
+            "readiness must not fire on failure"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("failed to bind"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// Unsupported game metadata is an init failure — the worker must
+    /// reject it rather than serving an API that cannot deploy.
+    #[tokio::test]
+    async fn run_rejects_a_game_without_dedicated_server_support() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = worker_config(dir.path(), "127.0.0.1:0".to_owned());
+        config.game = "h3vr".to_owned();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let err = super::run(
+            config,
+            worker_secrets(),
+            tokio_util::sync::CancellationToken::new(),
+            Some(ready_tx),
+        )
+        .await
+        .unwrap_err();
+        assert!(ready_rx.await.is_err());
+        assert!(
+            err.to_string().contains("no dedicated-server support"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// Codex's release failure: a cached `games.json` from an older app
+    /// version carries the legacy `server` flag instead of
+    /// `dedicatedServer`, and the worker wrongly rejected Valheim. The
+    /// worker resolves the bundled list, which this binary was built
+    /// against — the stale cache is irrelevant to it.
+    #[test]
+    fn bundled_metadata_is_immune_to_a_legacy_cache() {
+        // What the legacy cache actually looked like: a `server` flag,
+        // no `dedicatedServer` object. Parsed through the current schema
+        // it yields no dedicated-server metadata at all.
+        let legacy: crate::game::GameData = serde_json::from_str(
+            r#"{
+                "name": "Valheim",
+                "slug": "valheim",
+                "server": true,
+                "modLoader": { "name": "BepInEx" }
+            }"#,
+        )
+        .unwrap();
+        assert!(legacy.dedicated_server.is_none());
+
+        // The worker's lookup ignores that cache entirely.
+        let game =
+            crate::game::bundled_from_slug("valheim").expect("bundled valheim metadata missing");
+        assert!(game.dedicated_server.is_some());
+    }
+
+    /// `WorkerContext::new` is the gate the service exercises: bundled
+    /// metadata plus a usable token produce a context; a game without
+    /// dedicated-server support or a missing token are init errors.
+    #[test]
+    fn worker_context_init_gates() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = crate::worker::journal::Journal::load(dir.path()).unwrap();
+
+        let ctx = super::WorkerContext::new(
+            worker_config(dir.path(), "127.0.0.1:0".to_owned()),
+            worker_secrets(),
+            journal,
+        );
+        assert!(ctx.is_ok(), "unexpected error: {:?}", ctx.err());
+
+        let journal = crate::worker::journal::Journal::load(dir.path()).unwrap();
+        let mut unsupported = worker_config(dir.path(), "127.0.0.1:0".to_owned());
+        unsupported.game = "h3vr".to_owned();
+        let err = match super::WorkerContext::new(unsupported, worker_secrets(), journal) {
+            Ok(_) => panic!("a game without dedicated-server support must be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("no dedicated-server support"));
+
+        let journal = crate::worker::journal::Journal::load(dir.path()).unwrap();
+        let err = match super::WorkerContext::new(
+            worker_config(dir.path(), "127.0.0.1:0".to_owned()),
+            super::Secrets::default(),
+            journal,
+        ) {
+            Ok(_) => panic!("a missing worker token must be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("token"),
             "unexpected error: {err:#}"
         );
     }
