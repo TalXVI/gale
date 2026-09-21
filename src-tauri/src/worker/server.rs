@@ -997,6 +997,193 @@ mod tests {
         }
     }
 
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// A minimal plaintext FTP endpoint for end-to-end status tests. It
+    /// refuses AUTH TLS (exercising the automatic-FTP plaintext
+    /// fallback), accepts any login, treats every directory as present,
+    /// and reports every file as missing — exactly what an untouched
+    /// remote looks like to `open_session`.
+    fn spawn_ftp_server() -> std::net::SocketAddr {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::{TcpListener, TcpStream};
+
+        fn send(writer: &mut TcpStream, text: String) -> bool {
+            writer.write_all(format!("{text}\r\n").as_bytes()).is_ok()
+        }
+
+        fn serve(stream: TcpStream) {
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut passive: Option<TcpListener> = None;
+            let mut line = String::new();
+
+            if !send(&mut writer, "220 fake ftp ready".to_owned()) {
+                return;
+            }
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                let verb = line
+                    .trim_end()
+                    .split(' ')
+                    .next()
+                    .unwrap_or_default()
+                    .to_ascii_uppercase();
+                let response = match verb.as_str() {
+                    "AUTH" => "502 TLS is not supported".to_owned(),
+                    "USER" => "331 password required".to_owned(),
+                    "PASS" => "230 logged in".to_owned(),
+                    "PWD" | "XPWD" => "257 \"/\" is the current directory".to_owned(),
+                    "CWD" | "CDUP" => "250 directory changed".to_owned(),
+                    "TYPE" | "MODE" | "STRU" | "NOOP" => "200 ok".to_owned(),
+                    "SYST" => "215 UNIX Type: L8".to_owned(),
+                    // Missing files look exactly like this to read_state
+                    // and read_lease, which then fall back to defaults.
+                    "SIZE" | "MDTM" | "RETR" => "550 not found".to_owned(),
+                    "PASV" => {
+                        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                        let port = listener.local_addr().unwrap().port();
+                        passive = Some(listener);
+                        format!(
+                            "227 Entering Passive Mode (127,0,0,1,{},{})",
+                            port / 256,
+                            port % 256
+                        )
+                    }
+                    "LIST" | "NLST" | "MLSD" => {
+                        if !send(&mut writer, "150 opening data connection".to_owned()) {
+                            return;
+                        }
+                        // An empty listing: accept the data connection
+                        // and close it immediately.
+                        if let Some(listener) = passive.take() {
+                            let _ = listener.accept();
+                        }
+                        "226 transfer complete".to_owned()
+                    }
+                    "QUIT" => {
+                        let _ = send(&mut writer, "221 goodbye".to_owned());
+                        return;
+                    }
+                    _ => "502 not implemented".to_owned(),
+                };
+                if !send(&mut writer, response) {
+                    return;
+                }
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(stream) => std::thread::spawn(move || serve(stream)),
+                    Err(_) => break,
+                };
+            }
+        });
+        address
+    }
+
+    /// End-to-end coverage for the refresh flag: the desktop client must
+    /// produce a query the real router accepts, malformed values must be
+    /// rejected rather than coerced, and unauthenticated callers get
+    /// nothing. The original bug sent `?refresh=1`, which the parser
+    /// rejected with a 400 before the handler ever ran.
+    #[tokio::test]
+    async fn status_refresh_flag_round_trips_through_the_http_route() {
+        use crate::profile::server::{
+            settings::{RemoteProtocol, RemoteServerSettings},
+            worker_client::WorkerClient,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let ftp = spawn_ftp_server();
+        let api_port = free_port();
+
+        let mut config = worker_config(dir.path(), format!("127.0.0.1:{api_port}"));
+        config.remote = RemoteServerSettings {
+            protocol: RemoteProtocol::Ftp,
+            host: "127.0.0.1".to_owned(),
+            port: ftp.port(),
+            username: "u".to_owned(),
+            server_directory: "/".to_owned(),
+            ..RemoteServerSettings::default()
+        };
+        // The poll loop is not under test; keep it off the network.
+        config.sync_url = Some("http://127.0.0.1:1/".to_owned());
+        let secrets = super::Secrets {
+            remote_password: Some("pw".to_owned()),
+            ..worker_secrets()
+        };
+
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(super::run(
+            config,
+            secrets,
+            shutdown.clone(),
+            Some(ready_tx),
+        ));
+        ready_rx.await.expect("the worker never became ready");
+
+        let mut settings = RemoteServerSettings::default();
+        settings.worker.address = format!("http://127.0.0.1:{api_port}");
+        let client = WorkerClient::new(&settings, "token".to_owned()).unwrap();
+
+        // Without refresh the handler returns journal state only — no
+        // remote session is opened.
+        let status = client.status(false).await.unwrap();
+        assert!(status.server.is_none());
+
+        // With refresh the handler opens a real session against the
+        // remote and returns its live summary.
+        let status = client.status(true).await.unwrap();
+        let server = status
+            .server
+            .expect("a refresh request must return remote state");
+        assert_eq!(server.pending_configs, 0);
+        assert!(server.lease.is_none());
+
+        // The endpoint still requires the bearer token.
+        let unauthenticated = WorkerClient::new(&settings, "wrong".to_owned()).unwrap();
+        let err = unauthenticated.status(false).await.unwrap_err();
+        assert!(
+            err.to_string().contains("bearer token"),
+            "unexpected error: {err:#}"
+        );
+
+        // Malformed refresh values are rejected outright — never
+        // silently coerced into a wrong status.
+        let http = reqwest::Client::new();
+        for query in ["refresh=1", "refresh=yes", "refresh=bogus"] {
+            let response = http
+                .get(format!("http://127.0.0.1:{api_port}/v1/status?{query}"))
+                .bearer_auth("token")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "{query} must be rejected"
+            );
+        }
+
+        shutdown.cancel();
+        task.await.unwrap().unwrap();
+    }
+
     /// The readiness signal mirrors what the service reports to the SCM:
     /// it fires only once the API listener is bound — never while init
     /// is still running, and never when init fails.

@@ -93,7 +93,7 @@ impl WorkerClient {
     pub async fn status(&self, refresh: bool) -> Result<StatusResponse> {
         let url = format!("{}{}/status", self.base, api::API_BASE);
         let url = if refresh {
-            format!("{url}?refresh=1")
+            format!("{url}?refresh=true")
         } else {
             url
         };

@@ -95,7 +95,7 @@ pub struct StatusResponse {
     pub last_operation: Option<OperationRecord>,
     /// The last poll/deploy failure the worker recorded.
     pub last_error: Option<String>,
-    /// Live remote state, present only for `?refresh=1` requests.
+    /// Live remote state, present only for `?refresh=true` requests.
     pub server: Option<ServerStateSummary>,
 }
 
