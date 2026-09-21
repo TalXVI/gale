@@ -209,7 +209,15 @@ impl LocalServerSettings {
 }
 
 impl RemoteServerSettings {
-    pub fn validate(&self) -> Result<()> {
+    /// The checks a file-transfer connection needs: reachable host,
+    /// credentials to authenticate with, and a valid remote directory.
+    ///
+    /// Worker and host-provider fields are deliberately excluded. They
+    /// configure who executes deployments and what happens afterwards,
+    /// so requiring them here would block testing the FTP/SFTP settings
+    /// before a worker is provisioned or while an external worker is
+    /// still being configured.
+    pub fn validate_connection(&self) -> Result<()> {
         ensure!(!self.host.trim().is_empty(), "remote host cannot be empty");
         ensure!(self.port != 0, "remote port cannot be 0");
         ensure!(
@@ -227,6 +235,16 @@ impl RemoteServerSettings {
                 "SSH private key file is required"
             );
         }
+
+        Ok(())
+    }
+
+    /// Full validation for operations that act on the whole
+    /// configuration: saving settings, deploying, or testing the worker.
+    /// Worker mode requires a bound worker address here; connection-only
+    /// operations use [`Self::validate_connection`] instead.
+    pub fn validate(&self) -> Result<()> {
+        self.validate_connection()?;
 
         if self.sync_mode == SyncMode::Worker {
             let address = self.worker.address.trim();
@@ -274,6 +292,27 @@ impl RemoteServerSettings {
         )
     }
 
+    /// A copy with the file-transfer fields taken from `tested`, keeping
+    /// this settings' executor and host-control configuration.
+    ///
+    /// A successful connection test persists the proven transport this
+    /// way: it must not activate the executor the dialog happened to
+    /// hold, like an unprovisioned hosted worker or an incompletely
+    /// configured external one, nor change automation or restart policy.
+    pub fn with_tested_transport(&self, tested: &Self) -> Self {
+        let mut merged = self.clone();
+        merged.protocol = tested.protocol;
+        merged.host = tested.host.clone();
+        merged.port = tested.port;
+        merged.username = tested.username.clone();
+        merged.server_directory = tested.server_directory.clone();
+        merged.authentication = tested.authentication;
+        merged.private_key_path = tested.private_key_path.clone();
+        merged.trusted_host_key = tested.trusted_host_key.clone();
+        merged.trusted_certificate = tested.trusted_certificate.clone();
+        merged
+    }
+
     pub fn trust_host_key(&mut self, fingerprint: String) {
         self.trusted_host_key = Some(fingerprint);
     }
@@ -286,8 +325,8 @@ impl RemoteServerSettings {
 #[cfg(test)]
 mod tests {
     use super::{
-        LocalServerSettings, ProfileServerSettings, RemoteProtocol, RemoteServerSettings,
-        ServerLocation, SyncMode, WorkerSettings,
+        LocalServerSettings, ProfileServerSettings, RemoteAuthentication, RemoteProtocol,
+        RemoteServerSettings, RestartPolicy, ServerLocation, SyncMode, WorkerSettings,
     };
 
     /// The fresh-profile provisioning sequence relies on this contract:
@@ -333,6 +372,132 @@ mod tests {
             ..transport
         };
         assert!(external.validate().is_ok());
+    }
+
+    /// Connection testing uses the narrower check: the file transfer
+    /// must be testable while the dialog's sync mode names a worker
+    /// that has no address yet. Deployment-level `validate` stays
+    /// strict for the same settings.
+    #[test]
+    fn connection_validation_ignores_worker_configuration() {
+        let unprovisioned_hosted = RemoteServerSettings {
+            host: "ftp.example.com".into(),
+            port: 21,
+            username: "u".into(),
+            server_directory: "/".into(),
+            sync_mode: SyncMode::Worker,
+            worker: WorkerSettings {
+                hosted: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(unprovisioned_hosted.validate_connection().is_ok());
+        assert!(unprovisioned_hosted.validate().is_err());
+
+        let unconfigured_external = RemoteServerSettings {
+            worker: WorkerSettings::default(),
+            ..unprovisioned_hosted.clone()
+        };
+        assert!(unconfigured_external.validate_connection().is_ok());
+        assert!(unconfigured_external.validate().is_err());
+    }
+
+    /// Worker independence cannot weaken the checks the transport
+    /// itself needs; bad credentials or connection settings still fail.
+    #[test]
+    fn connection_validation_still_checks_the_transport() {
+        let base = RemoteServerSettings {
+            host: "ftp.example.com".into(),
+            port: 21,
+            username: "u".into(),
+            server_directory: "/".into(),
+            sync_mode: SyncMode::Worker,
+            ..Default::default()
+        };
+
+        for broken in [
+            RemoteServerSettings {
+                host: "  ".into(),
+                ..base.clone()
+            },
+            RemoteServerSettings {
+                port: 0,
+                ..base.clone()
+            },
+            RemoteServerSettings {
+                username: String::new(),
+                ..base.clone()
+            },
+            RemoteServerSettings {
+                server_directory: "/srv/../escape".into(),
+                ..base.clone()
+            },
+            RemoteServerSettings {
+                protocol: RemoteProtocol::Sftp,
+                authentication: RemoteAuthentication::PrivateKey,
+                private_key_path: String::new(),
+                ..base.clone()
+            },
+        ] {
+            assert!(broken.validate_connection().is_err());
+            assert!(broken.validate().is_err());
+        }
+    }
+
+    /// A successful connection test persists the proven transport onto
+    /// the stored settings; whatever executor the dialog held must not
+    /// leak in. With nothing stored, the merge cannot activate an
+    /// unprovisioned worker, and a stored worker keeps its binding.
+    #[test]
+    fn tested_transport_does_not_activate_unsaved_executor() {
+        let tested = RemoteServerSettings {
+            protocol: RemoteProtocol::Ftps,
+            host: "ftp.example.com".into(),
+            port: 21,
+            username: "u".into(),
+            server_directory: "/".into(),
+            trusted_certificate: Some("cert".into()),
+            sync_mode: SyncMode::Worker,
+            worker: WorkerSettings {
+                hosted: true,
+                auto_sync: true,
+                auto_mods: true,
+                ..Default::default()
+            },
+            restart_policy: RestartPolicy::Immediate,
+            ..Default::default()
+        };
+
+        let merged = RemoteServerSettings::default().with_tested_transport(&tested);
+        assert_eq!(merged.protocol, RemoteProtocol::Ftps);
+        assert_eq!(merged.host, "ftp.example.com");
+        assert_eq!(merged.trusted_certificate.as_deref(), Some("cert"));
+        assert_eq!(merged.sync_mode, SyncMode::Local);
+        assert!(!merged.worker.hosted);
+        assert!(!merged.worker.auto_sync);
+        assert_eq!(merged.restart_policy, RestartPolicy::Manual);
+        assert!(merged.validate().is_ok());
+
+        let stored = RemoteServerSettings {
+            sync_mode: SyncMode::Worker,
+            worker: WorkerSettings {
+                address: "http://127.0.0.1:8472".into(),
+                hosted: true,
+                auto_sync: true,
+                ..Default::default()
+            },
+            restart_policy: RestartPolicy::WhenEmpty,
+            ..Default::default()
+        };
+        let merged = stored.with_tested_transport(&tested);
+        assert_eq!(merged.host, "ftp.example.com");
+        assert_eq!(merged.sync_mode, SyncMode::Worker);
+        assert_eq!(merged.worker.address, "http://127.0.0.1:8472");
+        assert!(merged.worker.auto_sync);
+        assert!(!merged.worker.auto_mods);
+        assert_eq!(merged.restart_policy, RestartPolicy::WhenEmpty);
+        assert!(merged.validate().is_ok());
     }
 
     #[test]

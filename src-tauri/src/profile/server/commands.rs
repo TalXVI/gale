@@ -380,7 +380,10 @@ pub async fn test_remote_server_connection(
     app: AppHandle,
 ) -> Result<ConnectionTestResult> {
     let profile_id = active_profile_id(&app);
-    request.settings.validate()?;
+    // Only the file transfer is exercised, so worker and host-provider
+    // fields must not gate it: a worker may not be provisioned or fully
+    // configured yet.
+    request.settings.validate_connection()?;
 
     let secrets = ServerSecrets::for_profile(profile_id)?;
     let credential = remote_credential(&secrets, &request.settings, &request.password)?;
@@ -395,7 +398,7 @@ pub async fn test_remote_server_connection(
     if matches!(result, ConnectionTestResult::Connected { .. }) {
         // Save into the profile the test was started for. The network
         // call awaited, so the active profile may have changed.
-        save_remote_request_for(&app, profile_id, &secrets, &request, &credential)?;
+        save_tested_connection_for(&app, profile_id, &secrets, &request, &credential)?;
     }
 
     Ok(result)
@@ -1042,7 +1045,44 @@ fn save_remote_request_for(
     credential: &str,
 ) -> eyre::Result<()> {
     save_remote_settings_for(app, profile_id, request.settings.clone())?;
+    persist_request_credentials(secrets, request, credential)
+}
 
+/// Persists a successful connection test. The proven transport settings
+/// and credentials land on the profile the test started for, while the
+/// stored executor (`sync_mode`/`worker`) and host-control configuration
+/// stay untouched: the dialog's current sync-mode selection may name a
+/// worker that does not exist yet, and a test must not activate it.
+fn save_tested_connection_for(
+    app: &AppHandle,
+    profile_id: i64,
+    secrets: &ServerSecrets,
+    request: &RemoteServerRequest,
+    credential: &str,
+) -> eyre::Result<()> {
+    let stored_remote = {
+        let manager = app.lock_manager();
+        let (_, profile) = manager.profile_by_id(profile_id)?;
+        profile
+            .server_settings
+            .as_ref()
+            .map(|settings| settings.remote.clone())
+            .unwrap_or_default()
+    };
+
+    save_remote_settings_for(
+        app,
+        profile_id,
+        stored_remote.with_tested_transport(&request.settings),
+    )?;
+    persist_request_credentials(secrets, request, credential)
+}
+
+fn persist_request_credentials(
+    secrets: &ServerSecrets,
+    request: &RemoteServerRequest,
+    credential: &str,
+) -> eyre::Result<()> {
     if let Some(secret) = remote_secret(&request.settings)
         && (!credential.is_empty() || !request.remember_password)
     {
@@ -1053,9 +1093,7 @@ fn save_remote_request_for(
         Some(ServerSecret::DatHostPassword),
         &request.dat_host_password,
         request.remember_password,
-    )?;
-
-    Ok(())
+    )
 }
 
 fn save_settings_for(

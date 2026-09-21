@@ -264,9 +264,9 @@ pub fn test_connection(
 impl RemoteConnection {
     /// Connects and authenticates against the remote server.
     ///
-    /// `settings` is expected to have passed [`RemoteServerSettings::validate`]
-    /// already; this is the transport layer, so it only parses the paths it
-    /// actually needs.
+    /// `settings` is expected to have passed
+    /// [`RemoteServerSettings::validate_connection`] already; this is the
+    /// transport layer, so it only parses the paths it actually needs.
     pub fn connect(settings: &RemoteServerSettings, password: &str) -> Result<ConnectionAttempt> {
         if settings.protocol != RemoteProtocol::Sftp {
             return match Self::connect_ftp(settings, password) {
