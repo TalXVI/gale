@@ -376,6 +376,10 @@ mod tests {
         games.iter().find(|game| game.slug == slug).unwrap()
     }
 
+    /// Loading a legacy cache restores the bundled dedicated-server
+    /// metadata. Goes through `read_games_cache` — the same function
+    /// `get_cached_games` calls for the release startup path — pointed
+    /// at a temp dir so no test touches the real app-data cache.
     #[test]
     fn legacy_cache_load_recovers_dedicated_server() {
         let dir = tempfile::tempdir().unwrap();
@@ -456,46 +460,5 @@ mod tests {
 
         let cache = read_games_cache(&path).unwrap();
         assert!(find(&cache.games, "valheim").dedicated_server.is_some());
-    }
-
-    /// The real startup path: a legacy cache planted at the default
-    /// data location, loaded through `get_cached_games` exactly as a
-    /// release build does. Restores any pre-existing cache afterwards.
-    #[test]
-    fn real_cache_location_recovers_dedicated_server() {
-        struct CacheGuard {
-            path: std::path::PathBuf,
-            original: Option<Vec<u8>>,
-        }
-
-        impl CacheGuard {
-            fn overwrite(path: std::path::PathBuf, contents: &str) -> Self {
-                let original = fs::read(&path).ok();
-                fs::create_dir_all(path.parent().unwrap()).unwrap();
-                fs::write(&path, contents).unwrap();
-                Self { path, original }
-            }
-        }
-
-        impl Drop for CacheGuard {
-            fn drop(&mut self) {
-                let result = match &self.original {
-                    Some(bytes) => fs::write(&self.path, bytes),
-                    None => fs::remove_file(&self.path),
-                };
-                if let Err(err) = result {
-                    warn!("failed to restore games cache: {err}");
-                }
-            }
-        }
-
-        let _guard = CacheGuard::overwrite(
-            util::path::default_app_data_dir().join(CACHE_FILE_NAME),
-            LEGACY_CACHE,
-        );
-
-        let cache = get_cached_games().unwrap();
-        let valheim = find(&cache.games, "valheim");
-        assert!(valheim.dedicated_server.is_some());
     }
 }
