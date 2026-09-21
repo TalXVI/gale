@@ -815,18 +815,22 @@ impl Staging {
     ) -> Result<Self> {
         let path = root.join(format!("gale-worker-provision-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&path).context("failed to create the worker staging directory")?;
+        // Arm the cleanup guard before any fallible step — a failed ACL,
+        // config write, secrets write, or key copy must not strand a
+        // partially staged directory.
+        let staging = Self { path };
         // A bearer token and possibly an SSH private key are about to
         // land here — restrict the dir to this user (plus SYSTEM/Admins,
         // who must read it elevated) before writing anything sensitive.
-        restrict_dir(&path)?;
-        config.save(&path.join(local::CONFIG_FILE))?;
-        std::fs::write(path.join(local::SECRETS_FILE), secrets.render()?)
+        restrict_dir(&staging.path)?;
+        config.save(&staging.path.join(local::CONFIG_FILE))?;
+        std::fs::write(staging.path.join(local::SECRETS_FILE), secrets.render()?)
             .context("failed to write staged secrets")?;
         if let Some(source) = ssh_key {
-            std::fs::copy(source, path.join(local::SSH_KEY_FILE))
+            std::fs::copy(source, staging.path.join(local::SSH_KEY_FILE))
                 .context("failed to stage the SSH private key")?;
         }
-        Ok(Self { path })
+        Ok(staging)
     }
 
     fn path(&self) -> &std::path::Path {
@@ -1111,6 +1115,44 @@ mod tests {
         assert!(!stale.exists(), "abandoned staging dir should be swept");
         assert!(fresh.exists(), "an in-flight provision must be untouched");
         assert!(unrelated.exists(), "unrelated temp entries are off-limits");
+    }
+
+    /// A failure partway through staging — here, an SSH key that does
+    /// not exist, failing after config and secrets were already written —
+    /// must remove the directory. The cleanup guard is armed right after
+    /// `create_dir_all`, so no partial payload survives an early return.
+    #[test]
+    fn a_failed_ssh_key_copy_removes_the_partial_staging_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let secrets = Secrets {
+            token: Some("Bearer SECRET-TOKEN-9f2c".to_owned()),
+            ..Secrets::default()
+        };
+        let missing_key = root.path().join("no-such-key.pem");
+
+        let result = Staging::create_in(
+            root.path(),
+            &WorkerConfig::default(),
+            &secrets,
+            Some(&missing_key),
+        );
+        let err = match result {
+            Ok(_) => panic!("staging a missing SSH key must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("private key"),
+            "unexpected error: {err:#}"
+        );
+        // The failure message must never carry a credential value.
+        assert!(
+            !format!("{err:#}").contains("SECRET-TOKEN-9f2c"),
+            "error leaked the token: {err:#}"
+        );
+        assert!(
+            root.path().read_dir().unwrap().next().is_none(),
+            "partial staging dir was left behind"
+        );
     }
 
     #[test]

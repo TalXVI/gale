@@ -151,40 +151,41 @@ fn service_main_inner() -> Result<()> {
         Duration::from_secs(15),
     )?;
 
-    let loaded = WorkerConfig::load(&args.config)
-        .and_then(|config| Secrets::resolve(&config).map(|secrets| (config, secrets)));
-
-    let (config, result) = match loaded {
-        Ok((config, secrets)) => {
-            let result = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .context("failed to build worker runtime")?
-                .block_on(async {
-                    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
-                    let fut =
-                        server::run(config.clone(), secrets, shutdown.clone(), Some(ready_tx));
-                    tokio::pin!(fut);
-                    tokio::select! {
-                        // The run future completing before the ready
-                        // signal means initialization failed; propagate
-                        // its error rather than reporting Running.
-                        res = &mut fut => res,
-                        msg = ready_rx => {
-                            if msg.is_ok() {
-                                set_status(
-                                    ServiceState::Running,
-                                    ServiceControlAccept::STOP
-                                        | ServiceControlAccept::SHUTDOWN,
-                                    0,
-                                    0,
-                                    Duration::ZERO,
-                                )?;
-                            }
-                            fut.await
+    // Everything fallible that remains is inside `load_and_build`, so no
+    // `?` can bypass the Stopped/nonzero finalizer below — including
+    // Tokio runtime construction.
+    let (config, result) = match load_and_build(&args) {
+        Ok(init) => {
+            let config = init.config.clone();
+            let result = init.runtime.block_on(async {
+                let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+                let fut = server::run(
+                    config.clone(),
+                    init.secrets,
+                    shutdown.clone(),
+                    Some(ready_tx),
+                );
+                tokio::pin!(fut);
+                tokio::select! {
+                    // The run future completing before the ready
+                    // signal means initialization failed; propagate
+                    // its error rather than reporting Running.
+                    res = &mut fut => res,
+                    msg = ready_rx => {
+                        if msg.is_ok() {
+                            set_status(
+                                ServiceState::Running,
+                                ServiceControlAccept::STOP
+                                    | ServiceControlAccept::SHUTDOWN,
+                                0,
+                                0,
+                                Duration::ZERO,
+                            )?;
                         }
+                        fut.await
                     }
-                });
+                }
+            });
             (Some(config), result)
         }
         Err(err) => (None, Err(err)),
@@ -214,6 +215,31 @@ fn service_main_inner() -> Result<()> {
         warn!(%err, "failed to report stopped status");
     }
     result
+}
+
+/// Everything the worker needs to start serving, collected as one
+/// fallible unit. `service_main_inner` calls this after reporting
+/// StartPending so that any failure — malformed config, unreadable
+/// secrets, even Tokio runtime construction — lands on the common
+/// Stopped/nonzero finalizer rather than escaping through `?`.
+struct WorkerInit {
+    config: WorkerConfig,
+    secrets: Secrets,
+    runtime: tokio::runtime::Runtime,
+}
+
+fn load_and_build(args: &ServiceArgs) -> Result<WorkerInit> {
+    let config = WorkerConfig::load(&args.config)?;
+    let secrets = Secrets::resolve(&config)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to build worker runtime")?;
+    Ok(WorkerInit {
+        config,
+        secrets,
+        runtime,
+    })
 }
 
 /// Service logs go to a file — there is no console or stderr to see.
@@ -701,7 +727,7 @@ fn icacls(path: &Path, grants: &[&str]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::await_listen_ready;
+    use super::{ServiceArgs, await_listen_ready, load_and_build};
 
     /// Install/start trust a real probe, not a transient SCM state: a
     /// bound port passes immediately, a dead one fails rather than
@@ -718,5 +744,60 @@ mod tests {
             err.to_string().contains("not answering"),
             "unexpected error: {err:#}"
         );
+    }
+
+    /// `service_main_inner` reports StartPending, then routes every
+    /// remaining fallible step through `load_and_build` so a failure —
+    /// including runtime construction — lands on the Stopped/nonzero
+    /// finalizer instead of an early `?` return. This test pins the
+    /// contract: init failures surface as one `Err` channel.
+    #[test]
+    fn init_failures_all_flow_through_load_and_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = ServiceArgs {
+            config: dir.path().join("gale-worker.json"),
+            log_file: dir.path().join("worker.log"),
+        };
+
+        // Missing config file: init fails before the service could ever
+        // report Running.
+        let err = match load_and_build(&args) {
+            Ok(_) => panic!("a missing config must fail"),
+            Err(err) => err,
+        };
+        assert!(!err.to_string().is_empty());
+
+        // Malformed config takes the same path.
+        std::fs::write(&args.config, b"{ not json").unwrap();
+        let err = match load_and_build(&args) {
+            Ok(_) => panic!("a malformed config must fail"),
+            Err(err) => err,
+        };
+        assert!(!err.to_string().is_empty());
+
+        // A valid config with no secrets file proceeds through all three
+        // init steps — and produces a runtime the service can block on.
+        std::fs::write(
+            &args.config,
+            serde_json::to_vec(&serde_json::json!({
+                "workerId": "w",
+                "profileId": "p",
+                "game": "valheim",
+                "listen": "127.0.0.1:0",
+                "remote": {
+                    "protocol": "ftp",
+                    "host": "example.com",
+                    "port": 21,
+                    "username": "u",
+                    "serverDirectory": "/srv",
+                    "authentication": "password",
+                    "privateKeyPath": ""
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let init = load_and_build(&args).expect("valid config must load");
+        assert_eq!(init.runtime.block_on(async { 42 }), 42);
     }
 }
