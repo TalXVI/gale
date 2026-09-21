@@ -117,6 +117,31 @@ enum RemoteClient {
     Ftp(RustlsFtpStream),
 }
 
+/// The rustls provider for FTPS client configuration. Prefer the
+/// process-wide provider when the application installed one; fall back
+/// to aws-lc-rs, which this crate's feature graph always compiles in.
+/// Resolving it explicitly keeps this module working in processes that
+/// never install a default, where `ClientConfig::builder()` panics on
+/// the ambiguous feature set.
+fn crypto_provider() -> Arc<suppaftp::rustls::crypto::CryptoProvider> {
+    suppaftp::rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(suppaftp::rustls::crypto::aws_lc_rs::default_provider()))
+}
+
+/// The `ClientConfig` behind an FTPS session. Provider and protocol
+/// versions are chosen explicitly for the same reason as
+/// [`crypto_provider`]: the plain builder relies on process state this
+/// module cannot assume.
+fn ftps_client_config(verifier: FtpsCertVerifier) -> ClientConfig {
+    ClientConfig::builder_with_provider(crypto_provider())
+        .with_safe_default_protocol_versions()
+        .expect("the aws-lc-rs provider supports the default TLS versions")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_no_client_auth()
+}
+
 /// FTPS certificate verification. When a fingerprint pin is configured it
 /// is an exact-match requirement: the certificate the server presents
 /// must match it whether or not normal CA validation would have
@@ -145,15 +170,9 @@ impl FtpsCertVerifier {
         roots: RootCertStore,
         pinned: Option<String>,
     ) -> Result<(Self, Arc<Mutex<Option<String>>>)> {
-        // Prefer the process-wide provider when the application set one;
-        // fall back to aws-lc-rs so test binaries linking both providers
-        // don't panic on auto-selection.
-        let provider = suppaftp::rustls::crypto::CryptoProvider::get_default()
-            .cloned()
-            .unwrap_or_else(|| Arc::new(suppaftp::rustls::crypto::aws_lc_rs::default_provider()));
         let webpki = suppaftp::rustls::client::WebPkiServerVerifier::builder_with_provider(
             Arc::new(roots),
-            provider,
+            crypto_provider(),
         )
         .build()
         .context("failed to build certificate verifier")?;
@@ -344,10 +363,7 @@ impl RemoteConnection {
 
         let (verifier, observed) = FtpsCertVerifier::new(settings.trusted_certificate.clone())
             .map_err(FtpConnectError::Other)?;
-        let connector = ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(verifier))
-            .with_no_client_auth();
+        let connector = ftps_client_config(verifier);
 
         let (mut stream, encrypted) = match stream.into_secure(
             RustlsConnector::from(Arc::new(connector)),
@@ -1040,7 +1056,8 @@ mod tests {
 
     use super::{
         FtpsCertVerifier, RemoteProtocol, RemoteServerSettings, allows_plaintext_ftp_fallback,
-        certificate_fingerprint, ftp_list_entries, is_ftp_not_found, is_ftp_tls_unsupported,
+        certificate_fingerprint, ftp_list_entries, ftps_client_config, is_ftp_not_found,
+        is_ftp_tls_unsupported,
     };
 
     #[test]
@@ -1096,6 +1113,73 @@ mod tests {
 
         settings.protocol = RemoteProtocol::Ftps;
         assert!(!allows_plaintext_ftp_fallback(&settings, &tls_refused));
+    }
+
+    /// Both `ring` and `aws-lc-rs` providers are compiled into this
+    /// crate — tauri-plugin-updater pulls in `ring` — so rustls cannot
+    /// auto-select a provider and `ClientConfig::builder()` panics in any
+    /// process that did not install a default. That is what broke
+    /// gale-worker's FTPS connect. A test in this binary cannot
+    /// reproduce it because another test may already have installed a
+    /// process default, so this test re-runs itself in a fresh child
+    /// process, once against the pre-fix builder call (expected to
+    /// panic) and once against the production connector.
+    #[test]
+    fn ftps_config_builds_without_a_process_default_provider() {
+        const CHILD_ENV: &str = "GALE_FTPS_PROVIDER_CHILD";
+
+        match std::env::var(CHILD_ENV).ok().as_deref() {
+            Some("legacy") => {
+                assert!(
+                    suppaftp::rustls::crypto::CryptoProvider::get_default().is_none(),
+                    "child process must start without an installed provider"
+                );
+                let _ = ClientConfig::builder();
+            }
+            Some("production") => {
+                assert!(
+                    suppaftp::rustls::crypto::CryptoProvider::get_default().is_none(),
+                    "child process must start without an installed provider"
+                );
+                let (verifier, _) = FtpsCertVerifier::new(None).unwrap();
+                let _ = ftps_client_config(verifier);
+            }
+            _ => {
+                let exe = std::env::current_exe().unwrap();
+                let test = "profile::server::remote::tests::\
+                            ftps_config_builds_without_a_process_default_provider";
+
+                let legacy = std::process::Command::new(&exe)
+                    .args(["--exact", test])
+                    .env(CHILD_ENV, "legacy")
+                    .output()
+                    .unwrap();
+                assert!(
+                    !legacy.status.success(),
+                    "ambiguous provider auto-detection should still panic"
+                );
+                let output = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&legacy.stdout),
+                    String::from_utf8_lossy(&legacy.stderr)
+                );
+                assert!(
+                    output.contains("Could not automatically determine"),
+                    "expected the CryptoProvider panic, got: {output}"
+                );
+
+                let production = std::process::Command::new(&exe)
+                    .args(["--exact", test])
+                    .env(CHILD_ENV, "production")
+                    .output()
+                    .unwrap();
+                assert!(
+                    production.status.success(),
+                    "production connector failed in a fresh process: {}",
+                    String::from_utf8_lossy(&production.stderr)
+                );
+            }
+        }
     }
 
     // ---------- FTPS certificate verification ----------

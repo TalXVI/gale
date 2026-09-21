@@ -20,15 +20,27 @@ mod thunderstore;
 mod util;
 pub mod worker;
 
+/// Installs aws-lc-rs as the process-level rustls `CryptoProvider`.
+///
+/// The dependency graph compiles two providers — `aws_lc_rs` (this
+/// crate, reqwest, suppaftp) and `ring` (tauri-plugin-updater) — so
+/// rustls' feature-based auto-detection is ambiguous and any
+/// `ClientConfig::builder()` without an installed default panics. Every
+/// process that can open a TLS connection, the desktop app and
+/// gale-worker alike, must run this before its first TLS use.
+pub fn install_crypto_provider() {
+    if let Err(err) = rustls::crypto::aws_lc_rs::default_provider().install_default() {
+        warn!(?err, "failed to install aws_lc_rs default crypto provider");
+    }
+}
+
 fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     info!(
         version = env!("CARGO_PKG_VERSION"),
         os = std::env::consts::OS,
     );
 
-    if let Err(err) = rustls::crypto::aws_lc_rs::default_provider().install_default() {
-        warn!(?err, "failed to install aws_lc_rs default crypto provider");
-    }
+    install_crypto_provider();
 
     if let Err(err) = state::setup(app.handle()) {
         error!("setup error: {err:?}");
