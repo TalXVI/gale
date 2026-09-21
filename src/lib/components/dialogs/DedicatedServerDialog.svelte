@@ -13,13 +13,13 @@
 	import * as api from '$lib/api';
 	import type {
 		HostProvider,
+		LocalWorkerStatus,
 		ProfileServerSettings,
 		RemoteAuthentication,
 		RemoteProtocol,
 		RemoteServerSettings,
 		RestartPolicy,
-		ServerLocation,
-		SyncMode
+		ServerLocation
 	} from '$lib/types';
 	import games from '$lib/state/game.svelte';
 	import { Tabs } from 'bits-ui';
@@ -54,7 +54,10 @@
 	let trustedHostKey = $state<string | null>(null);
 	let trustedCertificate = $state<string | null>(null);
 	let remotePassword = $state('');
-	let syncMode = $state<SyncMode>('local');
+	/// The UI-level sync choice: 'hostedWorker' maps to syncMode 'worker'
+	/// with `hosted: true`.
+	let syncChoice = $state<'local' | 'hostedWorker' | 'worker'>('local');
+	let localWorker = $state<LocalWorkerStatus | null>(null);
 	let workerAddress = $state('');
 	let workerToken = $state('');
 	let workerAutoSync = $state(false);
@@ -71,6 +74,8 @@
 	let launching = $state(false);
 	let testing = $state(false);
 	let testingWorker = $state(false);
+	let provisioning = $state(false);
+	let workerBusy = $state(false);
 	let syncDialogOpen = $state(false);
 
 	$effect(() => {
@@ -84,6 +89,14 @@
 		}
 		if (!initialized) void loadSettings();
 	});
+
+	async function refreshLocalWorker() {
+		try {
+			localWorker = await api.profile.server.getLocalWorkerStatus();
+		} catch {
+			localWorker = null;
+		}
+	}
 
 	/// Initial settings built from the active game, for profiles that have
 	/// never configured a dedicated server.
@@ -108,7 +121,7 @@
 				trustedHostKey: null,
 				trustedCertificate: null,
 				syncMode: 'local',
-				worker: { address: '', autoSync: false, autoMods: false },
+				worker: { address: '', hosted: false, autoSync: false, autoMods: false },
 				hostControl: { provider: 'none', datHostServerId: '', datHostUsername: '' },
 				restartPolicy: 'manual'
 			}
@@ -140,10 +153,16 @@
 			privateKeyPath = value.remote.privateKeyPath;
 			trustedHostKey = value.remote.trustedHostKey;
 			trustedCertificate = value.remote.trustedCertificate;
-			syncMode = value.remote.syncMode;
+			syncChoice =
+				value.remote.syncMode === 'worker'
+					? value.remote.worker.hosted
+						? 'hostedWorker'
+						: 'worker'
+					: 'local';
 			workerAddress = value.remote.worker.address;
 			workerAutoSync = value.remote.worker.autoSync;
 			workerAutoMods = value.remote.worker.autoMods;
+			void refreshLocalWorker();
 			hostProvider = value.remote.hostControl.provider;
 			datHostServerId = value.remote.hostControl.datHostServerId;
 			datHostUsername = value.remote.hostControl.datHostUsername;
@@ -176,9 +195,10 @@
 			privateKeyPath: privateKeyPath.trim(),
 			trustedHostKey,
 			trustedCertificate,
-			syncMode,
+			syncMode: syncChoice === 'local' ? 'local' : 'worker',
 			worker: {
 				address: workerAddress.trim(),
+				hosted: syncChoice === 'hostedWorker',
 				autoSync: workerAutoSync,
 				autoMods: workerAutoMods
 			},
@@ -342,6 +362,80 @@
 			pushInfoToast({ message: m.dedicatedServerDialog_saved() });
 		} finally {
 			saving = false;
+		}
+	}
+
+	/// Saves the current transport settings first — provisioning derives
+	/// the worker's config from the *saved* settings, so unsaved edits
+	/// would otherwise leave worker and desktop pointing at different
+	/// remotes.
+	async function provisionWorker() {
+		const current = await checkedSettings();
+		if (!current) return;
+		provisioning = true;
+		try {
+			await api.profile.server.setSettings(
+				current,
+				remotePassword,
+				workerToken,
+				datHostPassword,
+				rememberRemotePassword
+			);
+			localWorker = await api.profile.server.provisionLocalWorker(remotePassword, datHostPassword);
+			if (localWorker.binding) workerAddress = localWorker.binding.address;
+		} finally {
+			provisioning = false;
+		}
+	}
+
+	async function controlWorker(action: 'start' | 'stop' | 'restart') {
+		workerBusy = true;
+		try {
+			localWorker = await api.profile.server.controlLocalWorker(action);
+		} finally {
+			workerBusy = false;
+		}
+	}
+
+	async function updateWorker() {
+		workerBusy = true;
+		try {
+			localWorker = await api.profile.server.updateLocalWorker();
+		} finally {
+			workerBusy = false;
+		}
+	}
+
+	async function uninstallWorker() {
+		const accepted = await confirm(m.dedicatedServerDialog_localWorkerUninstallConfirm(), {
+			title: m.dedicatedServerDialog_localWorkerUninstall(),
+			kind: 'warning'
+		});
+		if (!accepted) return;
+		workerBusy = true;
+		try {
+			localWorker = await api.profile.server.uninstallLocalWorker();
+			syncChoice = 'local';
+			workerAddress = '';
+		} finally {
+			workerBusy = false;
+		}
+	}
+
+	function localWorkerStateLabel(state: string | undefined): string {
+		switch (state) {
+			case 'running':
+				return m.dedicatedServerDialog_localWorkerStateRunning();
+			case 'stopped':
+				return m.dedicatedServerDialog_localWorkerStateStopped();
+			case 'startPending':
+				return m.dedicatedServerDialog_localWorkerStateStartPending();
+			case 'stopPending':
+				return m.dedicatedServerDialog_localWorkerStateStopPending();
+			case 'notInstalled':
+				return m.dedicatedServerDialog_localWorkerStateNotInstalled();
+			default:
+				return m.dedicatedServerDialog_localWorkerStateOther();
 		}
 	}
 
@@ -538,20 +632,117 @@
 						<Select
 							type="single"
 							triggerClass="mt-1 w-full"
-							bind:value={syncMode}
+							bind:value={syncChoice}
 							items={[
 								{ value: 'local', label: m.dedicatedServerDialog_syncModeLocal() },
+								...(localWorker?.supported
+									? [
+											{
+												value: 'hostedWorker',
+												label: m.dedicatedServerDialog_syncModeHostedWorker()
+											}
+										]
+									: []),
 								{ value: 'worker', label: m.dedicatedServerDialog_syncModeWorker() }
 							]}
 						/>
 						<p class="text-primary-500 mt-1 text-sm">
-							{syncMode === 'worker'
+							{syncChoice === 'worker'
 								? m.dedicatedServerDialog_syncModeWorkerInfo()
-								: m.dedicatedServerDialog_syncModeLocalInfo()}
+								: syncChoice === 'hostedWorker'
+									? m.dedicatedServerDialog_syncModeHostedWorkerInfo()
+									: m.dedicatedServerDialog_syncModeLocalInfo()}
 						</p>
 					</div>
 
-					{#if syncMode === 'worker'}
+					{#if syncChoice === 'hostedWorker'}
+						{#if localWorker === null || localWorker.service === 'notInstalled'}
+							<InfoBox type="info">{m.dedicatedServerDialog_localWorkerProvisionInfo()}</InfoBox>
+							<div>
+								<Button
+									color="primary"
+									icon="mdi:server-plus"
+									loading={provisioning}
+									onclick={provisionWorker}>{m.dedicatedServerDialog_localWorkerProvision()}</Button
+								>
+							</div>
+							{#if provisioning}
+								<p class="text-primary-500 text-sm">
+									{m.dedicatedServerDialog_localWorkerProvisioning()}
+								</p>
+							{/if}
+						{:else}
+							<div class="flex flex-col gap-2">
+								<p class="text-primary-600 dark:text-primary-300 text-sm">
+									{m.dedicatedServerDialog_localWorkerStatus({
+										state: localWorkerStateLabel(localWorker.service)
+									})}
+									{#if localWorker.binding}
+										— {localWorker.binding.address}
+									{/if}
+								</p>
+								{#if localWorker.stoppedForShutdown}
+									<InfoBox type="info">{m.dedicatedServerDialog_localWorkerShutdown()}</InfoBox>
+								{:else if localWorker.service !== 'running' && localWorker.run?.phase === 'running'}
+									<InfoBox type="warning">{m.dedicatedServerDialog_localWorkerCrash()}</InfoBox>
+								{:else if localWorker.service !== 'running'}
+									<InfoBox type="info">{m.dedicatedServerDialog_localWorkerOffline()}</InfoBox>
+								{:else if localWorker.worker === null && localWorker.workerError}
+									<InfoBox type="warning">{localWorker.workerError}</InfoBox>
+								{/if}
+								{#if localWorker.worker?.pendingRevision}
+									<InfoBox type="info">{m.dedicatedServerDialog_localWorkerPending()}</InfoBox>
+								{/if}
+								{#if localWorker.updateAvailable}
+									<InfoBox type="info">{m.dedicatedServerDialog_localWorkerUpdateInfo()}</InfoBox>
+								{/if}
+								{#each localWorker.warnings as warning (warning)}
+									<InfoBox type="warning">{warning}</InfoBox>
+								{/each}
+								<div class="flex flex-wrap gap-2">
+									{#if localWorker.service === 'stopped'}
+										<Button
+											color="primary"
+											icon="mdi:play"
+											loading={workerBusy}
+											onclick={() => controlWorker('start')}
+											>{m.dedicatedServerDialog_localWorkerStart()}</Button
+										>
+									{:else if localWorker.service === 'running'}
+										<Button
+											color="primary"
+											icon="mdi:stop"
+											loading={workerBusy}
+											onclick={() => controlWorker('stop')}
+											>{m.dedicatedServerDialog_localWorkerStop()}</Button
+										>
+										<Button
+											color="primary"
+											icon="mdi:restart"
+											loading={workerBusy}
+											onclick={() => controlWorker('restart')}
+											>{m.dedicatedServerDialog_localWorkerRestart()}</Button
+										>
+									{/if}
+									{#if localWorker.updateAvailable}
+										<Button
+											color="primary"
+											icon="mdi:update"
+											loading={workerBusy}
+											onclick={updateWorker}>{m.dedicatedServerDialog_localWorkerUpdate()}</Button
+										>
+									{/if}
+									<Button
+										color="primary"
+										icon="mdi:delete"
+										loading={workerBusy}
+										onclick={uninstallWorker}
+										>{m.dedicatedServerDialog_localWorkerUninstall()}</Button
+									>
+								</div>
+							</div>
+						{/if}
+					{:else if syncChoice === 'worker'}
 						<div>
 							<Label>{m.dedicatedServerDialog_workerAddress()}</Label><InputField
 								class="mt-1 w-full"
@@ -569,6 +760,16 @@
 								{m.dedicatedServerDialog_savedPassword()}
 							</p>
 						</div>
+						<div>
+							<Button
+								color="primary"
+								icon="mdi:lan-connect"
+								loading={testingWorker}
+								onclick={testWorker}>{m.dedicatedServerDialog_testWorker()}</Button
+							>
+						</div>
+					{/if}
+					{#if syncChoice !== 'local'}
 						<div class="flex items-center">
 							<Label>{m.dedicatedServerDialog_workerAutoSync()}</Label><Info
 								>{m.dedicatedServerDialog_workerAutoSyncInfo()}</Info
@@ -578,14 +779,6 @@
 							<Label>{m.dedicatedServerDialog_workerAutoMods()}</Label><Info
 								>{m.dedicatedServerDialog_workerAutoModsInfo()}</Info
 							><Checkbox bind:checked={workerAutoMods} />
-						</div>
-						<div>
-							<Button
-								color="primary"
-								icon="mdi:lan-connect"
-								loading={testingWorker}
-								onclick={testWorker}>{m.dedicatedServerDialog_testWorker()}</Button
-							>
 						</div>
 					{/if}
 

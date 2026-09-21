@@ -67,11 +67,38 @@ impl AuthCredentials {
             user,
         })
     }
+
+    pub fn user(&self) -> &User {
+        &self.user
+    }
+
+    /// The refresh token is the worker's long-lived credential: the sync
+    /// service rotates it on every grant and the worker journal persists
+    /// each rotation, so the seeded value only needs to be valid once.
+    pub fn refresh_token(&self) -> &str {
+        &self.refresh_token
+    }
 }
 
 const OAUTH_TIMEOUT: Duration = Duration::from_mins(1);
 
 pub async fn login_with_oauth(app: &AppHandle) -> Result<User> {
+    let creds = oauth_credentials(app).await?;
+    let user = creds.user.clone();
+
+    info!("logged in as {}", user.name);
+
+    app.sync_auth().set_creds(Some(creds), app.db())?;
+
+    Ok(user)
+}
+
+/// Runs the browser OAuth flow and returns the issued credentials
+/// *without* storing them as the desktop session. The managed worker uses
+/// this to get its own credential chain: the sync service rotates the
+/// refresh token on every grant, so handing the worker a copy of the
+/// desktop's token would break whichever side refreshed second.
+pub async fn oauth_credentials(app: &AppHandle) -> Result<AuthCredentials> {
     let url = format!("{}/auth/login", *super::API_URL);
     open::that(url).context("failed to open url in browser")?;
 
@@ -97,19 +124,28 @@ pub async fn login_with_oauth(app: &AppHandle) -> Result<User> {
 
          app.get_webview_window("main").unwrap().set_focus().ok();
 
-         let creds = AuthCredentials::from_tokens(access_token, refresh_token)?;
-         let user = creds.user.clone();
-
-         info!("logged in as {}", user.name);
-
-         app.sync_auth().set_creds(Some(creds), app.db())?;
-
-         Ok(user)
+         AuthCredentials::from_tokens(access_token, refresh_token)
         }
         () = tokio::time::sleep(OAUTH_TIMEOUT) => {
             Err(eyre!("auth callback timed out"))
         }
     }
+}
+
+/// Forces a token grant with the desktop's stored refresh token. A second
+/// OAuth login may invalidate the earlier chain, so worker provisioning
+/// calls this afterwards to find out whether the desktop session survived.
+pub async fn verify_session(app: &AppHandle) -> Result<()> {
+    let refresh_token = {
+        let state = app.sync_auth();
+        let creds = state.creds();
+        creds
+            .as_ref()
+            .map(|creds| creds.refresh_token.clone())
+            .ok_or_eyre("not logged in")?
+    };
+
+    request_token(refresh_token, app).await.map(|_| ())
 }
 
 pub fn handle_callback(url: String, app: &AppHandle) -> Result<()> {

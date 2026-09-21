@@ -104,6 +104,27 @@
 	"dedicatedServerDialog_keyPassphrase": "Key passphrase",
 	"dedicatedServerDialog_launch": "Launch server",
 	"dedicatedServerDialog_loading": "Loading server settings...",
+	"dedicatedServerDialog_localWorkerCrash": "The worker stopped unexpectedly. Windows restarts it automatically.",
+	"dedicatedServerDialog_localWorkerOffline": "The worker is installed but not running.",
+	"dedicatedServerDialog_localWorkerPending": "A publication is queued and will deploy automatically.",
+	"dedicatedServerDialog_localWorkerProvision": "Set up worker",
+	"dedicatedServerDialog_localWorkerProvisionInfo": "Installs gale-worker as a Windows service that starts with Windows and keeps syncing while Gale is closed. Setup asks for one more Gale sign-in (the worker gets its own credentials) and one elevation prompt.",
+	"dedicatedServerDialog_localWorkerProvisioning": "Setting up the worker — finish the browser sign-in and approve the elevation prompt.",
+	"dedicatedServerDialog_localWorkerRestart": "Restart",
+	"dedicatedServerDialog_localWorkerShutdown": "Windows shut down; the worker starts again on the next boot.",
+	"dedicatedServerDialog_localWorkerStart": "Start",
+	"dedicatedServerDialog_localWorkerStateNotInstalled": "not installed",
+	"dedicatedServerDialog_localWorkerStateOther": "unknown",
+	"dedicatedServerDialog_localWorkerStateRunning": "running",
+	"dedicatedServerDialog_localWorkerStateStartPending": "starting",
+	"dedicatedServerDialog_localWorkerStateStopped": "stopped",
+	"dedicatedServerDialog_localWorkerStateStopPending": "stopping",
+	"dedicatedServerDialog_localWorkerStatus": "Service: {state}",
+	"dedicatedServerDialog_localWorkerStop": "Stop",
+	"dedicatedServerDialog_localWorkerUninstall": "Uninstall",
+	"dedicatedServerDialog_localWorkerUninstallConfirm": "Stop and remove the managed worker? Its sync state and credentials are deleted, and this profile falls back to syncing from Gale.",
+	"dedicatedServerDialog_localWorkerUpdate": "Update worker",
+	"dedicatedServerDialog_localWorkerUpdateInfo": "This Gale update ships a newer worker. Updating swaps it in without losing the worker's credentials or queued work.",
 	"dedicatedServerDialog_locationLocal": "This computer",
 	"dedicatedServerDialog_locationRemote": "Remote server",
 	"dedicatedServerDialog_password": "Password",
@@ -136,10 +157,12 @@
 	"dedicatedServerDialog_sshPort": "SSH port",
 	"dedicatedServerDialog_sync": "Sync server...",
 	"dedicatedServerDialog_syncMode": "Synchronize with",
+	"dedicatedServerDialog_syncModeHostedWorker": "A worker service on this PC",
+	"dedicatedServerDialog_syncModeHostedWorkerInfo": "A gale-worker Windows service on this machine deploys the published profile. It starts with Windows and keeps syncing while Gale is closed.",
 	"dedicatedServerDialog_syncModeLocal": "Gale on this device",
 	"dedicatedServerDialog_syncModeLocalInfo": "Gale connects to the server and deploys the published profile itself.",
-	"dedicatedServerDialog_syncModeWorker": "A gale-worker service",
-	"dedicatedServerDialog_syncModeWorkerInfo": "An independently running gale-worker performs deployments. It can also synchronize new publications while this device is offline.",
+	"dedicatedServerDialog_syncModeWorker": "An externally hosted worker",
+	"dedicatedServerDialog_syncModeWorkerInfo": "A gale-worker running elsewhere (e.g. a VPS) performs deployments. It can also synchronize new publications while this device is offline.",
 	"dedicatedServerDialog_test": "Test connection",
 	"dedicatedServerDialog_testWorker": "Test worker",
 	"dedicatedServerDialog_title": "Dedicated server",
@@ -693,12 +716,17 @@
 	"updateAllBanner_button": "Update all",
 	"updateAllBanner_content": [
 		{
-			"declarations": ["input count", "local countPlural = count: plural"],
+			"declarations": [
+				"input count",
+				"local countPlural = count: plural"
+			],
 			"match": {
 				"countPlural=one": "There is one update available.",
 				"countPlural=other": "There are {count} updates available."
 			},
-			"selectors": ["countPlural"]
+			"selectors": [
+				"countPlural"
+			]
 		}
 	],
 	"updateAllBanner_dialog_button": "Update mods",

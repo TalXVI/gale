@@ -144,3 +144,30 @@ pub struct ConfigureRequest {
 pub struct ErrorResponse {
     pub error: String,
 }
+
+/// Why a worker process stopped, as recorded in its status file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkerRunPhase {
+    /// Serving and polling normally.
+    Running,
+    /// Stopped by request (service stop control or equivalent).
+    Stopped,
+    /// Stopped because the OS is shutting down.
+    Shutdown,
+}
+
+/// The worker's last-known run state, written to `statusFile` when the
+/// worker runs as a managed background service. The file lets the desktop
+/// distinguish a graceful stop from a crash: after a crash the last write
+/// still says `running`, which combined with a stopped service means the
+/// process died.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerRunReport {
+    pub worker_id: String,
+    pub profile_id: String,
+    pub pid: u32,
+    pub phase: WorkerRunPhase,
+    pub at: DateTime<Utc>,
+}

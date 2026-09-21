@@ -288,6 +288,9 @@ export type HostProvider = 'none' | 'datHost';
 
 export type WorkerSettings = {
 	address: string;
+	/// True when `address` points at the Gale-managed Windows service on
+	/// this machine rather than an independently hosted worker.
+	hosted: boolean;
 	autoSync: boolean;
 	autoMods: boolean;
 };
@@ -512,6 +515,54 @@ export type ServerSyncStatus = {
 	warnings: string[];
 };
 
+// ---------- managed local worker ("host worker on this PC") ----------
+
+export type LocalWorkerServiceState =
+	| 'notInstalled'
+	| 'stopped'
+	| 'startPending'
+	| 'running'
+	| 'stopPending'
+	| 'other';
+
+export type LocalWorkerBinding = {
+	workerId: string;
+	/// The sync-profile id the installed worker serves.
+	profileId: string;
+	listen: string;
+	address: string;
+};
+
+/// Why the worker process last stopped, from its status file. A `running`
+/// report on a stopped service means the process died unexpectedly.
+export type LocalWorkerRunPhase = 'running' | 'stopped' | 'shutdown';
+
+export type LocalWorkerRunReport = {
+	workerId: string;
+	profileId: string;
+	pid: number;
+	phase: LocalWorkerRunPhase;
+	at: string;
+};
+
+export type LocalWorkerAction = 'start' | 'stop' | 'restart';
+
+export type LocalWorkerStatus = {
+	/// False off Windows — provisioning is unavailable there.
+	supported: boolean;
+	service: LocalWorkerServiceState;
+	binding: LocalWorkerBinding | null;
+	run: LocalWorkerRunReport | null;
+	worker: WorkerStatus | null;
+	workerError: string | null;
+	/// The last run report says the machine shut down — the service
+	/// comes back with the next boot.
+	stoppedForShutdown: boolean;
+	/// A newer worker binary shipped with the app than the service runs.
+	updateAvailable: boolean;
+	warnings: string[];
+};
+
 export type ServerSyncProgress = {
 	completed: number;
 	total: number;
@@ -528,12 +579,12 @@ export type ServerSyncStageProgress = {
 export type DedicatedServerStatus =
 	| { state: 'stopped' }
 	| {
-			state: 'running';
-			profileId: number;
-			gameSlug: string;
-			pid: number;
-			serverDir: string;
-	  };
+		state: 'running';
+		profileId: number;
+		gameSlug: string;
+		pid: number;
+		serverDir: string;
+	};
 
 export type Game = {
 	name: string;
@@ -701,12 +752,12 @@ export type Folder = {
 
 export type ListItem =
 	| {
-			type: 'mod';
-			mod: Mod;
-	  }
+		type: 'mod';
+		mod: Mod;
+	}
 	| {
-			type: 'folder';
-			folder: Folder;
-	  };
+		type: 'folder';
+		folder: Folder;
+	};
 
 export type RgbaColor = [number, number, number, number];

@@ -19,15 +19,17 @@ use chrono::{DateTime, Utc};
 use eyre::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use super::{
     api::{
         ConfigureRequest, DeployRequest, DeployResponse, ErrorResponse, PolicyRequest,
-        PreviewRequest, PreviewResponse, StatusResponse,
+        PreviewRequest, PreviewResponse, StatusResponse, WorkerRunPhase, WorkerRunReport,
     },
     config::WorkerConfig,
     journal::{Journal, PendingWork, WorkerJournal, busy_marker},
+    secrets::Secrets,
     sync_client::{PublicationProbe, SyncClient},
 };
 use crate::{
@@ -50,6 +52,7 @@ use crate::{
 /// Everything a request handler or the poll loop needs.
 pub struct WorkerContext {
     config: WorkerConfig,
+    secrets: Secrets,
     journal: Journal,
     sync: SyncClient,
     /// Leaked so `Session<'static>` can move between blocking tasks.
@@ -63,11 +66,11 @@ pub struct WorkerContext {
 }
 
 impl WorkerContext {
-    fn new(config: WorkerConfig, journal: Journal) -> Result<Self> {
+    fn new(config: WorkerConfig, secrets: Secrets, journal: Journal) -> Result<Self> {
         let game = game::from_slug(&config.game)
             .ok_or_else(|| eyre::eyre!("unknown game slug '{}'", config.game))?;
         ensure!(
-            game.server,
+            game.dedicated_server.is_some(),
             "game '{}' has no dedicated-server support",
             config.game
         );
@@ -76,9 +79,10 @@ impl WorkerContext {
 
         Ok(Self {
             cache_dir: config.state_dir.join("cache"),
-            token: WorkerConfig::token()?,
-            sync: SyncClient::new(config.clone()),
+            token: secrets.token()?,
+            sync: SyncClient::new(config.clone(), secrets.seed_refresh_token()),
             config,
+            secrets,
             journal,
             spec: Box::leak(Box::new(spec)),
             operation_lock: Mutex::new(()),
@@ -87,7 +91,7 @@ impl WorkerContext {
 
     /// Opens an authenticated remote session. Runs inside `spawn_blocking`.
     fn connect(&self) -> Result<Box<dyn RemoteOps>> {
-        let password = WorkerConfig::remote_password();
+        let password = self.secrets.remote_password();
         match RemoteConnection::connect(&self.config.remote, &password)? {
             ConnectionAttempt::Connected(connection) => Ok(Box::new(connection)),
             ConnectionAttempt::HostKeyUntrusted { fingerprint } => bail!(
@@ -123,7 +127,7 @@ impl WorkerContext {
     fn host(&self) -> Box<dyn host::HostControl> {
         host::from_settings(
             &self.config.host_control,
-            WorkerConfig::dat_host_password().as_deref(),
+            self.secrets.dat_host_password().as_deref(),
         )
     }
 
@@ -579,15 +583,22 @@ async fn configure(
 /// successful deployment, retried with backoff), and
 /// `last_deployed_revision` (newest fully deployed). Observing a
 /// publication never acknowledges deploying it.
-async fn poll_loop(ctx: Arc<WorkerContext>) {
+async fn poll_loop(ctx: Arc<WorkerContext>, shutdown: CancellationToken) {
     let interval = Duration::from_secs(ctx.config.poll_interval_secs);
 
     // Poll once immediately, since a publication pushed while the worker
     // was down should not wait a full interval, then repeat on the fixed
-    // cadence.
+    // cadence. Both waits select on the shutdown token so a service stop
+    // is answered promptly rather than after the current interval.
     loop {
-        poll_once(&ctx).await;
-        tokio::time::sleep(interval).await;
+        tokio::select! {
+            () = shutdown.cancelled() => break,
+            () = poll_once(&ctx) => {}
+        }
+        tokio::select! {
+            () = shutdown.cancelled() => break,
+            () = tokio::time::sleep(interval) => {}
+        }
     }
 }
 
@@ -729,7 +740,67 @@ async fn poll_once(ctx: &Arc<WorkerContext>) {
 
 // ---------- entry point ----------
 
-pub async fn run(config: WorkerConfig) -> Result<()> {
+/// Writes the worker's run state to `statusFile`, if the config sets one.
+/// The desktop reads this to report service status: a `running` report
+/// left behind while the process is gone means the worker crashed.
+pub fn report_run_state(config: &WorkerConfig, phase: WorkerRunPhase) {
+    let Some(path) = &config.status_file else {
+        return;
+    };
+    let report = WorkerRunReport {
+        worker_id: config.worker_id.clone(),
+        profile_id: config.profile_id.clone(),
+        pid: std::process::id(),
+        phase,
+        at: Utc::now(),
+    };
+    match serde_json::to_vec(&report) {
+        Ok(bytes) => {
+            if let Err(err) = std::fs::write(path, bytes) {
+                warn!(%err, "failed to write worker status file");
+            }
+        }
+        Err(err) => warn!(%err, "failed to serialize worker status"),
+    }
+}
+
+/// Guards against a second worker process using the same state directory.
+/// The remote lease coordinates across machines; this lock covers the
+/// local case, e.g. a manual `gale-worker` run competing with the service.
+fn lock_instance(
+    state_dir: &std::path::Path,
+) -> Result<fd_lock::RwLockWriteGuard<'static, std::fs::File>> {
+    let path = state_dir.join("gale-worker.lock");
+    let file = std::fs::File::create(&path)
+        .with_context(|| format!("failed to open worker lock {}", path.display()))?;
+    // Leaked: the lock lives for the rest of the process by design.
+    let lock = Box::leak(Box::new(fd_lock::RwLock::new(file)));
+    let guard = lock.try_write().map_err(|err| match err.kind() {
+        std::io::ErrorKind::WouldBlock => eyre::eyre!(
+            "another gale-worker instance is already running in {}",
+            state_dir.display()
+        ),
+        _ => eyre::eyre!("failed to lock worker state directory: {err}"),
+    })?;
+    Ok(guard)
+}
+
+/// Serves the HTTP API and runs the poll loop until `shutdown` is
+/// cancelled. The caller writes the terminal status-file report, since it
+/// is the one that knows whether the stop was a request or an OS shutdown.
+pub async fn run(
+    config: WorkerConfig,
+    secrets: Secrets,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    std::fs::create_dir_all(&config.state_dir).with_context(|| {
+        format!(
+            "failed to create worker state directory {}",
+            config.state_dir.display()
+        )
+    })?;
+    let _instance_guard = lock_instance(&config.state_dir)?;
+
     let journal = Journal::load(&config.state_dir)?;
     {
         let mut state = journal.state.lock().await;
@@ -748,7 +819,7 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         journal.save(&state)?;
     }
 
-    let ctx = Arc::new(WorkerContext::new(config, journal)?);
+    let ctx = Arc::new(WorkerContext::new(config, secrets, journal)?);
 
     let app = Router::new()
         .route("/v1/status", get(status))
@@ -764,12 +835,17 @@ pub async fn run(config: WorkerConfig) -> Result<()> {
         .with_context(|| format!("failed to bind worker API on {}", ctx.config.listen))?;
 
     info!(listen = %ctx.config.listen, profile = %ctx.config.profile_id, "gale-worker listening");
+    report_run_state(&ctx.config, WorkerRunPhase::Running);
 
-    tokio::spawn(poll_loop(ctx.clone()));
+    tokio::spawn(poll_loop(ctx.clone(), shutdown.clone()));
 
-    axum::serve(listener, app)
+    let result = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown.cancelled_owned())
         .await
-        .context("worker API server failed")
+        .context("worker API server failed");
+
+    report_run_state(&ctx.config, WorkerRunPhase::Stopped);
+    result
 }
 
 #[cfg(test)]
@@ -836,5 +912,56 @@ mod tests {
         assert_eq!(state.last_seen_revision, Some(revision));
         assert_eq!(state.last_deployed_revision, None);
         assert!(state.pending.is_some());
+    }
+
+    fn status_config(dir: &std::path::Path) -> super::WorkerConfig {
+        super::WorkerConfig {
+            worker_id: "w".to_owned(),
+            profile_id: "p".to_owned(),
+            status_file: Some(dir.join("status.json")),
+            state_dir: dir.to_path_buf(),
+            ..super::WorkerConfig::default()
+        }
+    }
+
+    #[test]
+    fn run_report_lifecycle_writes_parseable_phases() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = status_config(dir.path());
+
+        super::report_run_state(&config, super::WorkerRunPhase::Running);
+        let report: super::WorkerRunReport =
+            serde_json::from_slice(&std::fs::read(config.status_file.as_ref().unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(report.phase, super::WorkerRunPhase::Running);
+        assert_eq!(report.profile_id, "p");
+        assert!(report.pid > 0);
+
+        // Later phases overwrite the file — the reader always sees the
+        // most recent terminal state.
+        super::report_run_state(&config, super::WorkerRunPhase::Shutdown);
+        let report: super::WorkerRunReport =
+            serde_json::from_slice(&std::fs::read(config.status_file.as_ref().unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(report.phase, super::WorkerRunPhase::Shutdown);
+    }
+
+    #[test]
+    fn run_report_is_optional_without_a_status_file() {
+        let config = super::WorkerConfig::default();
+        // No status_file configured: reporting must not fail or create
+        // anything — manual workers have no reader.
+        super::report_run_state(&config, super::WorkerRunPhase::Stopped);
+    }
+
+    #[test]
+    fn a_second_instance_lock_on_the_same_state_dir_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let _first = super::lock_instance(dir.path()).unwrap();
+        let err = super::lock_instance(dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("already running"),
+            "unexpected error: {err:#}"
+        );
     }
 }

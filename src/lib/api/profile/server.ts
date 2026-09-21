@@ -2,6 +2,8 @@ import { invoke } from '$lib/invoke';
 import type {
 	DedicatedServerStatus,
 	DeploySelection,
+	LocalWorkerAction,
+	LocalWorkerStatus,
 	ProfileServerSettings,
 	RemoteConnectionTestResult,
 	RemoteServerSettings,
@@ -125,3 +127,30 @@ export const configureWorker = (
 	invoke('configure_worker', {
 		request: { autoSync, autoMods, restartPolicy, workerToken }
 	});
+
+// ---------- managed local worker ("host worker on this PC") ----------
+
+/// SCM state + status file + live API status for the managed worker.
+export const getLocalWorkerStatus = () =>
+	invoke<LocalWorkerStatus>('get_local_worker_status');
+
+/// Provisions and installs the managed worker: a second Gale sign-in
+/// gives the worker its own credentials, then one UAC-elevated step
+/// registers and starts the Windows service.
+export const provisionLocalWorker = (password = '', datHostPassword = '') =>
+	invoke<LocalWorkerStatus>('provision_local_worker', {
+		request: { password, datHostPassword }
+	});
+
+export const controlLocalWorker = (action: LocalWorkerAction) =>
+	invoke<LocalWorkerStatus>('control_local_worker', { request: { action } });
+
+/// Reinstalls the service with the bundled worker binary, keeping the
+/// installed config, credentials, and journal.
+export const updateLocalWorker = () =>
+	invoke<LocalWorkerStatus>('update_local_worker');
+
+/// Stops and removes the service and its state; the profile falls back
+/// to Local sync when it still points at the managed worker.
+export const uninstallLocalWorker = () =>
+	invoke<LocalWorkerStatus>('uninstall_local_worker');

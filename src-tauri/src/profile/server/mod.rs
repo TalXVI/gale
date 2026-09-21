@@ -10,6 +10,7 @@ pub(crate) mod engine;
 pub(crate) mod host;
 pub(crate) mod lease;
 pub(crate) mod local;
+pub(crate) mod local_worker;
 pub(crate) mod paths;
 pub(crate) mod plan;
 pub(crate) mod remote;

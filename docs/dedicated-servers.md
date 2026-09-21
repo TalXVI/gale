@@ -72,11 +72,44 @@ Gale on your PC connects directly to the server and deploys. Nothing else needs 
 
 ### Worker
 
-`gale-worker` is a standalone binary that runs on the server host itself (or any always-on machine with access to it). It polls the sync service, deploys approved changes on its own, and can restart the server through the hosting provider's API. Your PC does not need to be online for automatic synchronization.
+`gale-worker` is a standalone binary that polls the sync service, deploys approved changes on its own, and can restart the server through the hosting provider's API. It can run on this PC as a managed Windows service, or on a separate always-on machine (a VPS, home server, or NAS) that can reach the game server over FTP/SFTP and the provider's control API.
 
-When to use it: automatic sync, or a host that is only reachable from a fixed location. Some game-panel providers do not allow running arbitrary persistent processes. In that case the worker must live on a separate always-on machine, like a VPS, a home server, or a NAS, that can reach the game server over FTP/SFTP and the provider's control API. File-management and restart APIs alone do not let a host run the worker.
+When to use it: automatic sync, or a host that is only reachable from a fixed location. Some game-panel providers do not allow running arbitrary persistent processes; file-management and restart APIs alone do not let a host run the worker.
 
-#### Installing the worker
+#### Hosting the worker on this PC (Windows)
+
+Choose **A worker service on this PC** in the sync-mode selector and select **Set up worker**. Gale then:
+
+1. Opens a browser sign-in so the worker gets **its own** Gale sync credentials. Sign-in tokens rotate on every use, so the worker cannot safely share the desktop's token — it needs an independent chain.
+2. Stages a worker config and credentials file, then shows **one UAC elevation prompt** that installs and starts the `GaleWorker` Windows service.
+3. Points this profile's sync mode at the worker's loopback address.
+
+Once installed, the service runs as LocalSystem and is independent of the Gale process: it starts with Windows before any user signs in, restarts automatically after a crash, and resumes queued deployments from its journal. Start, Stop, Restart, Uninstall, and an Update button (when a Gale update ships a newer worker) appear in the dialog; none of them need elevation.
+
+State layout:
+
+```text
+C:\ProgramData\Gale\worker\
+  gale-worker.json     worker configuration
+  status.json          last run report (running/stopped/shutdown)
+  worker.log           service log
+  gale-worker.exe      the copy the service actually runs
+  private\             ACL'd to SYSTEM + Administrators only
+    secrets.env        API token, remote credential, sync refresh token
+    gale-worker-state.json   durable journal (pending work, rotated tokens)
+    gale-worker.lock   instance lock — a second worker cannot take it
+    ssh.key            staged copy of the SSH key, when key auth is used
+```
+
+Notes and limitations:
+
+- Windows only. On Linux/macOS the dialog does not offer this option; use an externally hosted worker.
+- SSH **agent** authentication cannot run unattended in a service; use a password or a private key. A private key under `%USERPROFILE%` is copied into `private\` at setup, since LocalSystem cannot read your profile directory.
+- One managed worker per machine: the `GaleWorker` service name and the state-directory lock both reject duplicates.
+- Gale updates ship a newer `gale-worker.exe` beside the app, but the service keeps running its installed copy so updates never fight a locked executable. The dialog shows **Update worker** when the bundled copy is newer; updating keeps credentials and pending work.
+- `status.json` records why the worker last stopped. If the service is stopped but the report says `running`, the process crashed — SCM failure actions restart it. A `shutdown` report means the machine went down and the service returns on the next boot.
+
+#### Installing the worker on a separate host
 
 1. Build the binary: `cargo build --release --features worker --bin gale-worker` in `src-tauri`, or copy a prebuilt binary to the host.
 2. Create `gale-worker.json` (see `src-tauri/src/worker/config.rs` for the full reference):
@@ -134,6 +167,19 @@ In the remote settings, choose **Worker** sync mode and enter the worker's addre
 
 Manual **Deploy** through the worker works regardless of the `autoSync` toggle. You can change the automation toggles (`autoSync`, `autoMods`) and the restart policy from the dialog, and they persist across worker restarts.
 
+#### Moving a managed worker to a VPS
+
+The managed worker's job queue and rotated credentials live in `%ProgramData%\Gale\worker\private`. To move hosting to an external machine without losing pending work or re-doing the sign-in:
+
+1. **Stop the old worker first.** In the dedicated-server dialog choose **Stop**, wait until the service reports `stopped`, and confirm the last `status.json` report is not `running`. Never run two workers against the same server at once — the remote lease prevents simultaneous *deployments*, but the old worker would keep polling and racing the new one.
+2. **Copy the durable state** to the VPS: `private\gale-worker-state.json` (journal: pending work, retry backoff, rotated refresh token) and `private\secrets.env` (API token and credentials). Copy `gale-worker.json` too as a starting point.
+3. On the VPS, write a new `gale-worker.json`: same `profileId` and `game`, the remote settings copied over, `stateDir` pointing at the copied journal, `listen` on an address Gale can reach. Put the copied secrets in `secretsFile` (or the environment), and `secrets.env`'s rotated token keeps the credential chain alive — do **not** reuse the desktop's sign-in for it.
+4. Start the external worker (systemd example above), then switch the profile's sync mode to **An externally hosted worker** with the new address and the same bearer token.
+5. **Uninstall the local service** from the dialog (**Uninstall**) once the external worker reports healthy. Uninstall deletes `%ProgramData%\Gale\worker`, so copy the state out first.
+6. Verify the new worker's profile binding — Gale warns if a worker is bound to a different profile — and that `pendingRevision` drains after the first poll.
+
+If you skip step 2, the new worker simply starts with an empty journal and the desktop sign-in remains the only credential chain — set up fresh credentials on the VPS instead of copying.
+
 ## Deployment coordination
 
 Concurrent deployers coordinate through a lease directory claimed atomically on the remote (`/.gale-deploy.lock`). The holder keeps its lease alive with heartbeats while it works. Release and heartbeat both verify the record still belongs to that operation, so a stale executor cannot delete a newer executor's lease.
@@ -165,9 +211,10 @@ The backend lives in `src-tauri/src/profile/server`:
 - `remote.rs`: SFTP/FTP/FTPS operations; FTPS certificate pinning and verification.
 - `stage.rs`: publication → staged payloads; configs-only operations never touch mod sources.
 - `commands.rs`: Tauri commands, executor dispatch (Local vs Worker), credentials, progress events.
+- `local_worker.rs`: desktop orchestration for the managed Windows worker — provisioning, elevated install/uninstall via `ShellExecuteExW`, SCM status/start/stop, ProgramData layout.
 - `runtime.rs`: the local server process and its profile lock, including the stopping state.
 - `worker_client.rs`: desktop client for the worker API (loopback-only plaintext rule).
-- `src-tauri/src/worker/`: the worker, with its HTTP API (`server.rs`), durable journal (`journal.rs`), config (`config.rs`), sync client (`sync_client.rs`), and shared wire types (`api.rs`).
+- `src-tauri/src/worker/`: the worker, with its HTTP API (`server.rs`), durable journal (`journal.rs`), config (`config.rs`), secrets-file loading (`secrets.rs`), sync client (`sync_client.rs`), shared wire types (`api.rs`), managed-service layout constants (`local.rs`), and the SCM service entry/install/uninstall (`service.rs`, Windows only).
 
 Frontend bindings are in `src/lib/api/profile/server.ts`, the sync dialog is `src/lib/components/dialogs/ServerSyncDialog.svelte`, and user-facing text lives in `messages/en.json` via Paraglide.
 

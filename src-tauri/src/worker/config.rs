@@ -1,13 +1,9 @@
 //! Worker configuration file (`gale-worker.json`).
 //!
-//! Secrets are kept out of this file and taken from the environment:
-//!
-//! - `GALE_WORKER_TOKEN`: bearer token the API requires.
-//! - `GALE_WORKER_REMOTE_PASSWORD`: FTP/SFTP password or key passphrase.
-//! - `GALE_WORKER_REFRESH_TOKEN`: initial Gale sync refresh token. The
-//!   rotated token is then kept in the journal, so this is only a seed.
-//! - `GALE_WORKER_DATHOST_PASSWORD`: DatHost API password, when the host
-//!   provider is DatHost.
+//! Secrets are kept out of this file. They come from the environment
+//! (`GALE_WORKER_TOKEN` and friends) or from a `KEY=value` file referenced
+//! by `secretsFile`, which is how the Gale-managed Windows service passes
+//! them in — see `worker::secrets`.
 //!
 //! Example:
 //!
@@ -39,15 +35,22 @@
 //! }
 //! ```
 
-use std::path::{Path, PathBuf};
+#[cfg(any(windows, feature = "worker"))]
+use std::path::Path;
+use std::path::PathBuf;
 
-use eyre::{Context, Result, ensure};
+#[cfg(any(windows, feature = "worker"))]
+use eyre::Context;
+use eyre::Result;
+#[cfg(feature = "worker")]
+use eyre::ensure;
 use serde::{Deserialize, Serialize};
 
 use crate::profile::server::settings::{HostSettings, RemoteServerSettings, RestartPolicy};
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:8472";
 const DEFAULT_POLL_SECS: u64 = 300;
+#[cfg(feature = "worker")]
 const MIN_POLL_SECS: u64 = 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +84,14 @@ pub struct WorkerConfig {
     pub poll_interval_secs: u64,
     /// Where the journal and staged packages live.
     pub state_dir: PathBuf,
+    /// Optional `KEY=value` file supplying the worker's secrets. Values
+    /// set in the environment still win, so this is a fallback store for
+    /// contexts that cannot provide env vars (e.g. a Windows service).
+    pub secrets_file: Option<PathBuf>,
+    /// Optional path the worker writes its run state to (`running`,
+    /// `stopped`, `shutdown`). The desktop reads it to report service
+    /// status; it stays absent in manual operation.
+    pub status_file: Option<PathBuf>,
 }
 
 impl Default for WorkerConfig {
@@ -98,11 +109,14 @@ impl Default for WorkerConfig {
             restart_policy: RestartPolicy::default(),
             poll_interval_secs: DEFAULT_POLL_SECS,
             state_dir: PathBuf::from("."),
+            secrets_file: None,
+            status_file: None,
         }
     }
 }
 
 impl WorkerConfig {
+    #[cfg(feature = "worker")]
     pub fn load(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path)
             .with_context(|| format!("failed to read worker config {}", path.display()))?;
@@ -115,6 +129,7 @@ impl WorkerConfig {
         Ok(config)
     }
 
+    #[cfg(feature = "worker")]
     pub fn validate(&self) -> Result<()> {
         ensure!(
             !self.worker_id.trim().is_empty(),
@@ -134,33 +149,17 @@ impl WorkerConfig {
         Ok(())
     }
 
-    /// The API bearer token from `GALE_WORKER_TOKEN`.
-    pub fn token() -> Result<String> {
-        std::env::var("GALE_WORKER_TOKEN")
-            .context("GALE_WORKER_TOKEN is not set; the worker API requires a bearer token")
-    }
-
-    /// The remote transport credential from `GALE_WORKER_REMOTE_PASSWORD`.
-    pub fn remote_password() -> String {
-        std::env::var("GALE_WORKER_REMOTE_PASSWORD").unwrap_or_default()
-    }
-
-    /// The initial sync refresh token from `GALE_WORKER_REFRESH_TOKEN`.
-    pub fn seed_refresh_token() -> Option<String> {
-        std::env::var("GALE_WORKER_REFRESH_TOKEN")
-            .ok()
-            .filter(|token| !token.is_empty())
-    }
-
-    /// The DatHost API password from `GALE_WORKER_DATHOST_PASSWORD`.
-    pub fn dat_host_password() -> Option<String> {
-        std::env::var("GALE_WORKER_DATHOST_PASSWORD")
-            .ok()
-            .filter(|token| !token.is_empty())
+    /// Serializes back to a config file. Used by the desktop when it
+    /// provisions the managed local worker.
+    #[cfg(windows)]
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let bytes = serde_json::to_vec_pretty(self).context("failed to serialize worker config")?;
+        std::fs::write(path, bytes)
+            .with_context(|| format!("failed to write worker config {}", path.display()))
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "worker"))]
 mod tests {
     use super::*;
 

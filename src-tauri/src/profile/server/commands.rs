@@ -28,7 +28,7 @@ use crate::{
         server::{
             args,
             engine::{self, EngineProgress, OperationMeta},
-            host, local,
+            host, local, local_worker,
             plan::{self, DeploySelection, Publication},
             remote::{self, ConnectionAttempt, ConnectionTestResult, RemoteConnection, RemoteOps},
             runtime::{self, ServerStatus, SharedChild},
@@ -221,11 +221,11 @@ pub fn set_dedicated_server_settings(
 }
 
 /// The transport credential the remote settings require, if any.
-fn remote_secret(settings: &RemoteServerSettings) -> Option<ServerSecret> {
+pub(crate) fn remote_secret(settings: &RemoteServerSettings) -> Option<ServerSecret> {
     ServerSecret::required_by(settings)
 }
 
-fn persist_credential(
+pub(crate) fn persist_credential(
     secrets: &ServerSecrets,
     secret: Option<ServerSecret>,
     value: &str,
@@ -440,6 +440,65 @@ pub async fn test_worker_connection(
     Ok(status)
 }
 
+// ---------- managed local worker ("host worker on this PC") ----------
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalWorkerProvisionRequest {
+    /// Remote transport credential override when the keyring lacks one.
+    #[serde(default)]
+    pub password: String,
+    /// DatHost account password override when the keyring lacks one.
+    #[serde(default)]
+    pub dat_host_password: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalWorkerControlRequest {
+    pub action: local_worker::LocalWorkerAction,
+}
+
+/// SCM state + status file + live API status for the managed worker.
+#[command]
+pub async fn get_local_worker_status(app: AppHandle) -> Result<local_worker::LocalWorkerStatus> {
+    Ok(local_worker::status(&app).await?)
+}
+
+/// Provisions and installs the managed worker: a second OAuth login gives
+/// it an independent credential chain, then one elevated step registers
+/// and starts the Windows service.
+#[command]
+pub async fn provision_local_worker(
+    request: LocalWorkerProvisionRequest,
+    app: AppHandle,
+) -> Result<local_worker::LocalWorkerStatus> {
+    Ok(local_worker::provision(&app, &request.password, &request.dat_host_password).await?)
+}
+
+#[command]
+pub async fn control_local_worker(
+    request: LocalWorkerControlRequest,
+    app: AppHandle,
+) -> Result<local_worker::LocalWorkerStatus> {
+    Ok(local_worker::control(&app, request.action).await?)
+}
+
+/// Reinstalls the service with the bundled worker binary, keeping the
+/// installed config, credentials, and journal. Used after a Gale update
+/// shipped a newer worker than the installed service runs.
+#[command]
+pub async fn update_local_worker(app: AppHandle) -> Result<local_worker::LocalWorkerStatus> {
+    Ok(local_worker::update(&app).await?)
+}
+
+/// Stops and removes the service and its state, and reverts the profile
+/// to Local sync mode when it still points at the managed worker.
+#[command]
+pub async fn uninstall_local_worker(app: AppHandle) -> Result<local_worker::LocalWorkerStatus> {
+    Ok(local_worker::uninstall(&app).await?)
+}
+
 // ---------- routine synchronization ----------
 
 #[command]
@@ -649,18 +708,18 @@ pub async fn configure_worker(request: ConfigureWorkerRequest, app: AppHandle) -
 
 /// The pinned profile/server context for one operation, captured before
 /// any await so an active-profile switch cannot redirect it (R03).
-struct SyncTarget {
-    profile_id: i64,
+pub(crate) struct SyncTarget {
+    pub(crate) profile_id: i64,
     /// The profile's game slug, captured so plan approvals stay bound to
     /// the originating game across an active-profile switch.
-    game: String,
-    sync_id: Option<String>,
-    mod_loader: &'static ModLoader<'static>,
-    settings: RemoteServerSettings,
-    cache_dir: PathBuf,
+    pub(crate) game: String,
+    pub(crate) sync_id: Option<String>,
+    pub(crate) mod_loader: &'static ModLoader<'static>,
+    pub(crate) settings: RemoteServerSettings,
+    pub(crate) cache_dir: PathBuf,
 }
 
-fn sync_target(app: &AppHandle) -> eyre::Result<SyncTarget> {
+pub(crate) fn sync_target(app: &AppHandle) -> eyre::Result<SyncTarget> {
     let manager = app.lock_manager();
     let profile = manager.active_profile();
     let settings = profile
@@ -712,7 +771,7 @@ fn resolve_executor(
     }
 }
 
-fn worker_client(
+pub(crate) fn worker_client(
     secrets: &ServerSecrets,
     settings: &RemoteServerSettings,
     provided: &str,
@@ -721,7 +780,7 @@ fn worker_client(
     WorkerClient::new(settings, token)
 }
 
-fn remote_credential(
+pub(crate) fn remote_credential(
     secrets: &ServerSecrets,
     settings: &RemoteServerSettings,
     provided: &str,
@@ -1010,7 +1069,7 @@ fn save_settings_for(
     profile.save(app, true)
 }
 
-fn save_remote_settings_for(
+pub(crate) fn save_remote_settings_for(
     app: &AppHandle,
     profile_id: i64,
     remote: RemoteServerSettings,

@@ -71,6 +71,11 @@ pub enum HostProvider {
 pub struct WorkerSettings {
     /// Base URL of the worker's HTTP API, e.g. `http://192.168.1.10:8472`.
     pub address: String,
+    /// Whether `address` points at the Gale-managed Windows service on
+    /// this machine (`gale-worker` installed under ProgramData) rather
+    /// than an independently hosted worker. Provisioning sets it;
+    /// uninstall clears it.
+    pub hosted: bool,
     /// Whether the worker may synchronize new publications on its own.
     /// Manual Deploy Now requests work regardless of this toggle.
     pub auto_sync: bool,

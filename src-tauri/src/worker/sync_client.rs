@@ -15,7 +15,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
 use crate::profile::sync::{self, FetchedPublication, SyncProfileMetadata};
-use crate::worker::{config::WorkerConfig, journal::Journal};
+use crate::worker::{config::WorkerConfig, journal::Journal, secrets};
 
 static DEFAULT_API_URL: &str = "https://gale.kesomannen.com/api";
 
@@ -49,13 +49,17 @@ pub enum PublicationProbe {
 
 pub struct SyncClient {
     config: WorkerConfig,
+    /// The seed refresh token from the worker's secrets, used until the
+    /// journal holds a rotated one.
+    seed_refresh_token: Option<String>,
     http: reqwest::Client,
 }
 
 impl SyncClient {
-    pub fn new(config: WorkerConfig) -> Self {
+    pub fn new(config: WorkerConfig, seed_refresh_token: Option<String>) -> Self {
         Self {
             config,
+            seed_refresh_token,
             http: reqwest::Client::new(),
         }
     }
@@ -79,8 +83,11 @@ impl SyncClient {
             let state = journal.state.lock().await;
             state.refresh_token.clone()
         }
-        .or_else(WorkerConfig::seed_refresh_token)
-        .ok_or_eyre("no refresh token in journal and GALE_WORKER_REFRESH_TOKEN is unset")?;
+        .or_else(|| self.seed_refresh_token.clone())
+        .ok_or_eyre(format!(
+            "no refresh token in journal and {} is unset",
+            secrets::ENV_REFRESH_TOKEN
+        ))?;
 
         let response = self
             .http
@@ -93,7 +100,10 @@ impl SyncClient {
             .context("failed to reach the sync service")?;
 
         if response.status() == StatusCode::UNAUTHORIZED {
-            bail!("sync refresh token was rejected; re-seed GALE_WORKER_REFRESH_TOKEN");
+            bail!(
+                "sync refresh token was rejected; re-seed {}",
+                secrets::ENV_REFRESH_TOKEN
+            );
         }
         let response = response
             .error_for_status()
@@ -363,7 +373,7 @@ mod tests {
         let url = serve(api.clone()).await;
         let (_dir, journal) = journal().await;
 
-        let probe = SyncClient::new(config(url))
+        let probe = SyncClient::new(config(url), None)
             .poll(&journal, None)
             .await
             .unwrap();
@@ -390,7 +400,7 @@ mod tests {
         let url = serve(api.clone()).await;
         let (_dir, journal) = journal().await;
 
-        let probe = SyncClient::new(config(url))
+        let probe = SyncClient::new(config(url), None)
             .poll(&journal, None)
             .await
             .unwrap();
@@ -420,7 +430,7 @@ mod tests {
         let url = serve(api.clone()).await;
         let (_dir, journal) = journal().await;
 
-        let probe = SyncClient::new(config(url))
+        let probe = SyncClient::new(config(url), None)
             .poll(&journal, Some(updated))
             .await
             .unwrap();
@@ -438,7 +448,7 @@ mod tests {
         let url = serve(api).await;
         let (_dir, journal) = journal().await;
 
-        let result = SyncClient::new(config(url)).poll(&journal, None).await;
+        let result = SyncClient::new(config(url), None).poll(&journal, None).await;
         assert!(result.is_err());
     }
 
@@ -452,7 +462,7 @@ mod tests {
         let url = serve(api).await;
         let (_dir, journal) = journal().await;
 
-        let result = SyncClient::new(config(url)).poll(&journal, None).await;
+        let result = SyncClient::new(config(url), None).poll(&journal, None).await;
         assert!(result.is_err());
     }
 
@@ -465,7 +475,7 @@ mod tests {
         let url = serve(api).await;
         let (_dir, journal) = journal().await;
 
-        let result = SyncClient::new(config(url)).poll(&journal, None).await;
+        let result = SyncClient::new(config(url), None).poll(&journal, None).await;
         assert!(result.is_err());
     }
 }
