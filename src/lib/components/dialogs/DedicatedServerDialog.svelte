@@ -122,7 +122,7 @@
 				host: '',
 				port: Number(DEFAULT_SFTP_PORT),
 				username: '',
-				serverDirectory: '',
+				serverDirectory: '/',
 				authentication: 'password',
 				privateKeyPath: '',
 				trustedHostKey: null,
@@ -150,7 +150,7 @@
 			crossplay = value.crossplay;
 			extraArgs = value.extraArgs;
 			remoteHost = value.remote.host;
-			remoteProtocol = value.remote.protocol === 'ftps' ? 'ftp' : value.remote.protocol;
+			remoteProtocol = value.remote.protocol;
 			remotePort = String(
 				value.remote.port || (remoteProtocol === 'sftp' ? DEFAULT_SFTP_PORT : DEFAULT_FTP_PORT)
 			);
@@ -317,7 +317,7 @@
 			await message(
 				!result.encrypted
 					? m.dedicatedServerDialog_connectionPlain({ host: remoteHost })
-					: remoteProtocol === 'ftp' && trustedCertificate
+					: remoteProtocol !== 'sftp' && trustedCertificate
 						? m.dedicatedServerDialog_connectionEncrypted({ host: remoteHost })
 						: m.dedicatedServerDialog_connectionSecure({ host: remoteHost }),
 				{
@@ -547,9 +547,11 @@
 			<Tabs.Content value="remote">
 				<div class="mt-4 flex flex-col gap-3">
 					<InfoBox type={remoteProtocol === 'ftp' ? 'warning' : 'info'}
-						>{remoteProtocol === 'ftp'
-							? m.dedicatedServerDialog_ftpInfo()
-							: m.dedicatedServerDialog_sftpInfo()}</InfoBox
+						>{remoteProtocol === 'sftp'
+							? m.dedicatedServerDialog_sftpInfo()
+							: remoteProtocol === 'ftps'
+								? m.dedicatedServerDialog_ftpsInfo()
+								: m.dedicatedServerDialog_ftpInfo()}</InfoBox
 					>
 					<div>
 						<Label>{m.dedicatedServerDialog_protocol()}</Label>
@@ -560,6 +562,7 @@
 							onValueChange={(value) => changeRemoteProtocol(value as RemoteProtocol)}
 							items={[
 								{ value: 'sftp', label: m.dedicatedServerDialog_protocolSftp() },
+								{ value: 'ftps', label: m.dedicatedServerDialog_protocolFtps() },
 								{ value: 'ftp', label: m.dedicatedServerDialog_protocolFtp() }
 							]}
 						/>

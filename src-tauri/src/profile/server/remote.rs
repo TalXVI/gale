@@ -360,7 +360,7 @@ impl RemoteConnection {
                 }
                 // Plain FTP servers reject AUTH TLS entirely; reconnect and
                 // stay unencrypted instead of failing.
-                if settings.protocol == RemoteProtocol::Ftp && is_ftp_tls_unsupported(&error) {
+                if allows_plaintext_ftp_fallback(settings, &error) {
                     (
                         RustlsFtpStream::connect(address.as_str())
                             .with_context(|| format!("failed to reconnect to {}", settings.host))
@@ -769,6 +769,13 @@ fn is_ftp_tls_unsupported(error: &FtpError) -> bool {
     matches!(error, FtpError::UnexpectedResponse(response) if matches!(response.status, Status::NotImplemented | Status::BadCommand))
 }
 
+/// Whether a failed AUTH TLS negotiation may retry the connection
+/// unencrypted. Only automatic `ftp` mode degrades; an explicit `ftps`
+/// selection fails instead of sending credentials in the clear.
+fn allows_plaintext_ftp_fallback(settings: &RemoteServerSettings, error: &FtpError) -> bool {
+    settings.protocol == RemoteProtocol::Ftp && is_ftp_tls_unsupported(error)
+}
+
 fn ftp_list_entries(entries: Vec<String>) -> Result<Vec<RemoteEntry>> {
     entries
         .into_iter()
@@ -1032,8 +1039,8 @@ mod tests {
     use suppaftp::{FtpError, Status, types::Response};
 
     use super::{
-        FtpsCertVerifier, certificate_fingerprint, ftp_list_entries, is_ftp_not_found,
-        is_ftp_tls_unsupported,
+        FtpsCertVerifier, RemoteProtocol, RemoteServerSettings, allows_plaintext_ftp_fallback,
+        certificate_fingerprint, ftp_list_entries, is_ftp_not_found, is_ftp_tls_unsupported,
     };
 
     #[test]
@@ -1064,6 +1071,31 @@ mod tests {
         ));
 
         assert!(is_ftp_tls_unsupported(&unsupported));
+    }
+
+    /// Only automatic `ftp` mode may drop to plaintext when the server
+    /// refuses AUTH TLS. A strict `ftps` selection must surface the
+    /// failure instead of logging in unencrypted.
+    #[test]
+    fn strict_ftps_never_falls_back_to_plaintext() {
+        let tls_refused = FtpError::UnexpectedResponse(Response::new(
+            Status::from(502),
+            b"502 AUTH TLS not implemented".to_vec(),
+        ));
+        let unrelated = FtpError::UnexpectedResponse(Response::new(
+            Status::from(550),
+            b"550 unrelated".to_vec(),
+        ));
+
+        let mut settings = RemoteServerSettings {
+            protocol: RemoteProtocol::Ftp,
+            ..Default::default()
+        };
+        assert!(allows_plaintext_ftp_fallback(&settings, &tls_refused));
+        assert!(!allows_plaintext_ftp_fallback(&settings, &unrelated));
+
+        settings.protocol = RemoteProtocol::Ftps;
+        assert!(!allows_plaintext_ftp_fallback(&settings, &tls_refused));
     }
 
     // ---------- FTPS certificate verification ----------

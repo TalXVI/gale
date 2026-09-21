@@ -17,8 +17,9 @@ The server must already be installed. Gale manages only the process it starts, s
 Choose **Remote server** and enter the connection details supplied by the server host.
 
 - **SFTP (SSH)** supports password and private-key authentication. Confirm the host-key fingerprint the first time Gale connects.
-- **FTP / FTPS (automatic)** tries encrypted explicit FTPS first and falls back to plain FTP only when the host does not support TLS. If you pin a certificate fingerprint, the connection requires that exact certificate, so a different CA-valid certificate does not satisfy the pin. Self-signed certificates require an explicit trust decision before Gale sends credentials.
-- **Server directory** is the directory exposed by the host. Use `/` when the FTP account already opens at the server root.
+- **FTPS (TLS required)** encrypts FTP with TLS and fails instead of falling back to plaintext. If you pin a certificate fingerprint, the connection requires that exact certificate, so a different CA-valid certificate does not satisfy the pin. Self-signed certificates require an explicit trust decision before Gale sends credentials.
+- **FTP (automatic TLS, allows plaintext fallback)** tries encrypted FTPS first and falls back to plain FTP when the host does not support TLS. The same certificate-pinning rules apply while TLS is active.
+- **Server directory** is the directory exposed by the host and defaults to `/`, which fits accounts that already open at the server root.
 
 Use **Test connection** before syncing.
 

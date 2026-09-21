@@ -365,6 +365,23 @@ mod tests {
         assert_eq!(settings.remote.host, "example.com");
     }
 
+    /// `"ftps"` is a distinct protocol on the wire: it must not collapse
+    /// into `ftp` when settings round-trip, or a strict-TLS selection
+    /// would silently gain plaintext fallback.
+    #[test]
+    fn ftps_round_trips_as_a_distinct_protocol() {
+        let settings = RemoteServerSettings {
+            protocol: RemoteProtocol::Ftps,
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(&settings).unwrap();
+        assert_eq!(value["protocol"], "ftps");
+
+        let parsed: RemoteServerSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.protocol, RemoteProtocol::Ftps);
+    }
+
     #[test]
     fn tolerates_partial_payloads() {
         let settings: ProfileServerSettings =
