@@ -16,7 +16,7 @@ use suppaftp::rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     pki_types::{CertificateDer, ServerName, UnixTime},
 };
-use suppaftp::{FtpError, RustlsConnector, RustlsFtpStream, Status};
+use suppaftp::{FtpError, RustlsConnector, RustlsFtpStream, Status, types::FileType};
 
 use super::{
     paths::RemotePath,
@@ -396,6 +396,15 @@ impl RemoteConnection {
             .context("FTP authentication failed")
             .map_err(FtpConnectError::Other)?;
 
+        // Binary mode is required for byte-exact transfers — ASCII mode
+        // may newline-mangle payloads — and some servers (e.g. DatHost's
+        // ProFTPD) refuse SIZE entirely while in ASCII mode, which would
+        // make existing files look absent.
+        stream
+            .transfer_type(FileType::Binary)
+            .context("FTP server refused binary transfer mode")
+            .map_err(FtpConnectError::Other)?;
+
         Ok((RemoteClient::Ftp(stream), encrypted))
     }
 
@@ -428,20 +437,24 @@ impl RemoteOps for RemoteConnection {
                 Err(err) if is_sftp_not_found(&err) => Ok(false),
                 Err(err) => Err(err.into()),
             },
-            RemoteClient::Ftp(ftp) => {
-                let original = ftp.pwd()?;
-                match ftp.cwd(path.as_str()) {
-                    Ok(()) => {
-                        ftp.cwd(original)?;
-                        Ok(true)
+            RemoteClient::Ftp(ftp) => match ftp_mlst(ftp, path.as_str())? {
+                Mlst::Facts(facts) => Ok(facts.is_dir),
+                Mlst::Absent => Ok(false),
+                Mlst::Unsupported => {
+                    let original = ftp.pwd()?;
+                    match ftp.cwd(path.as_str()) {
+                        Ok(()) => {
+                            ftp.cwd(original)?;
+                            Ok(true)
+                        }
+                        Err(err) if is_ftp_not_found(&err) => {
+                            ftp.cwd(original)?;
+                            Ok(false)
+                        }
+                        Err(err) => Err(err.into()),
                     }
-                    Err(err) if is_ftp_not_found(&err) => {
-                        ftp.cwd(original)?;
-                        Ok(false)
-                    }
-                    Err(err) => Err(err.into()),
                 }
-            }
+            },
         }
     }
 
@@ -453,10 +466,14 @@ impl RemoteOps for RemoteConnection {
                 Err(err) if is_sftp_not_found(&err) => Ok(None),
                 Err(err) => Err(err.into()),
             },
-            RemoteClient::Ftp(ftp) => match ftp.size(path.as_str()) {
-                Ok(size) => Ok(Some(size as u64)),
-                Err(err) if is_ftp_not_found(&err) || is_ftp_size_unsupported(&err) => Ok(None),
-                Err(err) => Err(err.into()),
+            RemoteClient::Ftp(ftp) => match ftp_mlst(ftp, path.as_str())? {
+                Mlst::Absent => Ok(None),
+                Mlst::Facts(facts) if facts.is_dir => Ok(None),
+                Mlst::Facts(facts) => match facts.size {
+                    Some(size) => Ok(Some(size)),
+                    None => ftp_size(ftp, path.as_str()),
+                },
+                Mlst::Unsupported => ftp_size(ftp, path.as_str()),
             },
         }
     }
@@ -486,20 +503,19 @@ impl RemoteOps for RemoteConnection {
     }
 
     fn read(&mut self, path: &RemotePath, max: u64) -> Result<Option<Vec<u8>>> {
-        // Check the size first so oversized files are never downloaded.
-        match self.file_size(path)? {
-            Some(size) if size > max => {
-                bail!("remote file {path} is {size} bytes, exceeding the {max}-byte limit")
-            }
-            Some(_) => {}
-            None => {
-                if !self.is_file(path)? {
-                    return Ok(None);
-                }
-            }
+        // A concrete size lets oversized downloads be refused before the
+        // transfer starts. When the server cannot report one — `SIZE` is
+        // refused in FTP ASCII mode on some hosts, and an absent file
+        // reports the same way — the transfer itself decides existence
+        // and the cap is enforced on the received bytes.
+        if let Some(size) = self.file_size(path)? {
+            ensure!(
+                size <= max,
+                "remote file {path} is {size} bytes, exceeding the {max}-byte limit"
+            );
         }
 
-        match &mut self.client {
+        let result: Option<Vec<u8>> = match &mut self.client {
             RemoteClient::Sftp { sftp, .. } => match sftp.open(Path::new(path.as_str())) {
                 Ok(file) => {
                     let mut bytes = Vec::new();
@@ -508,10 +524,10 @@ impl RemoteOps for RemoteConnection {
                         bytes.len() as u64 <= max,
                         "remote file {path} exceeds the {max}-byte limit"
                     );
-                    Ok(Some(bytes))
+                    Some(bytes)
                 }
-                Err(err) if is_sftp_not_found(&err) => Ok(None),
-                Err(err) => Err(err.into()),
+                Err(err) if is_sftp_not_found(&err) => None,
+                Err(err) => return Err(err.into()),
             },
             RemoteClient::Ftp(ftp) => match ftp.retr_as_buffer(path.as_str()) {
                 Ok(bytes) => {
@@ -520,12 +536,22 @@ impl RemoteOps for RemoteConnection {
                         bytes.len() as u64 <= max,
                         "remote file {path} exceeds the {max}-byte limit"
                     );
-                    Ok(Some(bytes))
+                    Some(bytes)
                 }
-                Err(err) if is_ftp_not_found(&err) => Ok(None),
-                Err(err) => Err(err.into()),
+                Err(err) if is_ftp_not_found(&err) => None,
+                Err(err) => return Err(err.into()),
             },
+        };
+
+        // A RETR 550 conflates "absent" with "the server refuses to
+        // return this file" — filtering hosts use the same status for
+        // both. Cross-check existence so a refused read surfaces as an
+        // error rather than a silently empty one.
+        if result.is_none() && matches!(self.client, RemoteClient::Ftp(_)) && self.is_file(path)? {
+            bail!("remote server refuses to return the existing file {path}");
         }
+
+        Ok(result)
     }
 
     fn is_file(&mut self, path: &RemotePath) -> Result<bool> {
@@ -535,10 +561,10 @@ impl RemoteOps for RemoteConnection {
                 Err(err) if is_sftp_not_found(&err) => Ok(false),
                 Err(err) => Err(err.into()),
             },
-            RemoteClient::Ftp(ftp) => match ftp.size(path.as_str()) {
-                Ok(_) => Ok(true),
-                Err(err) if is_ftp_not_found(&err) || is_ftp_size_unsupported(&err) => Ok(false),
-                Err(err) => Err(err.into()),
+            RemoteClient::Ftp(ftp) => match ftp_mlst(ftp, path.as_str())? {
+                Mlst::Facts(facts) => Ok(!facts.is_dir),
+                Mlst::Absent => Ok(false),
+                Mlst::Unsupported => ftp_size(ftp, path.as_str()).map(|size| size.is_some()),
             },
         }
     }
@@ -777,12 +803,83 @@ fn is_ftp_not_found(error: &FtpError) -> bool {
     matches!(error, FtpError::UnexpectedResponse(response) if response.status == Status::FileUnavailable)
 }
 
+/// Whether the server does not implement the command at all (500/502),
+/// meaning callers should use their pre-RFC-3659 fallback probe.
+fn is_ftp_command_unsupported(error: &FtpError) -> bool {
+    matches!(error, FtpError::UnexpectedResponse(response) if matches!(response.status, Status::NotImplemented | Status::BadCommand))
+}
+
 fn is_ftp_size_unsupported(error: &FtpError) -> bool {
     matches!(error, FtpError::UnexpectedResponse(response) if FTP_SIZE_UNAVAILABLE.contains(&response.status))
 }
 
 fn is_ftp_tls_unsupported(error: &FtpError) -> bool {
-    matches!(error, FtpError::UnexpectedResponse(response) if matches!(response.status, Status::NotImplemented | Status::BadCommand))
+    is_ftp_command_unsupported(error)
+}
+
+/// What an RFC 3659 `MLST` probe learned about a path. `MLST` reports
+/// `type=` and `size=` facts for one path in a single command, which makes
+/// it the most reliable existence probe on FTP servers that restrict
+/// `SIZE` (e.g. ProFTPD's "SIZE not allowed in ASCII mode") or filter
+/// files out of listings entirely.
+enum Mlst {
+    /// The path exists; the server's facts describe it.
+    Facts(MlstFacts),
+    /// The server reported the path does not exist.
+    Absent,
+    /// The server does not implement `MLST`; callers should use their
+    /// fallback probe (CWD for directories, SIZE for files).
+    Unsupported,
+}
+
+struct MlstFacts {
+    /// `type=` was `dir`, `cdir`, or `pdir`.
+    is_dir: bool,
+    /// The `size=` fact, when the server reported one.
+    size: Option<u64>,
+}
+
+fn ftp_mlst(ftp: &mut RustlsFtpStream, path: &str) -> Result<Mlst> {
+    match ftp.mlst(Some(path)) {
+        Ok(line) => Ok(Mlst::Facts(parse_mlst_facts(&line))),
+        Err(err) if is_ftp_not_found(&err) => Ok(Mlst::Absent),
+        Err(err) if is_ftp_command_unsupported(&err) => Ok(Mlst::Unsupported),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Parses an MLST fact line like `modify=..;size=227;type=file; <path>`:
+/// the fact list runs to the first space, then the pathname follows.
+fn parse_mlst_facts(line: &str) -> MlstFacts {
+    let facts = line.split_once(' ').map_or(line, |(facts, _)| facts);
+    let mut parsed = MlstFacts {
+        is_dir: false,
+        size: None,
+    };
+
+    for fact in facts.split(';') {
+        match fact.split_once('=') {
+            Some(("type", kind)) => {
+                parsed.is_dir = matches!(kind, "dir" | "cdir" | "pdir");
+            }
+            Some(("size", size)) => parsed.size = size.trim().parse().ok(),
+            _ => {}
+        }
+    }
+
+    parsed
+}
+
+/// `SIZE` as an existence/size probe — the pre-RFC-3659 fallback. A 550
+/// or 500/502 response means the size cannot be determined this way,
+/// either because the path is absent or because the server refuses the
+/// command (as with ProFTPD in ASCII mode).
+fn ftp_size(ftp: &mut RustlsFtpStream, path: &str) -> Result<Option<u64>> {
+    match ftp.size(path) {
+        Ok(size) => Ok(Some(size as u64)),
+        Err(err) if is_ftp_not_found(&err) || is_ftp_size_unsupported(&err) => Ok(None),
+        Err(err) => Err(err.into()),
+    }
 }
 
 /// Whether a failed AUTH TLS negotiation may retry the connection
@@ -1169,6 +1266,460 @@ pub(crate) mod memory {
     }
 }
 
+/// An in-memory FTP endpoint for end-to-end tests. Unlike
+/// [`memory::MemoryRemote`], which stubs [`RemoteOps`] directly, this
+/// serves the actual wire protocol — USER/PASS/TYPE/PWD/CWD/PASV/LIST/
+/// MLST/SIZE/MDTM/RETR/STOR/RNFR/RNTO/DELE/MKD/RMD — so tests exercise
+/// `RemoteConnection`'s real command and error handling.
+///
+/// The knobs reproduce observed hosting behaviors: DatHost's ProFTPD
+/// refuses `SIZE` while in ASCII mode, and a deeper filtering host could
+/// refuse `RETR` on existing files while still proving their existence
+/// through `MLST`.
+#[cfg(test)]
+pub(crate) mod fake_ftp {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+
+    /// Behaviors the fake server can exhibit.
+    #[derive(Default, Clone, Copy)]
+    pub struct Options {
+        /// Refuse `SIZE` until the client sends `TYPE I` — DatHost's
+        /// ProFTPD answers `550 SIZE not allowed in ASCII mode`.
+        pub size_requires_binary: bool,
+        /// Refuse `RETR` even for files that exist and are provable via
+        /// `MLST` — a deeper read filter.
+        pub refuse_retr: bool,
+        /// Do not implement `MLST` (a pre-RFC-3659 host).
+        pub no_mlst: bool,
+    }
+
+    /// A running fake server. `fs` is shared with every accepted
+    /// connection, so tests observe and seed the remote filesystem
+    /// directly.
+    pub struct FakeFtp {
+        pub addr: SocketAddr,
+        /// Every `VERB arg` line received, for protocol assertions.
+        pub commands: Arc<Mutex<Vec<String>>>,
+        fs: Arc<Mutex<Fs>>,
+    }
+
+    #[derive(Default)]
+    struct Fs {
+        dirs: BTreeSet<String>,
+        files: BTreeMap<String, Vec<u8>>,
+    }
+
+    impl Fs {
+        fn exists(&self, path: &str) -> bool {
+            self.dirs.contains(path) || self.files.contains_key(path)
+        }
+
+        /// Immediate children of `dir` as `(name, is_dir)` pairs.
+        fn children(&self, dir: &str) -> Vec<(String, bool)> {
+            let prefix = format!("{}/", dir.trim_end_matches('/'));
+            let mut children = BTreeMap::new();
+
+            let mut collect = |path: &String, is_dir: bool| {
+                let Some(rest) = path.strip_prefix(&prefix) else {
+                    return;
+                };
+                if rest.is_empty() {
+                    return;
+                }
+                match rest.split_once('/') {
+                    None => {
+                        children.insert(rest.to_owned(), is_dir);
+                    }
+                    Some((head, _)) => {
+                        children.insert(head.to_owned(), true);
+                    }
+                }
+            };
+
+            for dir in &self.dirs {
+                collect(dir, true);
+            }
+            for file in self.files.keys() {
+                collect(file, false);
+            }
+            children.into_iter().collect()
+        }
+    }
+
+    /// Normalizes `path` to an absolute canonical form (`//`, `.`, `..`
+    /// resolved lexically; FTP has no symlinks here).
+    fn normalize(path: &str) -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        for segment in path.split('/') {
+            match segment {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                other => parts.push(other),
+            }
+        }
+        format!("/{}", parts.join("/"))
+    }
+
+    fn resolve(cwd: &str, arg: &str) -> String {
+        if arg.starts_with('/') {
+            normalize(arg)
+        } else {
+            normalize(&format!("{}/{}", cwd.trim_end_matches('/'), arg))
+        }
+    }
+
+    impl FakeFtp {
+        pub fn spawn(options: Options) -> Self {
+            let fs = Arc::new(Mutex::new(Fs {
+                dirs: ["/".to_owned()].into_iter().collect(),
+                ..Default::default()
+            }));
+            let commands = Arc::new(Mutex::new(Vec::new()));
+
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            {
+                let fs = fs.clone();
+                let commands = commands.clone();
+                std::thread::spawn(move || {
+                    for stream in listener.incoming() {
+                        match stream {
+                            Ok(stream) => {
+                                let fs = fs.clone();
+                                let commands = commands.clone();
+                                std::thread::spawn(move || serve(stream, &fs, &commands, &options));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+
+            Self { addr, commands, fs }
+        }
+
+        /// A server pre-seeded like a Valheim install, Gale-metadata
+        /// absent: the layout a first deployment sees.
+        pub fn valheim_host(options: Options) -> Self {
+            let server = Self::spawn(options);
+            server.seed_dir("/BepInEx");
+            server.seed_dir("/BepInEx/config");
+            server.seed_dir("/BepInEx/plugins");
+            server.seed_dir("/BepInEx/core");
+            server.seed_file("/BepInEx/config/BepInEx.cfg", b"[settings]\n");
+            server
+        }
+
+        pub fn seed_dir(&self, path: &str) {
+            self.fs.lock().unwrap().dirs.insert(normalize(path));
+        }
+
+        pub fn seed_file(&self, path: &str, bytes: &[u8]) {
+            self.fs
+                .lock()
+                .unwrap()
+                .files
+                .insert(normalize(path), bytes.to_vec());
+        }
+
+        pub fn file(&self, path: &str) -> Option<Vec<u8>> {
+            self.fs.lock().unwrap().files.get(&normalize(path)).cloned()
+        }
+
+        pub fn has_dir(&self, path: &str) -> bool {
+            self.fs.lock().unwrap().dirs.contains(&normalize(path))
+        }
+
+        /// Whether the client ever sent a command starting with
+        /// `prefix` (e.g. `TYPE I`).
+        pub fn saw(&self, prefix: &str) -> bool {
+            self.commands
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|line| line.starts_with(prefix))
+        }
+    }
+
+    fn send(writer: &mut TcpStream, text: &str) -> bool {
+        writer.write_all(format!("{text}\r\n").as_bytes()).is_ok()
+    }
+
+    /// The last space-separated argument, or the whole line when the
+    /// command carries none.
+    fn arg_of(line: &str) -> &str {
+        line.split_once(' ').map_or("", |(_, arg)| arg).trim()
+    }
+
+    fn serve(
+        stream: TcpStream,
+        fs: &Arc<Mutex<Fs>>,
+        commands: &Arc<Mutex<Vec<String>>>,
+        options: &Options,
+    ) {
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut passive: Option<TcpListener> = None;
+        let mut cwd = "/".to_owned();
+        let mut binary = false;
+        let mut rename_from: Option<String> = None;
+        let mut line = String::new();
+
+        /// Opens the pending passive data connection, if any.
+        macro_rules! data {
+            () => {
+                passive
+                    .take()
+                    .and_then(|listener| listener.accept().ok())
+                    .map(|(stream, _)| stream)
+            };
+        }
+
+        if !send(&mut writer, "220 fake ftp ready") {
+            return;
+        }
+
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                return;
+            }
+            let command = line.trim_end().to_owned();
+            commands.lock().unwrap().push(command.clone());
+            let verb = command
+                .split(' ')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_uppercase();
+            let path = resolve(&cwd, arg_of(&command));
+
+            let response = match verb.as_str() {
+                "AUTH" => "502 TLS is not supported".to_owned(),
+                "USER" => "331 password required".to_owned(),
+                "PASS" => "230 logged in".to_owned(),
+                "SYST" => "215 UNIX Type: L8".to_owned(),
+                "TYPE" => match arg_of(&command).to_ascii_uppercase().as_str() {
+                    "I" => {
+                        binary = true;
+                        "200 binary mode".to_owned()
+                    }
+                    "A" => {
+                        binary = false;
+                        "200 ascii mode".to_owned()
+                    }
+                    _ => "504 unsupported type".to_owned(),
+                },
+                "MODE" | "STRU" | "NOOP" | "OPTS" => "200 ok".to_owned(),
+                "PWD" | "XPWD" => format!("257 \"{cwd}\" is the current directory"),
+                "CWD" => {
+                    if fs.lock().unwrap().dirs.contains(&path) {
+                        cwd = path;
+                        "250 directory changed".to_owned()
+                    } else {
+                        "550 no such directory".to_owned()
+                    }
+                }
+                "CDUP" => {
+                    cwd = resolve(&cwd, "..");
+                    "250 directory changed".to_owned()
+                }
+                "PASV" => {
+                    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                    let port = listener.local_addr().unwrap().port();
+                    passive = Some(listener);
+                    format!(
+                        "227 Entering Passive Mode (127,0,0,1,{},{})",
+                        port / 256,
+                        port % 256
+                    )
+                }
+                "MLST" => {
+                    if options.no_mlst {
+                        "502 MLST not implemented".to_owned()
+                    } else {
+                        let fs = fs.lock().unwrap();
+                        // RFC 3659 multi-line form: the facts line is what
+                        // `mlst` returns to the caller.
+                        let facts = if let Some(bytes) = fs.files.get(&path) {
+                            Some(format!(
+                                " type=file;size={};modify=20240101000000; {path}",
+                                bytes.len()
+                            ))
+                        } else if fs.dirs.contains(&path) {
+                            Some(format!(" type=dir;modify=20240101000000; {path}"))
+                        } else {
+                            None
+                        };
+                        match facts {
+                            None => "550 no such file or directory".to_owned(),
+                            Some(facts) => {
+                                if !send(&mut writer, "250-MLST") || !send(&mut writer, &facts) {
+                                    return;
+                                }
+                                "250 End".to_owned()
+                            }
+                        }
+                    }
+                }
+                "SIZE" => {
+                    if options.size_requires_binary && !binary {
+                        "550 SIZE not allowed in ASCII mode.".to_owned()
+                    } else {
+                        match fs.lock().unwrap().files.get(&path) {
+                            Some(bytes) => format!("213 {}", bytes.len()),
+                            None => "550 is not retrievable".to_owned(),
+                        }
+                    }
+                }
+                "MDTM" => {
+                    if fs.lock().unwrap().files.contains_key(&path) {
+                        "213 20240101000000".to_owned()
+                    } else {
+                        "550 is not retrievable".to_owned()
+                    }
+                }
+                "RETR" => match fs.lock().unwrap().files.get(&path).cloned() {
+                    Some(_) if options.refuse_retr => "550 refused".to_owned(),
+                    Some(bytes) => {
+                        if !send(&mut writer, "150 opening data connection") {
+                            return;
+                        }
+                        if let Some(mut data) = data!() {
+                            let _ = data.write_all(&bytes);
+                        }
+                        "226 transfer complete".to_owned()
+                    }
+                    None => "550 no such file or directory".to_owned(),
+                },
+                "STOR" => {
+                    if !send(&mut writer, "150 opening data connection") {
+                        return;
+                    }
+                    let mut bytes = Vec::new();
+                    if let Some(mut data) = data!() {
+                        let _ = data.read_to_end(&mut bytes);
+                    }
+                    fs.lock().unwrap().files.insert(path.clone(), bytes);
+                    "226 transfer complete".to_owned()
+                }
+                "LIST" | "NLST" => {
+                    let lines = {
+                        let fs = fs.lock().unwrap();
+                        if !fs.dirs.contains(&path) {
+                            None
+                        } else {
+                            Some(
+                                fs.children(&path)
+                                    .into_iter()
+                                    .map(|(name, is_dir)| {
+                                        if verb == "NLST" {
+                                            format!("{name}\r\n")
+                                        } else {
+                                            let child = normalize(&format!(
+                                                "{}/{}",
+                                                path.trim_end_matches('/'),
+                                                name
+                                            ));
+                                            let (perm, size) = if is_dir {
+                                                ("drwxrwxrwx", 4096)
+                                            } else {
+                                                (
+                                                    "-rw-rw-rw-",
+                                                    fs.files.get(&child).map_or(0, Vec::len),
+                                                )
+                                            };
+                                            format!(
+                                                "{perm}   1 dathost  users {size:>8} Sep 09 12:01 {name}\r\n"
+                                            )
+                                        }
+                                    })
+                                    .collect::<Vec<_>>(),
+                            )
+                        }
+                    };
+                    match lines {
+                        None => "550 no such directory".to_owned(),
+                        Some(lines) => {
+                            if !send(&mut writer, "150 opening data connection") {
+                                return;
+                            }
+                            if let Some(mut data) = data!() {
+                                for line in lines {
+                                    let _ = data.write_all(line.as_bytes());
+                                }
+                            }
+                            "226 transfer complete".to_owned()
+                        }
+                    }
+                }
+                "RNFR" => {
+                    if fs.lock().unwrap().exists(&path) {
+                        rename_from = Some(path.clone());
+                        "350 ready for destination".to_owned()
+                    } else {
+                        rename_from = None;
+                        "550 no such file".to_owned()
+                    }
+                }
+                "RNTO" => match rename_from.take() {
+                    Some(from) => {
+                        let mut fs = fs.lock().unwrap();
+                        if let Some(bytes) = fs.files.remove(&from) {
+                            fs.files.insert(path.clone(), bytes);
+                        } else if fs.dirs.remove(&from) {
+                            fs.dirs.insert(path.clone());
+                        }
+                        "250 renamed".to_owned()
+                    }
+                    None => "503 RNFR first".to_owned(),
+                },
+                "DELE" => {
+                    if fs.lock().unwrap().files.remove(&path).is_some() {
+                        "250 deleted".to_owned()
+                    } else {
+                        "550 no such file".to_owned()
+                    }
+                }
+                "MKD" => {
+                    let mut fs = fs.lock().unwrap();
+                    let parent = resolve("/", &format!("{}/..", path));
+                    if fs.exists(&path) || !fs.dirs.contains(&parent) {
+                        "550 unavailable".to_owned()
+                    } else {
+                        fs.dirs.insert(path.clone());
+                        format!("257 \"{path}\" created")
+                    }
+                }
+                "RMD" => {
+                    let mut fs = fs.lock().unwrap();
+                    let empty = fs.children(&path).is_empty();
+                    if fs.dirs.contains(&path) && empty {
+                        fs.dirs.remove(&path);
+                        "250 removed".to_owned()
+                    } else {
+                        "550 unavailable".to_owned()
+                    }
+                }
+                "QUIT" => {
+                    let _ = send(&mut writer, "221 goodbye");
+                    return;
+                }
+                _ => "502 not implemented".to_owned(),
+            };
+
+            if !send(&mut writer, &response) {
+                return;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1181,10 +1732,12 @@ mod tests {
     use suppaftp::{FtpError, Status, types::Response};
 
     use super::{
-        FtpsCertVerifier, RemoteProtocol, RemoteServerSettings, allows_plaintext_ftp_fallback,
+        ConnectionAttempt, FtpsCertVerifier, RemoteClient, RemoteConnection, RemoteOps,
+        RemoteProtocol, RemoteServerSettings, allows_plaintext_ftp_fallback,
         certificate_fingerprint, ftp_list_entries, ftps_client_config, is_ftp_not_found,
         is_ftp_tls_unsupported,
     };
+    use eyre::Result;
 
     #[test]
     fn parses_ftp_directory_responses() {
@@ -1625,5 +2178,290 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    // ---------- live-protocol tests against the in-memory FTP server ----------
+
+    use super::fake_ftp::{FakeFtp, Options as FakeFtpOptions};
+    use super::memory::MemoryRemote;
+    use crate::profile::server::paths::RemotePathBuf;
+    use crate::profile::server::settings::RemoteAuthentication;
+
+    fn ftp_connect(server: &FakeFtp) -> RemoteConnection {
+        let settings = RemoteServerSettings {
+            protocol: RemoteProtocol::Ftp,
+            host: "127.0.0.1".to_owned(),
+            port: server.addr.port(),
+            username: "u".to_owned(),
+            server_directory: "/".to_owned(),
+            authentication: RemoteAuthentication::Password,
+            ..Default::default()
+        };
+        match RemoteConnection::connect(&settings, "pw").unwrap() {
+            ConnectionAttempt::Connected(conn) => conn,
+            _ => panic!("plaintext fallback should connect to the fake"),
+        }
+    }
+
+    fn remote_path(path: &str) -> RemotePathBuf {
+        RemotePathBuf::new(path).unwrap()
+    }
+
+    /// The DatHost profile verified against the live server: `SIZE` is
+    /// refused in ASCII mode (`550 SIZE not allowed in ASCII mode`),
+    /// while dot-prefixed paths are fully visible to LIST/MLST/MDTM/RETR.
+    /// Before the fix, `read` gated on `file_size`/`is_file`, so a
+    /// retrievable file looked absent — the false "lease taken over".
+    #[test]
+    fn reads_stay_correct_when_size_is_refused_in_ascii() {
+        let server = FakeFtp::valheim_host(FakeFtpOptions {
+            size_requires_binary: true,
+            ..Default::default()
+        });
+        server.seed_dir("/BepInEx/config/.gale-deploy.lock");
+        server.seed_file(
+            "/BepInEx/config/.gale-deploy.lock/lease.json",
+            b"{\"owner\":\"x\"}",
+        );
+
+        let mut conn = ftp_connect(&server);
+        assert!(server.saw("TYPE I"), "binary mode must be negotiated");
+
+        let lease = remote_path("/BepInEx/config/.gale-deploy.lock/lease.json");
+        assert_eq!(
+            conn.read(lease.as_path(), 64 * 1024).unwrap(),
+            Some(b"{\"owner\":\"x\"}".to_vec())
+        );
+        assert!(conn.is_file(lease.as_path()).unwrap());
+        assert_eq!(conn.file_size(lease.as_path()).unwrap(), Some(13));
+        assert!(
+            conn.is_dir(remote_path("/BepInEx/config/.gale-deploy.lock").as_path())
+                .unwrap()
+        );
+
+        // Genuinely absent paths still read as absent — not confused
+        // with the SIZE refusal.
+        let absent = remote_path("/BepInEx/config/.gale-server-state.json");
+        assert_eq!(conn.read(absent.as_path(), 64 * 1024).unwrap(), None);
+        assert!(!conn.is_file(absent.as_path()).unwrap());
+        assert_eq!(conn.file_size(absent.as_path()).unwrap(), None);
+
+        // Listings include dot-prefixed entries.
+        let entries = conn.list(remote_path("/BepInEx/config").as_path()).unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.name == ".gale-deploy.lock" && entry.is_directory)
+        );
+    }
+
+    /// On a host without RFC 3659 the same probes fall back to the
+    /// pre-3659 commands and still work once binary mode is on.
+    #[test]
+    fn reads_work_without_mlst() {
+        let server = FakeFtp::valheim_host(FakeFtpOptions {
+            size_requires_binary: true,
+            no_mlst: true,
+            ..Default::default()
+        });
+        server.seed_file("/BepInEx/config/file.cfg", b"abc");
+
+        let mut conn = ftp_connect(&server);
+        let path = remote_path("/BepInEx/config/file.cfg");
+        assert!(conn.is_file(path.as_path()).unwrap());
+        assert_eq!(conn.file_size(path.as_path()).unwrap(), Some(3));
+        assert_eq!(
+            conn.read(path.as_path(), 64 * 1024).unwrap(),
+            Some(b"abc".to_vec())
+        );
+        assert!(
+            conn.is_dir(remote_path("/BepInEx/config").as_path())
+                .unwrap()
+        );
+    }
+
+    /// A host that refuses to RETR an existing file must produce an
+    /// error, not a silently empty read: `Ok(None)` is reserved for
+    /// confirmed absence.
+    #[test]
+    fn a_refused_read_is_not_silently_absent() {
+        let server = FakeFtp::valheim_host(FakeFtpOptions {
+            refuse_retr: true,
+            ..Default::default()
+        });
+        server.seed_file("/BepInEx/config/locked.dat", b"data");
+
+        let mut conn = ftp_connect(&server);
+        let refused = remote_path("/BepInEx/config/locked.dat");
+        let err = conn.read(refused.as_path(), 64 * 1024).unwrap_err();
+        assert!(
+            format!("{err}").contains("refuses to return"),
+            "expected a refusal error, got: {err}"
+        );
+
+        // Genuine absence still reads as absent on the same connection.
+        let absent = remote_path("/BepInEx/config/missing.dat");
+        assert_eq!(conn.read(absent.as_path(), 64 * 1024).unwrap(), None);
+    }
+
+    /// `MemoryRemote` is also an `RemoteOps` for the `remote::memory`
+    /// test fixtures — smoke-check the shared-handle impl still works.
+    #[test]
+    fn memory_remote_shared_handle_round_trips() {
+        use std::sync::{Arc, Mutex};
+        let remote = Arc::new(Mutex::new(MemoryRemote::new()));
+        let path = remote_path("/x/y.txt");
+        remote.lock().unwrap().dirs.insert("/x".to_owned());
+        let mut ops = remote.clone();
+        ops.write(path.as_path(), b"hi").unwrap();
+        assert_eq!(ops.read(path.as_path(), 64).unwrap(), Some(b"hi".to_vec()));
+    }
+
+    /// Read-only diagnostic for a live FTP server, used to characterize
+    /// hosts that filter dot-prefixed paths. Distinguishes "absent" from
+    /// "present but refused" across LIST/NLST/MLSD/MLST/SIZE/MDTM/RETR/CWD
+    /// and across absolute versus CWD-relative paths. Never issues a
+    /// mutating command (no STOR/MKD/RMD/DELE/RNTO).
+    ///
+    /// The password comes from the OS credential store under the same
+    /// service/account Gale writes and is never printed.
+    ///
+    ///     $env:GALE_FTP_PROBE = "1"
+    ///     $env:GALE_PROBE_PROFILE_ID = "6"
+    ///     $env:GALE_PROBE_HOST = "<host>"
+    ///     $env:GALE_PROBE_USER = "<ftp username>"
+    ///     $env:GALE_PROBE_BASE = "/BepInEx/config"   # probe dir; default shown
+    ///     cargo test ftp_probe_dotpath_visibility -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn ftp_probe_dotpath_visibility() -> Result<()> {
+        use crate::profile::server::settings::RemoteAuthentication;
+        use eyre::bail;
+
+        if std::env::var("GALE_FTP_PROBE").ok().as_deref() != Some("1") {
+            eprintln!("skipped: set GALE_FTP_PROBE=1 and GALE_PROBE_* vars");
+            return Ok(());
+        }
+
+        let profile_id =
+            std::env::var("GALE_PROBE_PROFILE_ID").expect("GALE_PROBE_PROFILE_ID required");
+        let host = std::env::var("GALE_PROBE_HOST").expect("GALE_PROBE_HOST required");
+        let user = std::env::var("GALE_PROBE_USER").expect("GALE_PROBE_USER required");
+        let dir = std::env::var("GALE_PROBE_DIR").unwrap_or_else(|_| "/".to_owned());
+        let port = std::env::var("GALE_PROBE_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(21u16);
+
+        let password = keyring::Entry::new(
+            "com.kesomannen.gale.dedicated-server",
+            &format!("profile-{profile_id}-ftp-password"),
+        )?
+        .get_password()?;
+
+        let mut settings = RemoteServerSettings {
+            protocol: RemoteProtocol::Ftps,
+            host,
+            port,
+            username: user,
+            server_directory: dir,
+            authentication: RemoteAuthentication::Password,
+            ..Default::default()
+        };
+
+        let mut conn = match RemoteConnection::connect(&settings, &password)? {
+            ConnectionAttempt::Connected(conn) => conn,
+            ConnectionAttempt::CertificateUntrusted { fingerprint } => {
+                eprintln!("[probe] pinning observed certificate fingerprint {fingerprint}");
+                settings.trusted_certificate = Some(fingerprint);
+                match RemoteConnection::connect(&settings, &password)? {
+                    ConnectionAttempt::Connected(conn) => conn,
+                    _ => bail!("certificate still untrusted after pinning"),
+                }
+            }
+            ConnectionAttempt::HostKeyUntrusted { .. } => {
+                bail!("unexpected host-key prompt on an FTP connection")
+            }
+        };
+
+        eprintln!("[probe] connected encrypted={}", conn.encrypted);
+
+        let ftp = match &mut conn.client {
+            RemoteClient::Ftp(ftp) => ftp,
+            RemoteClient::Sftp { .. } => bail!("probe only supports FTP connections"),
+        };
+
+        macro_rules! probe {
+            ($label:expr, $op:expr) => {
+                match $op {
+                    Ok(value) => eprintln!("[probe] {:<58} OK   {:?}", $label, value),
+                    Err(error) => eprintln!("[probe] {:<58} ERR  {error}", $label),
+                }
+            };
+        }
+
+        let config_dir =
+            std::env::var("GALE_PROBE_BASE").unwrap_or_else(|_| "/BepInEx/config".to_owned());
+        let dot_state = format!("{config_dir}/.gale-server-state.json");
+        let plain_state = format!("{config_dir}/gale-server-state.json");
+        let dot_lock = format!("{config_dir}/.gale-deploy.lock");
+        let dot_lease = format!("{dot_lock}/lease.json");
+
+        probe!("SIZE lease.json (ascii)", ftp.size(&dot_lease));
+        probe!(
+            "TYPE I",
+            ftp.transfer_type(suppaftp::types::FileType::Binary)
+        );
+        probe!("SIZE lease.json (binary)", ftp.size(&dot_lease));
+        probe!("SIZE dot-state (binary)", ftp.size(&dot_state));
+
+        probe!("PWD", ftp.pwd());
+        probe!("LIST /", ftp.list(Some("/")));
+        probe!("NLST /", ftp.nlst(Some("/")));
+        probe!("MLSD /", ftp.mlsd(Some("/")));
+
+        probe!("LIST base", ftp.list(Some(&config_dir)));
+        probe!("NLST base", ftp.nlst(Some(&config_dir)));
+        probe!("MLSD base", ftp.mlsd(Some(&config_dir)));
+
+        probe!("MLST dot-state", ftp.mlst(Some(&dot_state)));
+        probe!("SIZE dot-state", ftp.size(&dot_state));
+        probe!("MDTM dot-state", ftp.mdtm(&dot_state));
+        probe!("MLST plain-state", ftp.mlst(Some(&plain_state)));
+        probe!("SIZE plain-state", ftp.size(&plain_state));
+
+        probe!("MLST dot-lock", ftp.mlst(Some(&dot_lock)));
+        probe!("CWD dot-lock (dir probe)", ftp.cwd(&dot_lock));
+        probe!("LIST dot-lock", ftp.list(Some(&dot_lock)));
+        probe!("NLST dot-lock", ftp.nlst(Some(&dot_lock)));
+        probe!("MLSD dot-lock", ftp.mlsd(Some(&dot_lock)));
+
+        probe!("MLST lease.json", ftp.mlst(Some(&dot_lease)));
+        probe!("SIZE lease.json", ftp.size(&dot_lease));
+        probe!("MDTM lease.json", ftp.mdtm(&dot_lease));
+        probe!("RETR lease.json", {
+            ftp.retr_as_buffer(&dot_lease).map(|b| b.into_inner().len())
+        });
+        probe!("RETR dot-state", {
+            ftp.retr_as_buffer(&dot_state).map(|b| b.into_inner().len())
+        });
+
+        probe!("CWD base", ftp.cwd(&config_dir));
+        probe!("LIST (cwd=config)", ftp.list(None));
+        probe!("NLST (cwd=config)", ftp.nlst(None));
+        probe!("MLSD (cwd=config)", ftp.mlsd(None));
+        probe!(
+            "MLST .gale-server-state.json (rel)",
+            ftp.mlst(Some(".gale-server-state.json"))
+        );
+        probe!("SIZE .gale-server-state.json (rel)", {
+            ftp.size(".gale-server-state.json")
+        });
+        probe!("MLST .gale-deploy.lock (rel)", {
+            ftp.mlst(Some(".gale-deploy.lock"))
+        });
+        probe!("CWD .. (restore)", ftp.cwd(".."));
+
+        Ok(())
     }
 }

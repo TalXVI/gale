@@ -88,13 +88,13 @@ pub struct Lease {
     file: RemotePathBuf,
     /// A directory named `holder-<operation_id>` inside the claim. It is
     /// the ownership fallback on hosts where the record file cannot be
-    /// read back: some FTP servers filter dot-paths like
-    /// `.gale-deploy.lock` from SIZE/RETR/LIST while MKD, STOR, CWD, DELE
-    /// and RMD all still work, which makes a perfectly healthy record
-    /// look deleted. The marker is still verifiable (`is_dir`/`CWD`), can
-    /// only exist inside the claim this executor made, and must be
-    /// removed before the claim directory itself can be — so its
-    /// continued presence proves the claim is still ours.
+    /// read back — whether because the server filters dot-paths like
+    /// `.gale-deploy.lock` from reads, or refuses `RETR`/`SIZE` on them
+    /// while `MKD`, `STOR`, `CWD`, `DELE`, and `RMD` all still work. The
+    /// marker is still verifiable (`is_dir`/`CWD`/`MLST`), can only exist
+    /// inside the claim this executor made, and must be removed before
+    /// the claim directory itself can be — so its continued presence
+    /// proves the claim is still ours.
     marker: RemotePathBuf,
     pub record: LeaseRecord,
     stop: StopSignal,

@@ -1050,20 +1050,29 @@ pub fn persist_state(session: &mut Session) -> Result<()> {
     })
     .context("failed to write remote deployment state")?;
 
-    session.base_seq = session.state.operation_seq;
-
-    // Some hosts filter dot-paths like the state file from read commands
-    // while writes still succeed. Surface that once per persist so the
-    // resulting blind spots (no durable ownership history, no operation
-    // records readable back) are diagnosable instead of silent.
-    match session.ops.is_file(&target) {
-        Ok(true) => {}
-        Ok(false) => warn!(
-            "remote deployment state was written to {target} but cannot be read back; \
-             this host appears to filter hidden files from reads"
+    // The state file is authoritative for every later operation, so a
+    // deployment only succeeds once its persistence is verified: the
+    // file must read back byte-identical. A host that cannot return it
+    // would silently lose ownership records, config policies, and the
+    // operation sequence on the next session — that failure must surface
+    // here, not after a subsequent deploy has already trusted it.
+    let verified = with_retry(session, |session| {
+        session.ops.read(&target, state::MAX_STATE_BYTES)
+    })
+    .context("could not verify the written deployment state")?;
+    match verified {
+        Some(actual) if actual == bytes => {}
+        Some(_) => bail!(
+            "remote deployment state at {target} does not read back as written; \
+             refusing to treat the deployment state as durable"
         ),
-        Err(err) => warn!("could not verify the written deployment state: {err}"),
+        None => bail!(
+            "remote deployment state was written to {target} but cannot be read back; \
+             refusing to treat the deployment state as durable"
+        ),
     }
+
+    session.base_seq = session.state.operation_seq;
     Ok(())
 }
 
@@ -1203,7 +1212,11 @@ mod tests {
                 lease::LeaseRecord,
                 paths::RemotePathBuf,
                 plan::{Publication, StagedFile},
-                remote::memory::{FilteredReads, MemoryRemote},
+                remote::{
+                    self, ConnectionAttempt, RemoteConnection,
+                    memory::{FilteredReads, MemoryRemote},
+                },
+                settings::{RemoteAuthentication, RemoteProtocol, RemoteServerSettings},
             },
             sync::{PendingConfigReason, archive::ValidatedConfigFile},
         },
@@ -1323,9 +1336,11 @@ mod tests {
         open_session(ops, spec, RemotePathBuf::new(BASE).unwrap())
     }
 
-    /// A remote whose dot-paths are invisible to read commands — the
-    /// observed DatHost condition behind the false "lease taken over"
-    /// abort: `lease.json` can be written but never read back.
+    /// A remote whose dot-paths are invisible to read commands: metadata
+    /// like `lease.json` can be written but never read back. DatHost
+    /// turned out not to filter paths — it refuses `SIZE` in ASCII mode —
+    /// but this fixture still models hosts with genuine read filtering,
+    /// which the marker fallback and state verification exist for.
     fn filtered() -> (Shared, FilteredReads) {
         let inner = remote();
         let filtered = FilteredReads::new(inner.clone());
@@ -2260,11 +2275,12 @@ mod tests {
 
     #[test]
     fn deploy_on_a_read_filtered_remote_uses_the_holder_marker() {
-        // Reproduces the live DatHost failure: the lease record is
-        // write-only there, so the ownership check falls back to the
-        // holder marker instead of aborting as a false takeover. The
-        // whole lifecycle still works: claim, plan gate, uploads, state
-        // persist, release.
+        // A host that hides dot-paths from every read: the lease record
+        // is write-only, so ownership falls back to the holder marker
+        // instead of aborting as a false takeover — and uploads still run
+        // under that verified claim. But the state file is equally
+        // unreadable, so persistence cannot be verified and the
+        // deployment must fail closed rather than claim success.
         let fixture = mod_fixture();
         let publication = fixture.publication();
         let desired = desired_payload();
@@ -2272,7 +2288,7 @@ mod tests {
         let mut session = open_ops(Box::new(filtered.clone())).unwrap();
 
         let conn = filtered.clone();
-        let deployment = deploy(
+        let err = deploy(
             &mut session,
             move || Ok(Box::new(conn.clone()) as Box<dyn RemoteOps>),
             &publication,
@@ -2284,34 +2300,32 @@ mod tests {
             false,
             |_| {},
         )
-        .unwrap();
-        assert_eq!(deployment.summary.uploaded_files, 1);
-        // The session reports why record reads are not the source of truth.
+        .err()
+        .expect("unverifiable state persistence must fail the deploy");
+
+        assert!(
+            format!("{err:#}").contains("failed to persist remote deployment state"),
+            "expected a persistence failure, got: {err:#}"
+        );
+        // Ownership was verified through the marker — never a phantom
+        // takeover.
         assert!(
             session
                 .warnings
                 .iter()
                 .any(|w| w.contains("marker directory"))
         );
-
-        let state = finish(
-            &mut session,
-            deployment,
-            RestartOutcome::NotRequired,
-            &meta(),
-        )
-        .unwrap();
-
+        // The upload landed before the persistence failure, the state
+        // write itself succeeded (only its read-back was refused), the
+        // failure was recorded, and the claim was fully released.
         assert_eq!(
             remote_contents(&memory, MOD_DLL_REMOTE),
             Some(b"dll-bytes".to_vec())
         );
         assert_eq!(
-            state.last_operation.unwrap().status,
-            OperationStatus::Succeeded
+            remote_state(&memory).last_operation.unwrap().status,
+            OperationStatus::Failed
         );
-        // The claim was fully released even though its record could never
-        // be read back: file, marker, and directory are all gone.
         assert!(!remote_has_dir(&memory, LEASE_DIR_REMOTE));
     }
 
@@ -2388,6 +2402,347 @@ mod tests {
         );
         assert!(persisted.restart_required);
         assert!(!remote_has_dir(&memory, LEASE_DIR_REMOTE));
+    }
+
+    // ---------- end-to-end over the in-memory FTP server ----------
+    //
+    // These run the real `RemoteConnection` against `remote::fake_ftp`,
+    // so the transport's command choices (TYPE I, MLST, RETR) are part
+    // of what is verified.
+
+    fn ftp_ops(addr: std::net::SocketAddr) -> Result<Box<dyn RemoteOps>> {
+        let settings = RemoteServerSettings {
+            protocol: RemoteProtocol::Ftp,
+            host: "127.0.0.1".to_owned(),
+            port: addr.port(),
+            username: "u".to_owned(),
+            server_directory: "/".to_owned(),
+            authentication: RemoteAuthentication::Password,
+            ..Default::default()
+        };
+        match RemoteConnection::connect(&settings, "pw")? {
+            ConnectionAttempt::Connected(conn) => Ok(Box::new(conn)),
+            _ => eyre::bail!("unexpected trust prompt from the fake FTP server"),
+        }
+    }
+
+    fn open_ftp(addr: std::net::SocketAddr) -> Result<Session<'static>> {
+        let spec = Box::leak(Box::new(spec()));
+        open_session(ftp_ops(addr)?, spec, RemotePathBuf::new("/").unwrap())
+    }
+
+    /// The live-verified DatHost profile — `SIZE` refused in ASCII mode,
+    /// dot-prefixed paths fully visible — exercised through the real FTP
+    /// transport. A completed deployment must write, verify, and reload
+    /// its exact recorded state through a fresh connection, and a second
+    /// operation must remove an owned file while preserving unmanaged
+    /// ones.
+    #[test]
+    fn deployment_state_round_trips_on_a_size_refusing_host() {
+        use remote::fake_ftp::{FakeFtp, Options};
+
+        let server = FakeFtp::valheim_host(Options {
+            size_requires_binary: true,
+            ..Default::default()
+        });
+        // An unmanaged file inside the payload tree must never be removed.
+        server.seed_file("/BepInEx/plugins/hand-placed.dll", b"foreign");
+        let addr = server.addr;
+
+        let fixture = mod_fixture();
+        let publication = fixture.publication();
+        let desired = desired_payload();
+
+        let mut session = open_ftp(addr).unwrap();
+        let deployment = deploy(
+            &mut session,
+            move || ftp_ops(addr),
+            &publication,
+            &desired,
+            &selection(true, false),
+            &context(),
+            &meta(),
+            None,
+            false,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(deployment.summary.uploaded_files, 1);
+        let first = finish(
+            &mut session,
+            deployment,
+            RestartOutcome::NotRequired,
+            &meta(),
+        )
+        .unwrap();
+        assert_eq!(first.operation_seq, 1);
+        drop(session);
+
+        // A fresh connection reloads the exact recorded state — the same
+        // authoritative record a worker executor would see.
+        let mut second = open_ftp(addr).unwrap();
+        assert_eq!(
+            state::serialize(&second.state).unwrap(),
+            state::serialize(&first).unwrap(),
+            "a fresh session must reload the persisted state exactly"
+        );
+        assert!(
+            second
+                .state
+                .files
+                .contains_key(&deploy_path("BepInEx/plugins/Author-ModA/ModA.dll"))
+        );
+
+        // Second operation over another connection: the owned mod is
+        // removed, the unmanaged file survives, the sequence advances.
+        let empty = Fixture {
+            mods: Vec::new(),
+            config: BTreeMap::new(),
+        };
+        let deployment = deploy(
+            &mut second,
+            move || ftp_ops(addr),
+            &empty.publication(),
+            &DesiredDeployment {
+                payload: BTreeMap::new(),
+                package_defaults: BTreeMap::new(),
+            },
+            &selection(true, false),
+            &context(),
+            &meta(),
+            None,
+            false,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(deployment.summary.removed_files, 1);
+        let second_state = finish(
+            &mut second,
+            deployment,
+            RestartOutcome::NotRequired,
+            &meta(),
+        )
+        .unwrap();
+        assert_eq!(second_state.operation_seq, 2);
+
+        assert!(
+            server
+                .file("/BepInEx/plugins/Author-ModA/ModA.dll")
+                .is_none()
+        );
+        assert_eq!(
+            server.file("/BepInEx/plugins/hand-placed.dll"),
+            Some(b"foreign".to_vec())
+        );
+        assert!(
+            server
+                .file("/BepInEx/config/.gale-server-state.json")
+                .is_some()
+        );
+        assert!(!server.has_dir("/BepInEx/config/.gale-deploy.lock"));
+    }
+
+    /// A host that refuses to return even freshly-written state cannot
+    /// prove persistence — the deployment must fail closed. The holder
+    /// marker still verifies the lease (its record is equally refused),
+    /// and the claim is released cleanly.
+    #[test]
+    fn deploy_fails_when_the_state_cannot_be_verified() {
+        use remote::fake_ftp::{FakeFtp, Options};
+
+        let server = FakeFtp::valheim_host(Options {
+            refuse_retr: true,
+            ..Default::default()
+        });
+        let addr = server.addr;
+
+        let fixture = mod_fixture();
+        let publication = fixture.publication();
+        let desired = desired_payload();
+
+        let mut session = open_ftp(addr).unwrap();
+        let err = deploy(
+            &mut session,
+            move || ftp_ops(addr),
+            &publication,
+            &desired,
+            &selection(true, false),
+            &context(),
+            &meta(),
+            None,
+            false,
+            |_| {},
+        )
+        .err()
+        .expect("unverifiable state persistence must fail the deploy");
+
+        assert!(
+            format!("{err:#}").contains("failed to persist remote deployment state"),
+            "expected a persistence failure, got: {err:#}"
+        );
+        // The marker proved ownership even though the lease record could
+        // not be read back either.
+        assert!(
+            session
+                .warnings
+                .iter()
+                .any(|w| w.contains("marker directory"))
+        );
+        // The upload landed and the lease was released. The state file
+        // exists on the fake — the host just refused to return it.
+        assert!(
+            server
+                .file("/BepInEx/plugins/Author-ModA/ModA.dll")
+                .is_some()
+        );
+        assert!(!server.has_dir("/BepInEx/config/.gale-deploy.lock"));
+        assert!(
+            server
+                .file("/BepInEx/config/.gale-server-state.json")
+                .is_some()
+        );
+    }
+
+    /// A legacy deployment manifest on the remote is adopted on open and
+    /// superseded by the state file on the next persist — over the real
+    /// FTP path.
+    #[test]
+    fn a_legacy_manifest_migrates_over_ftp() {
+        use remote::fake_ftp::{FakeFtp, Options};
+
+        let server = FakeFtp::valheim_host(Options::default());
+        let addr = server.addr;
+        let owned = OwnedFile {
+            hash: blake3::hash(b"dll-bytes").to_hex().to_string(),
+            size: 9,
+        };
+        let manifest = serde_json::json!({
+            "version": 1,
+            "files": { "BepInEx/plugins/Author-ModA/ModA.dll": owned },
+        });
+        server.seed_file(
+            "/BepInEx/config/.gale-server-manifest.json",
+            &serde_json::to_vec(&manifest).unwrap(),
+        );
+
+        let mut session = open_ftp(addr).unwrap();
+        assert!(session.migrated, "the legacy manifest must be adopted");
+        assert!(
+            session
+                .state
+                .files
+                .contains_key(&deploy_path("BepInEx/plugins/Author-ModA/ModA.dll"))
+        );
+
+        // A completed deployment persists the new-format state, which a
+        // fresh connection then loads instead of the manifest.
+        let fixture = mod_fixture();
+        let publication = fixture.publication();
+        let desired = desired_payload();
+        let deployment = deploy(
+            &mut session,
+            move || ftp_ops(addr),
+            &publication,
+            &desired,
+            &selection(true, false),
+            &context(),
+            &meta(),
+            None,
+            false,
+            |_| {},
+        )
+        .unwrap();
+        finish(
+            &mut session,
+            deployment,
+            RestartOutcome::NotRequired,
+            &meta(),
+        )
+        .unwrap();
+
+        let second = open_ftp(addr).unwrap();
+        assert!(!second.migrated);
+        assert_eq!(second.state.operation_seq, 1);
+    }
+
+    /// An existing-but-unreadable legacy manifest must never silently
+    /// become an empty authoritative state — opening fails closed.
+    #[test]
+    fn an_unreadable_legacy_manifest_fails_closed() {
+        use remote::fake_ftp::{FakeFtp, Options};
+
+        let server = FakeFtp::valheim_host(Options {
+            refuse_retr: true,
+            ..Default::default()
+        });
+        server.seed_file(
+            "/BepInEx/config/.gale-server-manifest.json",
+            br#"{"version":1,"files":{}}"#,
+        );
+
+        let err = open_ftp(server.addr).err().expect("must fail");
+        assert!(
+            format!("{err:#}").contains("refuses to return"),
+            "expected a refused read, got: {err:#}"
+        );
+    }
+
+    /// A remote state that moved under this session is never overwritten:
+    /// the sequence guard fires over the real transport too.
+    #[test]
+    fn persist_state_refuses_to_overwrite_a_moved_remote() {
+        use remote::fake_ftp::FakeFtp;
+
+        let server = FakeFtp::valheim_host(Default::default());
+        let mut session = open_ftp(server.addr).unwrap();
+
+        // Another writer moved the remote state after this session loaded it.
+        let moved = serde_json::json!({"version": 2, "operationSeq": 7});
+        server.seed_file(
+            "/BepInEx/config/.gale-server-state.json",
+            &serde_json::to_vec(&moved).unwrap(),
+        );
+
+        let err = persist_state(&mut session)
+            .err()
+            .expect("a moved remote sequence must refuse the write");
+        assert!(
+            format!("{err:#}").contains("changed during this operation"),
+            "expected the sequence guard, got: {err:#}"
+        );
+        // And nothing was written over the newer state.
+        assert_eq!(
+            server.file("/BepInEx/config/.gale-server-state.json"),
+            Some(serde_json::to_vec(&moved).unwrap())
+        );
+    }
+
+    /// A persistent config policy set under the lease survives a full
+    /// reconnect — decisions are part of the durable state.
+    #[test]
+    fn a_config_policy_persists_across_reconnects_over_ftp() {
+        use remote::fake_ftp::{FakeFtp, Options};
+
+        let server = FakeFtp::valheim_host(Options::default());
+        let addr = server.addr;
+        let path = config_path("BepInEx/config/test.cfg");
+
+        let mut session = open_ftp(addr).unwrap();
+        set_config_policy(
+            &mut session,
+            &path,
+            ConfigUpdatePolicy::AlwaysKeep,
+            None,
+            &meta(),
+        )
+        .unwrap();
+        drop(session);
+
+        let second = open_ftp(addr).unwrap();
+        assert_eq!(
+            second.state.config.get(&path).map(|r| r.policy),
+            Some(ConfigUpdatePolicy::AlwaysKeep)
+        );
     }
 
     // --- remote accessors through the shared handle ---

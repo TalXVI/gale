@@ -21,7 +21,7 @@ pub const LEASE_FILE_NAME: &str = "lease.json";
 pub const VERSION: u32 = 2;
 /// Upper bound for the remote state file. Reads are refused past it so a
 /// corrupt or hostile file cannot cause an unbounded download.
-const MAX_STATE_BYTES: u64 = 4 * 1024 * 1024;
+pub(crate) const MAX_STATE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_HISTORY: usize = 10;
 
 /// A Gale-owned remote payload file recorded by a completed deployment.
