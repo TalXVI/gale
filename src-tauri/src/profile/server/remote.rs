@@ -577,16 +577,22 @@ impl RemoteOps for RemoteConnection {
                 file.flush()?;
                 Ok(())
             }
-            RemoteClient::Ftp(ftp) => {
-                ftp.put_file(path.as_str(), &mut Cursor::new(bytes))?;
-                Ok(())
-            }
+            RemoteClient::Ftp(ftp) => ftp_store(
+                ftp,
+                path.as_str(),
+                &mut Cursor::new(bytes),
+                bytes.len() as u64,
+            ),
         }
     }
 
     fn upload(&mut self, local: &Path, remote: &RemotePath) -> Result<()> {
         let mut file = File::open(local)
             .with_context(|| format!("failed to read staged file {}", local.display()))?;
+        let expected_len = file
+            .metadata()
+            .with_context(|| format!("failed to stat staged file {}", local.display()))?
+            .len();
 
         match &mut self.client {
             RemoteClient::Sftp { sftp, .. } => {
@@ -595,10 +601,7 @@ impl RemoteOps for RemoteConnection {
                 remote_file.flush()?;
                 Ok(())
             }
-            RemoteClient::Ftp(ftp) => {
-                ftp.put_file(remote.as_str(), &mut file)?;
-                Ok(())
-            }
+            RemoteClient::Ftp(ftp) => ftp_store(ftp, remote.as_str(), &mut file, expected_len),
         }
     }
 
@@ -880,6 +883,31 @@ fn ftp_size(ftp: &mut RustlsFtpStream, path: &str) -> Result<Option<u64>> {
         Err(err) if is_ftp_not_found(&err) || is_ftp_size_unsupported(&err) => Ok(None),
         Err(err) => Err(err.into()),
     }
+}
+
+/// `STOR` with an explicit data-stream flush and byte-count check.
+///
+/// SuppaFTP's `put_file` only drops the data stream before reading the
+/// `226`; over FTPS the rustls stream defers socket errors to its flush,
+/// and dropping the stream merely logs that failure — so a transfer the
+/// server aborted mid-flight reported success. Flushing here surfaces
+/// the deferred error while the stream is still alive, and comparing
+/// copied bytes catches a truncated copy outright.
+fn ftp_store(
+    ftp: &mut RustlsFtpStream,
+    path: &str,
+    reader: &mut impl Read,
+    expected_len: u64,
+) -> Result<()> {
+    let mut stream = ftp.put_with_stream(path)?;
+    let written = std::io::copy(reader, &mut stream).context("failed to write FTP data stream")?;
+    ensure!(
+        written == expected_len,
+        "FTP upload for {path} copied {written} bytes, expected {expected_len}"
+    );
+    stream.flush().context("failed to flush FTP data stream")?;
+    ftp.finalize_put_stream(stream)?;
+    Ok(())
 }
 
 /// Whether a failed AUTH TLS negotiation may retry the connection
@@ -1282,6 +1310,13 @@ pub(crate) mod fake_ftp {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use suppaftp::rustls::{
+        ServerConfig, ServerConnection, StreamOwned, pki_types::PrivatePkcs8KeyDer,
+    };
+
+    use super::{certificate_fingerprint, crypto_provider};
 
     /// Behaviors the fake server can exhibit.
     #[derive(Default, Clone, Copy)]
@@ -1294,6 +1329,20 @@ pub(crate) mod fake_ftp {
         pub refuse_retr: bool,
         /// Do not implement `MLST` (a pre-RFC-3659 host).
         pub no_mlst: bool,
+        /// Require explicit FTPS: `AUTH TLS` upgrades the control
+        /// connection and `PROT P` protects the data connections with
+        /// a self-signed certificate.
+        pub tls: bool,
+        /// On `STOR`, complete the data-channel TLS handshake, then
+        /// kill the socket before the payload can be received while
+        /// still answering `226 transfer complete` — a mid-transfer
+        /// abort the client must not report as success.
+        pub abort_stor_after_tls_handshake: bool,
+        /// On `STOR`, keep only this prefix of the received payload but
+        /// still answer `226 transfer complete` — the observed host
+        /// behavior where a store reports success while persisting a
+        /// truncated file.
+        pub truncate_stor_to: Option<usize>,
     }
 
     /// A running fake server. `fs` is shared with every accepted
@@ -1303,6 +1352,9 @@ pub(crate) mod fake_ftp {
         pub addr: SocketAddr,
         /// Every `VERB arg` line received, for protocol assertions.
         pub commands: Arc<Mutex<Vec<String>>>,
+        /// The blake3 fingerprint of the self-signed certificate the
+        /// server presents when `Options::tls` is on; `None` otherwise.
+        certificate_fingerprint: Option<String>,
         fs: Arc<Mutex<Fs>>,
     }
 
@@ -1373,6 +1425,51 @@ pub(crate) mod fake_ftp {
         }
     }
 
+    /// Per-connection TLS configs: `control` covers the control channel
+    /// and ordinary data transfers, while `data` covers the data channel
+    /// when `abort_stor_after_tls_handshake` is on — it is pinned to
+    /// TLS 1.2 so the server owns the final handshake flight and can
+    /// reset the socket before the client's payload write is attempted.
+    /// (Under TLS 1.3 the client sends Finished and payload back-to-back,
+    /// leaving no window for the abort to precede the write.)
+    struct Tls {
+        control: Arc<ServerConfig>,
+        data: Arc<ServerConfig>,
+    }
+
+    /// Builds the self-signed server identity used when
+    /// `Options::tls` is on. Returns the `Tls` configs plus the
+    /// certificate's fingerprint so tests can pin it exactly the way a
+    /// user trusts a certificate in Gale.
+    fn tls_identity(tls12_data: bool) -> (Tls, String) {
+        use suppaftp::rustls::version::{TLS12, TLS13};
+
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let fingerprint = certificate_fingerprint(certified.cert.der());
+        let build = |versions: &[&'static suppaftp::rustls::SupportedProtocolVersion]| {
+            let key = PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der());
+            let mut config = ServerConfig::builder_with_provider(crypto_provider())
+                .with_protocol_versions(versions)
+                .expect("the aws-lc-rs provider supports these TLS versions")
+                .with_no_client_auth()
+                .with_single_cert(vec![certified.cert.der().clone()], key.into())
+                .unwrap();
+            // Post-handshake tickets would land on a client that never
+            // reads a STOR data socket; closing with them unread sends a
+            // RST that discards the payload the server just received.
+            config.send_tls13_tickets = 0;
+            config
+        };
+        let control = Arc::new(build(&[&TLS13, &TLS12]));
+        let data = if tls12_data {
+            Arc::new(build(&[&TLS12]))
+        } else {
+            control.clone()
+        };
+
+        (Tls { control, data }, fingerprint)
+    }
+
     impl FakeFtp {
         pub fn spawn(options: Options) -> Self {
             let fs = Arc::new(Mutex::new(Fs {
@@ -1380,6 +1477,10 @@ pub(crate) mod fake_ftp {
                 ..Default::default()
             }));
             let commands = Arc::new(Mutex::new(Vec::new()));
+            let tls = options
+                .tls
+                .then(|| tls_identity(options.abort_stor_after_tls_handshake));
+            let certificate_fingerprint = tls.as_ref().map(|(_, fingerprint)| fingerprint.clone());
 
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
@@ -1393,7 +1494,13 @@ pub(crate) mod fake_ftp {
                             Ok(stream) => {
                                 let fs = fs.clone();
                                 let commands = commands.clone();
-                                std::thread::spawn(move || serve(stream, &fs, &commands, &options));
+                                let tls = tls.as_ref().map(|(tls, _)| Tls {
+                                    control: tls.control.clone(),
+                                    data: tls.data.clone(),
+                                });
+                                std::thread::spawn(move || {
+                                    serve(stream, &fs, &commands, &options, tls)
+                                });
                             }
                             Err(_) => break,
                         }
@@ -1401,7 +1508,12 @@ pub(crate) mod fake_ftp {
                 });
             }
 
-            Self { addr, commands, fs }
+            Self {
+                addr,
+                commands,
+                certificate_fingerprint,
+                fs,
+            }
         }
 
         /// A server pre-seeded like a Valheim install, Gale-metadata
@@ -1436,6 +1548,12 @@ pub(crate) mod fake_ftp {
             self.fs.lock().unwrap().dirs.contains(&normalize(path))
         }
 
+        /// The fingerprint to pin as `trusted_certificate` when
+        /// `Options::tls` is on.
+        pub fn trusted_certificate(&self) -> Option<String> {
+            self.certificate_fingerprint.clone()
+        }
+
         /// Whether the client ever sent a command starting with
         /// `prefix` (e.g. `TYPE I`).
         pub fn saw(&self, prefix: &str) -> bool {
@@ -1447,7 +1565,7 @@ pub(crate) mod fake_ftp {
         }
     }
 
-    fn send(writer: &mut TcpStream, text: &str) -> bool {
+    fn send(writer: &mut impl Write, text: &str) -> bool {
         writer.write_all(format!("{text}\r\n").as_bytes()).is_ok()
     }
 
@@ -1457,27 +1575,135 @@ pub(crate) mod fake_ftp {
         line.split_once(' ').map_or("", |(_, arg)| arg).trim()
     }
 
+    /// The server side of a TLS handshake driven to completion over
+    /// `socket`. Returns the established connection, or `None` when the
+    /// peer goes away mid-handshake.
+    fn tls_accept(socket: &mut TcpStream, config: &Arc<ServerConfig>) -> Option<ServerConnection> {
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .ok()?;
+        let mut conn = ServerConnection::new(config.clone()).ok()?;
+        while conn.is_handshaking() {
+            if conn.complete_io(socket).is_err() {
+                return None;
+            }
+        }
+        socket.set_read_timeout(None).ok()?;
+        Some(conn)
+    }
+
+    /// A cloneable handle over a TLS stream so the control channel can
+    /// hold independent read and write ends.
+    #[derive(Clone)]
+    struct TlsSocket(Arc<Mutex<StreamOwned<ServerConnection, TcpStream>>>);
+
+    impl Read for TlsSocket {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().read(buf)
+        }
+    }
+
+    impl Write for TlsSocket {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.lock().unwrap().flush()
+        }
+    }
+
+    /// An accepted passive data connection: plain TCP, or TLS once the
+    /// session negotiated `PROT P`.
+    enum DataSocket {
+        Plain(TcpStream),
+        Tls(StreamOwned<ServerConnection, TcpStream>),
+    }
+
+    impl Read for DataSocket {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self {
+                Self::Plain(stream) => stream.read(buf),
+                Self::Tls(stream) => stream.read(buf),
+            }
+        }
+    }
+
+    impl Write for DataSocket {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            match self {
+                Self::Plain(stream) => stream.write(buf),
+                Self::Tls(stream) => stream.write(buf),
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            match self {
+                Self::Plain(stream) => stream.flush(),
+                Self::Tls(stream) => stream.flush(),
+            }
+        }
+    }
+
+    impl DataSocket {
+        /// rustls does not emit `close_notify` on drop; without it the
+        /// client's read reports `UnexpectedEof` after the payload.
+        /// `write_tls` flushes the alert without reading — `flush` would
+        /// block waiting for client data that never comes.
+        fn close(self) {
+            if let Self::Tls(mut conn) = self {
+                conn.conn.send_close_notify();
+                let _ = conn.conn.write_tls(&mut conn.sock);
+            }
+        }
+    }
+
     fn serve(
         stream: TcpStream,
         fs: &Arc<Mutex<Fs>>,
         commands: &Arc<Mutex<Vec<String>>>,
         options: &Options,
+        tls: Option<Tls>,
     ) {
-        let mut writer = stream.try_clone().unwrap();
-        let mut reader = BufReader::new(stream);
+        // `socket` keeps a handle to the control connection so `AUTH TLS`
+        // can upgrade it in place; the reader/writer work on clones until
+        // then and on the TLS stream afterwards.
+        let mut socket = Some(stream.try_clone().unwrap());
+        let mut writer: Box<dyn Write> = Box::new(stream.try_clone().unwrap());
+        let mut reader: Box<dyn BufRead> = Box::new(BufReader::new(stream));
         let mut passive: Option<TcpListener> = None;
         let mut cwd = "/".to_owned();
         let mut binary = false;
+        let mut protected = false;
         let mut rename_from: Option<String> = None;
         let mut line = String::new();
 
-        /// Opens the pending passive data connection, if any.
+        /// Opens the pending passive data connection, if any, and wraps
+        /// it in TLS when the session negotiated `PROT P`.
         macro_rules! data {
             () => {
                 passive
                     .take()
                     .and_then(|listener| listener.accept().ok())
                     .map(|(stream, _)| stream)
+                    .and_then(|mut stream| match (protected, tls.as_ref()) {
+                        (true, Some(tls)) => tls_accept(&mut stream, &tls.data)
+                            .map(|conn| DataSocket::Tls(StreamOwned::new(conn, stream))),
+                        _ => Some(DataSocket::Plain(stream)),
+                    })
+            };
+        }
+
+        /// The client connects the passive data socket before reading
+        /// the command's final response, so a refused command must still
+        /// accept and close it — a rustls data stream that is dropped
+        /// before its handshake runs `complete_io` and waits on a
+        /// channel that was never accepted.
+        macro_rules! reap_data {
+            () => {
+                if let Some(listener) = passive.take() {
+                    let _ = listener.accept();
+                }
             };
         }
 
@@ -1500,7 +1726,29 @@ pub(crate) mod fake_ftp {
             let path = resolve(&cwd, arg_of(&command));
 
             let response = match verb.as_str() {
-                "AUTH" => "502 TLS is not supported".to_owned(),
+                "AUTH" => match (tls.as_ref(), arg_of(&command).to_ascii_uppercase().as_str()) {
+                    (Some(tls), "TLS" | "SSL") => {
+                        if !send(&mut writer, "234 AUTH TLS successful") {
+                            return;
+                        }
+                        let Some(mut sock) = socket.take() else {
+                            return;
+                        };
+                        let Some(conn) = tls_accept(&mut sock, &tls.control) else {
+                            return;
+                        };
+                        let secure = TlsSocket(Arc::new(Mutex::new(StreamOwned::new(conn, sock))));
+                        reader = Box::new(BufReader::new(secure.clone()));
+                        writer = Box::new(secure);
+                        continue;
+                    }
+                    _ => "502 TLS is not supported".to_owned(),
+                },
+                "PBSZ" => "200 PBSZ=0".to_owned(),
+                "PROT" => {
+                    protected = arg_of(&command).eq_ignore_ascii_case("P");
+                    "200 protection level set".to_owned()
+                }
                 "USER" => "331 password required".to_owned(),
                 "PASS" => "230 logged in".to_owned(),
                 "SYST" => "215 UNIX Type: L8".to_owned(),
@@ -1585,25 +1833,50 @@ pub(crate) mod fake_ftp {
                     }
                 }
                 "RETR" => match fs.lock().unwrap().files.get(&path).cloned() {
-                    Some(_) if options.refuse_retr => "550 refused".to_owned(),
+                    Some(_) if options.refuse_retr => {
+                        reap_data!();
+                        "550 refused".to_owned()
+                    }
                     Some(bytes) => {
                         if !send(&mut writer, "150 opening data connection") {
                             return;
                         }
                         if let Some(mut data) = data!() {
                             let _ = data.write_all(&bytes);
+                            data.close();
                         }
                         "226 transfer complete".to_owned()
                     }
-                    None => "550 no such file or directory".to_owned(),
+                    None => {
+                        reap_data!();
+                        "550 no such file or directory".to_owned()
+                    }
                 },
                 "STOR" => {
                     if !send(&mut writer, "150 opening data connection") {
                         return;
                     }
                     let mut bytes = Vec::new();
-                    if let Some(mut data) = data!() {
-                        let _ = data.read_to_end(&mut bytes);
+                    match data!() {
+                        // The TLS 1.2 handshake completed inside `data!` —
+                        // the server just sent the final flight, so the
+                        // client is still finishing its side and has not
+                        // written its payload yet. Resetting the socket now
+                        // means the payload write lands on a dead
+                        // connection: rustls swallows that error and defers
+                        // it to the stream's next flush.
+                        Some(DataSocket::Tls(conn)) if options.abort_stor_after_tls_handshake => {
+                            let socket = tokio::net::TcpSocket::from_std_stream(conn.sock);
+                            let _ = socket.set_zero_linger();
+                            drop(socket);
+                        }
+                        Some(mut data) => {
+                            let _ = data.read_to_end(&mut bytes);
+                        }
+                        None => {}
+                    }
+                    if let Some(limit) = options.truncate_stor_to {
+                        bytes.truncate(limit);
                     }
                     fs.lock().unwrap().files.insert(path.clone(), bytes);
                     "226 transfer complete".to_owned()
@@ -1644,7 +1917,10 @@ pub(crate) mod fake_ftp {
                         }
                     };
                     match lines {
-                        None => "550 no such directory".to_owned(),
+                        None => {
+                            reap_data!();
+                            "550 no such directory".to_owned()
+                        }
                         Some(lines) => {
                             if !send(&mut writer, "150 opening data connection") {
                                 return;
@@ -1653,6 +1929,7 @@ pub(crate) mod fake_ftp {
                                 for line in lines {
                                     let _ = data.write_all(line.as_bytes());
                                 }
+                                data.close();
                             }
                             "226 transfer complete".to_owned()
                         }
@@ -2203,6 +2480,26 @@ mod tests {
         }
     }
 
+    fn ftps_connect(server: &FakeFtp) -> RemoteConnection {
+        let settings = RemoteServerSettings {
+            protocol: RemoteProtocol::Ftps,
+            host: "127.0.0.1".to_owned(),
+            port: server.addr.port(),
+            username: "u".to_owned(),
+            server_directory: "/".to_owned(),
+            authentication: RemoteAuthentication::Password,
+            trusted_certificate: server.trusted_certificate(),
+            ..Default::default()
+        };
+        match RemoteConnection::connect(&settings, "pw").unwrap() {
+            ConnectionAttempt::Connected(conn) => {
+                assert!(conn.encrypted, "FTPS connection must be encrypted");
+                conn
+            }
+            _ => panic!("pinned certificate should connect to the fake over TLS"),
+        }
+    }
+
     fn remote_path(path: &str) -> RemotePathBuf {
         RemotePathBuf::new(path).unwrap()
     }
@@ -2302,6 +2599,34 @@ mod tests {
         // Genuine absence still reads as absent on the same connection.
         let absent = remote_path("/BepInEx/config/missing.dat");
         assert_eq!(conn.read(absent.as_path(), 64 * 1024).unwrap(), None);
+    }
+
+    /// Regression test for an FTPS data channel that dies after the TLS
+    /// handshake: the fake completes the handshake, kills the socket
+    /// before the payload lands, then still answers `226 transfer
+    /// complete`. `write` must surface the aborted transfer instead of
+    /// reporting success for bytes the server never stored.
+    #[test]
+    fn ftps_write_reports_an_aborted_data_transfer() {
+        let server = FakeFtp::valheim_host(FakeFtpOptions {
+            tls: true,
+            abort_stor_after_tls_handshake: true,
+            ..Default::default()
+        });
+        let mut conn = ftps_connect(&server);
+        let path = remote_path("/BepInEx/config/state.tmp");
+        let expected = vec![b'x'; 8 * 1024];
+
+        let result = conn.write(path.as_path(), &expected);
+
+        assert!(
+            result.is_err(),
+            "an aborted FTPS data transfer must not report success"
+        );
+        assert_ne!(
+            server.file(path.as_str()).as_deref(),
+            Some(expected.as_slice())
+        );
     }
 
     /// `MemoryRemote` is also an `RemoteOps` for the `remote::memory`

@@ -1021,6 +1021,11 @@ fn replace_remote(
 /// newer or diverged remote sequence means another writer slipped past
 /// the lease. This session's stale view must never overwrite it, so the
 /// write fails closed instead.
+///
+/// The temporary file is verified byte-for-byte on a fresh connection
+/// before it may replace the target, and the target is verified again
+/// on a fresh connection after replacement — a truncated or refused
+/// transfer can never silently become the authoritative state.
 pub fn persist_state(session: &mut Session) -> Result<()> {
     let target = session.mapper.remote_path(&session.mapper.spec.state_path);
     let legacy = session
@@ -1046,16 +1051,35 @@ pub fn persist_state(session: &mut Session) -> Result<()> {
     let temporary = target.with_suffix(".tmp");
     with_retry(session, |session| {
         session.ops.write(&temporary, &bytes)?;
+        session
+            .ops
+            .reconnect()
+            .context("failed to reconnect before verifying temporary deployment state")?;
+        match session.ops.read(&temporary, state::MAX_STATE_BYTES)? {
+            Some(actual) if actual == bytes => {}
+            Some(_) => bail!(
+                "temporary remote deployment state at {temporary} does not read back as written"
+            ),
+            None => bail!(
+                "temporary remote deployment state was written to {temporary} but cannot be read back"
+            ),
+        }
         replace_remote(session.ops.as_mut(), &temporary, &target)
     })
     .context("failed to write remote deployment state")?;
 
     // The state file is authoritative for every later operation, so a
     // deployment only succeeds once its persistence is verified: the
-    // file must read back byte-identical. A host that cannot return it
-    // would silently lose ownership records, config policies, and the
+    // temporary file must read back byte-identical on a fresh connection
+    // before it may replace the target, and the target is verified again
+    // on a fresh connection after replacement. A host that cannot return
+    // it would silently lose ownership records, config policies, and the
     // operation sequence on the next session — that failure must surface
     // here, not after a subsequent deploy has already trusted it.
+    session
+        .ops
+        .reconnect()
+        .context("failed to reconnect before verifying remote deployment state")?;
     let verified = with_retry(session, |session| {
         session.ops.read(&target, state::MAX_STATE_BYTES)
     })
@@ -2315,17 +2339,15 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("marker directory"))
         );
-        // The upload landed before the persistence failure, the state
-        // write itself succeeded (only its read-back was refused), the
-        // failure was recorded, and the claim was fully released.
+        // The upload landed before the persistence failure and the
+        // claim was fully released. The state temp could never be
+        // verified, so it was never renamed — no authoritative state
+        // exists on an unreadable host.
         assert_eq!(
             remote_contents(&memory, MOD_DLL_REMOTE),
             Some(b"dll-bytes".to_vec())
         );
-        assert_eq!(
-            remote_state(&memory).last_operation.unwrap().status,
-            OperationStatus::Failed
-        );
+        assert!(remote_contents(&memory, STATE_REMOTE).is_none());
         assert!(!remote_has_dir(&memory, LEASE_DIR_REMOTE));
     }
 
@@ -2365,7 +2387,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_filtered_deploy_still_records_state_and_releases() {
+    fn a_failed_filtered_deploy_cannot_persist_state_but_releases() {
         let fixture = mod_fixture();
         let publication = fixture.publication();
         let desired = desired_payload();
@@ -2393,14 +2415,11 @@ mod tests {
         .expect("the upload failure must fail the deployment");
         assert!(format!("{err:#}").contains("failed to upload"));
 
-        // The failure was still recorded accurately (the state file is
-        // writeable even when it is not readable) and the lease released.
-        let persisted = remote_state(&memory);
-        assert_eq!(
-            persisted.last_operation.unwrap().status,
-            OperationStatus::Failed
-        );
-        assert!(persisted.restart_required);
+        // The failure could not be recorded: on a host where the state
+        // cannot be read back, an unverifiable temp must never become
+        // authoritative — so no state file exists — but the lease was
+        // still released.
+        assert!(remote_contents(&memory, STATE_REMOTE).is_none());
         assert!(!remote_has_dir(&memory, LEASE_DIR_REMOTE));
     }
 
@@ -2429,6 +2448,34 @@ mod tests {
     fn open_ftp(addr: std::net::SocketAddr) -> Result<Session<'static>> {
         let spec = Box::leak(Box::new(spec()));
         open_session(ftp_ops(addr)?, spec, RemotePathBuf::new("/").unwrap())
+    }
+
+    /// Same connection path as `ftp_ops`, but over explicit FTPS pinned
+    /// to the fake's self-signed certificate.
+    fn ftps_connection(server: &remote::fake_ftp::FakeFtp) -> Result<RemoteConnection> {
+        let settings = RemoteServerSettings {
+            protocol: RemoteProtocol::Ftps,
+            host: "127.0.0.1".to_owned(),
+            port: server.addr.port(),
+            username: "u".to_owned(),
+            server_directory: "/".to_owned(),
+            authentication: RemoteAuthentication::Password,
+            trusted_certificate: server.trusted_certificate(),
+            ..Default::default()
+        };
+        match RemoteConnection::connect(&settings, "pw")? {
+            ConnectionAttempt::Connected(conn) => Ok(conn),
+            _ => eyre::bail!("pinned fake FTPS certificate was not accepted"),
+        }
+    }
+
+    fn open_ftps(server: &remote::fake_ftp::FakeFtp) -> Result<Session<'static>> {
+        let spec = Box::leak(Box::new(spec()));
+        open_session(
+            Box::new(ftps_connection(server)?),
+            spec,
+            RemotePathBuf::new("/").unwrap(),
+        )
     }
 
     /// The live-verified DatHost profile — `SIZE` refused in ASCII mode,
@@ -2588,8 +2635,10 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("marker directory"))
         );
-        // The upload landed and the lease was released. The state file
-        // exists on the fake — the host just refused to return it.
+        // The upload landed and the lease was released. The state temp
+        // was written but could never be verified, so it was never
+        // renamed — an unverifiable write must not become the
+        // authoritative state.
         assert!(
             server
                 .file("/BepInEx/plugins/Author-ModA/ModA.dll")
@@ -2599,6 +2648,11 @@ mod tests {
         assert!(
             server
                 .file("/BepInEx/config/.gale-server-state.json")
+                .is_none()
+        );
+        assert!(
+            server
+                .file("/BepInEx/config/.gale-server-state.json.tmp")
                 .is_some()
         );
     }
@@ -2714,6 +2768,114 @@ mod tests {
         assert_eq!(
             server.file("/BepInEx/config/.gale-server-state.json"),
             Some(serde_json::to_vec(&moved).unwrap())
+        );
+    }
+
+    /// A store that truncates the state temp file but still answers `226`
+    /// fails the read-back check — and that failure must not have already
+    /// destroyed the previously valid state. A fresh FTPS connection
+    /// proves the exact original bytes survive.
+    #[test]
+    fn persist_state_never_replaces_valid_state_with_a_truncated_temp() {
+        use remote::fake_ftp::{FakeFtp, Options};
+
+        let server = FakeFtp::valheim_host(Options {
+            tls: true,
+            truncate_stor_to: Some(512),
+            ..Default::default()
+        });
+        let original = ServerDeploymentState {
+            version: state::VERSION,
+            ..Default::default()
+        };
+        let original_bytes = state::serialize(&original).unwrap();
+        let target = "/BepInEx/config/.gale-server-state.json";
+        server.seed_file(target, &original_bytes);
+
+        let mut session = open_ftps(&server).unwrap();
+        for index in 0..64 {
+            let path = deploy_path(&format!("BepInEx/plugins/Owned-{index}/file.dll"));
+            session.state.files.insert(
+                path,
+                OwnedFile {
+                    hash: blake3::hash(format!("owned-{index}").as_bytes())
+                        .to_hex()
+                        .to_string(),
+                    size: index as u64,
+                },
+            );
+        }
+        assert!(state::serialize(&session.state).unwrap().len() > 512);
+
+        let error = persist_state(&mut session).expect_err("truncated temp must fail persistence");
+        assert!(
+            format!("{error:#}").contains("does not read back as written"),
+            "expected the read-back verification failure, got: {error:#}"
+        );
+
+        let mut fresh = ftps_connection(&server).unwrap();
+        let actual = fresh
+            .read(&RemotePathBuf::new(target).unwrap(), state::MAX_STATE_BYTES)
+            .unwrap()
+            .expect("the prior state must remain");
+        assert_eq!(actual.len(), original_bytes.len());
+        assert_eq!(blake3::hash(&actual), blake3::hash(&original_bytes));
+        assert_eq!(actual, original_bytes);
+    }
+
+    /// The success path of the same contract: a verifiable state write
+    /// lands byte-identical on the target, proven through an independent
+    /// FTPS connection rather than the fake's filesystem shortcut.
+    #[test]
+    fn persist_state_round_trips_exact_bytes_across_fresh_ftps_connections() {
+        use remote::fake_ftp::{FakeFtp, Options};
+
+        let server = FakeFtp::valheim_host(Options {
+            tls: true,
+            ..Default::default()
+        });
+        let mut session = open_ftps(&server).unwrap();
+        for index in 0..64 {
+            let path = deploy_path(&format!("BepInEx/plugins/Owned-{index}/file.dll"));
+            session.state.files.insert(
+                path,
+                OwnedFile {
+                    hash: blake3::hash(format!("owned-{index}").as_bytes())
+                        .to_hex()
+                        .to_string(),
+                    size: index as u64,
+                },
+            );
+        }
+        let expected = state::serialize(&session.state).unwrap();
+
+        persist_state(&mut session).unwrap();
+        drop(session);
+
+        let target = RemotePathBuf::new("/BepInEx/config/.gale-server-state.json").unwrap();
+        let mut fresh = ftps_connection(&server).unwrap();
+        let actual = fresh
+            .read(target.as_path(), state::MAX_STATE_BYTES)
+            .unwrap()
+            .expect("persisted state must exist");
+        assert_eq!(actual.len(), expected.len());
+        assert_eq!(blake3::hash(&actual), blake3::hash(&expected));
+        assert_eq!(actual, expected);
+        assert!(
+            server
+                .file("/BepInEx/config/.gale-server-state.json.tmp")
+                .is_none()
+        );
+        let auth_tls_count = server
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.as_str() == "AUTH TLS")
+            .count();
+        assert!(
+            auth_tls_count >= 3,
+            "write, temporary verification, final verification, and test read must use fresh FTPS sessions"
         );
     }
 
