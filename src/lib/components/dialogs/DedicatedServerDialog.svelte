@@ -63,6 +63,14 @@
 	let workerToken = $state('');
 	let workerAutoSync = $state(false);
 	let workerAutoMods = $state(false);
+	/// The automation state the worker last confirmed (for the managed
+	/// worker, what it reports live). A failed save snaps the controls
+	/// back to this instead of leaving intent that never took effect.
+	let savedAutomation = $state<{
+		autoSync: boolean;
+		autoMods: boolean;
+		restartPolicy: RestartPolicy;
+	}>({ autoSync: false, autoMods: false, restartPolicy: 'manual' });
 	let hostProvider = $state<HostProvider>('none');
 	let datHostServerId = $state('');
 	let datHostUsername = $state('');
@@ -168,13 +176,18 @@
 						: 'worker'
 					: 'local';
 			workerAddress = value.remote.worker.address;
-			workerAutoSync = value.remote.worker.autoSync;
-			workerAutoMods = value.remote.worker.autoMods;
-			void refreshLocalWorker();
+			await refreshLocalWorker();
+			// The worker's journal is the authoritative automation state —
+			// for the managed worker its live report wins over the stored
+			// copy, which only seeds new installs.
+			const liveWorker = syncChoice === 'hostedWorker' ? localWorker?.worker : null;
+			workerAutoSync = liveWorker?.autoSync ?? value.remote.worker.autoSync;
+			workerAutoMods = liveWorker?.autoMods ?? value.remote.worker.autoMods;
+			restartPolicy = liveWorker?.restartPolicy ?? value.remote.restartPolicy;
+			savedAutomation = { autoSync: workerAutoSync, autoMods: workerAutoMods, restartPolicy };
 			hostProvider = value.remote.hostControl.provider;
 			datHostServerId = value.remote.hostControl.datHostServerId;
 			datHostUsername = value.remote.hostControl.datHostUsername;
-			restartPolicy = value.remote.restartPolicy;
 		} finally {
 			loadingSettings = false;
 		}
@@ -370,10 +383,27 @@
 			// Automation toggles may have changed — re-read the worker's own
 			// state so the pending banner reflects what it will actually do.
 			await refreshLocalWorker();
+			savedAutomation = { autoSync: workerAutoSync, autoMods: workerAutoMods, restartPolicy };
 			pushInfoToast({ message: m.dedicatedServerDialog_saved() });
+		} catch {
+			// The save failed — the backend leaves stored settings
+			// untouched when the worker did not accept the change. Snap
+			// the automation controls back to the worker's actual state.
+			await refreshLocalWorker();
+			reconcileAutomation();
 		} finally {
 			saving = false;
 		}
+	}
+
+	/// Reverts the automation controls to the last state the worker
+	/// confirmed — its live report for the managed worker, else the last
+	/// values it acknowledged.
+	function reconcileAutomation() {
+		const liveWorker = syncChoice === 'hostedWorker' ? localWorker?.worker : null;
+		workerAutoSync = liveWorker?.autoSync ?? savedAutomation.autoSync;
+		workerAutoMods = liveWorker?.autoMods ?? savedAutomation.autoMods;
+		restartPolicy = liveWorker?.restartPolicy ?? savedAutomation.restartPolicy;
 	}
 
 	/// Saves the current transport settings first — provisioning derives
@@ -402,6 +432,14 @@
 			);
 			localWorker = await api.profile.server.provisionLocalWorker(remotePassword, datHostPassword);
 			if (localWorker.binding) workerAddress = localWorker.binding.address;
+			// A reprovisioned worker keeps its journal — adopt whatever
+			// automation flags it actually runs.
+			reconcileAutomation();
+			savedAutomation = {
+				autoSync: workerAutoSync,
+				autoMods: workerAutoMods,
+				restartPolicy
+			};
 		} finally {
 			provisioning = false;
 		}

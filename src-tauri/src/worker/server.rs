@@ -1326,4 +1326,91 @@ mod tests {
             "unexpected error: {err:#}"
         );
     }
+
+    /// The defect-1 contract end to end: `POST /v1/config` must land in
+    /// the journal file, and a restart must keep the journal's flags
+    /// rather than re-seeding them from the config file.
+    #[tokio::test]
+    async fn configure_updates_the_journal_and_survives_restarts() {
+        use crate::profile::server::{
+            settings::{RemoteProtocol, RemoteServerSettings, RestartPolicy},
+            worker_client::WorkerClient,
+        };
+        use crate::worker::journal::Journal;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ftp = spawn_ftp_server();
+        let api_port = free_port();
+
+        let mut config = worker_config(dir.path(), format!("127.0.0.1:{api_port}"));
+        config.auto_sync = true;
+        config.auto_mods = true;
+        config.remote = RemoteServerSettings {
+            protocol: RemoteProtocol::Ftp,
+            host: "127.0.0.1".to_owned(),
+            port: ftp.port(),
+            username: "u".to_owned(),
+            server_directory: "/".to_owned(),
+            ..RemoteServerSettings::default()
+        };
+        config.sync_url = Some("http://127.0.0.1:1/".to_owned());
+
+        let mut settings = RemoteServerSettings::default();
+        settings.worker.address = format!("http://127.0.0.1:{api_port}");
+        let client = WorkerClient::new(&settings, "token".to_owned()).unwrap();
+
+        // First run: the config seeds the journal's automation flags.
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(super::run(
+            config.clone(),
+            worker_secrets(),
+            shutdown.clone(),
+            Some(ready_tx),
+        ));
+        ready_rx.await.expect("the worker never became ready");
+
+        let status = client.status(false).await.unwrap();
+        assert!(status.auto_sync && status.auto_mods);
+
+        // The update is visible in the API *and* durable on disk.
+        client
+            .configure(false, false, RestartPolicy::Manual)
+            .await
+            .unwrap();
+        let status = client.status(false).await.unwrap();
+        assert!(!status.auto_sync && !status.auto_mods);
+
+        shutdown.cancel();
+        task.await.unwrap().unwrap();
+
+        {
+            let journal = Journal::load(dir.path()).unwrap();
+            let state = journal.state.lock().await;
+            assert!(!state.auto_sync && !state.auto_mods);
+        }
+
+        // A restart with a config claiming the flags on keeps the
+        // journal's values — it is authoritative once seeded.
+        config.auto_sync = true;
+        config.auto_mods = true;
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(super::run(
+            config,
+            worker_secrets(),
+            shutdown.clone(),
+            Some(ready_tx),
+        ));
+        ready_rx.await.expect("the worker never became ready");
+
+        let status = client.status(false).await.unwrap();
+        assert!(
+            !status.auto_sync && !status.auto_mods,
+            "the journal must win over the config after the first seed"
+        );
+
+        shutdown.cancel();
+        task.await.unwrap().unwrap();
+    }
 }

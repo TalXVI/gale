@@ -195,13 +195,26 @@
 	async function saveWorkerConfig() {
 		savingWorker = true;
 		try {
-			await api.profile.server.configureWorker(
+			// The worker answers with the state it confirmed — reflect that,
+			// not just the submitted values.
+			const confirmed = await api.profile.server.configureWorker(
 				workerAutoSync,
 				workerAutoMods,
 				restartPolicy,
 				workerToken
 			);
+			workerAutoSync = confirmed.autoSync;
+			workerAutoMods = confirmed.autoMods;
+			restartPolicy = confirmed.restartPolicy;
 			await loadStatus(false);
+		} catch {
+			// The push failed — snap the controls back to the worker's
+			// last-known state instead of leaving intent it never ran.
+			if (status?.worker) {
+				workerAutoSync = status.worker.autoSync;
+				workerAutoMods = status.worker.autoMods;
+				restartPolicy = status.worker.restartPolicy;
+			}
 		} finally {
 			savingWorker = false;
 		}

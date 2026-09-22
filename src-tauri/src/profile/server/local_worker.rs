@@ -525,6 +525,29 @@ async fn provision_windows(
     )?;
 
     let mut worker_status = status(app).await?;
+    // A reprovisioned worker keeps its journal — the config written above
+    // only seeds a first run — so the journal's automation flags are
+    // authoritative even when they differ from what was just installed.
+    // Mirror the worker's actual flags into the profile's settings so the
+    // dialogs and future provisioning see the same truth.
+    if let Some(live) = worker_status.worker.as_ref() {
+        let mut remote = {
+            let manager = app.lock_manager();
+            let (_, profile) = manager.profile_by_id(target.profile_id)?;
+            profile.server_settings.clone().unwrap_or_default().remote
+        };
+        if remote.sync_mode == SyncMode::Worker
+            && (remote.worker.auto_sync != live.auto_sync
+                || remote.worker.auto_mods != live.auto_mods
+                || remote.restart_policy != live.restart_policy)
+        {
+            remote.worker.auto_sync = live.auto_sync;
+            remote.worker.auto_mods = live.auto_mods;
+            remote.restart_policy = live.restart_policy;
+            save_remote_settings_for(app, target.profile_id, remote)
+                .context("failed to mirror the worker's automation settings")?;
+        }
+    }
     // If the service enforces one session per user, the worker login may
     // have invalidated the desktop's chain; a forced grant finds out.
     if auth::verify_session(app).await.is_err() {

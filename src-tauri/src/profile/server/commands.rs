@@ -33,7 +33,10 @@ use crate::{
             remote::{self, ConnectionAttempt, ConnectionTestResult, RemoteConnection, RemoteOps},
             runtime::{self, ServerStatus, SharedChild},
             secrets::{ServerSecret, ServerSecrets},
-            settings::{ProfileServerSettings, RemoteServerSettings, RestartPolicy, SyncMode},
+            settings::{
+                ProfileServerSettings, RemoteServerSettings, RestartPolicy, ServerLocation,
+                SyncMode,
+            },
             spec::DeploymentSpec,
             stage::{self, CachePayloadSource},
             worker_client::WorkerClient,
@@ -185,22 +188,51 @@ pub fn get_dedicated_server_settings(app: AppHandle) -> Option<ProfileServerSett
 }
 
 #[command]
-pub fn set_dedicated_server_settings(
+pub async fn set_dedicated_server_settings(
     request: SaveServerSettingsRequest,
     app: AppHandle,
 ) -> Result<()> {
     request.settings.validate()?;
 
-    let profile_id = app.lock_manager().active_profile().id;
+    // The stored settings are captured with the profile id: the worker
+    // push below awaits, and an active-profile switch must not redirect
+    // either it or the save.
+    let (profile_id, stored) = {
+        let manager = app.lock_manager();
+        let profile = manager.active_profile();
+        (profile.id, profile.server_settings.clone())
+    };
     let secrets = ServerSecrets::for_profile(profile_id)?;
 
-    save_settings_for(&app, profile_id, request.settings.clone())?;
+    let mut settings = request.settings;
+    if settings.location == ServerLocation::Remote
+        && settings.remote.sync_mode == SyncMode::Worker
+        && worker_config_differs(stored.as_ref(), &settings)
+    {
+        // The running worker is authoritative for automation flags — the
+        // stored copy only seeds new workers. Push the requested
+        // configuration first and persist the values the worker
+        // confirmed: a worker that cannot be reached must not look
+        // configured.
+        let confirmed = configure_running_worker(
+            &secrets,
+            &settings.remote,
+            sync_id_for(&app, profile_id).as_deref(),
+            &request.worker_token,
+        )
+        .await?;
+        settings.remote.worker.auto_sync = confirmed.auto_sync;
+        settings.remote.worker.auto_mods = confirmed.auto_mods;
+        settings.remote.restart_policy = confirmed.restart_policy;
+    }
+
+    save_settings_for(&app, profile_id, settings.clone())?;
 
     // Credentials: a provided value is persisted per `remember`, an empty
     // one leaves the store alone unless `remember` is off (which clears).
     persist_credential(
         &secrets,
-        remote_secret(&request.settings.remote),
+        remote_secret(&settings.remote),
         &request.remote_password,
         request.remember_credentials,
     )?;
@@ -238,6 +270,70 @@ pub(crate) fn persist_credential(
         secrets.persist(secret, value, remember)?;
     }
     Ok(())
+}
+
+/// Whether the requested settings change what the bound worker runs —
+/// the automation toggles, the restart policy, or which worker is
+/// addressed. Skipping an unchanged configuration keeps a settings save
+/// from depending on the worker being reachable.
+fn worker_config_differs(
+    stored: Option<&ProfileServerSettings>,
+    new: &ProfileServerSettings,
+) -> bool {
+    let Some(stored) = stored else {
+        return true;
+    };
+    stored.remote.sync_mode != SyncMode::Worker
+        || stored.remote.worker.address.trim() != new.remote.worker.address.trim()
+        || stored.remote.worker.auto_sync != new.remote.worker.auto_sync
+        || stored.remote.worker.auto_mods != new.remote.worker.auto_mods
+        || stored.remote.restart_policy != new.remote.restart_policy
+}
+
+/// Pushes the automation configuration in `remote` to the worker it
+/// addresses and returns the state the worker confirmed. The worker is
+/// authoritative: when the push fails nothing was applied, and callers
+/// must not persist values it never accepted. A worker bound to a
+/// different sync profile is refused rather than reconfigured.
+async fn configure_running_worker(
+    secrets: &ServerSecrets,
+    remote: &RemoteServerSettings,
+    expected_profile: Option<&str>,
+    worker_token: &str,
+) -> eyre::Result<StatusResponse> {
+    let client = worker_client(secrets, remote, worker_token)?;
+    let status = client
+        .status(false)
+        .await
+        .context("the worker did not answer — its automation settings were not changed")?;
+    // A worker is always bound to a sync profile id. Without this
+    // profile's own id the binding cannot be verified — reconfiguring
+    // anyway could silently change a worker owned by another profile.
+    let Some(expected) = expected_profile else {
+        bail!(
+            "this profile is not published — publish it before Gale can verify \
+             and configure a worker (the worker is bound to '{}')",
+            status.profile_id,
+        );
+    };
+    if status.profile_id != expected {
+        bail!(
+            "the worker is bound to sync profile '{}', but this profile is '{expected}'",
+            status.profile_id,
+        );
+    }
+    client
+        .configure(
+            remote.worker.auto_sync,
+            remote.worker.auto_mods,
+            remote.restart_policy,
+        )
+        .await
+        .context("the worker did not accept the automation update")?;
+    client
+        .status(false)
+        .await
+        .context("the worker did not confirm the automation update")
 }
 
 // ---------- local launch ----------
@@ -674,10 +770,14 @@ pub async fn set_server_config_policy(
     Ok(())
 }
 
-/// Updates the worker's automation toggles and mirrors them into the
-/// stored settings so the UI reflects the worker's actual behavior.
+/// Updates the worker's automation toggles and mirrors the state it
+/// confirmed into the stored settings, so both dialogs reflect the
+/// worker's actual behavior. Returns the worker's confirmed status.
 #[command]
-pub async fn configure_worker(request: ConfigureWorkerRequest, app: AppHandle) -> Result<()> {
+pub async fn configure_worker(
+    request: ConfigureWorkerRequest,
+    app: AppHandle,
+) -> Result<StatusResponse> {
     let target = sync_target(&app)?;
     if target.settings.sync_mode != SyncMode::Worker {
         return Err(
@@ -686,25 +786,30 @@ pub async fn configure_worker(request: ConfigureWorkerRequest, app: AppHandle) -
     }
 
     let secrets = ServerSecrets::for_profile(target.profile_id)?;
-    let client = worker_client(&secrets, &target.settings, &request.worker_token)?;
-    client
-        .configure(request.auto_sync, request.auto_mods, request.restart_policy)
-        .await?;
+    let mut remote = target.settings.clone();
+    remote.worker.auto_sync = request.auto_sync;
+    remote.worker.auto_mods = request.auto_mods;
+    remote.restart_policy = request.restart_policy;
+    let confirmed = configure_running_worker(
+        &secrets,
+        &remote,
+        sync_id_for(&app, target.profile_id).as_deref(),
+        &request.worker_token,
+    )
+    .await?;
 
-    // Persist the same values into the stored settings.
+    // Persist what the worker confirmed — by profile id, so an
+    // active-profile switch during the push cannot redirect the write.
     let mut manager = app.lock_manager();
-    let profile = manager.active_profile_mut();
-    if profile.id != target.profile_id {
-        return Err(eyre::eyre!("the active profile changed while configuring the worker").into());
-    }
+    let (_, profile) = manager.profile_by_id_mut(target.profile_id)?;
     let mut settings = profile.server_settings.clone().unwrap_or_default();
-    settings.remote.worker.auto_sync = request.auto_sync;
-    settings.remote.worker.auto_mods = request.auto_mods;
-    settings.remote.restart_policy = request.restart_policy;
+    settings.remote.worker.auto_sync = confirmed.auto_sync;
+    settings.remote.worker.auto_mods = confirmed.auto_mods;
+    settings.remote.restart_policy = confirmed.restart_policy;
     profile.server_settings = Some(settings);
     profile.save(&app, true)?;
 
-    Ok(())
+    Ok(confirmed)
 }
 
 // ---------- Local-mode orchestration ----------
@@ -1118,4 +1223,62 @@ pub(crate) fn save_remote_settings_for(
     settings.remote = remote;
     profile.server_settings = Some(settings);
     profile.save(app, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Remote settings in worker mode bound to a worker address.
+    fn worker_settings() -> ProfileServerSettings {
+        let mut settings = ProfileServerSettings {
+            location: ServerLocation::Remote,
+            ..ProfileServerSettings::default()
+        };
+        settings.remote.sync_mode = SyncMode::Worker;
+        settings.remote.worker.address = "http://127.0.0.1:8472".to_owned();
+        settings
+    }
+
+    #[test]
+    fn worker_config_differs_only_for_worker_relevant_fields() {
+        let stored = worker_settings();
+
+        // Identical settings skip the worker round-trip entirely, so a
+        // plain save never depends on the worker being reachable.
+        assert!(!worker_config_differs(Some(&stored), &stored.clone()));
+
+        // Toggling either automation flag differs.
+        let mut new = stored.clone();
+        new.remote.worker.auto_sync = true;
+        assert!(worker_config_differs(Some(&stored), &new));
+
+        let mut new = stored.clone();
+        new.remote.worker.auto_mods = true;
+        assert!(worker_config_differs(Some(&stored), &new));
+
+        // The restart policy is worker-run configuration too.
+        let mut new = stored.clone();
+        new.remote.restart_policy = RestartPolicy::Immediate;
+        assert!(worker_config_differs(Some(&stored), &new));
+
+        // Retargeting the worker address pushes the flags to the new
+        // worker.
+        let mut new = stored.clone();
+        new.remote.worker.address = "http://127.0.0.1:9999".to_owned();
+        assert!(worker_config_differs(Some(&stored), &new));
+
+        // Unrelated fields never trigger a worker call.
+        let mut new = stored.clone();
+        new.remote.host = "example.com".to_owned();
+        new.local.server_name = "Other".to_owned();
+        assert!(!worker_config_differs(Some(&stored), &new));
+
+        // A stored binding that never pointed at a worker differs, as
+        // does having no stored settings at all.
+        let mut local = stored.clone();
+        local.remote.sync_mode = SyncMode::Local;
+        assert!(worker_config_differs(Some(&local), &stored));
+        assert!(worker_config_differs(None, &stored));
+    }
 }

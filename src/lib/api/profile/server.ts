@@ -118,13 +118,15 @@ export const setConfigPolicy = (
 		request: { path, policy, password, workerToken }
 	});
 
+/// Pushes the automation configuration to the bound worker and returns
+/// the status it confirmed — the values the worker actually runs.
 export const configureWorker = (
 	autoSync: boolean,
 	autoMods: boolean,
 	restartPolicy: RestartPolicy,
 	workerToken = ''
 ) =>
-	invoke('configure_worker', {
+	invoke<WorkerStatus>('configure_worker', {
 		request: { autoSync, autoMods, restartPolicy, workerToken }
 	});
 
