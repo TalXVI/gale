@@ -827,6 +827,8 @@ pub(crate) mod memory {
         pub fail_once: BTreeSet<String>,
         /// Paths whose write/upload/delete always fails.
         pub fail_always: BTreeSet<String>,
+        /// Simulates a dropped transport: reads and directory checks fail.
+        pub connection_dead: bool,
     }
 
     impl MemoryRemote {
@@ -838,6 +840,7 @@ pub(crate) mod memory {
                 dirs,
                 fail_once: BTreeSet::new(),
                 fail_always: BTreeSet::new(),
+                connection_dead: false,
             }
         }
 
@@ -872,18 +875,30 @@ pub(crate) mod memory {
 
     impl RemoteOps for MemoryRemote {
         fn is_dir(&mut self, path: &RemotePath) -> Result<bool> {
+            if self.connection_dead {
+                bail!("connection is dead");
+            }
             Ok(self.dirs.contains(path.as_str()))
         }
 
         fn is_file(&mut self, path: &RemotePath) -> Result<bool> {
+            if self.connection_dead {
+                bail!("connection is dead");
+            }
             Ok(self.files.contains_key(path.as_str()))
         }
 
         fn file_size(&mut self, path: &RemotePath) -> Result<Option<u64>> {
+            if self.connection_dead {
+                bail!("connection is dead");
+            }
             Ok(self.files.get(path.as_str()).map(|b| b.len() as u64))
         }
 
         fn list(&mut self, dir: &RemotePath) -> Result<Vec<RemoteEntry>> {
+            if self.connection_dead {
+                bail!("connection is dead");
+            }
             let base = dir.as_str().trim_end_matches('/');
             let mut entries = Vec::new();
             let mut seen = BTreeSet::new();
@@ -916,6 +931,9 @@ pub(crate) mod memory {
         }
 
         fn read(&mut self, path: &RemotePath, max: u64) -> Result<Option<Vec<u8>>> {
+            if self.connection_dead {
+                bail!("connection is dead");
+            }
             let Some(bytes) = self.files.get(path.as_str()) else {
                 return Ok(None);
             };
@@ -979,6 +997,114 @@ pub(crate) mod memory {
 
         fn claim_dir(&mut self, path: &RemotePath) -> Result<bool> {
             Ok(self.dirs.insert(path.as_str().to_owned()))
+        }
+
+        fn reconnect(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Wraps a shared remote and hides dot-segment paths
+    /// (`.gale-deploy.lock`, `.gale-server-state.json`, ...) from read
+    /// commands: `read`/`file_size`/`is_file` report them missing and
+    /// `list` omits them, while writes, mkdir, deletes, and `is_dir` still
+    /// work. That mirrors hosts which filter hidden paths from FTP read
+    /// commands — the condition behind a false "lease taken over" abort.
+    ///
+    /// `filter_lists` also hides them from directory listings, the
+    /// strictest observed variant; with it off, listings still expose
+    /// holder markers so competing claimants can report a busy lease.
+    #[derive(Clone)]
+    pub(crate) struct FilteredReads {
+        pub inner: std::sync::Arc<std::sync::Mutex<MemoryRemote>>,
+        pub filter_lists: bool,
+    }
+
+    impl FilteredReads {
+        pub fn new(inner: std::sync::Arc<std::sync::Mutex<MemoryRemote>>) -> Self {
+            Self {
+                inner,
+                filter_lists: true,
+            }
+        }
+
+        fn hidden(path: &RemotePath) -> bool {
+            path.as_str()
+                .split('/')
+                .any(|segment| segment.starts_with('.'))
+        }
+    }
+
+    impl RemoteOps for FilteredReads {
+        fn is_dir(&mut self, path: &RemotePath) -> Result<bool> {
+            self.inner.lock().unwrap().is_dir(path)
+        }
+
+        fn is_file(&mut self, path: &RemotePath) -> Result<bool> {
+            if Self::hidden(path) {
+                return Ok(false);
+            }
+            self.inner.lock().unwrap().is_file(path)
+        }
+
+        fn file_size(&mut self, path: &RemotePath) -> Result<Option<u64>> {
+            if Self::hidden(path) {
+                return Ok(None);
+            }
+            self.inner.lock().unwrap().file_size(path)
+        }
+
+        fn list(&mut self, dir: &RemotePath) -> Result<Vec<RemoteEntry>> {
+            if !self.filter_lists {
+                return self.inner.lock().unwrap().list(dir);
+            }
+            // Listing a hidden directory itself yields nothing.
+            if Self::hidden(dir) {
+                return Ok(Vec::new());
+            }
+            Ok(self
+                .inner
+                .lock()
+                .unwrap()
+                .list(dir)?
+                .into_iter()
+                .filter(|entry| !entry.name.starts_with('.'))
+                .collect())
+        }
+
+        fn read(&mut self, path: &RemotePath, max: u64) -> Result<Option<Vec<u8>>> {
+            if Self::hidden(path) {
+                return Ok(None);
+            }
+            self.inner.lock().unwrap().read(path, max)
+        }
+
+        fn write(&mut self, path: &RemotePath, bytes: &[u8]) -> Result<()> {
+            self.inner.lock().unwrap().write(path, bytes)
+        }
+
+        fn upload(&mut self, local: &Path, remote: &RemotePath) -> Result<()> {
+            self.inner.lock().unwrap().upload(local, remote)
+        }
+
+        fn rename(&mut self, from: &RemotePath, to: &RemotePath) -> Result<()> {
+            self.inner.lock().unwrap().rename(from, to)
+        }
+
+        fn delete_file(&mut self, path: &RemotePath) -> Result<bool> {
+            self.inner.lock().unwrap().delete_file(path)
+        }
+
+        fn delete_dir(&mut self, path: &RemotePath) -> Result<()> {
+            self.inner.lock().unwrap().delete_dir(path)
+        }
+
+        fn ensure_dir(&mut self, path: &RemotePath) -> Result<()> {
+            self.inner.lock().unwrap().ensure_dir(path)
+        }
+
+        fn claim_dir(&mut self, path: &RemotePath) -> Result<bool> {
+            self.inner.lock().unwrap().claim_dir(path)
         }
 
         fn reconnect(&mut self) -> Result<()> {

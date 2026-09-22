@@ -197,6 +197,8 @@ Guarantees:
 
 One limitation matters here: FTP/SFTP provide no true fencing, so a write that was already in flight from a lost-lease executor can still land. The conservative answer is built in. Gale never auto-breaks a lease that might still be live. If a lease is stuck because an executor hung, confirm it is actually stopped (check the machine or the worker status), then use the takeover option in the sync dialog. Treat takeover as the documented recovery path, not routine automation.
 
+Some hosts filter dot-prefixed paths from FTP read commands: `lease.json` can be written but `SIZE`/`RETR`/`LIST` report it missing. For that case the claim also contains a `holder-<operation>` marker directory. Directory probes still work on those hosts, so the marker is the fallback ownership proof — and since it keeps the claim directory non-empty, a filtered marker also prevents a competing executor from silently breaking a claim it cannot inspect. If a claim is left behind entirely (crashed executor on such a host), recovery is to remove `.gale-deploy.lock` manually through the host's file manager once no executor is running.
+
 ## What is preserved
 
 The deployment state file (`.gale-server-state.json` in the server directory, or under `config/` in restricted-root layouts) records owned files, content hashes, applied config revisions, per-file policies, operation history, and restart state. It is the authority for what Gale may remove. A file absent from the publication but never recorded as deployed stays put.

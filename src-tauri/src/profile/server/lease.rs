@@ -9,7 +9,11 @@
 //! The holder heartbeats a `lease.json` inside the directory through a
 //! second connection. Ownership is explicit: heartbeat and release verify
 //! the stored record still names this holder before touching it, so an old
-//! owner can never delete or overwrite a newer executor's lease.
+//! owner can never delete or overwrite a newer executor's lease. A
+//! `holder-<operation>` marker directory inside the claim is the fallback
+//! proof on hosts that filter the record file from read commands — the
+//! marker also keeps the claim non-empty, so a claim that cannot be
+//! inspected cannot be silently removed either.
 //!
 //! Stale takeover is deliberately conservative. A lease whose heartbeat
 //! expired is broken automatically only when it belongs to the *same*
@@ -35,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use super::{
-    paths::RemotePathBuf,
+    paths::{RemotePath, RemotePathBuf},
     remote::RemoteOps,
     state::{self, ExecutorKind},
 };
@@ -82,12 +86,45 @@ fn signal_stop(stop: &StopSignal) {
 pub struct Lease {
     dir: RemotePathBuf,
     file: RemotePathBuf,
+    /// A directory named `holder-<operation_id>` inside the claim. It is
+    /// the ownership fallback on hosts where the record file cannot be
+    /// read back: some FTP servers filter dot-paths like
+    /// `.gale-deploy.lock` from SIZE/RETR/LIST while MKD, STOR, CWD, DELE
+    /// and RMD all still work, which makes a perfectly healthy record
+    /// look deleted. The marker is still verifiable (`is_dir`/`CWD`), can
+    /// only exist inside the claim this executor made, and must be
+    /// removed before the claim directory itself can be — so its
+    /// continued presence proves the claim is still ours.
+    marker: RemotePathBuf,
     pub record: LeaseRecord,
     stop: StopSignal,
     heartbeat: Option<JoinHandle<()>>,
     /// Set by the heartbeat when the stored lease was replaced by another
     /// owner, meaning this executor must stop mutating.
     lost: Arc<AtomicBool>,
+}
+
+/// The result of a lease ownership check.
+///
+/// `still_ours` used to collapse every one of these into the same
+/// `false`, which reported a read-filtered or transiently unreadable
+/// record as a takeover and aborted healthy deployments.
+#[derive(Debug)]
+pub enum Ownership {
+    /// The claim verifiably still belongs to this holder: the stored
+    /// record names this operation.
+    Held,
+    /// The record cannot be read back, but the holder marker proves the
+    /// claim is intact — the host filters lease reads (e.g. FTP servers
+    /// that refuse SIZE/RETR/LIST on dot-prefixed paths).
+    HeldViaMarker,
+    /// The claim verifiably no longer belongs to this holder: a foreign
+    /// record was read (`holder` names its owner), or our marker was
+    /// removed, which only happens when the claim is dismantled.
+    Lost { holder: Option<String> },
+    /// Neither the record nor the marker could be checked — a transport
+    /// failure, not evidence of a takeover.
+    Unverifiable(eyre::Report),
 }
 
 /// A lease acquisition that found another live executor.
@@ -124,11 +161,14 @@ impl Lease {
     /// Whether the stored lease still belongs to this holder. Read fresh
     /// from the remote, this is the cheap ownership check the engine runs
     /// before each mutation phase.
-    pub fn still_ours(&self, ops: &mut dyn RemoteOps) -> bool {
-        match read_lease(ops, &self.file) {
-            Ok(Some(record)) => record.operation_id == self.record.operation_id,
-            _ => false,
-        }
+    pub fn check_ownership(&self, ops: &mut dyn RemoteOps) -> Ownership {
+        check_ownership(
+            ops,
+            &self.dir,
+            &self.file,
+            &self.marker,
+            &self.record.operation_id,
+        )
     }
 
     /// Whether the heartbeat observed a different owner. If so, the
@@ -149,24 +189,31 @@ impl Lease {
             let _ = heartbeat.join();
         }
 
-        match read_lease(ops, &self.file) {
-            Ok(Some(record)) if record.operation_id == self.record.operation_id => {
+        match self.check_ownership(ops) {
+            Ownership::Held | Ownership::HeldViaMarker => {
                 if let Err(err) = ops.delete_file(&self.file) {
                     warn!("failed to remove lease file: {err}");
+                }
+                if let Err(err) = ops.delete_dir(&self.marker) {
+                    warn!("failed to remove lease holder marker: {err}");
                 }
                 if let Err(err) = ops.delete_dir(&self.dir) {
                     warn!("failed to remove lease directory: {err}");
                 }
                 info!(owner = %self.record.owner, "released deployment lease");
             }
-            Ok(_) => {
+            Ownership::Lost { .. } => {
                 // Another owner holds the lease now, so theirs stays.
+                // Our marker, keyed to this operation's id, is the only
+                // piece that is still ours to remove — cleaning it keeps
+                // the new holder's eventual rmdir from failing on it.
+                ops.delete_dir(&self.marker).ok();
                 warn!(
                     owner = %self.record.owner,
                     "lease ownership changed; leaving the new holder's lease in place"
                 );
             }
-            Err(err) => {
+            Ownership::Unverifiable(err) => {
                 warn!("could not verify lease ownership for release: {err}; leaving it to expire");
             }
         }
@@ -213,12 +260,24 @@ pub fn acquire(
                     ttl_secs: LEASE_TTL.as_secs(),
                 };
                 let bytes = serde_json::to_vec_pretty(&record)?;
-                ops.write(&lease_file, &bytes)
-                    .context("failed to write deployment lease")?;
+                // The marker goes in first: a claim that dies before its
+                // record write still looks claimed to other executors
+                // instead of being mistaken for a husk. Both are removed
+                // if the claim cannot be established so it self-heals.
+                let marker = marker_path(lease_dir, operation_id);
+                if let Err(err) = ops
+                    .ensure_dir(&marker)
+                    .and_then(|_| ops.write(&lease_file, &bytes))
+                {
+                    ops.delete_dir(&marker).ok();
+                    ops.delete_dir(lease_dir).ok();
+                    return Err(err).context("failed to establish the deployment lease");
+                }
                 info!(owner, ?executor, "acquired deployment lease");
                 return Ok(Lease {
                     dir: lease_dir.clone(),
                     file: lease_file,
+                    marker,
                     record,
                     stop: stop_signal(),
                     heartbeat: None,
@@ -239,13 +298,13 @@ pub fn acquire(
                         // mid-operation and restarted, so it is safe to
                         // recover.
                         info!(owner, "recovering own stale deployment lease");
-                        break_lease(ops, lease_dir, &lease_file)?;
+                        break_lease(ops, lease_dir, &lease_file, Some(&record))?;
                     } else if force {
                         warn!(
                             owner = %record.owner,
                             "taking over a stale foreign deployment lease by request"
                         );
-                        break_lease(ops, lease_dir, &lease_file)?;
+                        break_lease(ops, lease_dir, &lease_file, Some(&record))?;
                     } else {
                         return Err(LeaseBusy {
                             record,
@@ -255,14 +314,39 @@ pub fn acquire(
                     }
                 }
                 // An empty husk or an unreadable record means the claim
-                // never finished. A live holder writes its file right
-                // after mkdir, so a husk that persists past the grace
-                // window is a crash remnant.
-                None if !husk_observed => {
-                    husk_observed = true;
-                    thread::sleep(HUSK_GRACE);
-                }
-                None => break_lease(ops, lease_dir, &lease_file)?,
+                // never finished — unless a holder marker is present.
+                // Hosts that filter dot-paths from reads hide the record
+                // of a *live* claim, but cannot hide the marker from a
+                // directory listing; either way it must not be broken
+                // without checking for one first.
+                None => match find_markers(ops, lease_dir) {
+                    Ok(markers) if !markers.is_empty() => {
+                        // A marker proves a claim was established; whether
+                        // its holder is still alive cannot be judged
+                        // without the record, so only an explicit force
+                        // decision may break it.
+                        if force {
+                            warn!(
+                                "taking over a deployment lease whose record is unreadable, by request"
+                            );
+                            break_lease(ops, lease_dir, &lease_file, None)?;
+                        } else {
+                            return Err(LeaseBusy {
+                                record: marker_record(&markers[0]),
+                                stale: true,
+                            }
+                            .into());
+                        }
+                    }
+                    Ok(_) if !husk_observed => {
+                        husk_observed = true;
+                        thread::sleep(HUSK_GRACE);
+                    }
+                    Ok(_) => break_lease(ops, lease_dir, &lease_file, None)?,
+                    Err(err) => {
+                        return Err(err).context("failed to inspect the deployment lease");
+                    }
+                },
             },
         }
 
@@ -293,7 +377,9 @@ fn start_heartbeat_every(
 ) {
     let stop = lease.stop.clone();
     let lost = lease.lost.clone();
+    let dir = lease.dir.clone();
     let file = lease.file.clone();
+    let marker = lease.marker.clone();
     let mut record = lease.record.clone();
 
     lease.heartbeat = Some(thread::spawn(move || {
@@ -318,10 +404,11 @@ fn start_heartbeat_every(
             };
 
             // Never overwrite a lease that was taken over: verify the
-            // stored record is still ours before writing.
-            match read_lease(conn.as_mut(), &file) {
-                Ok(Some(current)) if current.operation_id == record.operation_id => {}
-                Ok(_) => {
+            // claim is still ours before writing. On hosts that filter
+            // the record file from reads, the holder marker is the proof.
+            match check_ownership(conn.as_mut(), &dir, &file, &marker, &record.operation_id) {
+                Ownership::Held | Ownership::HeldViaMarker => {}
+                Ownership::Lost { .. } => {
                     lost.store(true, Ordering::SeqCst);
                     warn!(
                         owner = %record.owner,
@@ -329,7 +416,7 @@ fn start_heartbeat_every(
                     );
                     return;
                 }
-                Err(_) => {
+                Ownership::Unverifiable(_) => {
                     // Cannot verify ownership, so skip this beat rather
                     // than risk overwriting a foreign lease.
                     continue;
@@ -350,10 +437,7 @@ fn start_heartbeat_every(
 
 /// Reads the current lease record. Returns `None` when the file is
 /// missing or its contents do not parse.
-pub fn read_lease(
-    ops: &mut dyn RemoteOps,
-    lease_file: &RemotePathBuf,
-) -> Result<Option<LeaseRecord>> {
+pub fn read_lease(ops: &mut dyn RemoteOps, lease_file: &RemotePath) -> Result<Option<LeaseRecord>> {
     let Some(bytes) = ops.read(lease_file, 64 * 1024)? else {
         return Ok(None);
     };
@@ -375,12 +459,114 @@ impl LeaseRecord {
     }
 }
 
+/// Verifies a claim against the remote: the stored record is the primary
+/// proof, the holder marker the fallback when the record cannot be read.
+fn check_ownership(
+    ops: &mut dyn RemoteOps,
+    lease_dir: &RemotePath,
+    lease_file: &RemotePath,
+    marker: &RemotePath,
+    operation_id: &str,
+) -> Ownership {
+    let read_error = match read_lease(ops, lease_file) {
+        Ok(Some(record)) => {
+            return if record.operation_id == operation_id {
+                Ownership::Held
+            } else {
+                Ownership::Lost {
+                    holder: Some(record.owner),
+                }
+            };
+        }
+        Ok(None) => None,
+        Err(err) => Some(err),
+    };
+
+    // The record could not be read — missing, malformed, torn mid-write,
+    // or filtered by the host. The marker decides: it only exists inside
+    // the claim this holder made, and a competing claim must remove it
+    // before the lease directory can be reused. No other executor knows
+    // its name (the record that carries it is exactly what is unreadable),
+    // so a surviving marker means the claim is still ours.
+    match ops.is_dir(marker) {
+        Ok(true) => Ownership::HeldViaMarker,
+        Ok(false) => match ops.is_dir(lease_dir) {
+            // The claim directory stands but our marker is gone: the
+            // claim was dismantled by another executor.
+            Ok(true) => Ownership::Lost { holder: None },
+            // Neither marker nor claim directory can be observed. That
+            // either means the claim really is gone, or this host filters
+            // even directory probes on the lease path — the checks cannot
+            // tell those apart, so the honest answer is unverifiable.
+            Ok(false) => Ownership::Unverifiable(read_error.unwrap_or_else(|| {
+                eyre::eyre!("the lease directory at {lease_dir} is not observable on this host")
+            })),
+            Err(err) => Ownership::Unverifiable(err),
+        },
+        Err(err) => Ownership::Unverifiable(read_error.unwrap_or(err)),
+    }
+}
+
+/// Marker directory name prefix; the operation id follows it.
+const HOLDER_PREFIX: &str = "holder-";
+
+/// `lease_dir/holder-<operation_id>` — the fallback ownership proof.
+fn marker_path(lease_dir: &RemotePathBuf, operation_id: &str) -> RemotePathBuf {
+    let name = super::paths::DeployPathBuf::new(format!("{HOLDER_PREFIX}{operation_id}"))
+        .expect("operation ids are path-safe");
+    lease_dir.join(&name)
+}
+
+/// Holder markers found inside an existing claim directory.
+fn find_markers(ops: &mut dyn RemoteOps, lease_dir: &RemotePath) -> Result<Vec<RemotePathBuf>> {
+    Ok(ops
+        .list(lease_dir)?
+        .into_iter()
+        .filter(|entry| entry.is_directory && entry.name.starts_with(HOLDER_PREFIX))
+        .filter_map(|entry| super::paths::DeployPathBuf::new(entry.name).ok())
+        .map(|name| lease_dir.join(&name))
+        .collect())
+}
+
+/// A placeholder record for a claim whose marker is visible but whose
+/// record is unreadable, so the busy path can still report it honestly.
+fn marker_record(marker: &RemotePath) -> LeaseRecord {
+    LeaseRecord {
+        owner: "another executor (its lease record is unreadable)".to_owned(),
+        executor: ExecutorKind::Worker,
+        operation_id: marker
+            .file_name()
+            .and_then(|name| name.strip_prefix(HOLDER_PREFIX))
+            .unwrap_or_default()
+            .to_owned(),
+        acquired_at: Utc::now(),
+        heartbeat_at: Utc::now(),
+        ttl_secs: LEASE_TTL.as_secs(),
+    }
+}
+
 fn break_lease(
     ops: &mut dyn RemoteOps,
     lease_dir: &RemotePathBuf,
     lease_file: &RemotePathBuf,
+    record: Option<&LeaseRecord>,
 ) -> Result<()> {
     ops.delete_file(lease_file).ok();
+    // Holder markers keep the claim directory non-empty, so they must be
+    // removed before the directory itself can be. A readable record gives
+    // the marker's exact name even where listings are filtered; otherwise
+    // fall back to listing. If neither works, the final rmdir fails on
+    // the non-empty directory rather than removing a live claim.
+    let mut markers = find_markers(ops, lease_dir).unwrap_or_default();
+    if let Some(record) = record {
+        let derived = marker_path(lease_dir, &record.operation_id);
+        if !markers.contains(&derived) {
+            markers.push(derived);
+        }
+    }
+    for marker in markers {
+        ops.delete_dir(&marker).ok();
+    }
     ops.delete_dir(lease_dir)
         .context("failed to clear stale deployment lease")
 }
@@ -558,14 +744,187 @@ mod tests {
     }
 
     #[test]
-    fn still_ours_tracks_stored_ownership() {
+    fn check_ownership_tracks_stored_ownership() {
         let mut remote = MemoryRemote::new();
         let lease = acquire(&mut remote).unwrap();
 
-        assert!(lease.still_ours(&mut remote));
+        assert!(matches!(
+            lease.check_ownership(&mut remote),
+            Ownership::Held
+        ));
 
         plant_lease(&mut remote, Utc::now());
-        assert!(!lease.still_ours(&mut remote));
+        assert!(matches!(
+            lease.check_ownership(&mut remote),
+            Ownership::Lost {
+                holder: Some(ref owner)
+            } if owner == "other"
+        ));
+    }
+
+    /// A shared remote behind the dot-path read filter, mirroring hosts
+    /// whose FTP answers SIZE/RETR/LIST on `.gale-deploy.lock` contents
+    /// with 550 while MKD/STOR/CWD/DELE/RMD all work.
+    fn filtered_remote() -> (
+        Arc<std::sync::Mutex<MemoryRemote>>,
+        crate::profile::server::remote::memory::FilteredReads,
+    ) {
+        let inner = Arc::new(std::sync::Mutex::new(MemoryRemote::new()));
+        let filtered = crate::profile::server::remote::memory::FilteredReads::new(inner.clone());
+        (inner, filtered)
+    }
+
+    #[test]
+    fn ownership_survives_an_unreadable_record() {
+        let (inner, mut filtered) = filtered_remote();
+        let lease = super::acquire(
+            &mut filtered,
+            &dir(),
+            "local:1",
+            ExecutorKind::Local,
+            "op-1",
+            false,
+        )
+        .unwrap();
+
+        // The record file exists on the remote but reads as missing.
+        assert!(inner.lock().unwrap().contents(LEASE_FILE).is_some());
+        assert!(matches!(
+            lease.check_ownership(&mut filtered),
+            Ownership::HeldViaMarker
+        ));
+
+        // Release still verifies ownership through the marker and cleans
+        // the whole claim: record file, marker, and directory.
+        lease.release(&mut filtered);
+        let remote = inner.lock().unwrap();
+        assert!(remote.contents(LEASE_FILE).is_none());
+        assert!(!remote.dirs.contains(LEASE_DIR));
+        assert!(!remote.dirs.iter().any(|d| d.starts_with(LEASE_DIR)));
+    }
+
+    #[test]
+    fn ownership_is_lost_when_the_marker_is_removed() {
+        let (inner, mut filtered) = filtered_remote();
+        let lease = super::acquire(
+            &mut filtered,
+            &dir(),
+            "local:1",
+            ExecutorKind::Local,
+            "op-1",
+            false,
+        )
+        .unwrap();
+
+        // A competing executor dismantles our claim and establishes its
+        // own: the claim directory still stands but our marker is gone
+        // and a foreign marker took its place.
+        {
+            let mut remote = inner.lock().unwrap();
+            remote.dirs.remove(&format!("{LEASE_DIR}/holder-op-1"));
+            remote.dirs.insert(format!("{LEASE_DIR}/holder-op-foreign"));
+        }
+        assert!(matches!(
+            lease.check_ownership(&mut filtered),
+            Ownership::Lost { holder: None }
+        ));
+
+        // If the claim directory itself is also gone, the checks cannot
+        // tell "dismantled" from "this host filters even directory
+        // probes" — that degrades to Unverifiable, not a takeover claim.
+        inner.lock().unwrap().dirs.remove(LEASE_DIR);
+        assert!(matches!(
+            lease.check_ownership(&mut filtered),
+            Ownership::Unverifiable(_)
+        ));
+    }
+
+    #[test]
+    fn ownership_is_unverifiable_when_the_transport_fails() {
+        let (inner, mut filtered) = filtered_remote();
+        let lease = super::acquire(
+            &mut filtered,
+            &dir(),
+            "local:1",
+            ExecutorKind::Local,
+            "op-1",
+            false,
+        )
+        .unwrap();
+
+        inner.lock().unwrap().connection_dead = true;
+        assert!(matches!(
+            lease.check_ownership(&mut filtered),
+            Ownership::Unverifiable(_)
+        ));
+    }
+
+    #[test]
+    fn a_claim_with_a_marker_is_busy_even_when_its_record_is_unreadable() {
+        let (inner, mut filtered) = filtered_remote();
+        // A live claim whose record cannot be read: lock dir plus holder
+        // marker, no readable lease.json.
+        {
+            let mut remote = inner.lock().unwrap();
+            remote.dirs.insert(LEASE_DIR.to_owned());
+            remote.dirs.insert(format!("{LEASE_DIR}/holder-op-foreign"));
+        }
+        // Listings still work on this variant so the marker is visible.
+        filtered.filter_lists = false;
+
+        let err = super::acquire(
+            &mut filtered,
+            &dir(),
+            "local:1",
+            ExecutorKind::Local,
+            "op-1",
+            false,
+        )
+        .err()
+        .expect("expected LeaseBusy");
+        let busy = err.downcast_ref::<LeaseBusy>().expect("expected LeaseBusy");
+        assert!(busy.stale);
+
+        // And on a host whose listings are filtered too, the same claim
+        // must not be silently broken: the marker keeps the directory
+        // non-empty, so rmdir fails and the claim survives.
+        let (inner, mut filtered) = filtered_remote();
+        {
+            let mut remote = inner.lock().unwrap();
+            remote.dirs.insert(LEASE_DIR.to_owned());
+            remote.dirs.insert(format!("{LEASE_DIR}/holder-op-foreign"));
+        }
+        assert!(
+            super::acquire(
+                &mut filtered,
+                &dir(),
+                "local:1",
+                ExecutorKind::Local,
+                "op-1",
+                true,
+            )
+            .is_err()
+        );
+        let remote = inner.lock().unwrap();
+        assert!(remote.dirs.contains(LEASE_DIR));
+        assert!(
+            remote
+                .dirs
+                .contains(&format!("{LEASE_DIR}/holder-op-foreign"))
+        );
+    }
+
+    #[test]
+    fn break_clears_holder_markers() {
+        let mut remote = MemoryRemote::new();
+        // A stale claim carrying a marker: crashed before release.
+        plant_lease(&mut remote, expired());
+        remote.dirs.insert(format!("{LEASE_DIR}/holder-op-old"));
+
+        let lease = acquire_as(&mut remote, "local:1", "op-1", true).unwrap();
+        assert_eq!(lease.record.operation_id, "op-1");
+        assert!(remote.dirs.contains(&format!("{LEASE_DIR}/holder-op-1")));
+        assert!(!remote.dirs.contains(&format!("{LEASE_DIR}/holder-op-old")));
     }
 
     #[test]
@@ -618,6 +977,38 @@ mod tests {
         assert_eq!(stored.owner, "worker:vps");
 
         lease.release(&mut remote);
+    }
+
+    #[test]
+    fn heartbeat_beats_through_the_marker_on_a_filtered_remote() {
+        let (inner, mut filtered) = filtered_remote();
+        let mut lease = super::acquire(
+            &mut filtered,
+            &dir(),
+            "local:1",
+            ExecutorKind::Local,
+            "op-1",
+            false,
+        )
+        .unwrap();
+        let before = lease.record.heartbeat_at;
+
+        // The heartbeat's second connection sees the same filtered remote.
+        let conn = filtered.clone();
+        start_heartbeat_every(
+            &mut lease,
+            move || Ok(Box::new(conn.clone()) as Box<dyn RemoteOps>),
+            Duration::from_millis(50),
+        );
+
+        thread::sleep(Duration::from_millis(160));
+        assert!(!lease.is_lost());
+        let after: LeaseRecord =
+            serde_json::from_slice(inner.lock().unwrap().contents(LEASE_FILE).unwrap()).unwrap();
+        assert!(after.heartbeat_at > before);
+        assert_eq!(after.operation_id, "op-1");
+
+        lease.release(&mut filtered);
     }
 
     #[test]

@@ -23,13 +23,13 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use eyre::{Context, Result, ensure};
+use eyre::{Context, Result, bail, ensure};
 use serde::Serialize;
 use tracing::{info, warn};
 
 use super::{
     host::{HostCapabilities, HostControl},
-    lease::{self, Lease, LeaseRecord},
+    lease::{self, Lease, LeaseRecord, Ownership},
     paths::{DeployPath, DeployPathBuf, RemotePath, RemotePathBuf},
     plan::{
         self, ConfigAction, DeploySelection, DeploymentPlan, DesiredDeployment, FileSource,
@@ -50,6 +50,11 @@ use crate::profile::{
 
 const TRANSFER_ATTEMPTS: usize = 3;
 const RETRY_DELAY: Duration = Duration::from_millis(500);
+/// Ownership re-checks are cheap (a stat and a directory probe), so a
+/// check that cannot complete is retried a few times before the
+/// operation aborts with an honest reason rather than a false takeover.
+const OWNERSHIP_CHECK_ATTEMPTS: usize = 3;
+const OWNERSHIP_RETRY_DELAY: Duration = Duration::from_millis(400);
 /// Config files are small; remote reads for decision-making are bounded.
 const MAX_CONFIG_READ: u64 = 1024 * 1024;
 const RESTART_VERIFY_ATTEMPTS: usize = 12;
@@ -436,16 +441,55 @@ pub fn deploy(
     }
 }
 
-/// Fails the operation when the lease no longer belongs to this executor.
-/// A foreign owner means another deployment may be mutating the server,
-/// so this one must stop before its next phase rather than interleave its
-/// writes with the new owner's.
+/// Fails the operation when the lease verifiably no longer belongs to
+/// this executor. A foreign owner means another deployment may be
+/// mutating the server, so this one must stop before its next phase
+/// rather than interleave its writes with the new owner's. A check that
+/// cannot complete is retried and then aborts with the actual reason —
+/// an unreadable lease record is not proof of a takeover.
 fn ensure_ownership(lease: &Lease, session: &mut Session) -> Result<()> {
-    eyre::ensure!(
-        !lease.is_lost() && lease.still_ours(session.ops.as_mut()),
-        "the deployment lease was taken over by another executor; aborting this operation"
-    );
-    Ok(())
+    let mut last_error = None;
+    for attempt in 0..OWNERSHIP_CHECK_ATTEMPTS {
+        if lease.is_lost() {
+            bail!(
+                "the deployment lease was taken over by another executor; aborting this operation"
+            );
+        }
+        match lease.check_ownership(session.ops.as_mut()) {
+            Ownership::Held => return Ok(()),
+            Ownership::HeldViaMarker => {
+                // Ownership is proven by the marker directory because the
+                // host will not return the lease record on reads. Surface
+                // it once per session so support can tell this apart from
+                // a normal deployment.
+                const WARNING: &str = "this host does not return the lease record on reads; \
+                    lease ownership is being verified through its marker directory";
+                if !session.warnings.iter().any(|w| w == WARNING) {
+                    session.warnings.push(WARNING.to_owned());
+                }
+                return Ok(());
+            }
+            Ownership::Lost { holder } => match holder {
+                Some(owner) => {
+                    bail!("the deployment lease was taken over by {owner}; aborting this operation")
+                }
+                None => bail!(
+                    "the deployment lease was removed by another executor; aborting this operation"
+                ),
+            },
+            Ownership::Unverifiable(err) => {
+                warn!(attempt, %err, "could not verify deployment lease ownership; retrying");
+                last_error = Some(err);
+                thread::sleep(OWNERSHIP_RETRY_DELAY);
+                if let Err(err) = session.ops.reconnect() {
+                    warn!(%err, "lease ownership re-check could not reconnect");
+                }
+            }
+        }
+    }
+    Err(last_error
+        .expect("at least one ownership check ran")
+        .wrap_err("could not verify the deployment lease still belongs to this executor; aborting rather than risk conflicting writes"))
 }
 
 /// Consults the host provider for the configured restart policy.
@@ -1007,6 +1051,19 @@ pub fn persist_state(session: &mut Session) -> Result<()> {
     .context("failed to write remote deployment state")?;
 
     session.base_seq = session.state.operation_seq;
+
+    // Some hosts filter dot-paths like the state file from read commands
+    // while writes still succeed. Surface that once per persist so the
+    // resulting blind spots (no durable ownership history, no operation
+    // records readable back) are diagnosable instead of silent.
+    match session.ops.is_file(&target) {
+        Ok(true) => {}
+        Ok(false) => warn!(
+            "remote deployment state was written to {target} but cannot be read back; \
+             this host appears to filter hidden files from reads"
+        ),
+        Err(err) => warn!("could not verify the written deployment state: {err}"),
+    }
     Ok(())
 }
 
@@ -1146,7 +1203,7 @@ mod tests {
                 lease::LeaseRecord,
                 paths::RemotePathBuf,
                 plan::{Publication, StagedFile},
-                remote::memory::MemoryRemote,
+                remote::memory::{FilteredReads, MemoryRemote},
             },
             sync::{PendingConfigReason, archive::ValidatedConfigFile},
         },
@@ -1258,8 +1315,21 @@ mod tests {
     }
 
     fn open(remote: Shared) -> Result<Session<'static>> {
+        open_ops(Box::new(remote))
+    }
+
+    fn open_ops(ops: Box<dyn RemoteOps>) -> Result<Session<'static>> {
         let spec = Box::leak(Box::new(spec()));
-        open_session(Box::new(remote), spec, RemotePathBuf::new(BASE).unwrap())
+        open_session(ops, spec, RemotePathBuf::new(BASE).unwrap())
+    }
+
+    /// A remote whose dot-paths are invisible to read commands — the
+    /// observed DatHost condition behind the false "lease taken over"
+    /// abort: `lease.json` can be written but never read back.
+    fn filtered() -> (Shared, FilteredReads) {
+        let inner = remote();
+        let filtered = FilteredReads::new(inner.clone());
+        (inner, filtered)
     }
 
     fn context() -> PlanContext {
@@ -2186,6 +2256,138 @@ mod tests {
         let record = &persisted.config[&path];
         assert_eq!(record.policy, ConfigUpdatePolicy::AlwaysKeep);
         assert_eq!(record.policy_set_at, Some(hash));
+    }
+
+    #[test]
+    fn deploy_on_a_read_filtered_remote_uses_the_holder_marker() {
+        // Reproduces the live DatHost failure: the lease record is
+        // write-only there, so the ownership check falls back to the
+        // holder marker instead of aborting as a false takeover. The
+        // whole lifecycle still works: claim, plan gate, uploads, state
+        // persist, release.
+        let fixture = mod_fixture();
+        let publication = fixture.publication();
+        let desired = desired_payload();
+        let (memory, filtered) = filtered();
+        let mut session = open_ops(Box::new(filtered.clone())).unwrap();
+
+        let conn = filtered.clone();
+        let deployment = deploy(
+            &mut session,
+            move || Ok(Box::new(conn.clone()) as Box<dyn RemoteOps>),
+            &publication,
+            &desired,
+            &selection(true, false),
+            &context(),
+            &meta(),
+            None,
+            false,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(deployment.summary.uploaded_files, 1);
+        // The session reports why record reads are not the source of truth.
+        assert!(
+            session
+                .warnings
+                .iter()
+                .any(|w| w.contains("marker directory"))
+        );
+
+        let state = finish(
+            &mut session,
+            deployment,
+            RestartOutcome::NotRequired,
+            &meta(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            remote_contents(&memory, MOD_DLL_REMOTE),
+            Some(b"dll-bytes".to_vec())
+        );
+        assert_eq!(
+            state.last_operation.unwrap().status,
+            OperationStatus::Succeeded
+        );
+        // The claim was fully released even though its record could never
+        // be read back: file, marker, and directory are all gone.
+        assert!(!remote_has_dir(&memory, LEASE_DIR_REMOTE));
+    }
+
+    #[test]
+    fn deploy_does_not_confuse_a_dead_transport_with_a_takeover() {
+        // The transport dies after the session opens. Whatever fails
+        // first must report the transport problem — never a phantom
+        // competing executor — and must not touch payload files.
+        let fixture = mod_fixture();
+        let publication = fixture.publication();
+        let desired = desired_payload();
+        let (memory, filtered) = filtered();
+        let mut session = open_ops(Box::new(filtered)).unwrap();
+        memory.lock().unwrap().connection_dead = true;
+
+        let err = deploy(
+            &mut session,
+            no_connect,
+            &publication,
+            &desired,
+            &selection(true, false),
+            &context(),
+            &meta(),
+            None,
+            false,
+            |_| {},
+        )
+        .err()
+        .expect("a dead transport must fail the deployment");
+
+        let chain = format!("{err:#}");
+        assert!(
+            !chain.contains("taken over"),
+            "a transport failure must not blame another executor: {chain}"
+        );
+        assert!(remote_contents(&memory, MOD_DLL_REMOTE).is_none());
+    }
+
+    #[test]
+    fn a_failed_filtered_deploy_still_records_state_and_releases() {
+        let fixture = mod_fixture();
+        let publication = fixture.publication();
+        let desired = desired_payload();
+        let (memory, filtered) = filtered();
+        memory
+            .lock()
+            .unwrap()
+            .fail_always
+            .insert(format!("{MOD_DLL_REMOTE}.gale-upload"));
+        let mut session = open_ops(Box::new(filtered)).unwrap();
+
+        let err = deploy(
+            &mut session,
+            no_connect,
+            &publication,
+            &desired,
+            &selection(true, false),
+            &context(),
+            &meta(),
+            None,
+            false,
+            |_| {},
+        )
+        .err()
+        .expect("the upload failure must fail the deployment");
+        assert!(format!("{err:#}").contains("failed to upload"));
+
+        // The failure was still recorded accurately (the state file is
+        // writeable even when it is not readable) and the lease released.
+        let persisted = remote_state(&memory);
+        assert_eq!(
+            persisted.last_operation.unwrap().status,
+            OperationStatus::Failed
+        );
+        assert!(persisted.restart_required);
+        assert!(!remote_has_dir(&memory, LEASE_DIR_REMOTE));
     }
 
     // --- remote accessors through the shared handle ---
