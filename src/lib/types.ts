@@ -494,11 +494,18 @@ export type WorkerStatus = {
 	/// The newest publication revision the worker has observed.
 	/// Observation alone is not deployment.
 	observedRevision: string | null;
-	/// A publication revision awaiting successful deployment, if any.
+	/// A publication revision awaiting successful completion, if any.
+	/// Completion is phase-scoped — see `pendingMods`/`pendingConfigs`.
 	pendingRevision: string | null;
+	/// The pending publication's mod payload is not yet recorded as
+	/// deployed. Absent on workers older than phase-scoped status.
+	pendingMods?: boolean;
+	/// Config evaluation is still owed for the pending publication.
+	pendingConfigs?: boolean;
 	/// When the pending work becomes eligible for its next attempt.
 	nextAttemptAt: string | null;
-	/// The newest publication revision that fully deployed successfully.
+	/// The newest publication revision whose mods and config evaluation
+	/// are both fully applied to the server.
 	lastDeployedRevision: string | null;
 	busy: BusyOperation | null;
 	lastOperation: OperationRecord | null;
@@ -564,12 +571,16 @@ export type LocalWorkerOwnership =
 
 /// What the worker will do with its pending publication, derived from
 /// its own reported automation flags — not the unsaved local checkboxes.
-export type PendingPublicationMode = 'automatic' | 'configOnly' | 'manual';
+export type PendingPublicationMode = 'automatic' | 'configOnly' | 'modsManual' | 'manual';
 
 export type PendingPublication = {
 	mode: PendingPublicationMode;
 	/// A previous automatic attempt failed; a retry is scheduled.
 	retrying: boolean;
+	/// The pending publication's mod payload still awaits deployment.
+	modsOutstanding: boolean;
+	/// Config evaluation still awaits an automatic pass.
+	configsOutstanding: boolean;
 };
 
 export type LocalWorkerStatus = {

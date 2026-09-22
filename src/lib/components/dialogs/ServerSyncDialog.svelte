@@ -17,7 +17,8 @@
 		ServerSyncResult,
 		ServerSyncStageProgress,
 		ServerSyncStatus,
-		SyncConfigUpdatePolicy
+		SyncConfigUpdatePolicy,
+		WorkerStatus
 	} from '$lib/types';
 	import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 	import { message } from '@tauri-apps/plugin-dialog';
@@ -220,6 +221,25 @@
 		}
 	}
 
+	/// What of the pending publication still needs to reach the server.
+	/// `pendingRevision` alone no longer implies a full deploy — a
+	/// config-only pass may already have run, leaving only mods owed.
+	function pendingScopeLabel(worker: WorkerStatus): string {
+		const revision = new Date(worker.pendingRevision!).toLocaleString();
+		// Workers built before phase-scoped status emit neither flag —
+		// show the generic pending line rather than guess a scope.
+		if (worker.pendingMods === undefined && worker.pendingConfigs === undefined) {
+			return m.serverSync_pendingRevision({ revision });
+		}
+		if (worker.pendingMods && worker.pendingConfigs) {
+			return m.serverSync_pendingRevision({ revision });
+		}
+		if (worker.pendingMods) {
+			return m.serverSync_pendingMods({ revision });
+		}
+		return m.serverSync_pendingConfigs({ revision });
+	}
+
 	function actionLabel(entry: PlanConfigEntry): string {
 		switch (entry.action) {
 			case 'write':
@@ -307,9 +327,7 @@
 				{/if}
 				{#if status.worker?.pendingRevision}
 					<span class="text-orange-600 dark:text-orange-400">
-						{m.serverSync_pendingRevision({
-							revision: new Date(status.worker.pendingRevision).toLocaleString()
-						})}
+						{pendingScopeLabel(status.worker)}
 					</span>
 				{/if}
 				{#if status.worker?.lastError}
@@ -524,8 +542,12 @@
 		<div class="mt-4">
 			{#if result.state.lastOperation?.status === 'partial' || result.failedConfigWrites.length > 0}
 				<InfoBox type="warning">{m.serverSync_partialDone()}</InfoBox>
-			{:else}
+			{:else if result.plan.modsPhase && result.plan.configsPhase}
 				<InfoBox type="info">{m.serverSync_deployed_done()}</InfoBox>
+			{:else if result.plan.modsPhase}
+				<InfoBox type="info">{m.serverSync_deployed_modsDone()}</InfoBox>
+			{:else}
+				<InfoBox type="info">{m.serverSync_deployed_configsDone()}</InfoBox>
 			{/if}
 			<DeploymentStats
 				uploaded={result.summary.uploadedFiles}

@@ -489,9 +489,16 @@
 					? m.dedicatedServerDialog_localWorkerPendingRetry()
 					: m.dedicatedServerDialog_localWorkerPending();
 			case 'configOnly':
+				if (!pending.modsOutstanding) {
+					return pending.retrying
+						? m.dedicatedServerDialog_localWorkerPendingConfigsRetry()
+						: m.dedicatedServerDialog_localWorkerPendingConfigs();
+				}
 				return pending.retrying
 					? m.dedicatedServerDialog_localWorkerPendingConfigOnlyRetry()
 					: m.dedicatedServerDialog_localWorkerPendingConfigOnly();
+			case 'modsManual':
+				return m.dedicatedServerDialog_localWorkerPendingModsManual();
 			case 'manual':
 				return m.dedicatedServerDialog_localWorkerPendingManual();
 		}

@@ -169,7 +169,9 @@ In the remote settings, choose **Worker on another machine** as the sync mode an
 - Gale accepts `http://` **only** for a worker on the same machine (loopback). The bearer token travels in the clear over plaintext HTTP, so remote workers need `https://`. Terminate TLS with a reverse proxy (Caddy, nginx, Traefik) or reach the worker through a secure tunnel (WireGuard, Tailscale, SSH port-forward). Never expose the plaintext API to a LAN and assume it is safe.
 - **Test connection** verifies reachability, the token, and that the worker's bound profile matches this profile.
 
-Manual **Deploy** through the worker works regardless of the `autoSync` toggle. You can change the automation toggles (`autoSync`, `autoMods`) and the restart policy from the dialog, and they persist across worker restarts.
+Manual **Deploy** through the worker works regardless of the `autoSync` toggle. You can change the automation toggles (`autoSync`, `autoMods`) and the restart policy from the dedicated-server dialog or the sync dialog — Gale pushes the values to the running worker, reads them back, and they persist across worker restarts.
+
+The worker tracks a publication's phases separately: config evaluation/deployment and the mod payload. With `autoSync` on but `autoMods` off, a config-only sync settles the config phase while the publication's mod changes stay outstanding until a manual deploy runs them or `autoMods` is enabled — which retries the owed mods without a new publication. A publication counts as fully deployed only once both phases are applied.
 
 #### Moving a managed worker to a VPS
 

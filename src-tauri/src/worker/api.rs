@@ -84,11 +84,22 @@ pub struct StatusResponse {
     /// The newest publication revision the worker has observed.
     /// Observation alone is not deployment.
     pub observed_revision: Option<DateTime<Utc>>,
-    /// A publication revision awaiting successful deployment, if any.
+    /// A publication revision awaiting successful completion, if any.
+    /// Completion is phase-scoped — see `pending_mods`/`pending_configs`
+    /// for what remains owed.
     pub pending_revision: Option<DateTime<Utc>>,
+    /// The pending publication's mod payload is not yet recorded as
+    /// deployed — it awaits a manual deployment or `auto_mods`.
+    #[serde(default)]
+    pub pending_mods: bool,
+    /// Config evaluation is still owed for the pending publication.
+    #[serde(default)]
+    pub pending_configs: bool,
     /// When the pending work becomes eligible for its next attempt.
     pub next_attempt_at: Option<DateTime<Utc>>,
-    /// The newest publication revision that fully deployed successfully.
+    /// The newest publication revision whose mod payload *and* config
+    /// evaluation are both fully applied. A config-only deployment does
+    /// not advance it while that publication's mods remain owed.
     pub last_deployed_revision: Option<DateTime<Utc>>,
     /// The operation currently in flight, if any.
     pub busy: Option<BusyOperation>,
