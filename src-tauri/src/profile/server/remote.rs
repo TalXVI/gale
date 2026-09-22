@@ -1,7 +1,7 @@
 use std::{
     fs::File,
     io::{Cursor, Read, Write},
-    net::{TcpStream, ToSocketAddrs},
+    net::{Shutdown, TcpStream, ToSocketAddrs},
     path::Path,
     sync::{Arc, Mutex},
     time::Duration,
@@ -895,27 +895,113 @@ fn ftp_size(ftp: &mut RustlsFtpStream, path: &str) -> Result<Option<u64>> {
     }
 }
 
+/// Owns an FTPS upload stream and explicitly closes its TCP write side after
+/// the TLS stream has sent `close_notify`.
+///
+/// SuppaFTP 11's synchronous `finalize_put_stream` drops the data stream and
+/// immediately reads the control-channel reply. Its rustls stream emits
+/// `close_notify` from `Drop`, but the underlying socket is only closed as a
+/// side effect of dropping the last handle. Some ProFTPD installations can
+/// persist the first 8 KiB received when that implicit close races the final
+/// TLS records. Keeping a socket clone lets this wrapper make the lifecycle
+/// explicit: dropping the TLS stream sends `close_notify`, then `shutdown`
+/// sends the TCP FIN that terminates the data channel before `226` is read.
+struct FtpUploadStream<S> {
+    stream: Option<S>,
+    socket: TcpStream,
+    closed: bool,
+}
+
+impl<S: Write> FtpUploadStream<S> {
+    fn new(stream: S, socket: TcpStream) -> Self {
+        Self {
+            stream: Some(stream),
+            socket,
+            closed: false,
+        }
+    }
+
+    /// Send the TLS close notification, half-close the TCP write side, and
+    /// consume every response record before the socket is dropped.
+    fn close_tls_and_drain(&mut self) -> Result<()> {
+        drop(self.stream.take());
+        self.socket
+            .shutdown(Shutdown::Write)
+            .context("failed to shut down FTP data socket")?;
+
+        // FTPS servers may send post-handshake TLS records (notably TLS 1.3
+        // session tickets) on the data channel. Leaving those bytes unread
+        // makes Windows and some POSIX stacks reset the socket when the last
+        // handle is dropped, which can discard data the server received just
+        // before the reset. The data channel has no application response, so
+        // draining it to EOF is the complete close handshake.
+        let mut discarded = [0u8; 16 * 1024];
+        loop {
+            match self.socket.read(&mut discarded) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error) => return Err(error).context("failed to drain FTP data socket"),
+            }
+        }
+        self.closed = true;
+        Ok(())
+    }
+}
+
+impl<S: Write> Write for FtpUploadStream<S> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.stream
+            .as_mut()
+            .expect("FTP upload stream was already closed")
+            .write(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream
+            .as_mut()
+            .expect("FTP upload stream was already closed")
+            .flush()
+    }
+}
+
+impl<S> Drop for FtpUploadStream<S> {
+    fn drop(&mut self) {
+        if !self.closed {
+            // Best effort cleanup for an error path. The normal path calls
+            // `close_tls_and_drain` so drain errors can be reported.
+            drop(self.stream.take());
+            let _ = self.socket.shutdown(Shutdown::Write);
+        }
+    }
+}
+
 /// `STOR` with an explicit data-stream flush and byte-count check.
 ///
-/// SuppaFTP's `put_file` only drops the data stream before reading the
-/// `226`; over FTPS the rustls stream defers socket errors to its flush,
-/// and dropping the stream merely logs that failure — so a transfer the
-/// server aborted mid-flight reported success. Flushing here surfaces
-/// the deferred error while the stream is still alive, and comparing
-/// copied bytes catches a truncated copy outright.
+/// SuppaFTP's synchronous `finalize_put_stream` only drops the data stream
+/// before reading `226`. Over FTPS, the rustls stream can have unread
+/// post-handshake records from the server; dropping a socket with those bytes
+/// pending may reset the connection and make ProFTPD discard the tail. Flush
+/// the application records, complete the TLS/TCP close handshake, and compare
+/// the stored length so a truncated copy is never accepted.
 fn ftp_store(
     ftp: &mut RustlsFtpStream,
     path: &str,
     reader: &mut impl Read,
     expected_len: u64,
 ) -> Result<()> {
-    let mut stream = ftp.put_with_stream(path)?;
+    let stream = ftp.put_with_stream(path)?;
+    let socket = stream
+        .get_ref()
+        .try_clone()
+        .context("failed to duplicate FTP data socket")?;
+    let mut stream = FtpUploadStream::new(stream, socket);
     let written = std::io::copy(reader, &mut stream).context("failed to write FTP data stream")?;
     ensure!(
         written == expected_len,
         "FTP upload for {path} copied {written} bytes, expected {expected_len}"
     );
     stream.flush().context("failed to flush FTP data stream")?;
+    stream.close_tls_and_drain()?;
     ftp.finalize_put_stream(stream)?;
     // A flushed socket only proves local delivery. Some servers still
     // send 226 after aborting the data channel; check the stored length
@@ -1490,10 +1576,11 @@ pub(crate) mod fake_ftp {
                 .with_no_client_auth()
                 .with_single_cert(vec![certified.cert.der().clone()], key.into())
                 .unwrap();
-            // Post-handshake tickets would land on a client that never
-            // reads a STOR data socket; closing with them unread sends a
-            // RST that discards the payload the server just received.
-            config.send_tls13_tickets = 0;
+            // Keep post-handshake tickets enabled: an FTPS server can send
+            // these records on an upload data channel even though the client
+            // has no application response to read. The upload regression
+            // exercises draining those records before the TCP socket closes.
+            config.send_tls13_tickets = 2;
             config
         };
         let control = Arc::new(build(&[&TLS13, &TLS12]));
@@ -2771,6 +2858,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ftps_uploads_preserve_binary_payloads_across_record_boundaries() {
+        // The fake TLS server leaves TLS 1.3 post-handshake tickets enabled;
+        // every payload below therefore exercises the data-channel drain.
+        let server = FakeFtp::valheim_host(FakeFtpOptions {
+            tls: true,
+            ..Default::default()
+        });
+        let mut conn = ftps_connect(&server);
+
+        for (sequence, size) in [1usize, 8_191, 8_192, 8_193, 19_968, 32_769]
+            .into_iter()
+            .enumerate()
+        {
+            let bytes: Vec<u8> = (0..size)
+                .map(|index| ((index * 131 + sequence * 17) % 251) as u8)
+                .collect();
+            let path = remote_path(&format!("/BepInEx/config/upload-{sequence}-{size}.bin"));
+
+            conn.write(path.as_path(), &bytes).unwrap();
+
+            let stored = server.file(path.as_str()).expect("uploaded file is absent");
+            assert_eq!(stored.len(), bytes.len());
+            assert_eq!(blake3::hash(&stored), blake3::hash(&bytes));
+            assert_eq!(stored, bytes);
+        }
+    }
+
     /// Regression test for an FTPS data channel that dies after the TLS
     /// handshake: the fake completes the handshake, kills the socket
     /// before the payload lands, then still answers `226 transfer
@@ -2797,6 +2912,70 @@ mod tests {
             server.file(path.as_str()).as_deref(),
             Some(expected.as_slice())
         );
+    }
+
+    /// Exercises Gale's production FTPS transport against a real server.
+    ///
+    /// The ignored test is run in CI or locally with a disposable ProFTPD
+    /// endpoint. It deliberately crosses the 8 KiB copy boundary, performs
+    /// consecutive transfers, and verifies downloaded bytes and hashes.
+    #[test]
+    #[ignore = "requires GALE_TEST_FTPS_* for a disposable FTPS server"]
+    fn real_ftps_round_trips_varied_binary_payloads() {
+        let host = std::env::var("GALE_TEST_FTPS_HOST").expect("GALE_TEST_FTPS_HOST is required");
+        let port = std::env::var("GALE_TEST_FTPS_PORT")
+            .unwrap_or_else(|_| "21".to_owned())
+            .parse()
+            .expect("GALE_TEST_FTPS_PORT must be a port number");
+        let username =
+            std::env::var("GALE_TEST_FTPS_USER").expect("GALE_TEST_FTPS_USER is required");
+        let password =
+            std::env::var("GALE_TEST_FTPS_PASSWORD").expect("GALE_TEST_FTPS_PASSWORD is required");
+        let base = std::env::var("GALE_TEST_FTPS_DIR").unwrap_or_else(|_| "/".to_owned());
+        let mut settings = RemoteServerSettings {
+            protocol: RemoteProtocol::Ftps,
+            host,
+            port,
+            username,
+            server_directory: base.clone(),
+            authentication: RemoteAuthentication::Password,
+            ..Default::default()
+        };
+
+        let fingerprint = match RemoteConnection::connect(&settings, &password).unwrap() {
+            ConnectionAttempt::CertificateUntrusted { fingerprint } => fingerprint,
+            ConnectionAttempt::Connected(_) => {
+                panic!("test server certificate should be untrusted")
+            }
+            ConnectionAttempt::HostKeyUntrusted { .. } => panic!("FTPS returned an SSH host key"),
+        };
+        settings.trusted_certificate = Some(fingerprint);
+        let mut conn = match RemoteConnection::connect(&settings, &password).unwrap() {
+            ConnectionAttempt::Connected(conn) => conn,
+            _ => panic!("pinned FTPS certificate was not accepted"),
+        };
+
+        let sizes = [1usize, 8_191, 8_192, 8_193, 19_968, 1_048_613];
+        for (sequence, size) in sizes.into_iter().enumerate() {
+            let bytes: Vec<u8> = (0..size)
+                .map(|index| ((index * 131 + sequence * 17) % 251) as u8)
+                .collect();
+            let path = remote_path(&format!(
+                "{}/gale-ftps-{sequence}-{size}.bin",
+                base.trim_end_matches('/')
+            ));
+
+            conn.write(path.as_path(), &bytes).unwrap();
+            let stored = conn
+                .read(path.as_path(), size as u64 + 1)
+                .unwrap()
+                .expect("uploaded file is absent");
+
+            assert_eq!(stored.len(), size, "server stored the wrong length");
+            assert_eq!(blake3::hash(&stored), blake3::hash(&bytes));
+            assert_eq!(stored, bytes, "server stored different bytes");
+            assert!(conn.delete_file(path.as_path()).unwrap());
+        }
     }
 }
 
