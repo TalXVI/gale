@@ -1,10 +1,10 @@
 use std::{
     fs::File,
-    io::{Cursor, Read, Write},
+    io::{Cursor, ErrorKind, Read, Write},
     net::{Shutdown, TcpStream, ToSocketAddrs},
     path::Path,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD_NO_PAD};
@@ -24,6 +24,11 @@ use super::{
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound on draining an upload's data channel to EOF after the TLS/TCP
+/// close handshake. A healthy server closes its side as soon as the
+/// client's FIN arrives, so exceeding this means the peer is holding the
+/// channel open — the upload must fail rather than stall the deployment.
+const FTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const SSH_TIMEOUT: Duration = Duration::from_millis(15_000);
 const SFTP_NO_SUCH_FILE: i32 = 2;
 /// FTP servers do not always implement `SIZE` for directories.
@@ -588,6 +593,7 @@ impl RemoteOps for RemoteConnection {
                 path.as_str(),
                 &mut Cursor::new(bytes),
                 bytes.len() as u64,
+                FTP_DRAIN_TIMEOUT,
             ),
         }
     }
@@ -607,7 +613,13 @@ impl RemoteOps for RemoteConnection {
                 remote_file.flush()?;
                 Ok(())
             }
-            RemoteClient::Ftp(ftp) => ftp_store(ftp, remote.as_str(), &mut file, expected_len),
+            RemoteClient::Ftp(ftp) => ftp_store(
+                ftp,
+                remote.as_str(),
+                &mut file,
+                expected_len,
+                FTP_DRAIN_TIMEOUT,
+            ),
         }
     }
 
@@ -923,7 +935,10 @@ impl<S: Write> FtpUploadStream<S> {
 
     /// Send the TLS close notification, half-close the TCP write side, and
     /// consume every response record before the socket is dropped.
-    fn close_tls_and_drain(&mut self) -> Result<()> {
+    ///
+    /// `timeout` bounds the whole drain: a peer that never sends its FIN
+    /// must not block the upload indefinitely.
+    fn close_tls_and_drain(&mut self, timeout: Duration) -> Result<()> {
         drop(self.stream.take());
         self.socket
             .shutdown(Shutdown::Write)
@@ -935,11 +950,24 @@ impl<S: Write> FtpUploadStream<S> {
         // handle is dropped, which can discard data the server received just
         // before the reset. The data channel has no application response, so
         // draining it to EOF is the complete close handshake.
+        let deadline = Instant::now() + timeout;
         let mut discarded = [0u8; 16 * 1024];
         loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!("timed out waiting for the FTP server to close the data connection");
+            }
+            self.socket
+                .set_read_timeout(Some(remaining))
+                .context("failed to bound the FTP data socket drain")?;
             match self.socket.read(&mut discarded) {
                 Ok(0) => break,
                 Ok(_) => {}
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                {
+                    bail!("timed out waiting for the FTP server to close the data connection")
+                }
                 Err(error) => return Err(error).context("failed to drain FTP data socket"),
             }
         }
@@ -988,6 +1016,7 @@ fn ftp_store(
     path: &str,
     reader: &mut impl Read,
     expected_len: u64,
+    drain_timeout: Duration,
 ) -> Result<()> {
     let stream = ftp.put_with_stream(path)?;
     let socket = stream
@@ -1001,7 +1030,7 @@ fn ftp_store(
         "FTP upload for {path} copied {written} bytes, expected {expected_len}"
     );
     stream.flush().context("failed to flush FTP data stream")?;
-    stream.close_tls_and_drain()?;
+    stream.close_tls_and_drain(drain_timeout)?;
     ftp.finalize_put_stream(stream)?;
     // A flushed socket only proves local delivery. Some servers still
     // send 226 after aborting the data channel; check the stored length
@@ -1462,6 +1491,11 @@ pub(crate) mod fake_ftp {
         /// behavior where a store reports success while persisting a
         /// truncated file.
         pub truncate_stor_to: Option<usize>,
+        /// On `STOR`, hold the data connection open after the payload
+        /// arrives — no `close_notify`, no FIN — so the client's close
+        /// handshake never sees EOF: a wedged server the drain bound
+        /// must turn into an upload failure.
+        pub hold_stor_eof: bool,
     }
 
     /// A running fake server. `fs` is shared with every accepted
@@ -1877,6 +1911,9 @@ pub(crate) mod fake_ftp {
         let mut binary = false;
         let mut protected = false;
         let mut rename_from: Option<String> = None;
+        // STOR data sockets kept open under `hold_stor_eof`; they are
+        // dropped when the control session ends.
+        let mut held_data: Vec<DataSocket> = Vec::new();
         let mut line = String::new();
 
         /// Opens the pending passive data connection, if any, and wraps
@@ -2081,6 +2118,11 @@ pub(crate) mod fake_ftp {
                         }
                         Some(mut data) => {
                             let _ = data.read_to_end(&mut bytes);
+                            // Withhold EOF: dropping `data` here would FIN
+                            // the channel and complete the client's drain.
+                            if options.hold_stor_eof {
+                                held_data.push(data);
+                            }
                         }
                         None => {}
                     }
@@ -2220,9 +2262,10 @@ mod tests {
     use suppaftp::{FtpError, Status, types::Response};
 
     use super::{
-        ConnectionAttempt, FtpsCertVerifier, RemoteConnection, RemoteOps, RemoteProtocol,
-        RemoteServerSettings, allows_plaintext_ftp_fallback, certificate_fingerprint,
-        ftp_list_entries, ftps_client_config, is_ftp_not_found, is_ftp_tls_unsupported,
+        ConnectionAttempt, FtpsCertVerifier, RemoteClient, RemoteConnection, RemoteOps,
+        RemoteProtocol, RemoteServerSettings, allows_plaintext_ftp_fallback,
+        certificate_fingerprint, ftp_list_entries, ftp_store, ftps_client_config, is_ftp_not_found,
+        is_ftp_tls_unsupported,
     };
     use eyre::Result;
 
@@ -2912,6 +2955,39 @@ mod tests {
             server.file(path.as_str()).as_deref(),
             Some(expected.as_slice())
         );
+    }
+
+    /// Regression test for an FTPS server that accepts the payload but
+    /// never closes its end of the data connection: the close handshake
+    /// must fail once the drain bound elapses instead of stalling the
+    /// deployment, so the temporary file is never promoted.
+    #[test]
+    fn ftps_upload_fails_when_the_server_withholds_eof() {
+        let server = FakeFtp::valheim_host(FakeFtpOptions {
+            tls: true,
+            hold_stor_eof: true,
+            ..Default::default()
+        });
+        let mut conn = ftps_connect(&server);
+        let RemoteClient::Ftp(ftp) = &mut conn.client else {
+            panic!("expected an FTP connection");
+        };
+
+        let payload = vec![b'x'; 8 * 1024];
+        let error = ftp_store(
+            ftp,
+            "/BepInEx/config/state.tmp",
+            &mut std::io::Cursor::new(payload.as_slice()),
+            payload.len() as u64,
+            std::time::Duration::from_millis(500),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("timed out"),
+            "expected a drain timeout, got: {error}"
+        );
+        assert!(server.saw("STOR /BepInEx/config/state.tmp"));
     }
 
     /// Exercises Gale's production FTPS transport against a real server.
