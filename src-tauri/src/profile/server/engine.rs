@@ -25,7 +25,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use eyre::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::{
     host::{HostCapabilities, HostControl},
@@ -285,6 +285,7 @@ pub fn preview(
         Ok(lease) => Some(lease),
         Err(err) => match err.downcast::<lease::LeaseBusy>() {
             Ok(busy) => {
+                info!(phase = "preview.busy", owner = %busy.record.owner, stale = busy.stale, "preview found an existing deployment lease; taking a read-only snapshot");
                 let snapshot = take_snapshot(session, publication, desired, selection)?;
                 let plan = plan::build_plan(
                     publication,
@@ -669,6 +670,12 @@ fn take_snapshot(
     selection: &DeploySelection,
 ) -> Result<RemoteSnapshot> {
     refresh_state(session)?;
+    info!(
+        phase = "snapshot",
+        owned_files = session.state.files.len(),
+        desired_files = desired.payload.len(),
+        "starting remote snapshot"
+    );
 
     let spec = &session.mapper.spec;
     let mut payload_files = BTreeMap::new();
@@ -692,22 +699,34 @@ fn take_snapshot(
         // Only files that are both owned and desired are read: hashing
         // foreign files gains nothing, and an owned file that is no longer
         // desired is being removed anyway.
+        let mut hashed = 0usize;
         for (path, staged) in &desired.payload {
             let owned = session.state.files.contains_key(path);
             if !owned || payload_files.get(path) != Some(&staged.size) {
                 continue;
             }
             let remote = session.mapper.remote_path(path);
-            match session.ops.read(&remote, staged.size) {
-                Ok(Some(bytes)) => {
+            debug!(phase = "snapshot.payload", path = %remote, hashed, "reading owned payload");
+            match read_snapshot_file(
+                session.ops.as_mut(),
+                &remote,
+                staged.size,
+                "snapshot.payload",
+            )? {
+                Some(bytes) => {
                     payload_hashes
                         .insert(path.clone(), ContentHash::from_hash(blake3::hash(&bytes)));
+                    hashed += 1;
                 }
-                // Unreadable or resized between list and read: no hash is
-                // recorded and the planner conservatively re-uploads.
-                _ => {}
+                // A file removed after listing remains divergent. Transport
+                // failures are returned above and must not become uploads.
+                None => {}
             }
         }
+        info!(
+            phase = "snapshot.payload",
+            hashed, "completed owned payload hashes"
+        );
     }
 
     // Hash every config path a decision could touch: published files,
@@ -732,7 +751,12 @@ fn take_snapshot(
             let deploy = DeployPathBuf::new(path.as_str())
                 .map_err(|_| eyre::eyre!("config path is not deployable: {path}"))?;
             let remote = session.mapper.remote_path(&deploy);
-            let hash = match session.ops.read(&remote, MAX_CONFIG_READ)? {
+            let hash = match read_snapshot_file(
+                session.ops.as_mut(),
+                &remote,
+                MAX_CONFIG_READ,
+                "snapshot.config",
+            )? {
                 Some(bytes) => Some(ContentHash::from_hash(blake3::hash(&bytes))),
                 None => None,
             };
@@ -749,6 +773,29 @@ fn take_snapshot(
         host_managed: session.host_managed,
         layout: session.layout,
     })
+}
+
+/// A failed read can leave an FTP control channel waiting for a transfer
+/// completion reply. Replace the connection before retrying, and never turn
+/// an unresolved transport error into apparent content divergence.
+fn read_snapshot_file(
+    ops: &mut dyn RemoteOps,
+    path: &RemotePath,
+    max: u64,
+    phase: &'static str,
+) -> Result<Option<Vec<u8>>> {
+    match ops.read(path, max) {
+        Ok(bytes) => Ok(bytes),
+        Err(first) => {
+            warn!(phase, path = %path, error = %first, "remote read failed; reconnecting before retry");
+            ops.reconnect().with_context(|| {
+                format!("{phase}: failed to reconnect after reading {path}: {first}")
+            })?;
+            ops.read(path, max).with_context(|| {
+                format!("{phase}: read failed after reconnect for {path}; first error: {first}")
+            })
+        }
+    }
 }
 
 /// Applies the plan's file operations and updates `session.state` to
@@ -2517,6 +2564,185 @@ mod tests {
             &spec,
             RemotePathBuf::new("/").unwrap(),
         )
+    }
+
+    fn ftps_ops(addr: std::net::SocketAddr, certificate: &str) -> Result<Box<dyn RemoteOps>> {
+        let settings = RemoteServerSettings {
+            protocol: RemoteProtocol::Ftps,
+            host: "127.0.0.1".to_owned(),
+            port: addr.port(),
+            username: "u".to_owned(),
+            server_directory: "/".to_owned(),
+            authentication: RemoteAuthentication::Password,
+            trusted_certificate: Some(certificate.to_owned()),
+            ..Default::default()
+        };
+        match RemoteConnection::connect(&settings, "pw")? {
+            ConnectionAttempt::Connected(conn) => Ok(Box::new(conn)),
+            _ => eyre::bail!("pinned fake FTPS certificate was not accepted"),
+        }
+    }
+
+    #[test]
+    fn ftps_preview_recovers_after_reset_without_reupload_or_stranded_lease() {
+        use remote::fake_ftp::{FakeFtp, Options};
+
+        let server = FakeFtp::valheim_host(Options {
+            tls: true,
+            size_requires_binary: true,
+            ..Default::default()
+        });
+        let mut desired = DesiredDeployment {
+            payload: BTreeMap::new(),
+            package_defaults: BTreeMap::new(),
+        };
+        for index in 0..164 {
+            let path = deploy_path(&format!("BepInEx/plugins/Author-ModA/mod-{index:03}.dll"));
+            desired
+                .payload
+                .insert(path, staged(format!("mod-{index:03}").as_bytes()));
+        }
+        let fixture = mod_fixture();
+        let publication = fixture.publication();
+        let addr = server.addr;
+        let certificate = server.trusted_certificate().unwrap();
+        let mut deployed = open_ftps(&server).unwrap();
+        let deployment = deploy(
+            &mut deployed,
+            {
+                let certificate = certificate.clone();
+                move || ftps_ops(addr, &certificate)
+            },
+            &publication,
+            &desired,
+            &selection(true, false),
+            &context(),
+            &meta(),
+            None,
+            false,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(deployment.summary.uploaded_files, 164);
+        finish(
+            &mut deployed,
+            deployment,
+            RestartOutcome::NotRequired,
+            &meta(),
+        )
+        .unwrap();
+        drop(deployed);
+
+        let mut post_deploy = open_ftps(&server).unwrap();
+        assert_eq!(post_deploy.state.files.len(), 164);
+        // Drop the control connection before the 80th RETR completion.
+        // The incomplete hash must be retried on a new FTPS connection.
+        server.reset_on_retr(81, false); // state refresh is the first RETR
+        let recovered = preview(
+            &mut post_deploy,
+            &publication,
+            &desired,
+            &selection(true, false),
+            &context(),
+            &meta(),
+        )
+        .unwrap();
+        assert!(recovered.plan.uploads.is_empty());
+        assert!(recovered.busy.is_none());
+        assert!(!server.has_dir("/BepInEx/config/.gale-deploy.lock"));
+
+        // If the replacement connection also fails, Preview must return
+        // the transport error instead of manufacturing an upload plan.
+        server.reset_on_retrs(81, 2, false);
+        let error = preview(
+            &mut post_deploy,
+            &publication,
+            &desired,
+            &selection(true, false),
+            &context(),
+            &meta(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("read failed after reconnect"));
+        assert!(!server.has_dir("/BepInEx/config/.gale-deploy.lock"));
+
+        // The final payload's data and 226 arrive, then the server closes
+        // the control connection. Release must reconnect, verify the owner,
+        // and remove the claim through that fresh connection.
+        server.reset_on_retr(165, true);
+        let logins_before = server
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|command| command.starts_with("USER "))
+            .count();
+        let completed = preview(
+            &mut post_deploy,
+            &publication,
+            &desired,
+            &selection(true, false),
+            &context(),
+            &meta(),
+        )
+        .unwrap();
+        assert!(completed.plan.uploads.is_empty());
+        assert!(completed.busy.is_none());
+        assert!(!server.has_dir("/BepInEx/config/.gale-deploy.lock"));
+        let logins_after = server
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|command| command.starts_with("USER "))
+            .count();
+        assert_eq!(
+            logins_after,
+            logins_before + 1,
+            "lease release must reconnect after the reset"
+        );
+        drop(post_deploy);
+
+        let mut subsequent = open_ftps(&server).unwrap();
+        let next = preview(
+            &mut subsequent,
+            &publication,
+            &desired,
+            &selection(true, false),
+            &context(),
+            &meta(),
+        )
+        .unwrap();
+        assert!(next.plan.uploads.is_empty());
+        assert!(
+            next.busy.is_none(),
+            "a successful preview must leave no in-progress warning"
+        );
+        let unchanged = deploy(
+            &mut subsequent,
+            {
+                let certificate = certificate.clone();
+                move || ftps_ops(addr, &certificate)
+            },
+            &publication,
+            &desired,
+            &selection(true, false),
+            &context(),
+            &meta(),
+            Some(&next.plan.hash),
+            false,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(unchanged.summary.uploaded_files, 0);
+        finish(
+            &mut subsequent,
+            unchanged,
+            RestartOutcome::NotRequired,
+            &meta(),
+        )
+        .unwrap();
+        assert!(!server.has_dir("/BepInEx/config/.gale-deploy.lock"));
     }
 
     /// The live-verified DatHost profile — `SIZE` refused in ASCII mode,

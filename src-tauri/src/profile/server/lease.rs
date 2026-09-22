@@ -179,28 +179,47 @@ impl Lease {
     }
 
     /// Stops the heartbeat and removes the lease, but only while the
-    /// stored record still names this holder. If another executor took
-    /// over, its lease stays untouched, because release must never delete
-    /// a foreign lock. The whole operation is best-effort. A failure here
-    /// only means the lease expires on its own.
+    /// stored record still names this holder. A broken transport is replaced
+    /// once, and ownership is checked again before any cleanup on the new
+    /// connection. A foreign lock is never deleted.
     pub fn release(mut self, ops: &mut dyn RemoteOps) {
         signal_stop(&self.stop);
         if let Some(heartbeat) = self.heartbeat.take() {
             let _ = heartbeat.join();
         }
 
+        if !self.release_verified(ops) {
+            warn!(owner = %self.record.owner, "lease release failed; reconnecting for ownership-checked cleanup");
+            match ops.reconnect() {
+                Ok(()) => {
+                    if !self.release_verified(ops) {
+                        warn!(owner = %self.record.owner, "lease cleanup could not be verified after reconnect; leaving it to expire");
+                    }
+                }
+                Err(err) => {
+                    warn!(owner = %self.record.owner, error = %err, "could not reconnect to release deployment lease")
+                }
+            }
+        }
+    }
+
+    fn release_verified(&self, ops: &mut dyn RemoteOps) -> bool {
         match self.check_ownership(ops) {
             Ownership::Held | Ownership::HeldViaMarker => {
                 if let Err(err) = ops.delete_file(&self.file) {
                     warn!("failed to remove lease file: {err}");
+                    return false;
                 }
                 if let Err(err) = ops.delete_dir(&self.marker) {
                     warn!("failed to remove lease holder marker: {err}");
+                    return false;
                 }
                 if let Err(err) = ops.delete_dir(&self.dir) {
                     warn!("failed to remove lease directory: {err}");
+                    return false;
                 }
                 info!(owner = %self.record.owner, "released deployment lease");
+                true
             }
             Ownership::Lost { .. } => {
                 // Another owner holds the lease now, so theirs stays.
@@ -212,9 +231,11 @@ impl Lease {
                     owner = %self.record.owner,
                     "lease ownership changed; leaving the new holder's lease in place"
                 );
+                true
             }
             Ownership::Unverifiable(err) => {
-                warn!("could not verify lease ownership for release: {err}; leaving it to expire");
+                warn!("could not verify lease ownership for release: {err}");
+                false
             }
         }
     }
