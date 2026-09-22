@@ -339,11 +339,11 @@
 				<div class="mt-2 flex flex-col gap-3">
 					<div class="flex items-center">
 						<Label>{m.serverSync_autoSync()}</Label>
-						<Checkbox bind:checked={workerAutoSync} />
+						<Checkbox bind:checked={workerAutoSync} disabled={busy} />
 					</div>
 					<div class="flex items-center">
 						<Label>{m.serverSync_autoMods()}</Label>
-						<Checkbox bind:checked={workerAutoMods} />
+						<Checkbox bind:checked={workerAutoMods} disabled={busy} />
 					</div>
 					<Button color="primary" loading={savingWorker} disabled={busy} onclick={saveWorkerConfig}>
 						{m.serverSync_saveAutomation()}
@@ -359,6 +359,7 @@
 			type="single"
 			triggerClass="mt-1 w-full"
 			bind:value={scope}
+			disabled={busy}
 			items={[
 				{ value: 'both', label: m.serverSync_scopeBoth() },
 				{ value: 'mods', label: m.serverSync_scopeMods() },
@@ -375,13 +376,23 @@
 			{#if isWorker()}
 				<div>
 					<Label>{m.serverSync_workerToken()}</Label>
-					<InputField class="mt-1 w-full" bind:value={workerToken} type="password" />
+					<InputField
+						class="mt-1 w-full"
+						bind:value={workerToken}
+						type="password"
+						disabled={busy}
+					/>
 					<p class="text-primary-500 mt-1 text-sm">{m.serverSync_savedCredential()}</p>
 				</div>
 			{:else}
 				<div>
 					<Label>{m.dedicatedServerDialog_password()}</Label>
-					<InputField class="mt-1 w-full" bind:value={remotePassword} type="password" />
+					<InputField
+						class="mt-1 w-full"
+						bind:value={remotePassword}
+						type="password"
+						disabled={busy}
+					/>
 					<p class="text-primary-500 mt-1 text-sm">{m.serverSync_savedCredential()}</p>
 				</div>
 			{/if}
@@ -575,6 +586,7 @@
 				type="single"
 				triggerClass="w-40"
 				bind:value={restartPolicy}
+				disabled={busy}
 				items={[
 					{ value: 'manual', label: m.serverSync_restartManual() },
 					{ value: 'immediate', label: m.serverSync_restartImmediate() },
