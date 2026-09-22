@@ -562,6 +562,16 @@ export type LocalWorkerOwnership =
 	/// Installed for a different profile; controls must not be offered.
 	| 'foreign';
 
+/// What the worker will do with its pending publication, derived from
+/// its own reported automation flags — not the unsaved local checkboxes.
+export type PendingPublicationMode = 'automatic' | 'configOnly' | 'manual';
+
+export type PendingPublication = {
+	mode: PendingPublicationMode;
+	/// A previous automatic attempt failed; a retry is scheduled.
+	retrying: boolean;
+};
+
 export type LocalWorkerStatus = {
 	/// False off Windows — provisioning is unavailable there.
 	supported: boolean;
@@ -571,6 +581,9 @@ export type LocalWorkerStatus = {
 	ownership: LocalWorkerOwnership;
 	run: LocalWorkerRunReport | null;
 	worker: WorkerStatus | null;
+	/// The pending banner's content; null hides it — nothing pending, or
+	/// the worker is stopped/unreachable so pending state is unknown.
+	pendingPublication: PendingPublication | null;
 	workerError: string | null;
 	/// The last run report says the machine shut down — the service
 	/// comes back with the next boot.

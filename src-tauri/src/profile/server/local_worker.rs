@@ -113,6 +113,60 @@ fn ownership_of(
     }
 }
 
+/// What the managed worker will do with a publication it has observed
+/// but not yet deployed. Derived from the worker's live status — its
+/// journal is the authoritative automation state, since `/v1/config`
+/// writes persist across restarts while the install-time config only
+/// seeds them once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PendingPublicationMode {
+    /// `autoSync` and `autoMods` — the pending revision deploys on its
+    /// own.
+    Automatic,
+    /// `autoSync` without `autoMods` — config changes synchronize
+    /// automatically; mod updates still need a manual deployment.
+    ConfigOnly,
+    /// `autoSync` off — the pending revision is retained but nothing
+    /// deploys until a manual request or the setting is re-enabled.
+    Manual,
+}
+
+/// The pending-publication status the dialog shows. `retrying` marks
+/// that a previous automatic attempt failed and the worker is in its
+/// backoff delay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingPublication {
+    pub mode: PendingPublicationMode,
+    pub retrying: bool,
+}
+
+/// Derives the pending banner's content from the worker's live status.
+/// `None` means no banner: either nothing is pending, or the worker is
+/// stopped/unreachable so its pending state is unknown — the service and
+/// worker-error boxes already explain that case, and a banner must never
+/// promise a deployment the worker cannot perform.
+fn pending_publication(worker: Option<&StatusResponse>) -> Option<PendingPublication> {
+    let worker = worker?;
+    worker.pending_revision?;
+
+    let mode = if !worker.auto_sync {
+        PendingPublicationMode::Manual
+    } else if worker.auto_mods {
+        PendingPublicationMode::Automatic
+    } else {
+        PendingPublicationMode::ConfigOnly
+    };
+    Some(PendingPublication {
+        mode,
+        // `next_attempt_at` is only set after a failed attempt, and only
+        // automation honors it — a stale value must not mark a manual
+        // pending as retrying.
+        retrying: worker.auto_sync && worker.next_attempt_at.is_some(),
+    })
+}
+
 /// Everything the dialog needs to render the managed worker.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -132,6 +186,10 @@ pub struct LocalWorkerStatus {
     /// Live API status, present when the service is running and the
     /// profile holds the worker token.
     pub worker: Option<StatusResponse>,
+    /// What the worker will do with its pending publication, derived
+    /// from its own reported automation flags — `None` hides the
+    /// pending banner.
+    pub pending_publication: Option<PendingPublication>,
     /// Why `worker` is absent (unreachable, bad token, ...).
     pub worker_error: Option<String>,
     /// True when the run report says `shutdown` — the machine went down;
@@ -157,6 +215,7 @@ impl LocalWorkerStatus {
             ownership: WorkerOwnership::None,
             run: None,
             worker: None,
+            pending_publication: None,
             worker_error: None,
             stopped_for_shutdown: false,
             update_available: false,
@@ -247,6 +306,7 @@ pub async fn status(app: &AppHandle) -> Result<LocalWorkerStatus> {
                 Some(WorkerRunPhase::Shutdown)
             ),
             run,
+            pending_publication: pending_publication(worker.as_ref()),
             worker,
             worker_error,
             update_available: worker_update_available(),
@@ -1177,6 +1237,118 @@ mod tests {
         assert!(
             !acl.contains("BUILTIN\\Users") && !acl.contains("Everyone"),
             "world-readable staging dir: {acl}"
+        );
+    }
+}
+
+/// The pending-banner derivation is platform-free, unlike the service
+/// plumbing above — these run everywhere.
+#[cfg(test)]
+mod pending_tests {
+    use chrono::{Duration, Utc};
+
+    use super::{PendingPublication, PendingPublicationMode, pending_publication};
+    use crate::{profile::server::settings::RestartPolicy, worker::api::StatusResponse};
+
+    fn worker(
+        pending: bool,
+        auto_sync: bool,
+        auto_mods: bool,
+        next_attempt_at: Option<chrono::DateTime<Utc>>,
+    ) -> StatusResponse {
+        StatusResponse {
+            worker_id: "w".to_owned(),
+            profile_id: "p".to_owned(),
+            auto_sync,
+            auto_mods,
+            restart_policy: RestartPolicy::Manual,
+            observed_revision: Some(Utc::now()),
+            pending_revision: pending.then(Utc::now),
+            next_attempt_at,
+            last_deployed_revision: None,
+            busy: None,
+            last_operation: None,
+            last_error: None,
+            server: None,
+        }
+    }
+
+    #[test]
+    fn no_pending_work_shows_no_banner() {
+        assert_eq!(pending_publication(None), None);
+        assert_eq!(
+            pending_publication(Some(&worker(false, true, true, None))),
+            None,
+            "an idle worker has nothing pending"
+        );
+    }
+
+    #[test]
+    fn full_automation_reports_a_queued_deploy() {
+        let pending = pending_publication(Some(&worker(true, true, true, None)));
+        assert_eq!(
+            pending,
+            Some(PendingPublication {
+                mode: PendingPublicationMode::Automatic,
+                retrying: false,
+            })
+        );
+    }
+
+    #[test]
+    fn a_failed_attempt_reports_retrying() {
+        let retry_at = Utc::now() + Duration::minutes(5);
+        let pending = pending_publication(Some(&worker(true, true, true, Some(retry_at))));
+        assert_eq!(
+            pending,
+            Some(PendingPublication {
+                mode: PendingPublicationMode::Automatic,
+                retrying: true,
+            })
+        );
+    }
+
+    #[test]
+    fn config_only_automation_distinguishes_mod_deploys() {
+        let pending = pending_publication(Some(&worker(true, true, false, None)));
+        assert_eq!(
+            pending,
+            Some(PendingPublication {
+                mode: PendingPublicationMode::ConfigOnly,
+                retrying: false,
+            })
+        );
+
+        let retry_at = Utc::now() + Duration::minutes(5);
+        assert_eq!(
+            pending_publication(Some(&worker(true, true, false, Some(retry_at)))),
+            Some(PendingPublication {
+                mode: PendingPublicationMode::ConfigOnly,
+                retrying: true,
+            })
+        );
+    }
+
+    #[test]
+    fn disabled_automation_needs_a_manual_deploy() {
+        // Even with a stale retry timestamp left over from when
+        // automation was on, a disabled worker never retries on its own.
+        let retry_at = Utc::now() + Duration::minutes(5);
+        let pending = pending_publication(Some(&worker(true, false, false, Some(retry_at))));
+        assert_eq!(
+            pending,
+            Some(PendingPublication {
+                mode: PendingPublicationMode::Manual,
+                retrying: false,
+            })
+        );
+        assert_eq!(
+            pending_publication(Some(&worker(true, false, true, None))),
+            Some(PendingPublication {
+                mode: PendingPublicationMode::Manual,
+                retrying: false,
+            }),
+            "auto_mods is meaningless while auto_sync is off"
         );
     }
 }

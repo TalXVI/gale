@@ -14,6 +14,7 @@
 	import type {
 		HostProvider,
 		LocalWorkerStatus,
+		PendingPublication,
 		ProfileServerSettings,
 		RemoteAuthentication,
 		RemoteProtocol,
@@ -366,6 +367,9 @@
 				datHostPassword,
 				rememberRemotePassword
 			);
+			// Automation toggles may have changed — re-read the worker's own
+			// state so the pending banner reflects what it will actually do.
+			await refreshLocalWorker();
 			pushInfoToast({ message: m.dedicatedServerDialog_saved() });
 		} finally {
 			saving = false;
@@ -434,6 +438,24 @@
 			workerAddress = '';
 		} finally {
 			workerBusy = false;
+		}
+	}
+
+	/// The pending banner mirrors the worker's own automation state —
+	/// never the unsaved checkboxes — so it only promises an automatic
+	/// deployment the worker can actually perform.
+	function pendingLabel(pending: PendingPublication): string {
+		switch (pending.mode) {
+			case 'automatic':
+				return pending.retrying
+					? m.dedicatedServerDialog_localWorkerPendingRetry()
+					: m.dedicatedServerDialog_localWorkerPending();
+			case 'configOnly':
+				return pending.retrying
+					? m.dedicatedServerDialog_localWorkerPendingConfigOnlyRetry()
+					: m.dedicatedServerDialog_localWorkerPendingConfigOnly();
+			case 'manual':
+				return m.dedicatedServerDialog_localWorkerPendingManual();
 		}
 	}
 
@@ -723,8 +745,8 @@
 								{:else if localWorker.worker === null && localWorker.workerError}
 									<InfoBox type="warning">{localWorker.workerError}</InfoBox>
 								{/if}
-								{#if localWorker.worker?.pendingRevision}
-									<InfoBox type="info">{m.dedicatedServerDialog_localWorkerPending()}</InfoBox>
+								{#if localWorker.pendingPublication}
+									<InfoBox type="info">{pendingLabel(localWorker.pendingPublication)}</InfoBox>
 								{/if}
 								{#if localWorker.updateAvailable}
 									<InfoBox type="info">{m.dedicatedServerDialog_localWorkerUpdateInfo()}</InfoBox>
