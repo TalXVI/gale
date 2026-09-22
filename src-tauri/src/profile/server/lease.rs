@@ -989,6 +989,8 @@ mod tests {
         let before = lease.record.heartbeat_at;
 
         // The heartbeat's second connection sees the same filtered remote.
+        let (events, written) = std::sync::mpsc::channel();
+        inner.lock().unwrap().write_events = Some(events);
         let conn = filtered.clone();
         start_heartbeat_every(
             &mut lease,
@@ -996,7 +998,9 @@ mod tests {
             Duration::from_millis(50),
         );
 
-        thread::sleep(Duration::from_millis(160));
+        written
+            .recv_timeout(Duration::from_secs(5))
+            .expect("heartbeat did not write");
         assert!(!lease.is_lost());
         let after: LeaseRecord =
             serde_json::from_slice(inner.lock().unwrap().contents(LEASE_FILE).unwrap()).unwrap();
@@ -1020,6 +1024,8 @@ mod tests {
         let before: LeaseRecord =
             serde_json::from_slice(shared.lock().unwrap().contents(LEASE_FILE).unwrap()).unwrap();
 
+        let (events, written) = std::sync::mpsc::channel();
+        shared.lock().unwrap().write_events = Some(events);
         let conn = shared.clone();
         start_heartbeat_every(
             &mut lease,
@@ -1027,7 +1033,9 @@ mod tests {
             Duration::from_millis(50),
         );
 
-        thread::sleep(Duration::from_millis(160));
+        written
+            .recv_timeout(Duration::from_secs(5))
+            .expect("heartbeat did not write");
         let after: LeaseRecord =
             serde_json::from_slice(shared.lock().unwrap().contents(LEASE_FILE).unwrap()).unwrap();
         assert!(after.heartbeat_at > before.heartbeat_at);

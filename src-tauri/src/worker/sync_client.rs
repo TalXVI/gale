@@ -225,7 +225,7 @@ impl SyncClient {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -252,21 +252,46 @@ mod tests {
     const PROFILE_ID: &str = "sync-profile-1";
 
     #[derive(Clone, Default)]
-    struct MockApi {
-        meta: Option<SyncProfileMetadata>,
-        archive: Vec<u8>,
-        fail_auth: bool,
-        token_hits: Arc<AtomicUsize>,
-        meta_hits: Arc<AtomicUsize>,
-        archive_hits: Arc<AtomicUsize>,
-        refresh_tokens: Arc<tokio::sync::Mutex<Vec<String>>>,
+    pub(crate) struct MockApi {
+        pub(crate) meta: Option<SyncProfileMetadata>,
+        pub(crate) archive: Vec<u8>,
+        pub(crate) fail_auth: bool,
+        pub(crate) chunked: bool,
+        pub(crate) violations: Arc<std::sync::Mutex<Vec<String>>>,
+        pub(crate) token_hits: Arc<AtomicUsize>,
+        pub(crate) meta_hits: Arc<AtomicUsize>,
+        pub(crate) archive_hits: Arc<AtomicUsize>,
+        pub(crate) refresh_tokens: Arc<tokio::sync::Mutex<Vec<String>>>,
     }
 
-    async fn token(State(api): State<MockApi>, Json(request): Json<serde_json::Value>) -> Response {
-        api.refresh_tokens
-            .lock()
-            .await
-            .push(request["refreshToken"].as_str().unwrap().to_owned());
+    async fn token(
+        State(api): State<MockApi>,
+        request: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
+    ) -> Response {
+        let request = match request {
+            Ok(Json(request)) => request,
+            Err(error) => {
+                api.violations
+                    .lock()
+                    .unwrap()
+                    .push(format!("invalid token body: {error}"));
+                return HttpStatus::BAD_REQUEST.into_response();
+            }
+        };
+        let mut tokens = api.refresh_tokens.lock().await;
+        let expected = if tokens.is_empty() {
+            "refresh-seed"
+        } else {
+            "refresh-rotated"
+        };
+        if request != json!({"refreshToken": expected}) {
+            api.violations
+                .lock()
+                .unwrap()
+                .push(format!("unexpected token request: {request}"));
+            return HttpStatus::BAD_REQUEST.into_response();
+        }
+        tokens.push(expected.to_owned());
         api.token_hits.fetch_add(1, Ordering::Relaxed);
         if api.fail_auth {
             return HttpStatus::UNAUTHORIZED.into_response();
@@ -288,24 +313,85 @@ mod tests {
 
     async fn archive(State(api): State<MockApi>, Path(_id): Path<String>) -> Response {
         api.archive_hits.fetch_add(1, Ordering::Relaxed);
-        api.archive.clone().into_response()
+        if api.chunked {
+            let chunks: Vec<_> = api
+                .archive
+                .chunks(64 * 1024)
+                .map(|chunk| Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(chunk)))
+                .collect();
+            axum::body::Body::from_stream(futures_util::stream::iter(chunks)).into_response()
+        } else {
+            api.archive.clone().into_response()
+        }
     }
 
-    /// Serves the mock sync API on an ephemeral localhost port.
-    async fn serve(api: MockApi) -> String {
+    pub(crate) struct MockServer {
+        pub(crate) url: String,
+        task: tokio::task::JoinHandle<()>,
+        api: MockApi,
+    }
+
+    impl Drop for MockServer {
+        fn drop(&mut self) {
+            self.task.abort();
+            if !std::thread::panicking() {
+                let violations = self.api.violations.lock().unwrap();
+                assert!(
+                    violations.is_empty(),
+                    "unexpected sync API requests: {violations:?}"
+                );
+            }
+        }
+    }
+
+    async fn validate_request(
+        State(api): State<MockApi>,
+        request: axum::extract::Request,
+        next: axum::middleware::Next,
+    ) -> Response {
+        let path = request.uri().path();
+        let valid = match (request.method().as_str(), path) {
+            ("POST", "/auth/token") => true,
+            ("GET", "/profile/sync-profile-1" | "/profile/sync-profile-1/meta") => {
+                request
+                    .headers()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    == Some("Bearer access-1")
+            }
+            _ => false,
+        } && request.uri().query().is_none();
+        if !valid {
+            api.violations
+                .lock()
+                .unwrap()
+                .push(format!("{} {}", request.method(), request.uri()));
+            return HttpStatus::BAD_REQUEST.into_response();
+        }
+        next.run(request).await
+    }
+
+    pub(crate) async fn serve(api: MockApi) -> MockServer {
         let app = Router::new()
             .route("/auth/token", post(token))
             .route("/profile/{id}/meta", get(meta))
             .route("/profile/{id}", get(archive))
-            .with_state(api);
-
+            .layer(axum::middleware::from_fn_with_state(
+                api.clone(),
+                validate_request,
+            ))
+            .with_state(api.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        format!("http://{addr}")
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        MockServer {
+            url: format!("http://{addr}"),
+            task,
+            api,
+        }
     }
 
-    fn metadata(game: &str, updated_at: DateTime<Utc>) -> SyncProfileMetadata {
+    pub(crate) fn metadata(game: &str, updated_at: DateTime<Utc>) -> SyncProfileMetadata {
         SyncProfileMetadata {
             id: PROFILE_ID.to_owned(),
             created_at: Utc::now(),
@@ -320,7 +406,7 @@ mod tests {
         }
     }
 
-    fn manifest(game: &str) -> ProfileManifest {
+    pub(crate) fn manifest(game: &str) -> ProfileManifest {
         ProfileManifest {
             name: "Pack".to_owned(),
             mods: vec![R2Mod {
@@ -337,7 +423,7 @@ mod tests {
     }
 
     /// A legacy-format archive: `export.r2x` manifest plus config payloads.
-    fn archive_zip(manifest: &ProfileManifest) -> Vec<u8> {
+    pub(crate) fn archive_zip(manifest: &ProfileManifest) -> Vec<u8> {
         use std::io::{Cursor, Write};
         use zip::{ZipWriter, write::SimpleFileOptions};
 
@@ -382,7 +468,7 @@ mod tests {
         let url = serve(api.clone()).await;
         let (_dir, journal) = journal().await;
 
-        let probe = SyncClient::new(config(url), None)
+        let probe = SyncClient::new(config(url.url.clone()), None)
             .poll(&journal, None)
             .await
             .unwrap();
@@ -409,7 +495,7 @@ mod tests {
         let url = serve(api.clone()).await;
         let (_dir, journal) = journal().await;
 
-        let probe = SyncClient::new(config(url), None)
+        let probe = SyncClient::new(config(url.url.clone()), None)
             .poll(&journal, None)
             .await
             .unwrap();
@@ -439,7 +525,7 @@ mod tests {
         let url = serve(api.clone()).await;
         let (_dir, journal) = journal().await;
 
-        let probe = SyncClient::new(config(url), None)
+        let probe = SyncClient::new(config(url.url.clone()), None)
             .poll(&journal, Some(updated))
             .await
             .unwrap();
@@ -452,31 +538,51 @@ mod tests {
     async fn a_foreign_game_publication_is_rejected() {
         let api = MockApi {
             meta: Some(metadata("not-valheim", Utc::now())),
+            archive: archive_zip(&manifest("not-valheim")),
             ..Default::default()
         };
-        let url = serve(api).await;
+        let url = serve(api.clone()).await;
         let (_dir, journal) = journal().await;
 
-        let result = SyncClient::new(config(url), None)
+        let result = SyncClient::new(config(url.url.clone()), None)
             .poll(&journal, None)
             .await;
-        assert!(result.is_err());
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("sync profile is for game")
+        );
+        assert_eq!(api.archive_hits.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
     async fn an_oversized_archive_is_refused() {
-        let api = MockApi {
-            meta: Some(metadata("valheim", Utc::now())),
-            archive: vec![0u8; MAX_DOWNLOAD_BYTES + 1],
-            ..Default::default()
-        };
-        let url = serve(api).await;
-        let (_dir, journal) = journal().await;
-
-        let result = SyncClient::new(config(url), None)
-            .poll(&journal, None)
-            .await;
-        assert!(result.is_err());
+        for chunked in [false, true] {
+            // A valid ZIP with a large archive comment/prefix padding: ZIP readers allow
+            // prepended data. Rejection must be the transport bound, not ZIP parsing.
+            let mut archive = vec![0; MAX_DOWNLOAD_BYTES + 1];
+            archive.extend(archive_zip(&manifest("valheim")));
+            zip::ZipArchive::new(std::io::Cursor::new(&archive)).unwrap();
+            let api = MockApi {
+                meta: Some(metadata("valheim", Utc::now())),
+                archive,
+                chunked,
+                ..Default::default()
+            };
+            let server = serve(api).await;
+            let (_dir, journal) = journal().await;
+            let error = SyncClient::new(config(server.url.clone()), None)
+                .poll(&journal, None)
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(
+                error.to_string(),
+                "sync archive exceeds the download size limit"
+            );
+        }
     }
 
     #[tokio::test]
@@ -488,7 +594,7 @@ mod tests {
         let url = serve(api).await;
         let (_dir, journal) = journal().await;
 
-        let result = SyncClient::new(config(url), None)
+        let result = SyncClient::new(config(url.url.clone()), None)
             .poll(&journal, None)
             .await;
         assert!(result.is_err());
@@ -497,7 +603,8 @@ mod tests {
     #[tokio::test]
     async fn concurrent_polls_use_the_rotated_token() {
         let api = MockApi::default();
-        let client = SyncClient::new(config(serve(api.clone()).await), None);
+        let url = serve(api.clone()).await;
+        let client = SyncClient::new(config(url.url.clone()), None);
         let (_dir, journal) = journal().await;
         let (first, second) =
             tokio::join!(client.poll(&journal, None), client.poll(&journal, None));

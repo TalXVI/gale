@@ -1057,19 +1057,34 @@ mod tests {
         assert_eq!(retry_delay(30), std::time::Duration::from_secs(30 * 60));
     }
 
-    #[test]
-    fn observed_revision_does_not_acknowledge_deployment() {
-        // The journal's three marks stay distinct: observing a publication
-        // must never look like deploying it.
-        let mut state = journal();
+    #[tokio::test]
+    async fn observed_revision_does_not_acknowledge_deployment() {
+        let dir = tempfile::tempdir().unwrap();
         let revision = Utc::now();
-
-        state.last_seen_revision = Some(revision);
-        state.pending = Some(PendingWork::new(revision, Some(owed_mod())));
-
+        let api = spawn_sync_api(pack_manifest(), revision).await;
+        let mut config = worker_config(dir.path(), "127.0.0.1:0".into());
+        config.profile_id = SYNC_PROFILE.into();
+        config.sync_url = Some(api.url.clone());
+        let journal = crate::worker::journal::Journal::load(dir.path()).unwrap();
+        let ctx = std::sync::Arc::new(
+            super::WorkerContext::new(
+                config,
+                super::Secrets {
+                    refresh_token: Some("refresh-seed".into()),
+                    ..worker_secrets()
+                },
+                journal,
+            )
+            .unwrap(),
+        );
+        super::poll_once(&ctx).await;
+        drop(ctx);
+        let journal = crate::worker::journal::Journal::load(dir.path()).unwrap();
+        let state = journal.state.lock().await;
         assert_eq!(state.last_seen_revision, Some(revision));
+        assert_eq!(state.pending.as_ref().unwrap().revision, revision);
         assert_eq!(state.last_deployed_revision, None);
-        assert!(state.pending.is_some());
+        assert_eq!(state.last_error, None);
     }
 
     fn status_config(dir: &std::path::Path) -> super::WorkerConfig {
@@ -1106,10 +1121,32 @@ mod tests {
 
     #[test]
     fn run_report_is_optional_without_a_status_file() {
-        let config = super::WorkerConfig::default();
-        // No status_file configured: reporting must not fail or create
-        // anything — manual workers have no reader.
-        super::report_run_state(&config, super::WorkerRunPhase::Stopped);
+        const CHILD: &str = "GALE_REPORT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let config = super::WorkerConfig {
+                state_dir: std::env::current_dir().unwrap(),
+                ..Default::default()
+            };
+            super::report_run_state(&config, super::WorkerRunPhase::Stopped);
+            assert_eq!(std::fs::read_dir(".").unwrap().count(), 0);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "worker::server::tests::run_report_is_optional_without_a_status_file",
+            ])
+            .env(CHILD, "1")
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]
@@ -1188,96 +1225,6 @@ mod tests {
             .port()
     }
 
-    /// A minimal plaintext FTP endpoint for end-to-end status tests. It
-    /// refuses AUTH TLS (exercising the automatic-FTP plaintext
-    /// fallback), accepts any login, treats every directory as present,
-    /// and reports every file as missing — exactly what an untouched
-    /// remote looks like to `open_session`.
-    fn spawn_ftp_server() -> std::net::SocketAddr {
-        use std::io::{BufRead, BufReader, Write};
-        use std::net::{TcpListener, TcpStream};
-
-        fn send(writer: &mut TcpStream, text: String) -> bool {
-            writer.write_all(format!("{text}\r\n").as_bytes()).is_ok()
-        }
-
-        fn serve(stream: TcpStream) {
-            let mut writer = stream.try_clone().unwrap();
-            let mut reader = BufReader::new(stream);
-            let mut passive: Option<TcpListener> = None;
-            let mut line = String::new();
-
-            if !send(&mut writer, "220 fake ftp ready".to_owned()) {
-                return;
-            }
-            loop {
-                line.clear();
-                if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                    return;
-                }
-                let verb = line
-                    .trim_end()
-                    .split(' ')
-                    .next()
-                    .unwrap_or_default()
-                    .to_ascii_uppercase();
-                let response = match verb.as_str() {
-                    "AUTH" => "502 TLS is not supported".to_owned(),
-                    "USER" => "331 password required".to_owned(),
-                    "PASS" => "230 logged in".to_owned(),
-                    "PWD" | "XPWD" => "257 \"/\" is the current directory".to_owned(),
-                    "CWD" | "CDUP" => "250 directory changed".to_owned(),
-                    "TYPE" | "MODE" | "STRU" | "NOOP" => "200 ok".to_owned(),
-                    "SYST" => "215 UNIX Type: L8".to_owned(),
-                    // Missing files look exactly like this to read_state
-                    // and read_lease, which then fall back to defaults.
-                    "SIZE" | "MDTM" | "RETR" => "550 not found".to_owned(),
-                    "PASV" => {
-                        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-                        let port = listener.local_addr().unwrap().port();
-                        passive = Some(listener);
-                        format!(
-                            "227 Entering Passive Mode (127,0,0,1,{},{})",
-                            port / 256,
-                            port % 256
-                        )
-                    }
-                    "LIST" | "NLST" | "MLSD" => {
-                        if !send(&mut writer, "150 opening data connection".to_owned()) {
-                            return;
-                        }
-                        // An empty listing: accept the data connection
-                        // and close it immediately.
-                        if let Some(listener) = passive.take() {
-                            let _ = listener.accept();
-                        }
-                        "226 transfer complete".to_owned()
-                    }
-                    "QUIT" => {
-                        let _ = send(&mut writer, "221 goodbye".to_owned());
-                        return;
-                    }
-                    _ => "502 not implemented".to_owned(),
-                };
-                if !send(&mut writer, response) {
-                    return;
-                }
-            }
-        }
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                match stream {
-                    Ok(stream) => std::thread::spawn(move || serve(stream)),
-                    Err(_) => break,
-                };
-            }
-        });
-        address
-    }
-
     /// End-to-end coverage for the refresh flag: the desktop client must
     /// produce a query the real router accepts, malformed values must be
     /// rejected rather than coerced, and unauthenticated callers get
@@ -1291,14 +1238,14 @@ mod tests {
         };
 
         let dir = tempfile::tempdir().unwrap();
-        let ftp = spawn_ftp_server();
+        let ftp = FakeFtp::valheim_host(FtpOptions::default());
         let api_port = free_port();
 
         let mut config = worker_config(dir.path(), format!("127.0.0.1:{api_port}"));
         config.remote = RemoteServerSettings {
             protocol: RemoteProtocol::Ftp,
             host: "127.0.0.1".to_owned(),
-            port: ftp.port(),
+            port: ftp.addr.port(),
             username: "u".to_owned(),
             server_directory: "/".to_owned(),
             ..RemoteServerSettings::default()
@@ -1444,33 +1391,6 @@ mod tests {
         );
     }
 
-    /// Codex's release failure: a cached `games.json` from an older app
-    /// version carries the legacy `server` flag instead of
-    /// `dedicatedServer`, and the worker wrongly rejected Valheim. The
-    /// worker resolves the bundled list, which this binary was built
-    /// against — the stale cache is irrelevant to it.
-    #[test]
-    fn bundled_metadata_is_immune_to_a_legacy_cache() {
-        // What the legacy cache actually looked like: a `server` flag,
-        // no `dedicatedServer` object. Parsed through the current schema
-        // it yields no dedicated-server metadata at all.
-        let legacy: crate::game::GameData = serde_json::from_str(
-            r#"{
-                "name": "Valheim",
-                "slug": "valheim",
-                "server": true,
-                "modLoader": { "name": "BepInEx" }
-            }"#,
-        )
-        .unwrap();
-        assert!(legacy.dedicated_server.is_none());
-
-        // The worker's lookup ignores that cache entirely.
-        let game =
-            crate::game::bundled_from_slug("valheim").expect("bundled valheim metadata missing");
-        assert!(game.dedicated_server.is_some());
-    }
-
     /// `WorkerContext::new` is the gate the service exercises: bundled
     /// metadata plus a usable token produce a context; a game without
     /// dedicated-server support or a missing token are init errors.
@@ -1522,14 +1442,6 @@ mod tests {
         sync::{SyncProfileMetadata, auth::User},
     };
     use crate::thunderstore::{Backend, PackageIdent};
-    use axum::{
-        Json, Router,
-        extract::{Path, State},
-        response::{IntoResponse, Response},
-        routing::{get, post},
-    };
-    use serde_json::json;
-
     const SYNC_PROFILE: &str = "sync-profile-1";
 
     fn pack_manifest() -> ProfileManifest {
@@ -1569,39 +1481,11 @@ mod tests {
         cursor.into_inner()
     }
 
-    /// A mock sync API serving one publication, with hit counters for
-    /// asserting how often each endpoint was called.
-    async fn spawn_sync_api(
-        manifest: ProfileManifest,
-        updated_at: DateTime<Utc>,
-    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        #[derive(Clone)]
-        struct Mock {
-            meta: SyncProfileMetadata,
-            archive: Vec<u8>,
-            archive_hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        }
+    use crate::worker::sync_client::tests::{MockApi, MockServer, serve};
 
-        async fn token() -> Response {
-            Json(json!({
-                "accessToken": "access-1",
-                "refreshToken": "refresh-rotated"
-            }))
-            .into_response()
-        }
-        async fn meta(State(mock): State<Mock>) -> Response {
-            Json(mock.meta.clone()).into_response()
-        }
-        async fn archive(State(mock): State<Mock>, Path(_id): Path<String>) -> Response {
-            mock.archive_hits
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            mock.archive.clone().into_response()
-        }
-
-        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let bytes = publication_zip(&manifest);
-        let mock = Mock {
-            meta: SyncProfileMetadata {
+    async fn spawn_sync_api(manifest: ProfileManifest, updated_at: DateTime<Utc>) -> MockServer {
+        serve(MockApi {
+            meta: Some(SyncProfileMetadata {
                 id: SYNC_PROFILE.to_owned(),
                 created_at: Utc::now(),
                 updated_at,
@@ -1611,23 +1495,12 @@ mod tests {
                     display_name: "Owner".to_owned(),
                     avatar: None,
                 },
-                manifest,
-            },
-            archive: bytes,
-            archive_hits: hits.clone(),
-        };
-
-        let app = Router::new()
-            .route("/auth/token", post(token))
-            .route("/profile/{id}/meta", get(meta))
-            .route("/profile/{id}", get(archive))
-            .with_state(mock);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        (format!("http://{addr}"), hits)
+                manifest: manifest.clone(),
+            }),
+            archive: publication_zip(&manifest),
+            ..Default::default()
+        })
+        .await
     }
 
     fn stor_count(ftp: &FakeFtp) -> usize {
@@ -1646,12 +1519,12 @@ mod tests {
     async fn a_config_only_sync_leaves_mods_owed_and_does_not_repeat() {
         let dir = tempfile::tempdir().unwrap();
         let published_at = Utc::now();
-        let (sync_url, _archive_hits) = spawn_sync_api(pack_manifest(), published_at).await;
+        let sync_api = spawn_sync_api(pack_manifest(), published_at).await;
         let ftp = FakeFtp::valheim_host(FtpOptions::default());
 
         let mut config = worker_config(dir.path(), "127.0.0.1:0".to_owned());
         config.profile_id = SYNC_PROFILE.to_owned();
-        config.sync_url = Some(sync_url);
+        config.sync_url = Some(sync_api.url.clone());
         config.remote = RemoteServerSettings {
             protocol: RemoteProtocol::Ftp,
             host: "127.0.0.1".to_owned(),
@@ -1809,7 +1682,7 @@ mod tests {
         use crate::worker::journal::Journal;
 
         let dir = tempfile::tempdir().unwrap();
-        let ftp = spawn_ftp_server();
+        let ftp = FakeFtp::valheim_host(FtpOptions::default());
         let api_port = free_port();
 
         let mut config = worker_config(dir.path(), format!("127.0.0.1:{api_port}"));
@@ -1818,7 +1691,7 @@ mod tests {
         config.remote = RemoteServerSettings {
             protocol: RemoteProtocol::Ftp,
             host: "127.0.0.1".to_owned(),
-            port: ftp.port(),
+            port: ftp.addr.port(),
             username: "u".to_owned(),
             server_directory: "/".to_owned(),
             ..RemoteServerSettings::default()

@@ -414,8 +414,17 @@ mod tests {
     fn oversized_state_is_refused() {
         let mut remote = MemoryRemote::new();
         // Just over the 4 MiB bound; the reader must refuse rather than truncate.
-        remote.put_file(STATE_PATH, &vec![b' '; MAX_STATE_BYTES as usize + 1]);
-        assert!(read(&mut remote).is_err());
+        let mut bytes = serialize(&ServerDeploymentState::default()).unwrap();
+        bytes.resize(MAX_STATE_BYTES as usize + 1, b' ');
+        serde_json::from_slice::<ServerDeploymentState>(&bytes).unwrap();
+        remote.put_file(STATE_PATH, &bytes);
+        assert!(
+            read(&mut remote)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("read bound")
+        );
     }
 
     #[test]

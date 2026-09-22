@@ -210,3 +210,157 @@ fn warn_missing() {
         "host provider configured but credentials are incomplete; host control disabled"
     );
 }
+
+#[cfg(all(test, feature = "worker"))]
+mod tests {
+    use super::*;
+    use crate::profile::server::{
+        engine::apply_restart_policy, settings::RestartPolicy, state::RestartOutcome,
+    };
+    use axum::{
+        Router,
+        extract::{Request, State},
+        http::StatusCode,
+        response::{IntoResponse, Response},
+    };
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct Api {
+        players: Option<u32>,
+        fail_status: bool,
+        fail_restart: bool,
+        calls: Arc<Mutex<Vec<String>>>,
+        violations: Arc<Mutex<Vec<String>>>,
+    }
+
+    async fn handle(State(api): State<Api>, request: Request) -> Response {
+        let route = format!("{} {}", request.method(), request.uri());
+        api.calls.lock().unwrap().push(route.clone());
+        if request
+            .headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            != Some("Basic dXNlcjpwYXNz")
+        {
+            api.violations
+                .lock()
+                .unwrap()
+                .push("missing or wrong credentials".into());
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        match route.as_str() {
+            "GET /game-servers/server-1/" if api.fail_status => {
+                StatusCode::SERVICE_UNAVAILABLE.into_response()
+            }
+            "GET /game-servers/server-1/" => {
+                axum::Json(serde_json::json!({"on": true})).into_response()
+            }
+            "GET /game-servers/server-1/metrics" => {
+                axum::Json(serde_json::json!({"player_count": api.players})).into_response()
+            }
+            "POST /game-servers/server-1/start" if api.fail_restart => {
+                StatusCode::SERVICE_UNAVAILABLE.into_response()
+            }
+            "POST /game-servers/server-1/start" => StatusCode::NO_CONTENT.into_response(),
+            _ => {
+                api.violations.lock().unwrap().push(route);
+                StatusCode::BAD_REQUEST.into_response()
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_policy_uses_authenticated_host_status_and_restart_requests() {
+        use RestartOutcome::*;
+        use RestartPolicy::*;
+        let status = [
+            "GET /game-servers/server-1/",
+            "GET /game-servers/server-1/metrics",
+        ];
+        let restart = "POST /game-servers/server-1/start";
+        for (policy, required, players, fail_status, fail_restart, expected, calls) in [
+            (Immediate, false, Some(0), false, false, NotRequired, vec![]),
+            (Manual, true, Some(0), false, false, AwaitingManual, vec![]),
+            (
+                WhenEmpty,
+                true,
+                Some(2),
+                false,
+                false,
+                AwaitingEmpty,
+                status.to_vec(),
+            ),
+            (
+                WhenEmpty,
+                true,
+                None,
+                false,
+                false,
+                AwaitingEmpty,
+                status.to_vec(),
+            ),
+            (
+                WhenEmpty,
+                true,
+                Some(0),
+                true,
+                false,
+                AwaitingEmpty,
+                vec![status[0]],
+            ),
+            (
+                WhenEmpty,
+                true,
+                Some(0),
+                false,
+                false,
+                Restarted,
+                vec![status[0], status[1], restart, status[0], status[1]],
+            ),
+            (
+                Immediate,
+                true,
+                Some(2),
+                false,
+                false,
+                Restarted,
+                vec![restart, status[0], status[1]],
+            ),
+            (Immediate, true, Some(0), false, true, Failed, vec![restart]),
+            (
+                Immediate,
+                true,
+                Some(0),
+                true,
+                false,
+                StartupUnverified,
+                vec![restart, status[0]],
+            ),
+        ] {
+            let api = Api {
+                players,
+                fail_status,
+                fail_restart,
+                calls: Default::default(),
+                violations: Default::default(),
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let app = Router::new().fallback(handle).with_state(api.clone());
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let host = DatHostControl {
+                client: reqwest::Client::new(),
+                base,
+                server_id: "server-1".into(),
+                username: "user".into(),
+                password: "pass".into(),
+            };
+            let outcome = apply_restart_policy(&host, policy, required).await;
+            task.abort();
+            assert_eq!(outcome, expected, "policy {policy:?}, players {players:?}");
+            assert_eq!(*api.calls.lock().unwrap(), calls);
+            assert!(api.violations.lock().unwrap().is_empty());
+        }
+    }
+}

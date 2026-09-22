@@ -14,12 +14,14 @@
 		"format": "prettier --write .",
 		"tauri": "tauri",
 		"locale:compile": "paraglide-js compile --outdir src/lib/paraglide",
-		"locale:machine-translate": "inlang machine translate --project project.inlang --locale en"
+		"locale:machine-translate": "inlang machine translate --project project.inlang --locale en",
+		"test": "playwright test"
 	},
 	"devDependencies": {
 		"@iconify/svelte": "^5.2.1",
 		"@inlang/cli": "^3.1.4",
 		"@inlang/paraglide-js": "2.3.0",
+		"@playwright/test": "^1.63.0",
 		"@sveltejs/adapter-static": "^3.0.10",
 		"@sveltejs/kit": "^2.63.0",
 		"@sveltejs/vite-plugin-svelte": "^7.1.2",

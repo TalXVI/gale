@@ -458,6 +458,9 @@ mod tests {
         };
         util::fs::write_json(&path, &cache, JsonStyle::Pretty).unwrap();
 
+        let bytes = fs::read_to_string(&path).unwrap();
+        let written: GamesCache = serde_json::from_str(&bytes).unwrap();
+        assert!(find(&written.games, "valheim").dedicated_server.is_some());
         let cache = read_games_cache(&path).unwrap();
         assert!(find(&cache.games, "valheim").dedicated_server.is_some());
     }

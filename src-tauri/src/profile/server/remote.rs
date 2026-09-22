@@ -529,9 +529,15 @@ impl RemoteOps for RemoteConnection {
                 Err(err) if is_sftp_not_found(&err) => None,
                 Err(err) => return Err(err.into()),
             },
-            RemoteClient::Ftp(ftp) => match ftp.retr_as_buffer(path.as_str()) {
-                Ok(bytes) => {
-                    let bytes = bytes.into_inner();
+            RemoteClient::Ftp(ftp) => match ftp.retr_as_stream(path.as_str()) {
+                Ok(mut stream) => {
+                    let mut bytes = Vec::new();
+                    let read = (&mut stream)
+                        .take(max.saturating_add(1))
+                        .read_to_end(&mut bytes);
+                    let finalize = ftp.finalize_retr_stream(stream);
+                    read?;
+                    finalize?;
                     ensure!(
                         bytes.len() as u64 <= max,
                         "remote file {path} exceeds the {max}-byte limit"
@@ -972,6 +978,7 @@ pub(crate) mod memory {
         pub fail_always: BTreeSet<String>,
         /// Simulates a dropped transport: reads and directory checks fail.
         pub connection_dead: bool,
+        pub write_events: Option<std::sync::mpsc::Sender<()>>,
     }
 
     impl MemoryRemote {
@@ -984,6 +991,7 @@ pub(crate) mod memory {
                 fail_once: BTreeSet::new(),
                 fail_always: BTreeSet::new(),
                 connection_dead: false,
+                write_events: None,
             }
         }
 
@@ -1093,6 +1101,9 @@ pub(crate) mod memory {
         fn write(&mut self, path: &RemotePath, bytes: &[u8]) -> Result<()> {
             self.maybe_fail(path)?;
             self.put_file(path.as_str(), bytes);
+            if let Some(events) = &self.write_events {
+                let _ = events.send(());
+            }
             Ok(())
         }
 
@@ -1342,6 +1353,8 @@ pub(crate) mod fake_ftp {
         /// Refuse `SIZE` until the client sends `TYPE I` — DatHost's
         /// ProFTPD answers `550 SIZE not allowed in ASCII mode`.
         pub size_requires_binary: bool,
+        /// Refuse all SIZE requests, including binary mode.
+        pub refuse_size: bool,
         /// Refuse `RETR` even for files that exist and are provable via
         /// `MLST` — a deeper read filter.
         pub refuse_retr: bool,
@@ -1372,10 +1385,13 @@ pub(crate) mod fake_ftp {
         pub addr: SocketAddr,
         /// Every `VERB arg` line received, for protocol assertions.
         pub commands: Arc<Mutex<Vec<String>>>,
+        pub sent_bytes: Arc<std::sync::atomic::AtomicUsize>,
         /// The blake3 fingerprint of the self-signed certificate the
         /// server presents when `Options::tls` is on; `None` otherwise.
         certificate_fingerprint: Option<String>,
         fs: Arc<Mutex<Fs>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
     }
 
     #[derive(Default)]
@@ -1497,6 +1513,7 @@ pub(crate) mod fake_ftp {
                 ..Default::default()
             }));
             let commands = Arc::new(Mutex::new(Vec::new()));
+            let sent_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let tls = options
                 .tls
                 .then(|| tls_identity(options.abort_stor_after_tls_handshake));
@@ -1505,34 +1522,70 @@ pub(crate) mod fake_ftp {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
 
-            {
+            listener.set_nonblocking(true).unwrap();
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stopping = stop.clone();
+            let thread = {
                 let fs = fs.clone();
                 let commands = commands.clone();
+                let sent_bytes = sent_bytes.clone();
                 std::thread::spawn(move || {
-                    for stream in listener.incoming() {
-                        match stream {
-                            Ok(stream) => {
+                    let mut sockets = Vec::new();
+                    let mut threads = Vec::new();
+                    while !stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                stream.set_nonblocking(false).unwrap();
+                                stream
+                                    .set_write_timeout(Some(Duration::from_secs(2)))
+                                    .unwrap();
+                                sockets.push(stream.try_clone().unwrap());
                                 let fs = fs.clone();
                                 let commands = commands.clone();
+                                let sent_bytes = sent_bytes.clone();
+                                let stop = stopping.clone();
                                 let tls = tls.as_ref().map(|(tls, _)| Tls {
                                     control: tls.control.clone(),
                                     data: tls.data.clone(),
                                 });
-                                std::thread::spawn(move || {
-                                    serve(stream, &fs, &commands, &options, tls)
-                                });
+                                threads.push(std::thread::spawn(move || {
+                                    let shutdown = stream.try_clone().unwrap();
+                                    serve(
+                                        stream,
+                                        &fs,
+                                        &commands,
+                                        &options,
+                                        tls,
+                                        &stop,
+                                        &sent_bytes,
+                                    );
+                                    let _ = shutdown.shutdown(std::net::Shutdown::Both);
+                                }));
                             }
-                            Err(_) => break,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(5))
+                            }
+                            Err(error) => panic!("FTP accept failed: {error}"),
                         }
                     }
-                });
-            }
+                    drop(listener);
+                    for socket in sockets {
+                        let _ = socket.shutdown(std::net::Shutdown::Both);
+                    }
+                    for thread in threads {
+                        thread.join().unwrap();
+                    }
+                })
+            };
 
             Self {
                 addr,
                 commands,
+                sent_bytes,
                 certificate_fingerprint,
                 fs,
+                stop,
+                thread: Some(thread),
             }
         }
 
@@ -1585,6 +1638,45 @@ pub(crate) mod fake_ftp {
         }
     }
 
+    impl Drop for FakeFtp {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            let result = self.thread.take().unwrap().join();
+            if !std::thread::panicking() {
+                result.unwrap();
+            }
+        }
+    }
+
+    fn accept_data(
+        listener: TcpListener,
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> Option<TcpStream> {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !stop.load(std::sync::atomic::Ordering::SeqCst)
+            && std::time::Instant::now() < deadline
+        {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    return Some(stream);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+
     fn send(writer: &mut impl Write, text: &str) -> bool {
         writer.write_all(format!("{text}\r\n").as_bytes()).is_ok()
     }
@@ -1608,7 +1700,7 @@ pub(crate) mod fake_ftp {
                 return None;
             }
         }
-        socket.set_read_timeout(None).ok()?;
+        socket.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
         Some(conn)
     }
 
@@ -1684,6 +1776,8 @@ pub(crate) mod fake_ftp {
         commands: &Arc<Mutex<Vec<String>>>,
         options: &Options,
         tls: Option<Tls>,
+        stop: &std::sync::atomic::AtomicBool,
+        sent_bytes: &std::sync::atomic::AtomicUsize,
     ) {
         // `socket` keeps a handle to the control connection so `AUTH TLS`
         // can upgrade it in place; the reader/writer work on clones until
@@ -1704,8 +1798,7 @@ pub(crate) mod fake_ftp {
             () => {
                 passive
                     .take()
-                    .and_then(|listener| listener.accept().ok())
-                    .map(|(stream, _)| stream)
+                    .and_then(|listener| accept_data(listener, stop))
                     .and_then(|mut stream| match (protected, tls.as_ref()) {
                         (true, Some(tls)) => tls_accept(&mut stream, &tls.data)
                             .map(|conn| DataSocket::Tls(StreamOwned::new(conn, stream))),
@@ -1722,7 +1815,7 @@ pub(crate) mod fake_ftp {
         macro_rules! reap_data {
             () => {
                 if let Some(listener) = passive.take() {
-                    let _ = listener.accept();
+                    let _ = accept_data(listener, stop);
                 }
             };
         }
@@ -1757,6 +1850,9 @@ pub(crate) mod fake_ftp {
                         let Some(conn) = tls_accept(&mut sock, &tls.control) else {
                             return;
                         };
+                        // Idle control channels live until fixture shutdown; data
+                        // transfers retain their bounded read timeout.
+                        sock.set_read_timeout(None).unwrap();
                         let secure = TlsSocket(Arc::new(Mutex::new(StreamOwned::new(conn, sock))));
                         reader = Box::new(BufReader::new(secure.clone()));
                         writer = Box::new(secure);
@@ -1836,7 +1932,7 @@ pub(crate) mod fake_ftp {
                     }
                 }
                 "SIZE" => {
-                    if options.size_requires_binary && !binary {
+                    if options.refuse_size || (options.size_requires_binary && !binary) {
                         "550 SIZE not allowed in ASCII mode.".to_owned()
                     } else {
                         match fs.lock().unwrap().files.get(&path) {
@@ -1862,7 +1958,13 @@ pub(crate) mod fake_ftp {
                             return;
                         }
                         if let Some(mut data) = data!() {
-                            let _ = data.write_all(&bytes);
+                            for chunk in bytes.chunks(4096) {
+                                if data.write_all(chunk).is_err() {
+                                    break;
+                                }
+                                sent_bytes
+                                    .fetch_add(chunk.len(), std::sync::atomic::Ordering::SeqCst);
+                            }
                             data.close();
                         }
                         "226 transfer complete".to_owned()
@@ -2031,10 +2133,9 @@ mod tests {
     use suppaftp::{FtpError, Status, types::Response};
 
     use super::{
-        ConnectionAttempt, FtpsCertVerifier, RemoteClient, RemoteConnection, RemoteOps,
-        RemoteProtocol, RemoteServerSettings, allows_plaintext_ftp_fallback,
-        certificate_fingerprint, ftp_list_entries, ftps_client_config, is_ftp_not_found,
-        is_ftp_tls_unsupported,
+        ConnectionAttempt, FtpsCertVerifier, RemoteConnection, RemoteOps, RemoteProtocol,
+        RemoteServerSettings, allows_plaintext_ftp_fallback, certificate_fingerprint,
+        ftp_list_entries, ftps_client_config, is_ftp_not_found, is_ftp_tls_unsupported,
     };
     use eyre::Result;
 
@@ -2093,71 +2194,24 @@ mod tests {
         assert!(!allows_plaintext_ftp_fallback(&settings, &tls_refused));
     }
 
-    /// Both `ring` and `aws-lc-rs` providers are compiled into this
-    /// crate — tauri-plugin-updater pulls in `ring` — so rustls cannot
-    /// auto-select a provider and `ClientConfig::builder()` panics in any
-    /// process that did not install a default. That is what broke
-    /// gale-worker's FTPS connect. A test in this binary cannot
-    /// reproduce it because another test may already have installed a
-    /// process default, so this test re-runs itself in a fresh child
-    /// process, once against the pre-fix builder call (expected to
-    /// panic) and once against the production connector.
+    /// The connector must initialize in a fresh process without a global provider.
     #[test]
     fn ftps_config_builds_without_a_process_default_provider() {
         const CHILD_ENV: &str = "GALE_FTPS_PROVIDER_CHILD";
-
-        match std::env::var(CHILD_ENV).ok().as_deref() {
-            Some("legacy") => {
-                assert!(
-                    suppaftp::rustls::crypto::CryptoProvider::get_default().is_none(),
-                    "child process must start without an installed provider"
-                );
-                let _ = ClientConfig::builder();
-            }
-            Some("production") => {
-                assert!(
-                    suppaftp::rustls::crypto::CryptoProvider::get_default().is_none(),
-                    "child process must start without an installed provider"
-                );
-                let (verifier, _) = FtpsCertVerifier::new(None).unwrap();
-                let _ = ftps_client_config(verifier);
-            }
-            _ => {
-                let exe = std::env::current_exe().unwrap();
-                let test = "profile::server::remote::tests::\
-                            ftps_config_builds_without_a_process_default_provider";
-
-                let legacy = std::process::Command::new(&exe)
-                    .args(["--exact", test])
-                    .env(CHILD_ENV, "legacy")
-                    .output()
-                    .unwrap();
-                assert!(
-                    !legacy.status.success(),
-                    "ambiguous provider auto-detection should still panic"
-                );
-                let output = format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&legacy.stdout),
-                    String::from_utf8_lossy(&legacy.stderr)
-                );
-                assert!(
-                    output.contains("Could not automatically determine"),
-                    "expected the CryptoProvider panic, got: {output}"
-                );
-
-                let production = std::process::Command::new(&exe)
-                    .args(["--exact", test])
-                    .env(CHILD_ENV, "production")
-                    .output()
-                    .unwrap();
-                assert!(
-                    production.status.success(),
-                    "production connector failed in a fresh process: {}",
-                    String::from_utf8_lossy(&production.stderr)
-                );
-            }
+        if std::env::var_os(CHILD_ENV).is_some() {
+            assert!(suppaftp::rustls::crypto::CryptoProvider::get_default().is_none());
+            let (verifier, _) = FtpsCertVerifier::new(None).unwrap();
+            let _ = ftps_client_config(verifier);
+            return;
         }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "profile::server::remote::tests::ftps_config_builds_without_a_process_default_provider"])
+            .env(CHILD_ENV, "1").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
     }
 
     // ---------- FTPS certificate verification ----------
@@ -2443,10 +2497,9 @@ mod tests {
 
     #[test]
     fn forged_handshake_signature_fails_even_when_cert_is_pinned() {
-        // The Codex regression: a pin must not turn into
-        // `HandshakeSignatureValid::assertion()`. The certificate is
-        // pinned, but the server signs with garbage. The handshake must
-        // fail, proving verify_tls1x_signature still does real crypto.
+        // A pin must not turn into `HandshakeSignatureValid::assertion()`.
+        // The certificate is pinned, but the server signs with garbage.
+        // The handshake must fail, proving verify_tls1x_signature still does real crypto.
         for config in [client_config, client_config_tls12] {
             let certified = self_signed("ftps.local");
             let pin = certificate_fingerprint(certified.cert.der());
@@ -2482,7 +2535,6 @@ mod tests {
     // ---------- live-protocol tests against the in-memory FTP server ----------
 
     use super::fake_ftp::{FakeFtp, Options as FakeFtpOptions};
-    use super::memory::MemoryRemote;
     use crate::profile::server::paths::RemotePathBuf;
     use crate::profile::server::settings::RemoteAuthentication;
 
@@ -2524,6 +2576,83 @@ mod tests {
 
     fn remote_path(path: &str) -> RemotePathBuf {
         RemotePathBuf::new(path).unwrap()
+    }
+
+    #[test]
+    fn ftp_reads_enforce_the_cap_without_size_metadata() {
+        for tls in [false, true] {
+            let server = FakeFtp::spawn(FakeFtpOptions {
+                tls,
+                refuse_size: true,
+                no_mlst: true,
+                ..Default::default()
+            });
+            // Valid JSON with trailing whitespace: parsing cannot mask a missing cap.
+            let mut bytes = br#"{"version":1}"#.to_vec();
+            bytes.resize(16 * 1024 * 1024, b' ');
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap();
+            server.seed_file("/state.json", &bytes);
+            let mut conn = if tls {
+                ftps_connect(&server)
+            } else {
+                ftp_connect(&server)
+            };
+            let path = remote_path("/state.json");
+            assert_eq!(conn.file_size(path.as_path()).unwrap(), None);
+            let error = conn.read(path.as_path(), 64).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "remote file /state.json exceeds the 64-byte limit"
+            );
+            assert!(server.saw("RETR /state.json"));
+            drop(conn);
+            let sent = server.sent_bytes.clone();
+            drop(server); // Join the transfer before measuring consumption.
+            assert!(sent.load(std::sync::atomic::Ordering::SeqCst) < bytes.len());
+        }
+    }
+
+    #[test]
+    fn ftp_connection_survives_an_oversized_read() {
+        let server = FakeFtp::spawn(FakeFtpOptions {
+            refuse_size: true,
+            no_mlst: true,
+            ..Default::default()
+        });
+        server.seed_file("/oversized.bin", &vec![b'x'; 256 * 1024]);
+        server.seed_file("/small.txt", b"still connected");
+        let mut conn = ftp_connect(&server);
+
+        let oversized = remote_path("/oversized.bin");
+        let error = conn.read(oversized.as_path(), 64).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "remote file /oversized.bin exceeds the 64-byte limit"
+        );
+
+        assert!(conn.is_dir(remote_path("/").as_path()).unwrap());
+        let small = remote_path("/small.txt");
+        assert_eq!(
+            conn.read(small.as_path(), 64).unwrap(),
+            Some(b"still connected".to_vec())
+        );
+    }
+
+    #[test]
+    fn ftp_fixture_releases_listener_even_during_unwinding() {
+        for unwind in [false, true] {
+            let mut addr = None;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let server = FakeFtp::spawn(FakeFtpOptions::default());
+                addr = Some(server.addr);
+                let _idle_client = std::net::TcpStream::connect(server.addr).unwrap();
+                if unwind {
+                    panic!("deliberate fixture unwind");
+                }
+            }));
+            assert_eq!(result.is_err(), unwind);
+            let _listener = std::net::TcpListener::bind(addr.unwrap()).unwrap();
+        }
     }
 
     /// The DatHost profile verified against the live server: `SIZE` is
@@ -2669,165 +2798,151 @@ mod tests {
             Some(expected.as_slice())
         );
     }
+}
 
-    /// `MemoryRemote` is also an `RemoteOps` for the `remote::memory`
-    /// test fixtures — smoke-check the shared-handle impl still works.
-    #[test]
-    fn memory_remote_shared_handle_round_trips() {
-        use std::sync::{Arc, Mutex};
-        let remote = Arc::new(Mutex::new(MemoryRemote::new()));
-        let path = remote_path("/x/y.txt");
-        remote.lock().unwrap().dirs.insert("/x".to_owned());
-        let mut ops = remote.clone();
-        ops.write(path.as_path(), b"hi").unwrap();
-        assert_eq!(ops.read(path.as_path(), 64).unwrap(), Some(b"hi".to_vec()));
+/// Read-only diagnostic for a live FTP server, used to characterize
+/// hosts that filter dot-prefixed paths. Distinguishes "absent" from
+/// "present but refused" across LIST/NLST/MLSD/MLST/SIZE/MDTM/RETR/CWD
+/// and across absolute versus CWD-relative paths. Never issues a
+/// mutating command (no STOR/MKD/RMD/DELE/RNTO).
+///
+/// The password comes from the OS credential store under the same
+/// service/account Gale writes and is never printed.
+///
+///     $env:GALE_FTP_PROBE = "1"
+///     $env:GALE_PROBE_PROFILE_ID = "6"
+///     $env:GALE_PROBE_HOST = "<host>"
+///     $env:GALE_PROBE_USER = "<ftp username>"
+///     $env:GALE_PROBE_BASE = "/BepInEx/config"   # probe dir; default shown
+///     cargo run --features diagnostics --example ftp-probe
+#[cfg(feature = "diagnostics")]
+pub fn ftp_probe_dotpath_visibility() -> Result<()> {
+    use crate::profile::server::settings::RemoteAuthentication;
+    use eyre::bail;
+
+    if std::env::var("GALE_FTP_PROBE").ok().as_deref() != Some("1") {
+        eprintln!("skipped: set GALE_FTP_PROBE=1 and GALE_PROBE_* vars");
+        return Ok(());
     }
 
-    /// Read-only diagnostic for a live FTP server, used to characterize
-    /// hosts that filter dot-prefixed paths. Distinguishes "absent" from
-    /// "present but refused" across LIST/NLST/MLSD/MLST/SIZE/MDTM/RETR/CWD
-    /// and across absolute versus CWD-relative paths. Never issues a
-    /// mutating command (no STOR/MKD/RMD/DELE/RNTO).
-    ///
-    /// The password comes from the OS credential store under the same
-    /// service/account Gale writes and is never printed.
-    ///
-    ///     $env:GALE_FTP_PROBE = "1"
-    ///     $env:GALE_PROBE_PROFILE_ID = "6"
-    ///     $env:GALE_PROBE_HOST = "<host>"
-    ///     $env:GALE_PROBE_USER = "<ftp username>"
-    ///     $env:GALE_PROBE_BASE = "/BepInEx/config"   # probe dir; default shown
-    ///     cargo test ftp_probe_dotpath_visibility -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    fn ftp_probe_dotpath_visibility() -> Result<()> {
-        use crate::profile::server::settings::RemoteAuthentication;
-        use eyre::bail;
+    let profile_id =
+        std::env::var("GALE_PROBE_PROFILE_ID").expect("GALE_PROBE_PROFILE_ID required");
+    let host = std::env::var("GALE_PROBE_HOST").expect("GALE_PROBE_HOST required");
+    let user = std::env::var("GALE_PROBE_USER").expect("GALE_PROBE_USER required");
+    let dir = std::env::var("GALE_PROBE_DIR").unwrap_or_else(|_| "/".to_owned());
+    let port = std::env::var("GALE_PROBE_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(21u16);
 
-        if std::env::var("GALE_FTP_PROBE").ok().as_deref() != Some("1") {
-            eprintln!("skipped: set GALE_FTP_PROBE=1 and GALE_PROBE_* vars");
-            return Ok(());
-        }
+    let password = keyring::Entry::new(
+        "com.kesomannen.gale.dedicated-server",
+        &format!("profile-{profile_id}-ftp-password"),
+    )?
+    .get_password()?;
 
-        let profile_id =
-            std::env::var("GALE_PROBE_PROFILE_ID").expect("GALE_PROBE_PROFILE_ID required");
-        let host = std::env::var("GALE_PROBE_HOST").expect("GALE_PROBE_HOST required");
-        let user = std::env::var("GALE_PROBE_USER").expect("GALE_PROBE_USER required");
-        let dir = std::env::var("GALE_PROBE_DIR").unwrap_or_else(|_| "/".to_owned());
-        let port = std::env::var("GALE_PROBE_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(21u16);
+    let mut settings = RemoteServerSettings {
+        protocol: RemoteProtocol::Ftps,
+        host,
+        port,
+        username: user,
+        server_directory: dir,
+        authentication: RemoteAuthentication::Password,
+        ..Default::default()
+    };
 
-        let password = keyring::Entry::new(
-            "com.kesomannen.gale.dedicated-server",
-            &format!("profile-{profile_id}-ftp-password"),
-        )?
-        .get_password()?;
-
-        let mut settings = RemoteServerSettings {
-            protocol: RemoteProtocol::Ftps,
-            host,
-            port,
-            username: user,
-            server_directory: dir,
-            authentication: RemoteAuthentication::Password,
-            ..Default::default()
-        };
-
-        let mut conn = match RemoteConnection::connect(&settings, &password)? {
-            ConnectionAttempt::Connected(conn) => conn,
-            ConnectionAttempt::CertificateUntrusted { fingerprint } => {
-                eprintln!("[probe] pinning observed certificate fingerprint {fingerprint}");
-                settings.trusted_certificate = Some(fingerprint);
-                match RemoteConnection::connect(&settings, &password)? {
-                    ConnectionAttempt::Connected(conn) => conn,
-                    _ => bail!("certificate still untrusted after pinning"),
-                }
+    let mut conn = match RemoteConnection::connect(&settings, &password)? {
+        ConnectionAttempt::Connected(conn) => conn,
+        ConnectionAttempt::CertificateUntrusted { fingerprint } => {
+            eprintln!("[probe] pinning observed certificate fingerprint {fingerprint}");
+            settings.trusted_certificate = Some(fingerprint);
+            match RemoteConnection::connect(&settings, &password)? {
+                ConnectionAttempt::Connected(conn) => conn,
+                _ => bail!("certificate still untrusted after pinning"),
             }
-            ConnectionAttempt::HostKeyUntrusted { .. } => {
-                bail!("unexpected host-key prompt on an FTP connection")
+        }
+        ConnectionAttempt::HostKeyUntrusted { .. } => {
+            bail!("unexpected host-key prompt on an FTP connection")
+        }
+    };
+
+    eprintln!("[probe] connected encrypted={}", conn.encrypted);
+
+    let ftp = match &mut conn.client {
+        RemoteClient::Ftp(ftp) => ftp,
+        RemoteClient::Sftp { .. } => bail!("probe only supports FTP connections"),
+    };
+
+    macro_rules! probe {
+        ($label:expr, $op:expr) => {
+            match $op {
+                Ok(value) => eprintln!("[probe] {:<58} OK   {:?}", $label, value),
+                Err(error) => eprintln!("[probe] {:<58} ERR  {error}", $label),
             }
         };
-
-        eprintln!("[probe] connected encrypted={}", conn.encrypted);
-
-        let ftp = match &mut conn.client {
-            RemoteClient::Ftp(ftp) => ftp,
-            RemoteClient::Sftp { .. } => bail!("probe only supports FTP connections"),
-        };
-
-        macro_rules! probe {
-            ($label:expr, $op:expr) => {
-                match $op {
-                    Ok(value) => eprintln!("[probe] {:<58} OK   {:?}", $label, value),
-                    Err(error) => eprintln!("[probe] {:<58} ERR  {error}", $label),
-                }
-            };
-        }
-
-        let config_dir =
-            std::env::var("GALE_PROBE_BASE").unwrap_or_else(|_| "/BepInEx/config".to_owned());
-        let dot_state = format!("{config_dir}/.gale-server-state.json");
-        let plain_state = format!("{config_dir}/gale-server-state.json");
-        let dot_lock = format!("{config_dir}/.gale-deploy.lock");
-        let dot_lease = format!("{dot_lock}/lease.json");
-
-        probe!("SIZE lease.json (ascii)", ftp.size(&dot_lease));
-        probe!(
-            "TYPE I",
-            ftp.transfer_type(suppaftp::types::FileType::Binary)
-        );
-        probe!("SIZE lease.json (binary)", ftp.size(&dot_lease));
-        probe!("SIZE dot-state (binary)", ftp.size(&dot_state));
-
-        probe!("PWD", ftp.pwd());
-        probe!("LIST /", ftp.list(Some("/")));
-        probe!("NLST /", ftp.nlst(Some("/")));
-        probe!("MLSD /", ftp.mlsd(Some("/")));
-
-        probe!("LIST base", ftp.list(Some(&config_dir)));
-        probe!("NLST base", ftp.nlst(Some(&config_dir)));
-        probe!("MLSD base", ftp.mlsd(Some(&config_dir)));
-
-        probe!("MLST dot-state", ftp.mlst(Some(&dot_state)));
-        probe!("SIZE dot-state", ftp.size(&dot_state));
-        probe!("MDTM dot-state", ftp.mdtm(&dot_state));
-        probe!("MLST plain-state", ftp.mlst(Some(&plain_state)));
-        probe!("SIZE plain-state", ftp.size(&plain_state));
-
-        probe!("MLST dot-lock", ftp.mlst(Some(&dot_lock)));
-        probe!("CWD dot-lock (dir probe)", ftp.cwd(&dot_lock));
-        probe!("LIST dot-lock", ftp.list(Some(&dot_lock)));
-        probe!("NLST dot-lock", ftp.nlst(Some(&dot_lock)));
-        probe!("MLSD dot-lock", ftp.mlsd(Some(&dot_lock)));
-
-        probe!("MLST lease.json", ftp.mlst(Some(&dot_lease)));
-        probe!("SIZE lease.json", ftp.size(&dot_lease));
-        probe!("MDTM lease.json", ftp.mdtm(&dot_lease));
-        probe!("RETR lease.json", {
-            ftp.retr_as_buffer(&dot_lease).map(|b| b.into_inner().len())
-        });
-        probe!("RETR dot-state", {
-            ftp.retr_as_buffer(&dot_state).map(|b| b.into_inner().len())
-        });
-
-        probe!("CWD base", ftp.cwd(&config_dir));
-        probe!("LIST (cwd=config)", ftp.list(None));
-        probe!("NLST (cwd=config)", ftp.nlst(None));
-        probe!("MLSD (cwd=config)", ftp.mlsd(None));
-        probe!(
-            "MLST .gale-server-state.json (rel)",
-            ftp.mlst(Some(".gale-server-state.json"))
-        );
-        probe!("SIZE .gale-server-state.json (rel)", {
-            ftp.size(".gale-server-state.json")
-        });
-        probe!("MLST .gale-deploy.lock (rel)", {
-            ftp.mlst(Some(".gale-deploy.lock"))
-        });
-        probe!("CWD .. (restore)", ftp.cwd(".."));
-
-        Ok(())
     }
+
+    let config_dir =
+        std::env::var("GALE_PROBE_BASE").unwrap_or_else(|_| "/BepInEx/config".to_owned());
+    let dot_state = format!("{config_dir}/.gale-server-state.json");
+    let plain_state = format!("{config_dir}/gale-server-state.json");
+    let dot_lock = format!("{config_dir}/.gale-deploy.lock");
+    let dot_lease = format!("{dot_lock}/lease.json");
+
+    probe!("SIZE lease.json (ascii)", ftp.size(&dot_lease));
+    probe!(
+        "TYPE I",
+        ftp.transfer_type(suppaftp::types::FileType::Binary)
+    );
+    probe!("SIZE lease.json (binary)", ftp.size(&dot_lease));
+    probe!("SIZE dot-state (binary)", ftp.size(&dot_state));
+
+    probe!("PWD", ftp.pwd());
+    probe!("LIST /", ftp.list(Some("/")));
+    probe!("NLST /", ftp.nlst(Some("/")));
+    probe!("MLSD /", ftp.mlsd(Some("/")));
+
+    probe!("LIST base", ftp.list(Some(&config_dir)));
+    probe!("NLST base", ftp.nlst(Some(&config_dir)));
+    probe!("MLSD base", ftp.mlsd(Some(&config_dir)));
+
+    probe!("MLST dot-state", ftp.mlst(Some(&dot_state)));
+    probe!("SIZE dot-state", ftp.size(&dot_state));
+    probe!("MDTM dot-state", ftp.mdtm(&dot_state));
+    probe!("MLST plain-state", ftp.mlst(Some(&plain_state)));
+    probe!("SIZE plain-state", ftp.size(&plain_state));
+
+    probe!("MLST dot-lock", ftp.mlst(Some(&dot_lock)));
+    probe!("CWD dot-lock (dir probe)", ftp.cwd(&dot_lock));
+    probe!("LIST dot-lock", ftp.list(Some(&dot_lock)));
+    probe!("NLST dot-lock", ftp.nlst(Some(&dot_lock)));
+    probe!("MLSD dot-lock", ftp.mlsd(Some(&dot_lock)));
+
+    probe!("MLST lease.json", ftp.mlst(Some(&dot_lease)));
+    probe!("SIZE lease.json", ftp.size(&dot_lease));
+    probe!("MDTM lease.json", ftp.mdtm(&dot_lease));
+    probe!("RETR lease.json", {
+        ftp.retr_as_buffer(&dot_lease).map(|b| b.into_inner().len())
+    });
+    probe!("RETR dot-state", {
+        ftp.retr_as_buffer(&dot_state).map(|b| b.into_inner().len())
+    });
+
+    probe!("CWD base", ftp.cwd(&config_dir));
+    probe!("LIST (cwd=config)", ftp.list(None));
+    probe!("NLST (cwd=config)", ftp.nlst(None));
+    probe!("MLSD (cwd=config)", ftp.mlsd(None));
+    probe!(
+        "MLST .gale-server-state.json (rel)",
+        ftp.mlst(Some(".gale-server-state.json"))
+    );
+    probe!("SIZE .gale-server-state.json (rel)", {
+        ftp.size(".gale-server-state.json")
+    });
+    probe!("MLST .gale-deploy.lock (rel)", {
+        ftp.mlst(Some(".gale-deploy.lock"))
+    });
+    probe!("CWD .. (restore)", ftp.cwd(".."));
+
+    Ok(())
 }

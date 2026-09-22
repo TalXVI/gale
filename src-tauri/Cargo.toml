@@ -130,7 +130,12 @@ ashpd = { version = "0.13", features = ["settings"] }
 # Certificate fixtures for the FTPS verifier tests.
 rcgen = "0.13"
 
+[[example]]
+name = "ftp-probe"
+required-features = ["diagnostics"]
+
 [features]
+diagnostics = []
 custom-protocol = ["tauri/custom-protocol"]
 worker = ["dep:axum", "dep:fd-lock"]
 axum = ["dep:axum"]

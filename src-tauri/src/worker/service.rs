@@ -122,12 +122,25 @@ fn service_main_inner() -> Result<()> {
         }
     })?;
 
+    run_service(&args, shutdown, os_shutdown, |status| {
+        status_handle.set_service_status(status)
+    })
+}
+
+/// Runs the lifecycle after SCM registration, reporting every transition
+/// through the supplied SCM status sink.
+fn run_service(
+    args: &ServiceArgs,
+    shutdown: CancellationToken,
+    os_shutdown: Arc<AtomicBool>,
+    report: impl Fn(ServiceStatus) -> windows_service::Result<()>,
+) -> Result<()> {
     let set_status = |state: ServiceState,
                       accepted: ServiceControlAccept,
                       code: u32,
                       checkpoint: u32,
                       wait_hint: Duration| {
-        status_handle.set_service_status(ServiceStatus {
+        report(ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,
             current_state: state,
             controls_accepted: accepted,
@@ -154,7 +167,7 @@ fn service_main_inner() -> Result<()> {
     // Everything fallible that remains is inside `load_and_build`, so no
     // `?` can bypass the Stopped/nonzero finalizer below — including
     // Tokio runtime construction.
-    let (config, result) = match load_and_build(&args) {
+    let (config, result) = match load_and_build(args) {
         Ok(init) => {
             let config = init.config.clone();
             let result = init.runtime.block_on(async {
@@ -662,6 +675,37 @@ fn icacls(path: &Path, grants: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{ServiceArgs, await_listen_ready, load_and_build};
+
+    #[test]
+    fn initialization_failure_reports_stopped_with_nonzero_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = ServiceArgs {
+            config: dir.path().join("worker.json"),
+            log_file: dir.path().join("worker.log"),
+        };
+        for malformed in [false, true] {
+            if malformed {
+                std::fs::write(&args.config, b"{invalid").unwrap();
+            }
+            let statuses = std::sync::Mutex::new(Vec::new());
+            let result = super::run_service(
+                &args,
+                tokio_util::sync::CancellationToken::new(),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                |status| {
+                    statuses.lock().unwrap().push(status);
+                    Ok(())
+                },
+            );
+            assert!(result.is_err());
+            let statuses = statuses.into_inner().unwrap();
+            assert_eq!(statuses.len(), 2);
+            assert_eq!(statuses[0].current_state, super::ServiceState::StartPending);
+            assert_eq!(statuses[1].current_state, super::ServiceState::Stopped);
+            assert_eq!(statuses[1].exit_code, super::ServiceExitCode::Win32(1));
+            assert!(statuses[1].controls_accepted.is_empty());
+        }
+    }
 
     /// Install/start trust a real probe, not a transient SCM state: a
     /// bound port passes immediately, a dead one fails rather than

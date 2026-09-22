@@ -1209,26 +1209,59 @@ mod tests {
 
     #[test]
     fn restrict_dir_removes_inherited_access() {
+        fn powershell(path: &std::path::Path, script: &str) {
+            let output = std::process::Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", script])
+                .env("GALE_ACL_TEST_DIR", path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("restricted");
-        std::fs::create_dir(&path).unwrap();
-        restrict_dir(&path).unwrap();
-
-        // icacls reports the effective ACL (names, not SIDs): only the
-        // current user plus SYSTEM/Administrators remain.
-        let output = std::process::Command::new("icacls")
-            .arg(&path)
+        let status = std::process::Command::new("icacls")
+            .arg(dir.path())
+            .args(["/grant", "*S-1-1-0:(OI)(CI)R"])
             .output()
             .unwrap();
-        let acl = String::from_utf8_lossy(&output.stdout);
-        assert!(acl.contains("SYSTEM"), "SYSTEM grant missing: {acl}");
-        assert!(
-            acl.contains("Administrators"),
-            "Admins grant missing: {acl}"
+        assert!(status.status.success());
+        let path = dir.path().join("restricted");
+        std::fs::create_dir(&path).unwrap();
+        powershell(
+            &path,
+            r#"
+            $ErrorActionPreference = 'Stop'
+            $acl = [System.IO.Directory]::GetAccessControl($env:GALE_ACL_TEST_DIR)
+            $rules = $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
+            if (-not ($rules | Where-Object { $_.IdentityReference.Value -eq 'S-1-1-0' -and $_.IsInherited })) {
+                throw 'fixture must inherit Everyone access'
+            }
+        "#,
         );
-        assert!(
-            !acl.contains("BUILTIN\\Users") && !acl.contains("Everyone"),
-            "world-readable staging dir: {acl}"
+        restrict_dir(&path).unwrap();
+        powershell(
+            &path,
+            r#"
+            $ErrorActionPreference = 'Stop'
+            $acl = [System.IO.Directory]::GetAccessControl($env:GALE_ACL_TEST_DIR)
+            if (-not $acl.AreAccessRulesProtected) { throw 'inheritance must be disabled' }
+            $rules = $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
+            $userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+            $allowed = @($userSid, 'S-1-5-18', 'S-1-5-32-544')
+            foreach ($rule in $rules) {
+                if ($rule.IsInherited -or $rule.IdentityReference.Value -notin $allowed) { throw 'unexpected inherited or broad access' }
+            }
+            foreach ($sid in $allowed) {
+                if (-not ($rules | Where-Object {
+                    $_.IdentityReference.Value -eq $sid -and $_.AccessControlType -eq 'Allow' -and
+                    ($_.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -eq
+                        [System.Security.AccessControl.FileSystemRights]::FullControl
+                })) { throw ('required FullControl grant missing: ' + $sid) }
+            }
+        "#,
         );
     }
 }

@@ -258,3 +258,6 @@ pub fn run() {
         .expect("error while running tauri application")
         .run(event_handler);
 }
+
+#[cfg(feature = "diagnostics")]
+pub use profile::server::remote::ftp_probe_dotpath_visibility;

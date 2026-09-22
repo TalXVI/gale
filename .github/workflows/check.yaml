@@ -6,6 +6,7 @@ on:
   pull_request:
     branches:
       - main
+      - master
 
 jobs:
   check-backend:
@@ -19,14 +20,8 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          sudo apt update;
-          sudo apt-get install -y libappindicator3-dev librsvg2-dev libudev-dev patchelf \
-            libwebkit2gtk-4.1-0=2.44.0-2 \
-            libwebkit2gtk-4.1-dev=2.44.0-2 \
-            libjavascriptcoregtk-4.1-0=2.44.0-2 \
-            libjavascriptcoregtk-4.1-dev=2.44.0-2 \
-            gir1.2-javascriptcoregtk-4.1=2.44.0-2 \
-            gir1.2-webkit2-4.1=2.44.0-2
+          sudo apt-get update
+          sudo apt-get install -y libappindicator3-dev librsvg2-dev libudev-dev patchelf libwebkit2gtk-4.1-dev
 
       - name: Run clippy lint
         run: |
@@ -56,8 +51,24 @@ jobs:
       - name: Compile locales
         run: pnpm locale:compile
 
+      - name: Install test browser
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Run dialog regressions
+        run: pnpm test
+
       - name: Run Prettier lint
         run: pnpm lint
 
       - name: Run Svelte check
         run: pnpm check
+
+  test-backend:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run worker and desktop regressions
+        run: cargo test --manifest-path src-tauri/Cargo.toml --features worker --lib
+      - name: Check opt-in diagnostic
+        run: cargo check --manifest-path src-tauri/Cargo.toml --features diagnostics --example ftp-probe
