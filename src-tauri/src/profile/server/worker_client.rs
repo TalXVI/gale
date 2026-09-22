@@ -140,7 +140,7 @@ impl WorkerClient {
     /// deployment state, through the worker. The worker derives the
     /// publication pin itself, so clients never supply it.
     pub async fn set_policy(&self, path: &ConfigPath, policy: ConfigUpdatePolicy) -> Result<()> {
-        self.send::<serde_json::Value>(
+        self.send(
             self.http
                 .post(format!("{}{}/policy", self.base, api::API_BASE))
                 .json(&PolicyRequest {
@@ -148,8 +148,7 @@ impl WorkerClient {
                     policy,
                 }),
         )
-        .await?;
-        Ok(())
+        .await
     }
 
     /// Updates the worker's automation toggles. Manual Deploy Now requests
@@ -160,7 +159,7 @@ impl WorkerClient {
         auto_mods: bool,
         restart_policy: RestartPolicy,
     ) -> Result<()> {
-        self.send::<serde_json::Value>(
+        self.send(
             self.http
                 .post(format!("{}{}/config", self.base, api::API_BASE))
                 .json(&ConfigureRequest {
@@ -169,8 +168,7 @@ impl WorkerClient {
                     restart_policy,
                 }),
         )
-        .await?;
-        Ok(())
+        .await
     }
 }
 

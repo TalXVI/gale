@@ -106,7 +106,7 @@
 	async function launchServer() {
 		const settings = await api.profile.server.getSettings();
 
-		if (settings === null || settings.serverName.trim() === '') {
+		if (settings === null || settings.location === 'remote' || settings.serverName.trim() === '') {
 			dedicatedServerDialogOpen = true;
 			return;
 		}

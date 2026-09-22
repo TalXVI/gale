@@ -39,7 +39,7 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use super::api::WorkerRunPhase;
 use super::config::WorkerConfig;
 use super::journal;
-use super::local;
+use super::local::{self, await_listen_ready, stop_and_wait, wait_for_state};
 use super::secrets::Secrets;
 use super::server;
 
@@ -348,6 +348,14 @@ fn install_inner(staging: &Path, log: &Path) -> Result<()> {
         private.join(local::SECRETS_FILE),
     )
     .context("failed to install worker secrets")?;
+    if staged_secrets.refresh_token.is_some() {
+        // Setup obtains a new login. An old rotated token must not override
+        // it when the retained journal is loaded on the next start.
+        let journal = journal::Journal::load(&config.state_dir)?;
+        let mut state = journal.state.blocking_lock();
+        state.refresh_token = staged_secrets.refresh_token;
+        journal.save(&state)?;
+    }
     // A staged SSH key accompanies private-key configs — the service
     // cannot reach user-profile paths as LocalSystem.
     let staged_key = staging.join(local::SSH_KEY_FILE);
@@ -356,24 +364,25 @@ fn install_inner(staging: &Path, log: &Path) -> Result<()> {
             .context("failed to install the SSH private key")?;
     }
 
-    // The service runs a copy in ProgramData, not the bundled binary:
-    // Gale updates can then replace the bundled exe without fighting a
-    // file lock on the running service.
-    let exe = install_worker_binary(&root)?;
-    let service = create_service(&manager, &exe, &root)?;
+    start_installed_worker(&manager, &root, &config.listen, log)
+}
+
+fn start_installed_worker(
+    manager: &ServiceManager,
+    root: &Path,
+    listen: &str,
+    log: &Path,
+) -> Result<()> {
+    let exe = install_worker_binary(root)?;
+    let service = create_service(manager, &exe, root)?;
     configure_recovery(&service).context("failed to configure crash recovery")?;
     grant_user_control().context("failed to grant user control")?;
-
     provision_log(log, "starting service");
     service
         .start(&[] as &[&OsStr])
         .context("failed to start the service")?;
     wait_for_state(&service, ServiceState::Running)?;
-    // The service reports Running only after the API is bound, but a
-    // crash between the report and now would leave SCM's view stale —
-    // confirm the port actually answers before declaring success.
-    await_listen_ready(&config.listen)?;
-    Ok(())
+    await_listen_ready(listen)
 }
 
 /// `gale-worker service uninstall --log <file>`. Stops and deletes the
@@ -391,23 +400,7 @@ fn uninstall_inner(log: &Path) -> Result<()> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .context("failed to open the service control manager")?;
 
-    match manager.open_service(
-        local::SERVICE_NAME,
-        ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
-    ) {
-        Ok(service) => {
-            provision_log(log, "stopping service");
-            stop_and_wait(&service)?;
-            service.delete().context("failed to delete the service")?;
-            // The handle must close before the deletion can complete —
-            // while any handle is open the service lingers in the
-            // marked-for-delete state.
-            drop(service);
-            wait_until_deleted(&manager)?;
-        }
-        Err(err) if is_not_found(&err) => {}
-        Err(err) => return Err(err).context("failed to open the service"),
-    }
+    remove_existing_service(&manager, log)?;
 
     let root = local::root_dir();
     if root.exists() {
@@ -436,34 +429,6 @@ fn uninstall_inner(log: &Path) -> Result<()> {
 
 fn is_not_found(err: &windows_service::Error) -> bool {
     matches!(err, windows_service::Error::Winapi(io) if io.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST))
-}
-
-fn stop_and_wait(service: &windows_service::service::Service) -> Result<()> {
-    if service.query_status()?.current_state == ServiceState::Stopped {
-        return Ok(());
-    }
-    if let Err(err) = service.stop()
-        && service.query_status()?.current_state != ServiceState::Stopped
-    {
-        return Err(err).context("failed to stop the service");
-    }
-    wait_for_state(service, ServiceState::Stopped)
-}
-
-fn wait_for_state(service: &windows_service::service::Service, target: ServiceState) -> Result<()> {
-    let deadline = Instant::now() + TRANSITION_TIMEOUT;
-    loop {
-        let state = service.query_status()?.current_state;
-        if state == target {
-            return Ok(());
-        }
-        if Instant::now() > deadline {
-            bail!(
-                "service did not reach {target:?} within {TRANSITION_TIMEOUT:?} (state: {state:?})"
-            );
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
 }
 
 fn wait_until_deleted(manager: &ServiceManager) -> Result<()> {
@@ -610,38 +575,7 @@ fn reinstall_inner(log: &Path) -> Result<()> {
     remove_existing_service(&manager, log)?;
     apply_directory_acls(&root, &private).context("failed to set directory permissions")?;
 
-    let exe = install_worker_binary(&root)?;
-    let service = create_service(&manager, &exe, &root)?;
-    configure_recovery(&service).context("failed to configure crash recovery")?;
-    grant_user_control().context("failed to grant user control")?;
-
-    provision_log(log, "starting service");
-    service
-        .start(&[] as &[&OsStr])
-        .context("failed to start the service")?;
-    wait_for_state(&service, ServiceState::Running)?;
-    await_listen_ready(&config.listen)
-}
-
-/// Confirms the worker's listen address accepts TCP connections. SCM
-/// state alone cannot prove the API survived past the Running report —
-/// a crashed process can linger in Running briefly.
-fn await_listen_ready(listen: &str) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let mut last_err = None;
-    while Instant::now() < deadline {
-        match std::net::TcpStream::connect(listen) {
-            Ok(_) => return Ok(()),
-            Err(err) => {
-                last_err = Some(err);
-                std::thread::sleep(Duration::from_millis(200));
-            }
-        }
-    }
-    Err(last_err.unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out")))
-        .context(format!(
-            "the worker service reports running but {listen} is not answering"
-        ))
+    start_installed_worker(&manager, &root, &config.listen, log)
 }
 
 /// SCM-managed crash recovery: restart after 5s, then 15s, then every 60s.

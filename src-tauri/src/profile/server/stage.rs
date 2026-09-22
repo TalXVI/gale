@@ -85,33 +85,24 @@ impl PayloadSource for CachePayloadSource {
             // Extract to a sibling temp dir, then rename into place so an
             // interrupted extraction can't leave a half-populated tree
             // behind.
-            let tmp = parent.join(format!(".staging-{}", uuid::Uuid::new_v4().simple()));
-            std::fs::create_dir_all(&tmp)?;
-            let result = self.extract(bytes, ident, &tmp);
-            match result {
-                Ok(()) => {
-                    if dest.exists() {
-                        std::fs::remove_dir_all(&tmp)?;
-                    } else {
-                        std::fs::rename(&tmp, &dest).or_else(|_| {
-                            util::fs::copy_dir(
-                                &tmp,
-                                &dest,
-                                util::fs::Overwrite::Yes,
-                                util::fs::UseLinks::No,
-                            )
-                            .and_then(|_| std::fs::remove_dir_all(&tmp).map_err(eyre::Report::from))
-                        })?;
-                    }
-                    Ok(dest)
-                }
-                Err(error) => {
-                    std::fs::remove_dir_all(&tmp).ok();
-                    Err(error)
-                }
-            }
+            let tmp = tempfile::tempdir_in(parent)?;
+            self.extract(bytes, ident, tmp.path())?;
+            commit_staged(tmp, &dest)?;
+            Ok(dest)
         })
     }
+}
+
+fn commit_staged(tmp: tempfile::TempDir, dest: &Path) -> Result<()> {
+    if is_staged(dest) {
+        return Ok(());
+    }
+    if dest.exists() {
+        // Remove only an empty cache entry. A concurrent writer must not
+        // lose files, and an incomplete tree must never be copied into view.
+        std::fs::remove_dir(dest)?;
+    }
+    std::fs::rename(tmp.path(), dest).context("failed to publish staged package")
 }
 
 impl CachePayloadSource {
@@ -287,6 +278,23 @@ mod tests {
             },
         })
         .unwrap()
+    }
+
+    #[test]
+    fn staging_replaces_empty_cache_entries_and_preserves_completed_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("package");
+        std::fs::create_dir(&dest).unwrap();
+        for contents in ["complete", "concurrent download"] {
+            let tmp = tempfile::tempdir_in(root.path()).unwrap();
+            std::fs::write(tmp.path().join("plugin.dll"), contents).unwrap();
+            super::commit_staged(tmp, &dest).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(dest.join("plugin.dll")).unwrap(),
+                "complete"
+            );
+        }
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
 
     #[tokio::test]

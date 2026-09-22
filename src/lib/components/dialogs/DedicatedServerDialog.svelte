@@ -12,15 +12,12 @@
 	import ServerSyncDialog from './ServerSyncDialog.svelte';
 	import * as api from '$lib/api';
 	import type {
-		HostProvider,
 		LocalWorkerStatus,
 		PendingPublication,
 		ProfileServerSettings,
-		RemoteAuthentication,
 		RemoteProtocol,
 		RemoteServerSettings,
-		RestartPolicy,
-		ServerLocation
+		RestartPolicy
 	} from '$lib/types';
 	import games from '$lib/state/game.svelte';
 	import { Tabs } from 'bits-ui';
@@ -36,33 +33,17 @@
 	type Props = { open?: boolean };
 	let { open = $bindable(false) }: Props = $props();
 
-	let location = $state<ServerLocation>('local');
-	let serverName = $state('');
-	let worldName = $state('');
 	let gamePassword = $state('');
 	let rememberGamePassword = $state(true);
+	let form = $state<ProfileServerSettings>(defaultSettings());
 	let port = $state('');
-	let publicServer = $state(true);
-	let crossplay = $state(false);
-	let extraArgs = $state('');
-	let remoteHost = $state('');
-	let remoteProtocol = $state<RemoteProtocol>('sftp');
 	let remotePort = $state(DEFAULT_SFTP_PORT);
-	let remoteUser = $state('');
-	let remotePath = $state('');
-	let remoteAuthentication = $state<RemoteAuthentication>('password');
-	let privateKeyPath = $state('');
-	let trustedHostKey = $state<string | null>(null);
-	let trustedCertificate = $state<string | null>(null);
 	let remotePassword = $state('');
 	/// The UI-level sync choice: 'hostedWorker' maps to syncMode 'worker'
 	/// with `hosted: true`.
 	let syncChoice = $state<'local' | 'hostedWorker' | 'worker'>('local');
 	let localWorker = $state<LocalWorkerStatus | null>(null);
-	let workerAddress = $state('');
 	let workerToken = $state('');
-	let workerAutoSync = $state(false);
-	let workerAutoMods = $state(false);
 	/// The automation state the worker last confirmed (for the managed
 	/// worker, what it reports live). A failed save snaps the controls
 	/// back to this instead of leaving intent that never took effect.
@@ -71,11 +52,7 @@
 		autoMods: boolean;
 		restartPolicy: RestartPolicy;
 	}>({ autoSync: false, autoMods: false, restartPolicy: 'manual' });
-	let hostProvider = $state<HostProvider>('none');
-	let datHostServerId = $state('');
-	let datHostUsername = $state('');
 	let datHostPassword = $state('');
-	let restartPolicy = $state<RestartPolicy>('manual');
 	let rememberRemotePassword = $state(true);
 	let initialized = $state(false);
 	let loadingSettings = $state(false);
@@ -149,52 +126,40 @@
 		loadingSettings = true;
 		try {
 			const value = (await api.profile.server.getSettings()) ?? defaultSettings();
-			location = value.location;
-			serverName = value.serverName;
-			worldName = value.world;
+			form = value;
 			port = String(
 				value.port || games.active?.dedicatedServer?.defaultPort || FALLBACK_SERVER_PORT
 			);
-			publicServer = value.publicServer;
-			crossplay = value.crossplay;
-			extraArgs = value.extraArgs;
-			remoteHost = value.remote.host;
-			remoteProtocol = value.remote.protocol;
 			remotePort = String(
-				value.remote.port || (remoteProtocol === 'sftp' ? DEFAULT_SFTP_PORT : DEFAULT_FTP_PORT)
+				value.remote.port ||
+					(value.remote.protocol === 'sftp' ? DEFAULT_SFTP_PORT : DEFAULT_FTP_PORT)
 			);
-			remoteUser = value.remote.username;
-			remotePath = value.remote.serverDirectory;
-			remoteAuthentication = value.remote.authentication;
-			privateKeyPath = value.remote.privateKeyPath;
-			trustedHostKey = value.remote.trustedHostKey;
-			trustedCertificate = value.remote.trustedCertificate;
 			syncChoice =
 				value.remote.syncMode === 'worker'
 					? value.remote.worker.hosted
 						? 'hostedWorker'
 						: 'worker'
 					: 'local';
-			workerAddress = value.remote.worker.address;
 			await refreshLocalWorker();
 			// The worker's journal is the authoritative automation state —
 			// for the managed worker its live report wins over the stored
 			// copy, which only seeds new installs.
 			const liveWorker = syncChoice === 'hostedWorker' ? localWorker?.worker : null;
-			workerAutoSync = liveWorker?.autoSync ?? value.remote.worker.autoSync;
-			workerAutoMods = liveWorker?.autoMods ?? value.remote.worker.autoMods;
-			restartPolicy = liveWorker?.restartPolicy ?? value.remote.restartPolicy;
-			savedAutomation = { autoSync: workerAutoSync, autoMods: workerAutoMods, restartPolicy };
-			hostProvider = value.remote.hostControl.provider;
-			datHostServerId = value.remote.hostControl.datHostServerId;
-			datHostUsername = value.remote.hostControl.datHostUsername;
+			form.remote.worker.autoSync = liveWorker?.autoSync ?? value.remote.worker.autoSync;
+			form.remote.worker.autoMods = liveWorker?.autoMods ?? value.remote.worker.autoMods;
+			form.remote.restartPolicy = liveWorker?.restartPolicy ?? value.remote.restartPolicy;
+			savedAutomation = {
+				autoSync: form.remote.worker.autoSync,
+				autoMods: form.remote.worker.autoMods,
+				restartPolicy: form.remote.restartPolicy
+			};
 		} finally {
 			loadingSettings = false;
 		}
 	}
 
 	function parsePort(value: string, label: string) {
-		const parsed = Number.parseInt(value, 10);
+		const parsed = Number(value);
 		if (!Number.isInteger(parsed) || parsed < 1 || parsed > MAX_PORT)
 			throw new Error(m.dedicatedServerDialog_portError({ label }));
 		return parsed;
@@ -202,46 +167,41 @@
 
 	function remoteSettings(): RemoteServerSettings {
 		return {
-			protocol: remoteProtocol,
-			host: remoteHost.trim(),
+			...form.remote,
+			host: form.remote.host.trim(),
 			port: parsePort(
 				remotePort,
-				remoteProtocol === 'sftp'
+				form.remote.protocol === 'sftp'
 					? m.dedicatedServerDialog_sshPort()
 					: m.dedicatedServerDialog_ftpPort()
 			),
-			username: remoteUser.trim(),
-			serverDirectory: remotePath.trim(),
-			authentication: remoteAuthentication,
-			privateKeyPath: privateKeyPath.trim(),
-			trustedHostKey,
-			trustedCertificate,
+			username: form.remote.username.trim(),
+			serverDirectory: form.remote.serverDirectory.trim(),
+			privateKeyPath: form.remote.privateKeyPath.trim(),
 			syncMode: syncChoice === 'local' ? 'local' : 'worker',
 			worker: {
-				address: workerAddress.trim(),
-				hosted: syncChoice === 'hostedWorker',
-				autoSync: workerAutoSync,
-				autoMods: workerAutoMods
+				...form.remote.worker,
+				address: form.remote.worker.address.trim(),
+				hosted: syncChoice === 'hostedWorker'
 			},
 			hostControl: {
-				provider: hostProvider,
-				datHostServerId: datHostServerId.trim(),
-				datHostUsername: datHostUsername.trim()
-			},
-			restartPolicy
+				...form.remote.hostControl,
+				datHostServerId: form.remote.hostControl.datHostServerId.trim(),
+				datHostUsername: form.remote.hostControl.datHostUsername.trim()
+			}
 		};
 	}
 
 	function changeRemoteProtocol(value: RemoteProtocol) {
 		if (
-			(remoteProtocol === 'sftp' && remotePort === DEFAULT_SFTP_PORT) ||
-			(remoteProtocol !== 'sftp' && remotePort === DEFAULT_FTP_PORT)
+			(form.remote.protocol === 'sftp' && remotePort === DEFAULT_SFTP_PORT) ||
+			(form.remote.protocol !== 'sftp' && remotePort === DEFAULT_FTP_PORT)
 		) {
 			remotePort = value === 'sftp' ? DEFAULT_SFTP_PORT : DEFAULT_FTP_PORT;
 		}
-		remoteProtocol = value;
-		trustedHostKey = null;
-		trustedCertificate = null;
+		form.remote.protocol = value;
+		form.remote.trustedHostKey = null;
+		form.remote.trustedCertificate = null;
 	}
 
 	async function choosePrivateKey() {
@@ -250,18 +210,16 @@
 			directory: false,
 			multiple: false
 		});
-		if (typeof selected === 'string') privateKeyPath = selected;
+		if (typeof selected === 'string') form.remote.privateKeyPath = selected;
 	}
 
 	function settings(): ProfileServerSettings {
 		return {
-			location,
-			serverName: serverName.trim(),
-			world: worldName.trim(),
+			...form,
+			serverName: form.serverName.trim(),
+			world: form.world.trim(),
 			port: parsePort(port, m.dedicatedServerDialog_serverPort()),
-			publicServer,
-			crossplay,
-			extraArgs: extraArgs.trim(),
+			extraArgs: form.extraArgs.trim(),
 			remote: remoteSettings()
 		};
 	}
@@ -280,19 +238,19 @@
 			title: m.dedicatedServerDialog_trustTitle(),
 			kind: 'warning'
 		});
-		if (accepted) trustedHostKey = fingerprint;
+		if (accepted) form.remote.trustedHostKey = fingerprint;
 		return accepted;
 	}
 
 	async function trustInvalidCertificate(fingerprint: string) {
 		const accepted = await confirm(
-			m.dedicatedServerDialog_certificateMessage({ host: remoteHost.trim() }),
+			m.dedicatedServerDialog_certificateMessage({ host: form.remote.host.trim() }),
 			{
 				title: m.dedicatedServerDialog_certificateTitle(),
 				kind: 'warning'
 			}
 		);
-		if (accepted) trustedCertificate = fingerprint;
+		if (accepted) form.remote.trustedCertificate = fingerprint;
 		return accepted;
 	}
 
@@ -309,7 +267,7 @@
 			);
 			if (result.status === 'hostKeyUntrusted') {
 				if (!(await trustHost(result.fingerprint))) return;
-				current.remote.trustedHostKey = trustedHostKey;
+				current.remote.trustedHostKey = form.remote.trustedHostKey;
 				result = await api.profile.server.testRemoteConnection(
 					current.remote,
 					remotePassword,
@@ -319,7 +277,7 @@
 			}
 			if (result.status === 'certificateUntrusted') {
 				if (!(await trustInvalidCertificate(result.fingerprint))) return;
-				current.remote.trustedCertificate = trustedCertificate;
+				current.remote.trustedCertificate = form.remote.trustedCertificate;
 				result = await api.profile.server.testRemoteConnection(
 					current.remote,
 					remotePassword,
@@ -330,10 +288,10 @@
 			if (result.status !== 'connected') return;
 			await message(
 				!result.encrypted
-					? m.dedicatedServerDialog_connectionPlain({ host: remoteHost })
-					: remoteProtocol !== 'sftp' && trustedCertificate
-						? m.dedicatedServerDialog_connectionEncrypted({ host: remoteHost })
-						: m.dedicatedServerDialog_connectionSecure({ host: remoteHost }),
+					? m.dedicatedServerDialog_connectionPlain({ host: form.remote.host })
+					: form.remote.protocol !== 'sftp' && form.remote.trustedCertificate
+						? m.dedicatedServerDialog_connectionEncrypted({ host: form.remote.host })
+						: m.dedicatedServerDialog_connectionSecure({ host: form.remote.host }),
 				{
 					title: m.dedicatedServerDialog_connectionTitle(),
 					kind: 'info'
@@ -383,7 +341,11 @@
 			// Automation toggles may have changed — re-read the worker's own
 			// state so the pending banner reflects what it will actually do.
 			await refreshLocalWorker();
-			savedAutomation = { autoSync: workerAutoSync, autoMods: workerAutoMods, restartPolicy };
+			savedAutomation = {
+				autoSync: form.remote.worker.autoSync,
+				autoMods: form.remote.worker.autoMods,
+				restartPolicy: form.remote.restartPolicy
+			};
 			pushInfoToast({ message: m.dedicatedServerDialog_saved() });
 		} catch {
 			// The save failed — the backend leaves stored settings
@@ -401,9 +363,9 @@
 	/// values it acknowledged.
 	function reconcileAutomation() {
 		const liveWorker = syncChoice === 'hostedWorker' ? localWorker?.worker : null;
-		workerAutoSync = liveWorker?.autoSync ?? savedAutomation.autoSync;
-		workerAutoMods = liveWorker?.autoMods ?? savedAutomation.autoMods;
-		restartPolicy = liveWorker?.restartPolicy ?? savedAutomation.restartPolicy;
+		form.remote.worker.autoSync = liveWorker?.autoSync ?? savedAutomation.autoSync;
+		form.remote.worker.autoMods = liveWorker?.autoMods ?? savedAutomation.autoMods;
+		form.remote.restartPolicy = liveWorker?.restartPolicy ?? savedAutomation.restartPolicy;
 	}
 
 	/// Saves the current transport settings first — provisioning derives
@@ -431,14 +393,14 @@
 				rememberRemotePassword
 			);
 			localWorker = await api.profile.server.provisionLocalWorker(remotePassword, datHostPassword);
-			if (localWorker.binding) workerAddress = localWorker.binding.address;
+			if (localWorker.binding) form.remote.worker.address = localWorker.binding.address;
 			// A reprovisioned worker keeps its journal — adopt whatever
 			// automation flags it actually runs.
 			reconcileAutomation();
 			savedAutomation = {
-				autoSync: workerAutoSync,
-				autoMods: workerAutoMods,
-				restartPolicy
+				autoSync: form.remote.worker.autoSync,
+				autoMods: form.remote.worker.autoMods,
+				restartPolicy: form.remote.restartPolicy
 			};
 		} finally {
 			provisioning = false;
@@ -473,7 +435,7 @@
 		try {
 			localWorker = await api.profile.server.uninstallLocalWorker();
 			syncChoice = 'local';
-			workerAddress = '';
+			form.remote.worker.address = '';
 		} finally {
 			workerBusy = false;
 		}
@@ -556,7 +518,7 @@
 		<div class="text-primary-500 mt-5">{m.dedicatedServerDialog_loading()}</div>
 	{:else}
 		<TabsMenu
-			bind:value={location}
+			bind:value={form.location}
 			options={[
 				{ value: 'local', label: m.dedicatedServerDialog_locationLocal() },
 				{ value: 'remote', label: m.dedicatedServerDialog_locationRemote() }
@@ -567,14 +529,14 @@
 					<div>
 						<Label>{m.dedicatedServerDialog_serverName()}</Label><InputField
 							class="mt-1 w-full"
-							bind:value={serverName}
+							bind:value={form.serverName}
 							placeholder={m.dedicatedServerDialog_serverNamePlaceholder()}
 						/>
 					</div>
 					<div>
 						<Label>{m.dedicatedServerDialog_world()}</Label><InputField
 							class="mt-1 w-full"
-							bind:value={worldName}
+							bind:value={form.world}
 							placeholder={m.dedicatedServerDialog_worldPlaceholder()}
 						/>
 					</div>
@@ -601,22 +563,22 @@
 					<div class="flex items-center">
 						<Label>{m.dedicatedServerDialog_public()}</Label><Info
 							>{m.dedicatedServerDialog_publicInfo()}</Info
-						><Checkbox bind:checked={publicServer} />
+						><Checkbox bind:checked={form.publicServer} />
 					</div>
 					<div class="flex items-center">
 						<Label>{m.dedicatedServerDialog_crossplay()}</Label><Info
 							>{m.dedicatedServerDialog_crossplayInfo()}</Info
-						><Checkbox bind:checked={crossplay} />
+						><Checkbox bind:checked={form.crossplay} />
 					</div>
 				</div>
 			</Tabs.Content>
 
 			<Tabs.Content value="remote">
 				<div class="mt-4 flex flex-col gap-3">
-					<InfoBox type={remoteProtocol === 'ftp' ? 'warning' : 'info'}
-						>{remoteProtocol === 'sftp'
+					<InfoBox type={form.remote.protocol === 'ftp' ? 'warning' : 'info'}
+						>{form.remote.protocol === 'sftp'
 							? m.dedicatedServerDialog_sftpInfo()
-							: remoteProtocol === 'ftps'
+							: form.remote.protocol === 'ftps'
 								? m.dedicatedServerDialog_ftpsInfo()
 								: m.dedicatedServerDialog_ftpInfo()}</InfoBox
 					>
@@ -625,7 +587,7 @@
 						<Select
 							type="single"
 							triggerClass="mt-1 w-full"
-							bind:value={remoteProtocol}
+							value={form.remote.protocol}
 							onValueChange={(value) => changeRemoteProtocol(value as RemoteProtocol)}
 							items={[
 								{ value: 'sftp', label: m.dedicatedServerDialog_protocolSftp() },
@@ -637,14 +599,14 @@
 					<div>
 						<Label>{m.dedicatedServerDialog_host()}</Label><InputField
 							class="mt-1 w-full"
-							bind:value={remoteHost}
+							bind:value={form.remote.host}
 							placeholder="example.com"
 						/>
 					</div>
 					<div class="grid grid-cols-2 gap-3">
 						<div>
 							<Label
-								>{remoteProtocol === 'sftp'
+								>{form.remote.protocol === 'sftp'
 									? m.dedicatedServerDialog_sshPort()
 									: m.dedicatedServerDialog_ftpPort()}</Label
 							><InputField class="mt-1 w-full" bind:value={remotePort} inputmode="numeric" />
@@ -652,17 +614,17 @@
 						<div>
 							<Label>{m.dedicatedServerDialog_username()}</Label><InputField
 								class="mt-1 w-full"
-								bind:value={remoteUser}
+								bind:value={form.remote.username}
 							/>
 						</div>
 					</div>
-					{#if remoteProtocol === 'sftp'}
+					{#if form.remote.protocol === 'sftp'}
 						<div>
 							<Label>{m.dedicatedServerDialog_authentication()}</Label>
 							<Select
 								type="single"
 								triggerClass="mt-1 w-full"
-								bind:value={remoteAuthentication}
+								bind:value={form.remote.authentication}
 								items={[
 									{ value: 'password', label: m.dedicatedServerDialog_password() },
 									{ value: 'privateKey', label: m.dedicatedServerDialog_privateKeyFile() },
@@ -671,26 +633,26 @@
 							/>
 						</div>
 					{/if}
-					{#if remoteProtocol === 'sftp' && remoteAuthentication === 'privateKey'}
+					{#if form.remote.protocol === 'sftp' && form.remote.authentication === 'privateKey'}
 						<PathField
 							label={m.dedicatedServerDialog_privateKey()}
-							bind:value={privateKeyPath}
+							bind:value={form.remote.privateKeyPath}
 							onclick={choosePrivateKey}
 							icon="mdi:file-key"
 						>
 							{m.dedicatedServerDialog_privateKeyInfo()}
 						</PathField>
 					{/if}
-					{#if remoteProtocol !== 'sftp' || remoteAuthentication !== 'agent'}
+					{#if form.remote.protocol !== 'sftp' || form.remote.authentication !== 'agent'}
 						<div>
 							<Label
-								>{remoteProtocol !== 'sftp' || remoteAuthentication === 'password'
+								>{form.remote.protocol !== 'sftp' || form.remote.authentication === 'password'
 									? m.dedicatedServerDialog_password()
 									: m.dedicatedServerDialog_keyPassphrase()}</Label
 							>
 							<InputField class="mt-1 w-full" bind:value={remotePassword} type="password" />
 							<p class="text-primary-500 mt-1 text-sm">
-								{remoteProtocol !== 'sftp' || remoteAuthentication === 'password'
+								{form.remote.protocol !== 'sftp' || form.remote.authentication === 'password'
 									? m.dedicatedServerDialog_savedPassword()
 									: m.dedicatedServerDialog_remoteSavedPassphrase()}
 							</p>
@@ -699,7 +661,7 @@
 					<div>
 						<Label>{m.dedicatedServerDialog_directory()}</Label><InputField
 							class="mt-1 w-full"
-							bind:value={remotePath}
+							bind:value={form.remote.serverDirectory}
 							placeholder="/home/valheim/server"
 						/>
 					</div>
@@ -846,8 +808,8 @@
 						<div>
 							<Label>{m.dedicatedServerDialog_workerAddress()}</Label><InputField
 								class="mt-1 w-full"
-								bind:value={workerAddress}
-								placeholder="http://192.168.1.10:8472"
+								bind:value={form.remote.worker.address}
+								placeholder="https://worker.example.com"
 							/>
 						</div>
 						<div>
@@ -873,12 +835,12 @@
 						<div class="flex items-center">
 							<Label>{m.dedicatedServerDialog_workerAutoSync()}</Label><Info
 								>{m.dedicatedServerDialog_workerAutoSyncInfo()}</Info
-							><Checkbox bind:checked={workerAutoSync} />
+							><Checkbox bind:checked={form.remote.worker.autoSync} />
 						</div>
 						<div class="flex items-center">
 							<Label>{m.dedicatedServerDialog_workerAutoMods()}</Label><Info
 								>{m.dedicatedServerDialog_workerAutoModsInfo()}</Info
-							><Checkbox bind:checked={workerAutoMods} />
+							><Checkbox bind:checked={form.remote.worker.autoMods} />
 						</div>
 					{/if}
 
@@ -887,7 +849,7 @@
 						<Select
 							type="single"
 							triggerClass="mt-1 w-full"
-							bind:value={hostProvider}
+							bind:value={form.remote.hostControl.provider}
 							items={[
 								{ value: 'none', label: m.dedicatedServerDialog_hostProviderNone() },
 								{ value: 'datHost', label: 'DatHost' }
@@ -897,17 +859,17 @@
 							{m.dedicatedServerDialog_hostProviderInfo()}
 						</p>
 					</div>
-					{#if hostProvider === 'datHost'}
+					{#if form.remote.hostControl.provider === 'datHost'}
 						<div>
 							<Label>{m.dedicatedServerDialog_datHostServerId()}</Label><InputField
 								class="mt-1 w-full"
-								bind:value={datHostServerId}
+								bind:value={form.remote.hostControl.datHostServerId}
 							/>
 						</div>
 						<div>
 							<Label>{m.dedicatedServerDialog_datHostUsername()}</Label><InputField
 								class="mt-1 w-full"
-								bind:value={datHostUsername}
+								bind:value={form.remote.hostControl.datHostUsername}
 								placeholder="you@example.com"
 							/>
 						</div>
@@ -927,7 +889,7 @@
 						<Select
 							type="single"
 							triggerClass="mt-1 w-full"
-							bind:value={restartPolicy}
+							bind:value={form.remote.restartPolicy}
 							items={[
 								{ value: 'manual', label: m.dedicatedServerDialog_restartManual() },
 								{ value: 'immediate', label: m.dedicatedServerDialog_restartImmediate() },
@@ -954,7 +916,7 @@
 			<div class="mt-2">
 				<Label>{m.dedicatedServerDialog_additionalArgs()}</Label><InputField
 					class="mt-1 w-full"
-					bind:value={extraArgs}
+					bind:value={form.extraArgs}
 					placeholder="-savedir ..."
 				/>
 			</div>
@@ -968,7 +930,7 @@
 		<Button color="primary" icon="mdi:content-save" loading={saving} onclick={save}
 			>{m.dedicatedServerDialog_save()}</Button
 		>
-		{#if location === 'local'}
+		{#if form.location === 'local'}
 			<Button icon="mdi:server" loading={launching} onclick={launch}
 				>{m.dedicatedServerDialog_launch()}</Button
 			>

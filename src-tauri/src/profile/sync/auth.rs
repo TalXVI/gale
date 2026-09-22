@@ -68,10 +68,6 @@ impl AuthCredentials {
         })
     }
 
-    pub fn user(&self) -> &User {
-        &self.user
-    }
-
     /// The refresh token is the worker's long-lived credential: the sync
     /// service rotates it on every grant and the worker journal persists
     /// each rotation, so the seeded value only needs to be valid once.

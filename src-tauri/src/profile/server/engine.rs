@@ -24,7 +24,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use eyre::{Context, Result, bail, ensure};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use super::{
@@ -130,13 +130,13 @@ pub enum ProgressOp {
 }
 
 /// Maps deploy paths to absolute remote paths for the detected layout.
-struct RemoteMapper<'a> {
-    spec: &'a DeploymentSpec,
+struct RemoteMapper {
+    spec: DeploymentSpec,
     base: RemotePathBuf,
     layout: RemoteLayout,
 }
 
-impl<'a> RemoteMapper<'a> {
+impl RemoteMapper {
     fn remote_path(&self, deploy: &DeployPath) -> RemotePathBuf {
         match self.layout {
             RemoteLayout::Standard => self.base.join(deploy),
@@ -151,9 +151,9 @@ impl<'a> RemoteMapper<'a> {
 
 /// An open remote session: connection, path mapping, layout, and the
 /// authoritative deployment state.
-pub struct Session<'a> {
+pub struct Session {
     pub ops: Box<dyn RemoteOps>,
-    mapper: RemoteMapper<'a>,
+    mapper: RemoteMapper,
     pub layout: RemoteLayout,
     pub host_managed: bool,
     pub state: ServerDeploymentState,
@@ -169,11 +169,11 @@ pub struct Session<'a> {
 }
 
 /// Everything [`open_session`] needs besides a connection.
-pub fn open_session<'a>(
+pub fn open_session(
     mut ops: Box<dyn RemoteOps>,
-    spec: &'a DeploymentSpec,
+    spec: &DeploymentSpec,
     base: RemotePathBuf,
-) -> Result<Session<'a>> {
+) -> Result<Session> {
     ensure!(
         ops.is_dir(&base)
             .context("failed to check remote directory")?,
@@ -181,7 +181,11 @@ pub fn open_session<'a>(
     );
 
     let layout = detect_layout(ops.as_mut(), spec, &base)?;
-    let mapper = RemoteMapper { spec, base, layout };
+    let mapper = RemoteMapper {
+        spec: spec.clone(),
+        base,
+        layout,
+    };
 
     let LoadedState {
         state,
@@ -225,7 +229,7 @@ pub fn open_session<'a>(
 /// persistence sequence guard all work on fresh state rather than what
 /// was loaded when the session opened.
 fn refresh_state(session: &mut Session) -> Result<()> {
-    let spec = session.mapper.spec;
+    let spec = &session.mapper.spec;
     let LoadedState {
         state,
         warnings,
@@ -248,7 +252,7 @@ fn refresh_state(session: &mut Session) -> Result<()> {
 }
 
 /// A preview: the plan plus the context the UI needs to explain it.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Preview {
     pub plan: DeploymentPlan,
@@ -288,7 +292,7 @@ pub fn preview(
                     &snapshot,
                     selection,
                     context,
-                    session.mapper.spec,
+                    &session.mapper.spec,
                 )?;
                 return Ok(Preview {
                     plan,
@@ -311,7 +315,7 @@ pub fn preview(
         &snapshot?,
         selection,
         context,
-        session.mapper.spec,
+        &session.mapper.spec,
     )?;
 
     Ok(Preview {
@@ -331,6 +335,45 @@ pub struct Deployment {
     /// advanced.
     pub failed_config_writes: Vec<ConfigPath>,
     lease: Lease,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeploymentResult {
+    pub plan: DeploymentPlan,
+    pub summary: OperationSummary,
+    pub warnings: Vec<String>,
+    pub failed_config_writes: Vec<ConfigPath>,
+    pub restart: RestartOutcome,
+    pub state: ServerDeploymentState,
+}
+
+/// Completes the restart and records the result before releasing the lease.
+pub async fn complete(
+    mut session: Session,
+    deployment: Deployment,
+    host: &dyn HostControl,
+    policy: RestartPolicy,
+    meta: OperationMeta,
+) -> Result<DeploymentResult> {
+    let restart = apply_restart_policy(host, policy, session.state.restart_required).await;
+    let plan = deployment.plan.clone();
+    let summary = deployment.summary.clone();
+    let warnings = deployment.warnings.clone();
+    let failed_config_writes = deployment.failed_config_writes.clone();
+    let state =
+        tokio::task::spawn_blocking(move || finish(&mut session, deployment, restart, &meta))
+            .await
+            .context("deployment finalization task failed")??;
+
+    Ok(DeploymentResult {
+        plan,
+        summary,
+        warnings,
+        failed_config_writes,
+        restart,
+        state,
+    })
 }
 
 /// Executes an approved plan under the deployment lease.
@@ -379,7 +422,7 @@ pub fn deploy(
             &snapshot,
             selection,
             context,
-            session.mapper.spec,
+            &session.mapper.spec,
         )?;
 
         if let Some(expected) = expected_plan_hash
@@ -417,7 +460,7 @@ pub fn deploy(
             // aborts the operation.
             if let Err(err) = ensure_ownership(&lease, session).and_then(|_| persist_state(session))
             {
-                let _ = fail_operation(session, meta, &plan, &err);
+                let _ = fail_operation(session, &lease, meta, &plan, &err);
                 lease.release(session.ops.as_mut());
                 return Err(err.wrap_err("failed to persist remote deployment state"));
             }
@@ -432,7 +475,7 @@ pub fn deploy(
         }
         Err(error) => {
             warn!(%error, "deployment failed; recording accurate state");
-            if let Err(state_err) = fail_operation(session, meta, &plan, &error) {
+            if let Err(state_err) = fail_operation(session, &lease, meta, &plan, &error) {
                 warn!(%state_err, "failed to record deployment failure remotely");
             }
             lease.release(session.ops.as_mut());
@@ -591,10 +634,12 @@ pub fn finish(
 /// Records a failed operation and persists whatever state is accurate.
 fn fail_operation(
     session: &mut Session,
+    lease: &Lease,
     meta: &OperationMeta,
     plan: &DeploymentPlan,
     error: &eyre::Report,
 ) -> Result<()> {
+    ensure_ownership(lease, session)?;
     session.state.restart_required = true;
     session.state.record_operation(OperationRecord {
         id: meta.id.clone(),
@@ -625,7 +670,7 @@ fn take_snapshot(
 ) -> Result<RemoteSnapshot> {
     refresh_state(session)?;
 
-    let spec = session.mapper.spec;
+    let spec = &session.mapper.spec;
     let mut payload_files = BTreeMap::new();
     let mut payload_dirs = BTreeSet::new();
     let mut payload_hashes = BTreeMap::new();
@@ -731,18 +776,15 @@ fn execute(
     // the next deployment retries instead of forgetting the file.
     for path in &plan.removals {
         let remote = session.mapper.remote_path(path);
-        match session.ops.delete_file(&remote) {
-            Ok(true) => {
-                session.state.files.remove(path);
-                summary.removed_files += 1;
-            }
-            Ok(false) => {
-                session.state.files.remove(path);
-            }
-            Err(error) => {
-                warnings.push(format!("could not remove {path}: {error}"));
-            }
+        if session
+            .ops
+            .delete_file(&remote)
+            .with_context(|| format!("failed to remove {path}"))?
+        {
+            summary.removed_files += 1;
+            session.state.restart_required = true;
         }
+        session.state.files.remove(path);
         completed += 1;
         report(EngineProgress {
             completed,
@@ -809,6 +851,7 @@ fn execute(
 
         match result {
             Ok(()) => {
+                session.state.restart_required = true;
                 if matches!(upload.kind, UploadKind::Payload | UploadKind::ConfigSeed) {
                     summary.uploaded_files += 1;
                     summary.uploaded_bytes += upload.size;
@@ -959,13 +1002,14 @@ fn ensure_remote_parents(
 
     for ancestor in ancestors {
         let remote = session.mapper.remote_path(&ancestor);
-        if !ensured.insert(remote.clone()) {
+        if ensured.contains(&remote) {
             continue;
         }
         session
             .ops
             .ensure_dir(&remote)
             .with_context(|| format!("failed to create remote directory {remote}"))?;
+        ensured.insert(remote);
     }
 
     Ok(())
@@ -1031,7 +1075,7 @@ pub fn persist_state(session: &mut Session) -> Result<()> {
     let legacy = session
         .mapper
         .remote_path(&session.mapper.spec.legacy_manifest_path);
-    let remote = state::read_state(session.ops.as_mut(), session.mapper.spec, &target, &legacy)
+    let remote = state::read_state(session.ops.as_mut(), &session.mapper.spec, &target, &legacy)
         .context("failed to verify remote deployment state before writing")?;
     ensure!(
         remote.state.operation_seq == session.base_seq,
@@ -1127,6 +1171,7 @@ pub fn set_config_policy(
         let record = session.state.config.entry(path.clone()).or_default();
         record.policy = policy;
         record.policy_set_at = pinned_at.cloned();
+        ensure_ownership(&lease, session)?;
         persist_state(session)
     })();
 
@@ -1351,13 +1396,13 @@ mod tests {
         Arc::new(Mutex::new(remote))
     }
 
-    fn open(remote: Shared) -> Result<Session<'static>> {
+    fn open(remote: Shared) -> Result<Session> {
         open_ops(Box::new(remote))
     }
 
-    fn open_ops(ops: Box<dyn RemoteOps>) -> Result<Session<'static>> {
-        let spec = Box::leak(Box::new(spec()));
-        open_session(ops, spec, RemotePathBuf::new(BASE).unwrap())
+    fn open_ops(ops: Box<dyn RemoteOps>) -> Result<Session> {
+        let spec = spec();
+        open_session(ops, &spec, RemotePathBuf::new(BASE).unwrap())
     }
 
     /// A remote whose dot-paths are invisible to read commands: metadata
@@ -1442,6 +1487,10 @@ mod tests {
         )
         .unwrap();
 
+        assert!(
+            remote_state(&memory).restart_required,
+            "restart must survive a crash before finalization"
+        );
         assert_eq!(deployment.summary.uploaded_files, 1);
         assert!(!progress.is_empty());
 
@@ -1618,7 +1667,7 @@ mod tests {
         }
 
         let mut session = open(memory.clone()).unwrap();
-        let deployment = deploy(
+        let result = deploy(
             &mut session,
             no_connect,
             &publication,
@@ -1630,25 +1679,17 @@ mod tests {
             false,
             |_| {},
         )
-        .unwrap();
-        assert!(
-            deployment
-                .warnings
-                .iter()
-                .any(|w| w.contains("could not remove"))
-        );
-
-        // The remote file remains, and so does the ownership record. The
-        // next deployment retries the removal instead of forgetting it.
+        .err()
+        .expect("failed removal must fail the deployment");
+        assert!(format!("{result:#}").contains("failed to remove"));
         assert!(remote_contents(&memory, &format!("{BASE}/{stale}")).is_some());
-        let state = finish(
-            &mut session,
-            deployment,
-            RestartOutcome::NotRequired,
-            &meta(),
-        )
-        .unwrap();
+        let state = remote_state(&memory);
         assert!(state.files.contains_key(&deploy_path(stale)));
+        assert_eq!(state.mods_revision, None);
+        assert_eq!(
+            state.last_operation.unwrap().status,
+            OperationStatus::Failed
+        );
     }
 
     #[test]
@@ -2445,9 +2486,9 @@ mod tests {
         }
     }
 
-    fn open_ftp(addr: std::net::SocketAddr) -> Result<Session<'static>> {
-        let spec = Box::leak(Box::new(spec()));
-        open_session(ftp_ops(addr)?, spec, RemotePathBuf::new("/").unwrap())
+    fn open_ftp(addr: std::net::SocketAddr) -> Result<Session> {
+        let spec = spec();
+        open_session(ftp_ops(addr)?, &spec, RemotePathBuf::new("/").unwrap())
     }
 
     /// Same connection path as `ftp_ops`, but over explicit FTPS pinned
@@ -2469,11 +2510,11 @@ mod tests {
         }
     }
 
-    fn open_ftps(server: &remote::fake_ftp::FakeFtp) -> Result<Session<'static>> {
-        let spec = Box::leak(Box::new(spec()));
+    fn open_ftps(server: &remote::fake_ftp::FakeFtp) -> Result<Session> {
+        let spec = spec();
         open_session(
             Box::new(ftps_connection(server)?),
-            spec,
+            &spec,
             RemotePathBuf::new("/").unwrap(),
         )
     }
@@ -2809,8 +2850,8 @@ mod tests {
 
         let error = persist_state(&mut session).expect_err("truncated temp must fail persistence");
         assert!(
-            format!("{error:#}").contains("does not read back as written"),
-            "expected the read-back verification failure, got: {error:#}"
+            format!("{error:#}").contains("failed to write remote deployment state"),
+            "expected truncated state persistence to fail, got: {error:#}"
         );
 
         let mut fresh = ftps_connection(&server).unwrap();

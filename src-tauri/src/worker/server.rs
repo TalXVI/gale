@@ -25,7 +25,7 @@ use tracing::{error, info, warn};
 use super::{
     api::{
         ConfigureRequest, DeployRequest, DeployResponse, ErrorResponse, PolicyRequest,
-        PreviewRequest, PreviewResponse, StatusResponse, WorkerRunPhase, WorkerRunReport,
+        PreviewRequest, StatusResponse, WorkerRunPhase, WorkerRunReport,
     },
     config::WorkerConfig,
     journal::{Journal, PendingWork, WorkerJournal, busy_marker},
@@ -36,14 +36,14 @@ use crate::{
     game,
     profile::{
         server::{
-            engine::{self, OperationMeta, Preview, Session},
+            engine::{self, OperationMeta, Session},
             host,
             plan::{self, DeploySelection, Publication},
             remote::{ConnectionAttempt, RemoteConnection, RemoteOps},
             settings::RestartPolicy,
             spec::DeploymentSpec,
             stage::{self, CachePayloadSource},
-            state::{OperationKind, ServerDeploymentState},
+            state::OperationKind,
         },
         sync::FetchedPublication,
     },
@@ -55,8 +55,7 @@ pub struct WorkerContext {
     secrets: Secrets,
     journal: Journal,
     sync: SyncClient,
-    /// Leaked so `Session<'static>` can move between blocking tasks.
-    spec: &'static DeploymentSpec,
+    spec: DeploymentSpec,
     /// Serializes operations inside this process. Cross-executor safety is
     /// the remote lease's job; this keeps a manual request and an automatic
     /// poll from racing in the same process.
@@ -87,7 +86,7 @@ impl WorkerContext {
             config,
             secrets,
             journal,
-            spec: Box::leak(Box::new(spec)),
+            spec,
             operation_lock: Mutex::new(()),
         })
     }
@@ -106,9 +105,9 @@ impl WorkerContext {
         }
     }
 
-    fn open_session(&self) -> Result<Session<'static>> {
+    fn open_session(&self) -> Result<Session> {
         let ops = self.connect()?;
-        engine::open_session(ops, self.spec, self.config.remote.server_directory()?)
+        engine::open_session(ops, &self.spec, self.config.remote.server_directory()?)
     }
 
     fn meta(&self, kind: OperationKind) -> OperationMeta {
@@ -158,7 +157,7 @@ impl WorkerContext {
         let source = CachePayloadSource {
             root: self.cache_dir.clone(),
             client: reqwest::Client::new(),
-            mod_loader: &game::from_slug(&self.config.game)
+            mod_loader: &game::bundled_from_slug(&self.config.game)
                 .ok_or_else(|| eyre::eyre!("unknown game slug"))?
                 .mod_loader,
         };
@@ -166,7 +165,7 @@ impl WorkerContext {
         let desired = stage::stage_publication(
             &Publication::from_fetched(&publication),
             &source,
-            self.spec,
+            &self.spec,
             include_mods,
             |_, _, _| {},
         )
@@ -325,16 +324,7 @@ async fn preview(
     })
     .await
     {
-        Ok(Ok(Preview {
-            plan,
-            busy,
-            warnings,
-        })) => Json(PreviewResponse {
-            plan,
-            busy,
-            warnings,
-        })
-        .into_response(),
+        Ok(Ok(preview)) => Json(preview).into_response(),
         Ok(Err(err)) => error_response(&err),
         Err(err) => error_response(&eyre::eyre!(err)),
     }
@@ -472,7 +462,7 @@ async fn execute_deployment(
         move || ctx3.connect()
     };
 
-    let (mut session, deployment) = tokio::task::spawn_blocking(move || {
+    let (session, deployment) = tokio::task::spawn_blocking(move || {
         let mut session = ctx2.open_session()?;
         let deployment = engine::deploy(
             &mut session,
@@ -491,35 +481,19 @@ async fn execute_deployment(
     .await
     .context("deployment task panicked")??;
 
-    // A restart is owed when this plan changed content *or* an earlier
-    // deployment left one pending, since a failed restart must not be lost.
-    let requires_restart = deployment.plan.requires_restart || session.state.restart_required;
-    let restart =
-        engine::apply_restart_policy(ctx.host().as_ref(), restart_policy, requires_restart).await;
-
-    let mut response = DeployResponse {
-        plan: deployment.plan.clone(),
-        summary: deployment.summary.clone(),
-        warnings: deployment.warnings.clone(),
-        failed_config_writes: deployment.failed_config_writes.clone(),
-        restart,
-        state: ServerDeploymentState::default(),
-    };
-
-    let meta3 = meta.clone();
-    let state = tokio::task::spawn_blocking(move || {
-        engine::finish(&mut session, deployment, restart, &meta3)
-    })
-    .await
-    .context("deployment task panicked")??;
-
-    if let Some(record) = state.last_operation.clone() {
+    let response = engine::complete(
+        session,
+        deployment,
+        ctx.host().as_ref(),
+        restart_policy,
+        meta.clone(),
+    )
+    .await?;
+    if let Some(record) = response.state.last_operation.clone() {
         if let Err(err) = ctx.journal.record_operation(record).await {
             warn!(%err, "failed to record operation in journal");
         }
     }
-
-    response.state = state;
     Ok(response)
 }
 
@@ -582,19 +556,23 @@ async fn configure(
     }
 
     let mut state = ctx.journal.state.lock().await;
-    state.auto_sync = request.auto_sync;
-    state.auto_mods = request.auto_mods;
-    state.restart_policy = request.restart_policy;
+    let mut updated = state.clone();
+    updated.auto_sync = request.auto_sync;
+    updated.auto_mods = request.auto_mods;
+    updated.restart_policy = request.restart_policy;
     // Re-enabling either automation re-evaluates outstanding work
     // immediately, so a revision observed while disabled does not sit in
     // backoff — including mods deferred while `auto_mods` was off.
     if (request.auto_sync || request.auto_mods)
-        && let Some(work) = state.pending.as_mut()
+        && let Some(work) = updated.pending.as_mut()
     {
         work.next_attempt_at = None;
     }
-    match ctx.journal.save(&state) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+    match ctx.journal.save(&updated) {
+        Ok(()) => {
+            *state = updated;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(err) => error_response(&err),
     }
 }
@@ -870,22 +848,18 @@ pub fn report_run_state(config: &WorkerConfig, phase: WorkerRunPhase) {
 /// Guards against a second worker process using the same state directory.
 /// The remote lease coordinates across machines; this lock covers the
 /// local case, e.g. a manual `gale-worker` run competing with the service.
-fn lock_instance(
-    state_dir: &std::path::Path,
-) -> Result<fd_lock::RwLockWriteGuard<'static, std::fs::File>> {
+fn lock_instance(state_dir: &std::path::Path) -> Result<std::fs::File> {
     let path = state_dir.join("gale-worker.lock");
     let file = std::fs::File::create(&path)
         .with_context(|| format!("failed to open worker lock {}", path.display()))?;
-    // Leaked: the lock lives for the rest of the process by design.
-    let lock = Box::leak(Box::new(fd_lock::RwLock::new(file)));
-    let guard = lock.try_write().map_err(|err| match err.kind() {
-        std::io::ErrorKind::WouldBlock => eyre::eyre!(
+    file.try_lock().map_err(|err| match err {
+        std::fs::TryLockError::WouldBlock => eyre::eyre!(
             "another gale-worker instance is already running in {}",
             state_dir.display()
         ),
         _ => eyre::eyre!("failed to lock worker state directory: {err}"),
     })?;
-    Ok(guard)
+    Ok(file)
 }
 
 /// Serves the HTTP API and runs the poll loop until `shutdown` is
@@ -1166,6 +1140,44 @@ mod tests {
             token: Some("token".to_owned()),
             ..super::Secrets::default()
         }
+    }
+
+    #[tokio::test]
+    async fn failed_configuration_save_keeps_confirmed_automation() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = crate::worker::journal::Journal::load(dir.path()).unwrap();
+        // A directory at the temporary-file path makes the next save fail.
+        std::fs::create_dir(dir.path().join("gale-worker-state.json.tmp")).unwrap();
+        let ctx = std::sync::Arc::new(
+            super::WorkerContext::new(
+                worker_config(dir.path(), "127.0.0.1:0".to_owned()),
+                worker_secrets(),
+                journal,
+            )
+            .unwrap(),
+        );
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer token".parse().unwrap(),
+        );
+        let response = super::configure(
+            axum::extract::State(ctx.clone()),
+            headers,
+            axum::Json(crate::worker::api::ConfigureRequest {
+                auto_sync: true,
+                auto_mods: true,
+                restart_policy: crate::profile::server::settings::RestartPolicy::Immediate,
+            }),
+        )
+        .await;
+        assert!(!response.status().is_success());
+        let state = ctx.journal.state.lock().await;
+        assert!(!state.auto_sync && !state.auto_mods);
+        assert_eq!(
+            state.restart_policy,
+            crate::profile::server::settings::RestartPolicy::Manual
+        );
     }
 
     fn free_port() -> u16 {

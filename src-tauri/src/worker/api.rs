@@ -8,13 +8,15 @@ use crate::profile::{
     export::{ConfigPath, ModRevision},
     server::{
         lease::LeaseRecord,
-        plan::{DeploySelection, DeploymentPlan},
+        plan::DeploySelection,
         settings::RestartPolicy,
-        state::{
-            OperationKind, OperationRecord, OperationSummary, RestartOutcome, ServerDeploymentState,
-        },
+        state::{OperationKind, OperationRecord},
     },
     sync::ConfigUpdatePolicy,
+};
+
+pub use crate::profile::server::engine::{
+    DeploymentResult as DeployResponse, Preview as PreviewResponse,
 };
 
 pub const API_BASE: &str = "/v1";
@@ -32,16 +34,6 @@ pub struct PreviewRequest {
     pub restart_policy: Option<RestartPolicy>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PreviewResponse {
-    pub plan: DeploymentPlan,
-    /// The live lease holder and whether it is stale, so the UI can warn
-    /// before Deploy Now fails and offer a takeover when it is.
-    pub busy: Option<crate::profile::server::lease::LeaseBusy>,
-    pub warnings: Vec<String>,
-}
-
 /// `POST /v1/deploy` executes a previously previewed plan. `plan_hash`
 /// binds the request to the approved preview exactly like Local mode.
 #[derive(Debug, Serialize, Deserialize)]
@@ -56,17 +48,6 @@ pub struct DeployRequest {
     /// the old executor is confirmed stopped. Live leases always win.
     #[serde(default)]
     pub force: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeployResponse {
-    pub plan: DeploymentPlan,
-    pub summary: OperationSummary,
-    pub warnings: Vec<String>,
-    pub failed_config_writes: Vec<ConfigPath>,
-    pub restart: RestartOutcome,
-    pub state: ServerDeploymentState,
 }
 
 /// `GET /v1/status` returns journal state plus, when `refresh` is set, a

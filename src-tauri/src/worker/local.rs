@@ -4,7 +4,14 @@
 //! installs or runs as that service. Keeping them in one place keeps the
 //! two binaries' on-disk contract identical.
 
-use std::ops::RangeInclusive;
+use eyre::{Context, Result, bail};
+use std::{
+    ops::RangeInclusive,
+    time::{Duration, Instant},
+};
+use windows_service::service::ServiceState;
+
+const TRANSITION_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// SCM service name for the managed worker. One service exists per
 /// machine, which is also the first line of defense against duplicate
@@ -50,4 +57,56 @@ pub fn root_dir() -> std::path::PathBuf {
 /// `%ProgramData%\Gale\worker\private` — secrets, journal, and lock.
 pub fn private_dir() -> std::path::PathBuf {
     root_dir().join(PRIVATE_DIR)
+}
+
+pub fn stop_and_wait(service: &windows_service::service::Service) -> Result<()> {
+    if service.query_status()?.current_state == ServiceState::Stopped {
+        return Ok(());
+    }
+    if let Err(err) = service.stop()
+        && service.query_status()?.current_state != ServiceState::Stopped
+    {
+        return Err(err).context("failed to stop the service");
+    }
+    wait_for_state(service, ServiceState::Stopped)
+}
+
+pub fn wait_for_state(
+    service: &windows_service::service::Service,
+    target: ServiceState,
+) -> Result<()> {
+    let deadline = Instant::now() + TRANSITION_TIMEOUT;
+    loop {
+        let state = service.query_status()?.current_state;
+        if state == target {
+            return Ok(());
+        }
+        if Instant::now() > deadline {
+            bail!(
+                "service did not reach {target:?} within {TRANSITION_TIMEOUT:?} (state: {state:?})"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Confirms the worker's listen address accepts TCP connections. SCM
+/// state alone cannot prove the API survived past the Running report —
+/// a crashed process can linger in Running briefly.
+pub fn await_listen_ready(listen: &str) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut last_err = None;
+    while Instant::now() < deadline {
+        match std::net::TcpStream::connect(listen) {
+            Ok(_) => return Ok(()),
+            Err(err) => {
+                last_err = Some(err);
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out")))
+        .context(format!(
+            "the worker service reports running but {listen} is not answering"
+        ))
 }

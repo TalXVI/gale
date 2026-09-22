@@ -31,6 +31,7 @@ const GALE_INTERNAL_NAMES: &[&str] = &[
 /// - [`Self::config_dirs`] hold server configuration. They are
 ///   policy-governed: nothing inside them is ever removed by a deployment,
 ///   and writes happen only through config synchronization rules.
+#[derive(Clone)]
 pub struct DeploymentSpec {
     /// The top-level directory the mod loader installs into inside the
     /// profile, e.g. `BepInEx`. Managed hosts may expose this directory

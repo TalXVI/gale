@@ -428,7 +428,7 @@ async fn provision_windows(
         "SSH agent authentication cannot run unattended in a service; use a password or a private key"
     );
 
-    let port = pick_port(installed_port());
+    let port = pick_port(installed_port())?;
     let listen = format!("127.0.0.1:{port}");
     let root = local::root_dir();
     let private = local::private_dir();
@@ -543,8 +543,8 @@ async fn provision_windows(
     };
     // Persisting the desktop half of the binding can still fail, leaving
     // a running worker whose profile can't reach it — status reports it
-    // as `incomplete` and retrying provisioning finishes the setup
-    // without replacing anything.
+    // as `incomplete`. Retrying setup reinstalls and relinks the worker,
+    // preserving its pending work for the same profile and server.
     save_remote_settings_for(app, target.profile_id, remote).context(
         "the worker is installed and running, but saving its settings failed — run 'Set up worker' again to finish setup",
     )?;
@@ -599,30 +599,31 @@ pub async fn control(app: &AppHandle, action: LocalWorkerAction) -> Result<Local
     #[cfg(windows)]
     {
         require_owned(app)?;
-        use windows_service::service::ServiceState as ScmState;
-        match action {
-            LocalWorkerAction::Start => {
-                let service = open_service(Access::Start)?;
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            use windows_service::service::ServiceState as ScmState;
+            let service = open_service(match action {
+                LocalWorkerAction::Start => Access::Start,
+                LocalWorkerAction::Stop => Access::Stop,
+                LocalWorkerAction::Restart => Access::StartStop,
+            })?;
+            if !matches!(action, LocalWorkerAction::Start) {
+                local::stop_and_wait(&service)?;
+            }
+            if !matches!(action, LocalWorkerAction::Stop) {
                 service
                     .start(&[] as &[&std::ffi::OsStr])
                     .context("failed to start the service")?;
-                wait_for_state(&service, ScmState::Running)?;
-                await_listen_ready()?;
+                local::wait_for_state(&service, ScmState::Running)?;
+                local::await_listen_ready(
+                    &installed_binding()
+                        .ok_or_eyre("the managed worker is not installed")?
+                        .listen,
+                )?;
             }
-            LocalWorkerAction::Stop => {
-                let service = open_service(Access::Stop)?;
-                stop_and_wait(&service)?;
-            }
-            LocalWorkerAction::Restart => {
-                let service = open_service(Access::StartStop)?;
-                stop_and_wait(&service)?;
-                service
-                    .start(&[] as &[&std::ffi::OsStr])
-                    .context("failed to start the service")?;
-                wait_for_state(&service, ScmState::Running)?;
-                await_listen_ready()?;
-            }
-        }
+            Ok(())
+        })
+        .await
+        .context("worker control task failed")??;
         status(app).await
     }
 }
@@ -768,38 +769,6 @@ fn service_state() -> Result<ServiceState> {
     })
 }
 
-#[cfg(windows)]
-fn wait_for_state(
-    service: &windows_service::service::Service,
-    target: windows_service::service::ServiceState,
-) -> Result<()> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
-    loop {
-        let state = service.query_status()?.current_state;
-        if state == target {
-            return Ok(());
-        }
-        if std::time::Instant::now() > deadline {
-            bail!("the worker service did not reach {target:?} (state: {state:?})");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(250));
-    }
-}
-
-#[cfg(windows)]
-fn stop_and_wait(service: &windows_service::service::Service) -> Result<()> {
-    use windows_service::service::ServiceState as ScmState;
-    if service.query_status()?.current_state == ScmState::Stopped {
-        return Ok(());
-    }
-    if let Err(err) = service.stop()
-        && service.query_status()?.current_state != ScmState::Stopped
-    {
-        return Err(err).context("failed to stop the service");
-    }
-    wait_for_state(service, ScmState::Stopped)
-}
-
 /// Backend ownership gate for every operation that touches the globally
 /// installed `GaleWorker` service: the active profile's sync id must
 /// match the installed binding. A worker bound to another profile is
@@ -814,30 +783,6 @@ fn require_owned(app: &AppHandle) -> Result<()> {
         "the installed worker belongs to a different profile — switch to that profile to manage it"
     );
     Ok(())
-}
-
-/// Confirms the worker's loopback API accepts TCP connections after an
-/// SCM `Running` report — SCM state alone can't prove the listener
-/// survived past it (a crash can linger in Running briefly).
-#[cfg(windows)]
-fn await_listen_ready() -> Result<()> {
-    let binding = installed_binding().ok_or_eyre("the managed worker is not installed")?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    let mut last_err = None;
-    while std::time::Instant::now() < deadline {
-        match std::net::TcpStream::connect(&binding.listen) {
-            Ok(_) => return Ok(()),
-            Err(err) => {
-                last_err = Some(err);
-                std::thread::sleep(std::time::Duration::from_millis(200));
-            }
-        }
-    }
-    Err(last_err.unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out")))
-        .context(format!(
-            "the worker service reports running but {} is not answering",
-            binding.listen
-        ))
 }
 
 /// Runs `gale-worker <args>` elevated through the UAC prompt and waits
@@ -1052,19 +997,12 @@ fn read_run_report() -> Option<WorkerRunReport> {
 /// First free port in the managed range; `preferred` wins when free so a
 /// reprovisioned worker keeps the same address.
 #[cfg(windows)]
-fn pick_port(preferred: Option<u16>) -> u16 {
-    let free = |port: u16| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok();
-    if let Some(port) = preferred
-        && free(port)
-    {
-        return port;
-    }
-    for port in local::PORT_RANGE {
-        if free(port) {
-            return port;
-        }
-    }
-    local::DEFAULT_PORT
+fn pick_port(preferred: Option<u16>) -> Result<u16> {
+    preferred
+        .into_iter()
+        .chain(local::PORT_RANGE)
+        .find(|&port| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok())
+        .ok_or_eyre("no free port is available for the managed worker")
 }
 
 /// True when the installed service binary differs from the bundled one —
@@ -1168,12 +1106,15 @@ mod tests {
     fn pick_port_prefers_the_existing_install_and_skips_taken_ports() {
         // A free preferred port always wins, so reprovisioning keeps the
         // profile's worker address stable.
-        assert_eq!(pick_port(Some(local::DEFAULT_PORT)), local::DEFAULT_PORT);
+        let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let preferred = probe.local_addr().unwrap().port();
+        drop(probe);
+        assert_eq!(pick_port(Some(preferred)).unwrap(), preferred);
 
         // With the preferred port taken, the probe moves down the range.
-        let blocker = std::net::TcpListener::bind(("127.0.0.1", local::DEFAULT_PORT)).unwrap();
-        let port = pick_port(Some(local::DEFAULT_PORT));
-        assert_ne!(port, local::DEFAULT_PORT);
+        let blocker = std::net::TcpListener::bind(("127.0.0.1", preferred)).unwrap();
+        let port = pick_port(Some(preferred)).unwrap();
+        assert_ne!(port, preferred);
         assert!(local::PORT_RANGE.contains(&port));
         drop(blocker);
     }

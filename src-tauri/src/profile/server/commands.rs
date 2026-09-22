@@ -345,15 +345,15 @@ pub async fn launch_dedicated_server(
 ) -> Result<ServerStatus> {
     let profile_id = active_profile_id(&app);
 
+    if app.lock_server_runtime().is_running() {
+        return Err(eyre::eyre!("a Gale-managed dedicated server is already running").into());
+    }
+
     if app.lock_prefs().pull_before_launch {
         sync::pull_profile(false, profile_id, &app).await?;
     }
 
     ensure_no_pending_installs(&app)?;
-
-    if app.lock_server_runtime().is_running() {
-        return Err(eyre::eyre!("a Gale-managed dedicated server is already running").into());
-    }
 
     let secrets = ServerSecrets::for_profile(profile_id)?;
     let password = secrets.resolve(ServerSecret::GamePassword, &request.password)?;
@@ -383,7 +383,7 @@ pub async fn launch_dedicated_server(
         request.remember_password,
     )?;
 
-    let process = {
+    let (status, child, pid) = {
         let prefs = app.lock_prefs();
         let manager = app.lock_manager();
         let (game, profile) = manager.profile_by_id(profile_id)?;
@@ -392,24 +392,26 @@ pub async fn launch_dedicated_server(
             .get(&game)
             .ok_or_eyre("the profile's game is not installed")?;
 
-        local::launch(managed, profile, &settings.local, &password, &prefs)?
-    };
-
-    let pid = process
-        .child
-        .id()
-        .ok_or_eyre("dedicated server process has no pid")?;
-    let child: SharedChild = Arc::new(Mutex::new(process.child));
-
-    let status = {
+        // Keep the runtime locked from the final check through registration
+        // so concurrent launches cannot leave an untracked process running.
         let mut runtime = app.lock_server_runtime();
-        runtime.register(
+        if runtime.is_running() {
+            return Err(eyre::eyre!("a Gale-managed dedicated server is already running").into());
+        }
+        let process = local::launch(managed, profile, &settings.local, &password, &prefs)?;
+        let pid = process
+            .child
+            .id()
+            .ok_or_eyre("dedicated server process has no pid")?;
+        let child: SharedChild = Arc::new(Mutex::new(process.child));
+        let status = runtime.register(
             process.profile_id,
             process.game,
             process.server_dir,
             pid,
             child.clone(),
-        )?
+        )?;
+        (status, child, pid)
     };
 
     runtime::emit_status(&app, &status);
@@ -632,21 +634,20 @@ pub async fn get_server_sync_status(
         warnings,
     };
 
-    if !request.refresh {
+    if !request.refresh && target.settings.sync_mode == SyncMode::Local {
         return Ok(status);
     }
 
-    match resolve_executor(&target, &request.password, &request.worker_token)? {
-        Executor::Worker(client) => {
-            let worker = client.status(true).await?;
+    let refreshed = match resolve_executor(&target, &request.password, &request.worker_token) {
+        Ok(Executor::Worker(client)) => client.status(request.refresh).await.map(|worker| {
             status.server = worker.server.clone();
             status.publication_revision = worker.observed_revision.or(status.publication_revision);
             status.worker = Some(worker);
-        }
-        Executor::Local(credential) => {
-            let (settings, password) = (target.settings.clone(), credential);
-            match open_remote_session(&settings, &password, target.mod_loader).await {
-                Ok(session) => {
+        }),
+        Ok(Executor::Local(credential)) => {
+            open_remote_session(&target.settings, &credential, target.mod_loader)
+                .await
+                .map(|session| {
                     if session.migrated {
                         status.warnings.push(
                             "adopted the previous deployment manifest into the new state format"
@@ -661,15 +662,15 @@ pub async fn get_server_sync_status(
                         lease: session.lease.clone(),
                     });
                     status.warnings.extend(session.warnings);
-                }
-                Err(err) => {
-                    status.credential_required = true;
-                    status
-                        .warnings
-                        .push(format!("remote session failed: {err:#}"));
-                }
-            }
+                })
         }
+        Err(err) => Err(err),
+    };
+    if let Err(err) = refreshed {
+        status.credential_required = true;
+        status
+            .warnings
+            .push(format!("could not read server status: {err:#}"));
     }
 
     Ok(status)
@@ -920,11 +921,11 @@ fn open_session_blocking(
     settings: &RemoteServerSettings,
     password: &str,
     mod_loader: &'static ModLoader<'static>,
-) -> eyre::Result<engine::Session<'static>> {
-    let spec = Box::leak(Box::new(DeploymentSpec::for_loader(mod_loader)?));
+) -> eyre::Result<engine::Session> {
+    let spec = DeploymentSpec::for_loader(mod_loader)?;
     engine::open_session(
         connect_remote(settings, password)?,
-        spec,
+        &spec,
         settings.server_directory()?,
     )
 }
@@ -933,7 +934,7 @@ async fn open_remote_session(
     settings: &RemoteServerSettings,
     password: &str,
     mod_loader: &'static ModLoader<'static>,
-) -> eyre::Result<engine::Session<'static>> {
+) -> eyre::Result<engine::Session> {
     let (settings, password) = (settings.clone(), password.to_owned());
     tokio::task::spawn_blocking(move || open_session_blocking(&settings, &password, mod_loader))
         .await
@@ -1032,11 +1033,6 @@ async fn local_preview(
     })
     .await
     .map_err(|err| eyre::eyre!("preview worker failed: {err}"))?
-    .map(|preview| PreviewResponse {
-        plan: preview.plan,
-        busy: preview.busy,
-        warnings: preview.warnings,
-    })
 }
 
 async fn local_deploy(
@@ -1070,7 +1066,7 @@ async fn local_deploy(
     };
 
     let meta2 = meta.clone();
-    let (mut session, deployment) = tokio::task::spawn_blocking(move || {
+    let (session, deployment) = tokio::task::spawn_blocking(move || {
         let mut session = open_session_blocking(&settings, &password, mod_loader)?;
         let deployment = engine::deploy(
             &mut session,
@@ -1099,28 +1095,7 @@ async fn local_deploy(
     let policy = request
         .restart_policy
         .unwrap_or(target.settings.restart_policy);
-    // A restart is owed when this plan changed content *or* an earlier
-    // deployment left one pending, since a failed restart must not be lost.
-    let requires_restart = deployment.plan.requires_restart || session.state.restart_required;
-    let restart = engine::apply_restart_policy(host.as_ref(), policy, requires_restart).await;
-
-    let mut response = DeployResponse {
-        plan: deployment.plan.clone(),
-        summary: deployment.summary.clone(),
-        warnings: deployment.warnings.clone(),
-        failed_config_writes: deployment.failed_config_writes.clone(),
-        restart,
-        state: Default::default(),
-    };
-
-    let state = tokio::task::spawn_blocking(move || {
-        engine::finish(&mut session, deployment, restart, &meta)
-    })
-    .await
-    .map_err(|err| eyre::eyre!("deployment finish failed: {err}"))??;
-
-    response.state = state;
-    Ok(response)
+    engine::complete(session, deployment, host.as_ref(), policy, meta).await
 }
 
 // ---------- misc ----------

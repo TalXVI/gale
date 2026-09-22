@@ -151,23 +151,21 @@ impl ServerRuntime {
 /// held for the non-blocking `try_wait` call, so `kill` can still proceed.
 pub fn watch(app: AppHandle, child: SharedChild, pid: u32) {
     tauri::async_runtime::spawn(async move {
-        let result = loop {
+        let status = loop {
             let status = {
                 let mut child = child.lock().await;
                 child.try_wait()
             };
 
             match status {
-                Ok(Some(status)) => break Ok(status),
-                Ok(None) => tokio::time::sleep(PROCESS_POLL_INTERVAL).await,
-                Err(err) => break Err(err),
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(err) => warn!(pid, ?err, "failed to query dedicated server process"),
             }
+            tokio::time::sleep(PROCESS_POLL_INTERVAL).await;
         };
 
-        match result {
-            Ok(status) => info!(pid, ?status, "dedicated server exited"),
-            Err(err) => warn!(pid, ?err, "failed to query dedicated server process"),
-        }
+        info!(pid, ?status, "dedicated server exited");
 
         let mut runtime = app.lock_server_runtime();
         if runtime.clear_if_pid(pid) {

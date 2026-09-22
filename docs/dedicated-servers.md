@@ -86,9 +86,9 @@ Choose **Worker on this PC** as the sync mode and select **Set up worker**. Gale
 3. Stages a worker config and credentials file in a permission-restricted temp directory, then shows **one UAC elevation prompt** that installs and starts the `GaleWorker` Windows service.
 4. Points this profile's sync mode at the worker's loopback address and stores its bearer token.
 
-If setup stops after the service was installed but before the profile was linked — for example the settings save failed — the dialog reports the worker as *setup incomplete* instead of leaving it orphaned. Running **Set up worker** again finishes the link; the installed identity, port, credentials, and journal are reused rather than replaced.
+If setup stops after the service was installed but before the profile was linked — for example the settings save failed — the dialog reports the worker as *setup incomplete* instead of leaving it orphaned. Running **Set up worker** again signs in, reinstalls the worker, and finishes the link. Pending work and automation settings are retained when the profile and remote server are unchanged.
 
-Once installed, the service runs as LocalSystem and is independent of the Gale process: it starts with Windows before any user signs in, restarts automatically after a crash, and resumes queued deployments from its journal. The service only reports `Running` to Windows once its API is bound and serving — a start that fails during initialization ends in `Stopped` with a failure exit, so SCM recovery actions behave correctly. Start, Stop, Restart, Uninstall, and an Update button (when a Gale update ships a newer worker) appear in the dialog; none of them need elevation.
+Once installed, the service runs as LocalSystem and is independent of the Gale process: it starts with Windows before any user signs in, restarts automatically after a crash, and resumes queued deployments from its journal. The service only reports `Running` to Windows once its API is bound and serving — a start that fails during initialization ends in `Stopped` with a failure exit, so SCM recovery actions behave correctly. Start, Stop, and Restart use the service's configured control permissions. Update (available when Gale ships a newer worker) and Uninstall request UAC elevation.
 
 State layout:
 

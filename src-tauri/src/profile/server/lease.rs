@@ -323,20 +323,13 @@ pub fn acquire(
                     Ok(markers) if !markers.is_empty() => {
                         // A marker proves a claim was established; whether
                         // its holder is still alive cannot be judged
-                        // without the record, so only an explicit force
-                        // decision may break it.
-                        if force {
-                            warn!(
-                                "taking over a deployment lease whose record is unreadable, by request"
-                            );
-                            break_lease(ops, lease_dir, &lease_file, None)?;
-                        } else {
-                            return Err(LeaseBusy {
-                                record: marker_record(&markers[0]),
-                                stale: true,
-                            }
-                            .into());
+                        // without the record. Force is only authorized for
+                        // a confirmed stale lease, never an unknown one.
+                        return Err(LeaseBusy {
+                            record: marker_record(&markers[0]),
+                            stale: false,
                         }
+                        .into());
                     }
                     Ok(_) if !husk_observed => {
                         husk_observed = true;
@@ -872,18 +865,20 @@ mod tests {
         // Listings still work on this variant so the marker is visible.
         filtered.filter_lists = false;
 
-        let err = super::acquire(
-            &mut filtered,
-            &dir(),
-            "local:1",
-            ExecutorKind::Local,
-            "op-1",
-            false,
-        )
-        .err()
-        .expect("expected LeaseBusy");
-        let busy = err.downcast_ref::<LeaseBusy>().expect("expected LeaseBusy");
-        assert!(busy.stale);
+        for force in [false, true] {
+            let err = super::acquire(
+                &mut filtered,
+                &dir(),
+                "local:1",
+                ExecutorKind::Local,
+                "op-1",
+                force,
+            )
+            .err()
+            .expect("expected LeaseBusy");
+            let busy = err.downcast_ref::<LeaseBusy>().expect("expected LeaseBusy");
+            assert!(!busy.stale, "an unreadable heartbeat does not prove expiry");
+        }
 
         // And on a host whose listings are filtered too, the same claim
         // must not be silently broken: the marker keeps the directory

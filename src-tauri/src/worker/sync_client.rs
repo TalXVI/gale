@@ -53,6 +53,8 @@ pub struct SyncClient {
     /// journal holds a rotated one.
     seed_refresh_token: Option<String>,
     http: reqwest::Client,
+    /// Refresh tokens rotate once per grant; serialize reading and replacing them.
+    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 impl SyncClient {
@@ -61,6 +63,7 @@ impl SyncClient {
             config,
             seed_refresh_token,
             http: reqwest::Client::new(),
+            refresh_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -79,6 +82,7 @@ impl SyncClient {
     /// `POST /auth/token` when needed and persisting the rotated refresh
     /// token back into the journal.
     async fn access_token(&self, journal: &Journal) -> Result<String> {
+        let _guard = self.refresh_lock.lock().await;
         let refresh = {
             let state = journal.state.lock().await;
             state.refresh_token.clone()
@@ -255,9 +259,14 @@ mod tests {
         token_hits: Arc<AtomicUsize>,
         meta_hits: Arc<AtomicUsize>,
         archive_hits: Arc<AtomicUsize>,
+        refresh_tokens: Arc<tokio::sync::Mutex<Vec<String>>>,
     }
 
-    async fn token(State(api): State<MockApi>) -> Response {
+    async fn token(State(api): State<MockApi>, Json(request): Json<serde_json::Value>) -> Response {
+        api.refresh_tokens
+            .lock()
+            .await
+            .push(request["refreshToken"].as_str().unwrap().to_owned());
         api.token_hits.fetch_add(1, Ordering::Relaxed);
         if api.fail_auth {
             return HttpStatus::UNAUTHORIZED.into_response();
@@ -448,7 +457,9 @@ mod tests {
         let url = serve(api).await;
         let (_dir, journal) = journal().await;
 
-        let result = SyncClient::new(config(url), None).poll(&journal, None).await;
+        let result = SyncClient::new(config(url), None)
+            .poll(&journal, None)
+            .await;
         assert!(result.is_err());
     }
 
@@ -462,7 +473,9 @@ mod tests {
         let url = serve(api).await;
         let (_dir, journal) = journal().await;
 
-        let result = SyncClient::new(config(url), None).poll(&journal, None).await;
+        let result = SyncClient::new(config(url), None)
+            .poll(&journal, None)
+            .await;
         assert!(result.is_err());
     }
 
@@ -475,7 +488,24 @@ mod tests {
         let url = serve(api).await;
         let (_dir, journal) = journal().await;
 
-        let result = SyncClient::new(config(url), None).poll(&journal, None).await;
+        let result = SyncClient::new(config(url), None)
+            .poll(&journal, None)
+            .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn concurrent_polls_use_the_rotated_token() {
+        let api = MockApi::default();
+        let client = SyncClient::new(config(serve(api.clone()).await), None);
+        let (_dir, journal) = journal().await;
+        let (first, second) =
+            tokio::join!(client.poll(&journal, None), client.poll(&journal, None));
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(
+            *api.refresh_tokens.lock().await,
+            ["refresh-seed", "refresh-rotated"]
+        );
     }
 }

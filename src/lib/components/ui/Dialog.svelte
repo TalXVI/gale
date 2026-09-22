@@ -64,6 +64,7 @@
 		</Dialog.Overlay>
 		<Dialog.Content
 			interactOutsideBehavior={canClose && confirmClose === null ? 'close' : 'ignore'}
+			onEscapeKeydown={close}
 			class="pointer-events-none"
 		>
 			{#if open}

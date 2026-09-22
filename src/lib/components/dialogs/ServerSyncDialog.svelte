@@ -20,9 +20,9 @@
 		SyncConfigUpdatePolicy,
 		WorkerStatus
 	} from '$lib/types';
-	import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+	import { listen } from '@tauri-apps/api/event';
 	import { message } from '@tauri-apps/plugin-dialog';
-	import { onDestroy } from 'svelte';
+	import { untrack } from 'svelte';
 	import { m } from '$lib/paraglide/messages';
 
 	type Props = { open?: boolean };
@@ -30,59 +30,53 @@
 
 	type Scope = 'mods' | 'configs' | 'both';
 	/// What the user decided for one config path.
-	type Decision = 'apply' | 'decline';
+	type Decision = 'apply' | 'restore' | 'decline';
 
 	let scope = $state<Scope>('both');
 	let decisions = $state<Record<string, Decision>>({});
 	let status = $state<ServerSyncStatus | null>(null);
 	let preview = $state<ServerSyncPreview | null>(null);
 	let result = $state<ServerSyncResult | null>(null);
-	/// Whether the selection changed after the last preview. The approved
-	/// plan hash only binds the previewed selection, so Deploy requires a
-	/// fresh preview first.
-	let dirty = $state(true);
+	let restartPolicy = $state<RestartPolicy>('manual');
+	let approvedInput = $state('');
+	const currentInput = $derived(JSON.stringify({ selection: selection(), restartPolicy }));
+	const dirty = $derived(!preview || approvedInput !== currentInput);
 	let loadingStatus = $state(false);
 	let previewing = $state(false);
 	let deploying = $state(false);
 	let progress = $state<ServerSyncProgress | null>(null);
 	let stageProgress = $state<ServerSyncStageProgress | null>(null);
-	let restartPolicy = $state<RestartPolicy>('manual');
 	let remotePassword = $state('');
 	let workerToken = $state('');
 	let workerAutoSync = $state(false);
 	let workerAutoMods = $state(false);
 	let savingWorker = $state(false);
-	let unlisten: UnlistenFn[] = [];
+	let savingPolicy = $state(false);
+	const busy = $derived(previewing || deploying || savingWorker || savingPolicy);
 
 	$effect(() => {
 		if (!open) {
-			unlisten.forEach((fn) => fn());
-			unlisten = [];
+			decisions = {};
 			preview = null;
 			result = null;
 			progress = null;
 			stageProgress = null;
-			dirty = true;
+			approvedInput = '';
 			remotePassword = '';
 			workerToken = '';
 			return;
 		}
-		void loadStatus(false);
-		void listenToProgress();
-	});
-
-	onDestroy(() => unlisten.forEach((fn) => fn()));
-
-	async function listenToProgress() {
-		unlisten = [
-			await listen<ServerSyncProgress>('server_sync_progress', (event) => {
+		untrack(() => void loadStatus(false));
+		const listeners = Promise.all([
+			listen<ServerSyncProgress>('server_sync_progress', (event) => {
 				if (deploying) progress = event.payload;
 			}),
-			await listen<ServerSyncStageProgress>('server_sync_stage_progress', (event) => {
+			listen<ServerSyncStageProgress>('server_sync_stage_progress', (event) => {
 				if (previewing || deploying) stageProgress = event.payload;
 			})
-		];
-	}
+		]);
+		return () => void listeners.then((unlisten) => unlisten.forEach((fn) => fn()));
+	});
 
 	async function loadStatus(refresh: boolean) {
 		loadingStatus = true;
@@ -114,7 +108,7 @@
 				applyConfigs.push(path);
 				// Restoring recreates a file the server side deleted; the
 				// planner requires the extra authorization for that case.
-				if (pendingReason(path) === 'deletedLocally') restoreConfigs.push(path);
+				if (decision === 'restore') restoreConfigs.push(path);
 			}
 		}
 
@@ -127,24 +121,16 @@
 		};
 	}
 
-	function pendingReason(path: string) {
-		const entry = preview?.plan.configEntries.find((entry) => entry.path === path);
-		return entry?.action === 'pending' ? entry.reason : null;
-	}
-
 	async function previewSync() {
 		previewing = true;
 		result = null;
 		try {
+			const selected = selection();
+			const policy = restartPolicy;
 			// The restart policy is bound into the plan hash, so the approval
 			// is only valid while this selection stands.
-			preview = await api.profile.server.previewSync(
-				selection(),
-				restartPolicy,
-				remotePassword,
-				workerToken
-			);
-			dirty = false;
+			preview = await api.profile.server.previewSync(selected, policy, remotePassword, workerToken);
+			approvedInput = JSON.stringify({ selection: selected, restartPolicy: policy });
 		} finally {
 			previewing = false;
 			stageProgress = null;
@@ -154,18 +140,22 @@
 	function decide(path: string, decision: Decision | null) {
 		if (decision === null) delete decisions[path];
 		else decisions[path] = decision;
-		dirty = true;
 	}
 
 	/// A persistent per-file policy for *future* revisions, distinct from
 	/// the one-time Apply/Decline decision for the current conflict.
 	async function setPolicy(path: string, policy: SyncConfigUpdatePolicy) {
-		await api.profile.server.setConfigPolicy(path, policy, remotePassword, workerToken);
-		dirty = true;
+		approvedInput = '';
+		savingPolicy = true;
+		try {
+			await api.profile.server.setConfigPolicy(path, policy, remotePassword, workerToken);
+		} finally {
+			savingPolicy = false;
+		}
 	}
 
 	async function deploy(force = false) {
-		if (!preview) return;
+		if (!preview || dirty) return;
 		deploying = true;
 		progress = null;
 		try {
@@ -179,7 +169,6 @@
 			);
 			decisions = {};
 			preview = null;
-			dirty = true;
 			void loadStatus(false);
 		} catch (error) {
 			await message(error instanceof Error ? error.message : String(error), {
@@ -277,7 +266,7 @@
 	}
 </script>
 
-<Dialog title={m.serverSync_title()} bind:open large>
+<Dialog title={m.serverSync_title()} bind:open canClose={!busy} large>
 	<p class="text-primary-600 dark:text-primary-300 mt-1">{m.serverSync_content()}</p>
 
 	{#if status}
@@ -288,7 +277,7 @@
 				<span class="text-primary-700 dark:text-primary-300 font-medium">
 					{isWorker() ? m.serverSync_modeWorker() : m.serverSync_modeLocal()}
 				</span>
-				<Button loading={loadingStatus} onclick={() => loadStatus(true)}>
+				<Button loading={loadingStatus} disabled={busy} onclick={() => loadStatus(true)}>
 					{m.serverSync_refresh()}
 				</Button>
 			</div>
@@ -356,7 +345,7 @@
 						<Label>{m.serverSync_autoMods()}</Label>
 						<Checkbox bind:checked={workerAutoMods} />
 					</div>
-					<Button color="primary" loading={savingWorker} onclick={saveWorkerConfig}>
+					<Button color="primary" loading={savingWorker} disabled={busy} onclick={saveWorkerConfig}>
 						{m.serverSync_saveAutomation()}
 					</Button>
 				</div>
@@ -370,7 +359,6 @@
 			type="single"
 			triggerClass="mt-1 w-full"
 			bind:value={scope}
-			onValueChange={() => (dirty = true)}
 			items={[
 				{ value: 'both', label: m.serverSync_scopeBoth() },
 				{ value: 'mods', label: m.serverSync_scopeMods() },
@@ -457,6 +445,7 @@
 								<span class="text-primary-500 shrink-0">{actionLabel(entry)}</span>
 								<Select
 									type="single"
+									disabled={busy}
 									triggerClass="w-44 shrink-0"
 									value={entry.policy}
 									onValueChange={(value) => setPolicy(entry.path, value as SyncConfigUpdatePolicy)}
@@ -466,23 +455,25 @@
 										{ value: 'alwaysKeep', label: m.serverSync_policyAlwaysKeep() }
 									]}
 								/>
-								{#if entry.action === 'pending'}
-									<Button onclick={() => decide(entry.path, 'apply')}>
-										{entry.reason === 'deletedLocally'
-											? m.serverSync_restore()
-											: m.serverSync_apply()}
-									</Button>
-									<Button onclick={() => decide(entry.path, 'decline')}>
-										{m.serverSync_decline()}
-									</Button>
-								{:else if decisions[entry.path]}
+								{#if decisions[entry.path]}
 									<span class="shrink-0 text-green-600 dark:text-green-400">
-										{decisions[entry.path] === 'apply'
+										{decisions[entry.path] !== 'decline'
 											? m.serverSync_willApply()
 											: m.serverSync_willDecline()}
 									</span>
-									<Button onclick={() => decide(entry.path, null)}>
+									<Button disabled={busy} onclick={() => decide(entry.path, null)}>
 										{m.serverSync_undo()}
+									</Button>
+								{:else if entry.action !== 'markApplied' && entry.action !== 'write'}
+									{@const restore = entry.action === 'pending' && entry.reason === 'deletedLocally'}
+									<Button
+										disabled={busy}
+										onclick={() => decide(entry.path, restore ? 'restore' : 'apply')}
+									>
+										{restore ? m.serverSync_restore() : m.serverSync_apply()}
+									</Button>
+									<Button disabled={busy} onclick={() => decide(entry.path, 'decline')}>
+										{m.serverSync_decline()}
 									</Button>
 								{/if}
 							</div>
@@ -555,9 +546,11 @@
 				removed={result.summary.removedFiles}
 				unchanged={result.summary.unchangedFiles}
 			/>
-			<p class="text-primary-600 dark:text-primary-300 mt-2 text-sm">
-				{restartLabel(result.restart)}
-			</p>
+			{#if result.restart !== 'notRequired'}
+				<p class="text-primary-600 dark:text-primary-300 mt-2 text-sm">
+					{restartLabel(result.restart)}
+				</p>
+			{/if}
 			{#if result.failedConfigWrites.length > 0}
 				<InfoBox type="warning" class="mt-2">
 					{m.serverSync_failedConfigs({ count: result.failedConfigWrites.length })}
@@ -570,7 +563,9 @@
 	{/if}
 
 	<div class="mt-5 flex w-full items-center justify-end gap-2">
-		<Button color="primary" onclick={() => (open = false)}>{m.serverSync_close()}</Button>
+		<Button color="primary" disabled={busy} onclick={() => (open = false)}
+			>{m.serverSync_close()}</Button
+		>
 		{#if dirty}
 			<span class="text-primary-500 mr-auto text-sm">{m.serverSync_dirtyHint()}</span>
 		{/if}
@@ -580,7 +575,6 @@
 				type="single"
 				triggerClass="w-40"
 				bind:value={restartPolicy}
-				onValueChange={() => (dirty = true)}
 				items={[
 					{ value: 'manual', label: m.serverSync_restartManual() },
 					{ value: 'immediate', label: m.serverSync_restartImmediate() },
@@ -588,14 +582,14 @@
 				]}
 			/>
 		</div>
-		<Button icon="mdi:cloud-search" loading={previewing} onclick={previewSync}>
+		<Button icon="mdi:cloud-search" loading={previewing} disabled={busy} onclick={previewSync}>
 			{m.serverSync_preview()}
 		</Button>
 		{#if preview?.busy?.stale}
 			<Button
 				icon="mdi:cloud-upload"
 				loading={deploying}
-				disabled={dirty}
+				disabled={dirty || busy}
 				onclick={() => deploy(true)}
 			>
 				{m.serverSync_takeover()}
@@ -604,7 +598,7 @@
 			<Button
 				icon="mdi:cloud-upload"
 				loading={deploying}
-				disabled={!preview || dirty || !!preview.busy}
+				disabled={!preview || dirty || !!preview.busy || busy}
 				onclick={() => deploy()}
 			>
 				{m.serverSync_deploy()}

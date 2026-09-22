@@ -475,6 +475,10 @@ async fn apply_archive(
 
     let resolved = resolve_target(&target, &manifest.name, app)?;
 
+    if let Some(profile_id) = resolved.profile_id {
+        super::server::ensure_profile_unlocked(app, profile_id)?;
+    }
+
     if clone && resolved.profile_id.is_none() && resolved.dir.is_some() {
         ensure_clone_target(resolved.prior_sync.as_ref(), &metadata.id, &manifest.name)?;
     }

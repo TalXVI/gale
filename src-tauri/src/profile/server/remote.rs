@@ -623,18 +623,22 @@ impl RemoteOps for RemoteConnection {
     }
 
     fn delete_file(&mut self, path: &RemotePath) -> Result<bool> {
-        match &mut self.client {
+        let deleted = match &mut self.client {
             RemoteClient::Sftp { sftp, .. } => match sftp.unlink(Path::new(path.as_str())) {
-                Ok(()) => Ok(true),
-                Err(err) if is_sftp_not_found(&err) => Ok(false),
-                Err(err) => Err(err.into()),
+                Ok(()) => true,
+                Err(err) if is_sftp_not_found(&err) => false,
+                Err(err) => return Err(err.into()),
             },
             RemoteClient::Ftp(ftp) => match ftp.rm(path.as_str()) {
-                Ok(()) => Ok(true),
-                Err(err) if is_ftp_not_found(&err) => Ok(false),
-                Err(err) => Err(err.into()),
+                Ok(()) => true,
+                Err(err) if is_ftp_not_found(&err) => false,
+                Err(err) => return Err(err.into()),
             },
+        };
+        if !deleted && matches!(self.client, RemoteClient::Ftp(_)) && self.is_file(path)? {
+            bail!("remote server refuses to delete the existing file {path}");
         }
+        Ok(deleted)
     }
 
     fn delete_dir(&mut self, path: &RemotePath) -> Result<()> {
@@ -907,6 +911,20 @@ fn ftp_store(
     );
     stream.flush().context("failed to flush FTP data stream")?;
     ftp.finalize_put_stream(stream)?;
+    // A flushed socket only proves local delivery. Some servers still
+    // send 226 after aborting the data channel; check the stored length
+    // wherever the protocol exposes it.
+    let stored = match ftp_mlst(ftp, path)? {
+        Mlst::Facts(facts) => facts.size,
+        Mlst::Absent => bail!("FTP upload for {path} completed but the file is absent"),
+        Mlst::Unsupported => ftp_size(ftp, path)?,
+    };
+    if let Some(stored) = stored {
+        ensure!(
+            stored == expected_len,
+            "FTP upload for {path} stored {stored} bytes, expected {expected_len}"
+        );
+    }
     Ok(())
 }
 
@@ -1327,6 +1345,8 @@ pub(crate) mod fake_ftp {
         /// Refuse `RETR` even for files that exist and are provable via
         /// `MLST` — a deeper read filter.
         pub refuse_retr: bool,
+        /// Refuse deletion with the same status used for absent files.
+        pub refuse_dele: bool,
         /// Do not implement `MLST` (a pre-RFC-3659 host).
         pub no_mlst: bool,
         /// Require explicit FTPS: `AUTH TLS` upgrades the control
@@ -1957,7 +1977,9 @@ pub(crate) mod fake_ftp {
                     None => "503 RNFR first".to_owned(),
                 },
                 "DELE" => {
-                    if fs.lock().unwrap().files.remove(&path).is_some() {
+                    if options.refuse_dele {
+                        "550 refused".to_owned()
+                    } else if fs.lock().unwrap().files.remove(&path).is_some() {
                         "250 deleted".to_owned()
                     } else {
                         "550 no such file".to_owned()
@@ -2599,6 +2621,25 @@ mod tests {
         // Genuine absence still reads as absent on the same connection.
         let absent = remote_path("/BepInEx/config/missing.dat");
         assert_eq!(conn.read(absent.as_path(), 64 * 1024).unwrap(), None);
+    }
+
+    #[test]
+    fn a_refused_deletion_is_not_silently_absent() {
+        let server = FakeFtp::valheim_host(FakeFtpOptions {
+            refuse_dele: true,
+            ..Default::default()
+        });
+        server.seed_file("/BepInEx/config/locked.dat", b"data");
+        let mut conn = ftp_connect(&server);
+        let err = conn
+            .delete_file(remote_path("/BepInEx/config/locked.dat").as_path())
+            .unwrap_err();
+        assert!(err.to_string().contains("refuses to delete"));
+        assert!(
+            !conn
+                .delete_file(remote_path("/BepInEx/config/missing.dat").as_path())
+                .unwrap()
+        );
     }
 
     /// Regression test for an FTPS data channel that dies after the TLS
