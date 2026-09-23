@@ -61,7 +61,7 @@ Each config also has a persistent policy stored in the remote deployment state: 
 
 Deployments that change mod payloads or apply config writes require a server restart to take effect. Choose per deployment:
 
-- **Never (manual)** deploys only; restart it yourself.
+- **Never** deploys only; restart it yourself.
 - **Immediately** restarts as soon as the deployment lands.
 - **When empty** restarts once no players are connected (requires a hosting provider that reports presence).
 

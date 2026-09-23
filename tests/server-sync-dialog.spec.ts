@@ -56,7 +56,7 @@ for (const mode of ['local', 'worker']) {
 			'Mods and selected configs'
 		);
 		await expect(page.getByLabel('Restart after deploying', { exact: true })).toHaveText(
-			'Never (manual)'
+			'Never'
 		);
 		await page.goto(`/tests/dialog/?mode=${mode}&profile=first`);
 		await expect(page.getByLabel('Deployment scope', { exact: true })).toHaveText('Mods only');
@@ -178,7 +178,7 @@ for (const mode of ['local', 'worker']) {
 			const button = (name: string) => {
 				if (name === 'Mods and selected configs')
 					return page.getByLabel('Deployment scope', { exact: true });
-				if (name === 'Never (manual)')
+				if (name === 'Never')
 					return page.getByLabel('Restart after deploying', { exact: true });
 				if (['Ask each update', 'Always apply updates'].includes(name))
 					return page.getByLabel('Future updates for BepInEx/config/test.cfg', { exact: true });
@@ -214,7 +214,7 @@ for (const mode of ['local', 'worker']) {
 							: 'Preview'
 				).click();
 			const scope = button('Mods and selected configs');
-			const restart = button('Never (manual)');
+			const restart = button('Never');
 			for (const control of [
 				scope,
 				restart,
