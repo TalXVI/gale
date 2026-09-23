@@ -54,6 +54,11 @@
 	let workerRestartPolicy = $state<RestartPolicy>('manual');
 	let savingWorker = $state(false);
 	let savingPolicy = $state(false);
+	/// Policy picks still being confirmed by the backend. While a save is in
+	/// flight the override is what the dropdown shows; once it lands the value
+	/// is folded into the preview entry, and on failure the override is dropped
+	/// so the control falls back to the last confirmed policy.
+	let policyOverrides = $state<Record<string, SyncConfigUpdatePolicy>>({});
 	let acknowledgingRestart = $state(false);
 	let reviewOnly = $state(false);
 	let loadingPreferences = $state(false);
@@ -83,6 +88,7 @@
 			decisions = {};
 			reviewOnly = false;
 			preview = null;
+			policyOverrides = {};
 			result = null;
 			progress = null;
 			stageProgress = null;
@@ -191,6 +197,7 @@
 			// The restart policy is bound into the plan hash, so the approval
 			// is only valid while this selection stands.
 			preview = await api.profile.server.previewSync(selected, policy, remotePassword, workerToken);
+			policyOverrides = {};
 			approvedInput = JSON.stringify({ selection: selected, restartPolicy: policy });
 		} finally {
 			previewing = false;
@@ -208,9 +215,24 @@
 	async function setPolicy(path: string, policy: SyncConfigUpdatePolicy) {
 		approvedInput = '';
 		savingPolicy = true;
+		policyOverrides[path] = policy;
 		try {
 			await api.profile.server.setConfigPolicy(path, policy, remotePassword, workerToken);
+			// The command persists the policy but returns nothing, so the
+			// confirmed value is folded into the rendered preview here.
+			const entry = preview?.plan.configEntries.find((entry) => entry.path === path);
+			if (entry) entry.policy = policy;
+		} catch (error) {
+			// The write never landed — drop the pending pick so the control
+			// falls back to the last confirmed policy instead of implying an
+			// unsaved value.
+			delete policyOverrides[path];
+			await message(error instanceof Error ? error.message : String(error), {
+				title: m.serverSync_title(),
+				kind: 'error'
+			});
 		} finally {
+			delete policyOverrides[path];
 			savingPolicy = false;
 		}
 	}
@@ -568,7 +590,7 @@
 										disabled={busy}
 										triggerClass="w-52 shrink-0"
 										aria-label={m.serverSync_futurePolicy({ path: entry.path })}
-										value={entry.policy}
+										value={policyOverrides[entry.path] ?? entry.policy}
 										onValueChange={(value) =>
 											setPolicy(entry.path, value as SyncConfigUpdatePolicy)}
 										items={[

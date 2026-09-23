@@ -45,6 +45,7 @@ const calls: { cmd: string; args: any }[] = [];
 const unexpected: string[] = [];
 let held = '';
 let release: (() => void) | undefined;
+const failing = new Set<string>();
 
 Object.assign(window, {
 	calls,
@@ -55,6 +56,12 @@ Object.assign(window, {
 	release: () => {
 		held = '';
 		release?.();
+	},
+	fail: (cmd: string) => {
+		failing.add(cmd);
+	},
+	unfail: (cmd: string) => {
+		failing.delete(cmd);
 	}
 });
 
@@ -64,6 +71,8 @@ mockIPC(async (cmd, args) => {
 		await new Promise<void>((resolve) => {
 			release = resolve;
 		});
+	if (failing.has(cmd))
+		throw { message: `Simulated failure: ${cmd}`, detail: `Simulated failure: ${cmd}` };
 	switch (cmd) {
 		case 'get_dedicated_server_settings':
 			return settings;
@@ -98,6 +107,8 @@ mockIPC(async (cmd, args) => {
 			return;
 		case 'plugin:dialog|message':
 			return cancelStop ? 'Cancel' : 'Ok';
+		case 'log_err':
+			return;
 		case 'get_server_sync_status':
 			return {
 				mode: workerMode ? 'worker' : 'local',
@@ -124,11 +135,10 @@ mockIPC(async (cmd, args) => {
 			return;
 		case 'preview_server_sync':
 			return { plan, warnings: [] };
-		case 'set_server_config_policy': {
-			const request = (args as any).request;
-			configEntries.find((entry) => entry.path === request.path)!.policy = request.policy;
+		case 'set_server_config_policy':
+			// The real command returns nothing; the dialog reflects the saved
+			// policy itself rather than waiting on a mutated preview.
 			return;
-		}
 		case 'configure_worker':
 			Object.assign(worker, (args as any).request);
 			return worker;

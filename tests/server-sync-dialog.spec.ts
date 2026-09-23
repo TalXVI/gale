@@ -118,6 +118,53 @@ for (const mode of ['local', 'worker']) {
 		);
 	});
 
+	test(`${mode}: saved future policies stick, failed saves revert`, async ({ page }) => {
+		const errors: string[] = [];
+		page.on('pageerror', (error) => errors.push(error.message));
+		await page.goto(`/tests/dialog/?mode=${mode}&many=1`);
+		await page.getByRole('button', { name: 'Preview', exact: true }).click();
+		const rows = page.getByTestId('server-config-row');
+		await expect(rows).toHaveCount(133);
+		const order = await rows.evaluateAll((elements) =>
+			elements.map((row) => row.getAttribute('data-path'))
+		);
+		const policy = page.getByLabel('Future updates for BepInEx/config/file-000.cfg', {
+			exact: true
+		});
+		await expect(policy).toHaveText('Ask each update');
+		await policy.click();
+		await page.getByRole('option', { name: 'Always apply updates', exact: true }).click();
+		// The command returns nothing; the saved value is reflected locally.
+		await expect(policy).toHaveText('Always apply updates');
+		// A future policy is not a current Apply/Decline decision — but it
+		// does invalidate the approved deployment inputs.
+		await expect(page.getByText('31 files still need a decision')).toBeVisible();
+		await expect(page.getByRole('button', { name: 'Deploy', exact: true })).toBeDisabled();
+		expect(
+			await rows.evaluateAll((elements) => elements.map((row) => row.getAttribute('data-path')))
+		).toEqual(order);
+		// Filtering the row away and back must not resurrect the old policy.
+		await page.getByRole('button', { name: 'Show files needing review' }).click();
+		await expect(rows).toHaveCount(31);
+		await page.getByRole('button', { name: 'Show all config files' }).click();
+		await expect(rows).toHaveCount(133);
+		await expect(policy).toHaveText('Always apply updates');
+		// A failed write snaps back to the last saved policy and reports it.
+		await page.evaluate(() => (window as any).fail('set_server_config_policy'));
+		await policy.click();
+		await page.getByRole('option', { name: 'Always keep my config', exact: true }).click();
+		await expect(policy).toHaveText('Always apply updates');
+		expect(
+			await page.evaluate(
+				() =>
+					(window as any).calls.filter(
+						(call: any) => call.cmd === 'plugin:dialog|message' && call.args.kind === 'error'
+					).length
+			)
+		).toBe(1);
+		expect(errors).toEqual([]);
+	});
+
 	for (const operation of [
 		'preview_server_sync',
 		'deploy_server_sync',
