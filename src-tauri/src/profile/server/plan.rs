@@ -44,13 +44,17 @@ pub struct DeploySelection {
 }
 
 impl DeploySelection {
-    fn validate(&self, published: &BTreeMap<ConfigPath, ValidatedConfigFile>) -> Result<()> {
+    fn validate(
+        &self,
+        published: &BTreeMap<ConfigPath, ValidatedConfigFile>,
+        spec: &DeploymentSpec,
+    ) -> Result<()> {
         let mut seen = BTreeSet::new();
         for path in &self.apply_configs {
             ensure!(seen.insert(path), "duplicate selected config path: {path}");
             ensure!(
-                published.contains_key(path),
-                "selected config file is not published: {path}"
+                published.contains_key(path) && spec.is_managed_config(path),
+                "selected config file is not a supported published server config: {path}"
             );
         }
         for path in &self.restore_configs {
@@ -65,8 +69,8 @@ impl DeploySelection {
                 "config file is both applied and declined: {path}"
             );
             ensure!(
-                published.contains_key(path),
-                "declined config file is not published: {path}"
+                published.contains_key(path) && spec.is_managed_config(path),
+                "declined config file is not a supported published server config: {path}"
             );
         }
         Ok(())
@@ -294,7 +298,7 @@ pub fn build_plan(
     context: &PlanContext,
     spec: &DeploymentSpec,
 ) -> Result<DeploymentPlan> {
-    selection.validate(publication.config)?;
+    selection.validate(publication.config, spec)?;
 
     let state = &snapshot.state;
     let mut uploads: Vec<PlanUpload> = Vec::new();
@@ -381,6 +385,10 @@ pub fn build_plan(
         // ---- Package-default configs: seed only when absent, never
         // overwrite or delete server configuration.
         for (path, staged) in &desired.package_defaults {
+            ensure!(
+                spec.is_config_seed(path),
+                "package default is outside supported server config scope: {path}"
+            );
             let config_path = ConfigPath::try_from(path.as_str())
                 .map_err(|_| eyre::eyre!("package default has an unsafe path: {path}"))?;
             if publication.config.contains_key(&config_path) {
@@ -433,6 +441,9 @@ pub fn build_plan(
     let mut config_entries = Vec::new();
     if configs_phase {
         for (path, file) in publication.config {
+            if !spec.is_managed_config(path) {
+                continue;
+            }
             let published = file.hash.clone();
             let remote = snapshot.config_remote.get(path).cloned().flatten();
             let record = state.config.get(path);
@@ -558,12 +569,17 @@ fn decide_config(
         return ConfigAction::Write;
     }
 
-    if record.and_then(|r| r.applied.as_ref()) == Some(published) {
-        return ConfigAction::Keep;
-    }
-
     if record.and_then(|r| r.declined.as_ref()) == Some(published) {
         return ConfigAction::Decline;
+    }
+
+    // A recorded hash cannot prove a file still exists. A remote deletion
+    // must reach the restore gate even when the publication is unchanged or
+    // an automatic update policy was previously selected.
+    if remote.is_none() && record.is_some_and(|r| r.applied.is_some() || r.written.is_some()) {
+        return ConfigAction::Pending {
+            reason: PendingConfigReason::DeletedLocally,
+        };
     }
 
     // A policy set at the currently advertised hash governs updates, not the
@@ -1174,9 +1190,8 @@ mod tests {
             },
         );
 
-        // Unselected: the remote deletion of a file applied at the
-        // published revision stands. The file stays absent (Keep) and is
-        // never silently recreated.
+        // Unselected: the remote deletion must remain visible, even though
+        // the recorded applied hash still matches the publication.
         let plan = build_plan(
             &fixture.publication(),
             &DesiredDeployment::default(),
@@ -1186,8 +1201,18 @@ mod tests {
             &spec(),
         )
         .unwrap();
-        assert!(plan.conflicts.is_empty());
-        assert_eq!(plan.config_entries[0].action, ConfigAction::Keep);
+        assert_eq!(plan.conflicts.len(), 1);
+        assert_eq!(
+            plan.conflicts[0].reason,
+            PendingConfigReason::DeletedLocally
+        );
+        assert_eq!(
+            plan.config_entries[0].action,
+            ConfigAction::Pending {
+                reason: PendingConfigReason::DeletedLocally
+            }
+        );
+        assert!(plan.uploads.is_empty());
 
         // Selected without restore still stays pending.
         let mut apply_only = selection(false, true);
@@ -1220,6 +1245,113 @@ mod tests {
         .unwrap();
         assert!(plan.conflicts.is_empty());
         assert!(plan.uploads.iter().any(|u| u.kind == UploadKind::Config));
+    }
+
+    #[test]
+    fn actual_remote_config_presence_precedes_recorded_applied_hash_and_policy() {
+        let mut fixture = fixture();
+        let path = config_path("BepInEx/config/mod.cfg");
+        let published = config_file(b"published");
+        fixture.config.insert(path.clone(), published.clone());
+        let mut snapshot = empty_snapshot();
+
+        let action = |snapshot: &RemoteSnapshot| {
+            build_plan(
+                &fixture.publication(),
+                &DesiredDeployment::default(),
+                snapshot,
+                &selection(false, true),
+                &context(),
+                &spec(),
+            )
+            .unwrap()
+            .config_entries[0]
+                .action
+                .clone()
+        };
+
+        assert_eq!(action(&snapshot), ConfigAction::Unapplied);
+        snapshot
+            .config_remote
+            .insert(path.clone(), Some(published.hash.clone()));
+        assert_eq!(action(&snapshot), ConfigAction::MarkApplied);
+
+        snapshot.state.config.insert(
+            path.clone(),
+            AppliedFile {
+                applied: Some(published.hash.clone()),
+                written: Some(published.hash.clone()),
+                policy: ConfigUpdatePolicy::AlwaysApply,
+                ..Default::default()
+            },
+        );
+        snapshot.config_remote.insert(path.clone(), None);
+        assert_eq!(
+            action(&snapshot),
+            ConfigAction::Pending {
+                reason: PendingConfigReason::DeletedLocally
+            }
+        );
+        snapshot
+            .config_remote
+            .insert(path, Some(ContentHash::from_hash(blake3::hash(b"custom"))));
+        assert_eq!(action(&snapshot), ConfigAction::Write);
+    }
+
+    #[test]
+    fn published_text_outside_server_config_scope_cannot_be_selected() {
+        let mut fixture = fixture();
+        let ordinary = config_path("BepInEx/config/mod.cfg");
+        let translation = config_path("BepInEx/plugins/Mod/translations/en.json");
+        let loader = config_path("doorstop_config.ini");
+        for path in [&ordinary, &translation, &loader] {
+            fixture
+                .config
+                .insert(path.clone(), config_file(b"published"));
+        }
+        let plan = build_plan(
+            &fixture.publication(),
+            &DesiredDeployment::default(),
+            &empty_snapshot(),
+            &selection(false, true),
+            &context(),
+            &spec(),
+        )
+        .unwrap();
+        assert_eq!(plan.config_entries.len(), 1);
+        assert_eq!(plan.config_entries[0].path, ordinary);
+
+        for path in [translation, loader] {
+            let mut selected = selection(false, true);
+            selected.apply_configs.push(path);
+            assert!(
+                build_plan(
+                    &fixture.publication(),
+                    &DesiredDeployment::default(),
+                    &empty_snapshot(),
+                    &selected,
+                    &context(),
+                    &spec(),
+                )
+                .is_err()
+            );
+        }
+        let mut desired = DesiredDeployment::default();
+        desired.package_defaults.insert(
+            deploy("BepInEx/plugins/Mod/translations/en.json"),
+            staged(b"package"),
+        );
+        assert!(
+            build_plan(
+                &fixture.publication(),
+                &desired,
+                &empty_snapshot(),
+                &selection(true, false),
+                &context(),
+                &spec(),
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -181,6 +181,7 @@ pub fn run() {
             profile::server::commands::preview_server_sync,
             profile::server::commands::deploy_server_sync,
             profile::server::commands::set_server_config_policy,
+            profile::server::commands::acknowledge_external_server_restart,
             profile::server::commands::configure_worker,
             profile::server::commands::get_dedicated_server_status,
             profile::server::commands::open_dedicated_server_dir,

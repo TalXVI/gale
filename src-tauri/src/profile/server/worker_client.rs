@@ -151,6 +151,14 @@ impl WorkerClient {
         .await
     }
 
+    pub async fn acknowledge_external_restart(&self) -> Result<()> {
+        self.send(
+            self.http
+                .post(format!("{}{}/restart-ack", self.base, api::API_BASE)),
+        )
+        .await
+    }
+
     /// Updates the worker's automation toggles. Manual Deploy Now requests
     /// are unaffected by `auto_sync`.
     pub async fn configure(

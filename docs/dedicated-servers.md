@@ -65,6 +65,8 @@ Deployments that change mod payloads or apply config writes require a server res
 
 No-op, declined, or unselected changes do not trigger a restart.
 
+After restarting through the host panel, use **I confirmed the restart** in the sync dialog. Gale records that confirmation in the remote deployment state. A Gale-issued restart clears the reminder only after the host reports a stop followed by a start; a running status by itself leaves the restart unverified.
+
 ## Execution modes
 
 ### Local

@@ -223,13 +223,17 @@ mod tests {
         http::StatusCode,
         response::{IntoResponse, Response},
     };
-    use std::sync::{Arc, Mutex};
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+    };
 
     #[derive(Clone)]
     struct Api {
         players: Option<u32>,
         fail_status: bool,
         fail_restart: bool,
+        post_restart_statuses: Arc<Mutex<VecDeque<bool>>>,
         calls: Arc<Mutex<Vec<String>>>,
         violations: Arc<Mutex<Vec<String>>>,
     }
@@ -254,7 +258,13 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE.into_response()
             }
             "GET /game-servers/server-1/" => {
-                axum::Json(serde_json::json!({"on": true})).into_response()
+                let running = api
+                    .post_restart_statuses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(true);
+                axum::Json(serde_json::json!({"on": running})).into_response()
             }
             "GET /game-servers/server-1/metrics" => {
                 axum::Json(serde_json::json!({"player_count": api.players})).into_response()
@@ -262,7 +272,13 @@ mod tests {
             "POST /game-servers/server-1/start" if api.fail_restart => {
                 StatusCode::SERVICE_UNAVAILABLE.into_response()
             }
-            "POST /game-servers/server-1/start" => StatusCode::NO_CONTENT.into_response(),
+            "POST /game-servers/server-1/start" => {
+                api.post_restart_statuses
+                    .lock()
+                    .unwrap()
+                    .extend([false, true]);
+                StatusCode::NO_CONTENT.into_response()
+            }
             _ => {
                 api.violations.lock().unwrap().push(route);
                 StatusCode::BAD_REQUEST.into_response()
@@ -316,7 +332,9 @@ mod tests {
                 false,
                 false,
                 Restarted,
-                vec![status[0], status[1], restart, status[0], status[1]],
+                vec![
+                    status[0], status[1], restart, status[0], status[1], status[0], status[1],
+                ],
             ),
             (
                 Immediate,
@@ -325,9 +343,19 @@ mod tests {
                 false,
                 false,
                 Restarted,
-                vec![restart, status[0], status[1]],
+                vec![
+                    status[0], status[1], restart, status[0], status[1], status[0], status[1],
+                ],
             ),
-            (Immediate, true, Some(0), false, true, Failed, vec![restart]),
+            (
+                Immediate,
+                true,
+                Some(0),
+                false,
+                true,
+                Failed,
+                vec![status[0], status[1], restart],
+            ),
             (
                 Immediate,
                 true,
@@ -335,13 +363,14 @@ mod tests {
                 true,
                 false,
                 StartupUnverified,
-                vec![restart, status[0]],
+                vec![status[0], restart, status[0]],
             ),
         ] {
             let api = Api {
                 players,
                 fail_status,
                 fail_restart,
+                post_restart_statuses: Default::default(),
                 calls: Default::default(),
                 violations: Default::default(),
             };

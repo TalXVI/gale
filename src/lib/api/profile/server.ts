@@ -118,6 +118,11 @@ export const setConfigPolicy = (
 		request: { path, policy, password, workerToken }
 	});
 
+export const acknowledgeExternalRestart = (password = '', workerToken = '') =>
+	invoke('acknowledge_external_server_restart', {
+		request: { password, workerToken }
+	});
+
 /// Pushes the automation configuration to the bound worker and returns
 /// the status it confirmed — the values the worker actually runs.
 export const configureWorker = (

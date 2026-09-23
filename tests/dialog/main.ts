@@ -2,7 +2,24 @@ import { mockIPC } from '@tauri-apps/api/mocks';
 import { mount } from 'svelte';
 
 const workerMode = new URLSearchParams(location.search).get('mode') === 'worker';
+const manyConfigs = new URLSearchParams(location.search).has('many');
+let restartRequired = new URLSearchParams(location.search).has('restart');
 const worker = { autoSync: false, autoMods: false, restartPolicy: 'manual' };
+const configEntries = manyConfigs
+	? Array.from({ length: 133 }, (_, index) => ({
+			path: `BepInEx/config/file-${String(index).padStart(3, '0')}.cfg`,
+			action: index % 4 === 3 && index < 124 ? 'pending' : 'markApplied',
+			reason: 'modifiedLocally',
+			policy: 'ask'
+		}))
+	: [
+			{
+				path: 'BepInEx/config/test.cfg',
+				action: 'pending',
+				reason: 'deletedLocally',
+				policy: 'ask'
+			}
+		];
 const plan = {
 	hash: 'approved-plan',
 	uploads: [],
@@ -12,10 +29,8 @@ const plan = {
 	unchangedFiles: 0,
 	modsPhase: true,
 	configsPhase: true,
-	conflicts: ['BepInEx/config/test.cfg'],
-	configEntries: [
-		{ path: 'BepInEx/config/test.cfg', action: 'pending', reason: 'deletedLocally', policy: 'ask' }
-	]
+	conflicts: configEntries.filter((entry) => entry.action === 'pending').map((entry) => entry.path),
+	configEntries
 };
 
 const calls: { cmd: string; args: any }[] = [];
@@ -48,12 +63,26 @@ mockIPC(async (cmd, args) => {
 			return calls.length;
 		case 'plugin:event|unlisten':
 			return;
+		case 'plugin:dialog|message':
+			return 'Ok';
 		case 'get_server_sync_status':
 			return {
 				mode: workerMode ? 'worker' : 'local',
 				worker: workerMode ? worker : null,
+				server: restartRequired
+					? {
+							restartRequired,
+							pendingConfigs: 0,
+							modsRevision: null,
+							lastOperation: null,
+							lease: null
+						}
+					: null,
 				warnings: []
 			};
+		case 'acknowledge_external_server_restart':
+			restartRequired = false;
+			return;
 		case 'preview_server_sync':
 			return { plan, warnings: [] };
 		case 'set_server_config_policy':

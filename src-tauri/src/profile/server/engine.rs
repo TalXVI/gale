@@ -25,10 +25,12 @@ use std::{
 use chrono::{DateTime, Utc};
 use eyre::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
+use ssh2::ErrorCode;
+use suppaftp::{FtpError, Status};
 use tracing::{debug, info, warn};
 
 use super::{
-    host::{HostCapabilities, HostControl},
+    host::{HostCapabilities, HostControl, HostStatus},
     lease::{self, Lease, LeaseRecord, Ownership},
     paths::{DeployPath, DeployPathBuf, RemotePath, RemotePathBuf},
     plan::{
@@ -191,12 +193,7 @@ pub fn open_session(
         state,
         warnings,
         migrated,
-    } = state::read_state(
-        ops.as_mut(),
-        spec,
-        &mapper.remote_path(&spec.state_path),
-        &mapper.remote_path(&spec.legacy_manifest_path),
-    )?;
+    } = read_authoritative_state(ops.as_mut(), &mapper)?;
 
     let host_managed = detect_host_managed(ops.as_mut(), &mapper, &state)?;
     let lease_file = spec.lease_dir.join(state::LEASE_FILE_NAME)?;
@@ -229,17 +226,11 @@ pub fn open_session(
 /// persistence sequence guard all work on fresh state rather than what
 /// was loaded when the session opened.
 fn refresh_state(session: &mut Session) -> Result<()> {
-    let spec = &session.mapper.spec;
     let LoadedState {
         state,
         warnings,
         migrated,
-    } = state::read_state(
-        session.ops.as_mut(),
-        spec,
-        &session.mapper.remote_path(&spec.state_path),
-        &session.mapper.remote_path(&spec.legacy_manifest_path),
-    )?;
+    } = read_authoritative_state(session.ops.as_mut(), &session.mapper)?;
     session.base_seq = state.operation_seq;
     session.state = state;
     session.migrated = migrated;
@@ -249,6 +240,33 @@ fn refresh_state(session: &mut Session) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A state read is read-only, so an interrupted MLST/RETR can be repeated
+/// on a new control connection. The sequence guard still runs on the bytes
+/// returned by the successful read before any state write.
+fn read_authoritative_state(ops: &mut dyn RemoteOps, mapper: &RemoteMapper) -> Result<LoadedState> {
+    let read = |ops: &mut dyn RemoteOps| {
+        state::read_state(
+            ops,
+            &mapper.spec,
+            &mapper.remote_path(&mapper.spec.state_path),
+            &mapper.remote_path(&mapper.spec.legacy_manifest_path),
+        )
+    };
+    match read(ops) {
+        Ok(loaded) => Ok(loaded),
+        Err(error) if error.downcast_ref::<state::StateReadError>().is_none() => Err(error),
+        Err(first) => {
+            warn!(error = %first, "authoritative state read failed; reconnecting before retry");
+            ops.reconnect().with_context(|| {
+                format!("failed to reconnect after authoritative state read: {first}")
+            })?;
+            read(ops).with_context(|| {
+                format!("authoritative state read failed after reconnect; first error: {first}")
+            })
+        }
+    }
 }
 
 /// A preview: the plan plus the context the UI needs to explain it.
@@ -461,9 +479,15 @@ pub fn deploy(
             // aborts the operation.
             if let Err(err) = ensure_ownership(&lease, session).and_then(|_| persist_state(session))
             {
-                let _ = fail_operation(session, &lease, meta, &plan, &err);
+                let recorded = fail_operation(session, &lease, meta, &plan, &err);
                 lease.release(session.ops.as_mut());
-                return Err(err.wrap_err("failed to persist remote deployment state"));
+                return Err(err.wrap_err(format!(
+                    "failed to persist remote deployment state after file changes; remote filesystem may need reconciliation{}",
+                    recorded
+                        .err()
+                        .map(|error| format!("; failure record could not be persisted: {error:#}"))
+                        .unwrap_or_default()
+                )));
             }
 
             Ok(Deployment {
@@ -476,11 +500,15 @@ pub fn deploy(
         }
         Err(error) => {
             warn!(%error, "deployment failed; recording accurate state");
-            if let Err(state_err) = fail_operation(session, &lease, meta, &plan, &error) {
-                warn!(%state_err, "failed to record deployment failure remotely");
-            }
+            let recorded = fail_operation(session, &lease, meta, &plan, &error);
             lease.release(session.ops.as_mut());
-            Err(error)
+            Err(error.wrap_err(format!(
+                "deployment failed during the file phase; remote filesystem may need reconciliation{}",
+                recorded
+                    .err()
+                    .map(|state_err| format!("; failure record could not be persisted: {state_err:#}"))
+                    .unwrap_or_default()
+            )))
         }
     }
 }
@@ -556,27 +584,37 @@ pub async fn apply_restart_policy(
 
     match policy {
         RestartPolicy::Manual => RestartOutcome::AwaitingManual,
-        RestartPolicy::Immediate => do_restart(host).await,
+        RestartPolicy::Immediate => do_restart(host, host.status().await.ok()).await,
         RestartPolicy::WhenEmpty => match host.status().await {
-            Ok(status) if status.players == Some(0) => do_restart(host).await,
+            Ok(status) if status.players == Some(0) => do_restart(host, Some(status)).await,
             _ => RestartOutcome::AwaitingEmpty,
         },
     }
 }
 
-async fn do_restart(host: &dyn HostControl) -> RestartOutcome {
+fn observed_restart(saw_stopped: &mut bool, running: Option<bool>) -> bool {
+    if running == Some(false) {
+        *saw_stopped = true;
+    }
+    *saw_stopped && running == Some(true)
+}
+
+async fn do_restart(host: &dyn HostControl, before: Option<HostStatus>) -> RestartOutcome {
     info!(host = host.name(), "restarting dedicated server");
     if host.restart().await.is_err() {
         return RestartOutcome::Failed;
     }
 
-    // Poll until the provider reports the server running again. Absent
-    // process visibility the outcome is StartupUnverified, not Ready.
+    // A running response alone may still describe the old process. Only a
+    // stop followed by a start confirms the requested restart took effect.
+    let mut saw_stopped = before.is_some_and(|status| status.running == Some(false));
     for _ in 0..RESTART_VERIFY_ATTEMPTS {
         tokio::time::sleep(RESTART_VERIFY_DELAY).await;
         match host.status().await {
-            Ok(status) if status.running == Some(true) => return RestartOutcome::Restarted,
-            Ok(_) => continue,
+            Ok(status) if observed_restart(&mut saw_stopped, status.running) => {
+                return RestartOutcome::Restarted;
+            }
+            Ok(_) => {}
             Err(_) => return RestartOutcome::StartupUnverified,
         }
     }
@@ -591,10 +629,11 @@ pub fn finish(
     restart: RestartOutcome,
     meta: &OperationMeta,
 ) -> Result<ServerDeploymentState> {
-    session.state.restart_required = !matches!(
-        restart,
-        RestartOutcome::NotRequired | RestartOutcome::Restarted
-    );
+    session.state.restart_required = match restart {
+        RestartOutcome::Restarted | RestartOutcome::ExternallyAcknowledged => false,
+        RestartOutcome::NotRequired => session.state.restart_required,
+        _ => true,
+    };
 
     session.state.record_operation(OperationRecord {
         id: meta.id.clone(),
@@ -630,6 +669,49 @@ pub fn finish(
     persist?;
 
     Ok(session.state.clone())
+}
+
+/// Records the user's explicit confirmation that the server was restarted
+/// outside Gale. A running status alone cannot prove a restart occurred.
+pub fn acknowledge_external_restart(
+    session: &mut Session,
+    meta: &OperationMeta,
+) -> Result<ServerDeploymentState> {
+    let lease = lease::acquire(
+        session.ops.as_mut(),
+        &session.mapper.remote_path(&session.mapper.spec.lease_dir),
+        &meta.owner,
+        meta.executor,
+        &meta.id,
+        false,
+    )?;
+    let result = (|| {
+        refresh_state(session)?;
+        ensure!(
+            session.state.restart_required,
+            "there is no outstanding restart to acknowledge"
+        );
+        ensure_ownership(&lease, session)?;
+        session.state.restart_required = false;
+        session.state.record_operation(OperationRecord {
+            id: meta.id.clone(),
+            executor: meta.executor,
+            kind: meta.kind,
+            worker_id: meta.worker_id.clone(),
+            publication_revision: None,
+            mods_revision: session.state.mods_revision.clone(),
+            status: OperationStatus::Succeeded,
+            summary: OperationSummary::default(),
+            restart: RestartOutcome::ExternallyAcknowledged,
+            error: None,
+            started_at: meta.started_at,
+            finished_at: Utc::now(),
+        });
+        persist_state(session)?;
+        Ok(session.state.clone())
+    })();
+    lease.release(session.ops.as_mut());
+    result
 }
 
 /// Records a failed operation and persists whatever state is accurate.
@@ -735,7 +817,13 @@ fn take_snapshot(
     if selection.include_configs || selection.include_mods {
         let mut paths: BTreeSet<ConfigPath> = BTreeSet::new();
         if selection.include_configs {
-            paths.extend(publication.config.keys().cloned());
+            paths.extend(
+                publication
+                    .config
+                    .keys()
+                    .filter(|path| spec.is_managed_config(path))
+                    .cloned(),
+            );
             paths.extend(session.state.config.keys().cloned());
             paths.extend(selection.apply_configs.iter().cloned());
         }
@@ -937,6 +1025,7 @@ fn execute(
         let published: BTreeMap<ConfigPath, ContentHash> = publication
             .config
             .iter()
+            .filter(|(path, _)| session.mapper.spec.is_managed_config(path))
             .map(|(path, file)| (path.clone(), file.hash.clone()))
             .collect();
 
@@ -1009,14 +1098,12 @@ fn upload_file(
 
     // Re-hash staged disk content right before upload: a file that changed
     // since staging must not silently deploy different bytes than planned.
-    with_retry(session, |session| {
-        match source {
-            FileSource::Path(local) => session.ops.upload(local, &temporary),
-            FileSource::Bytes(bytes) => session.ops.write(&temporary, bytes),
-        }?;
-        replace_remote(session.ops.as_mut(), &temporary, &target)
-    })
-    .with_context(|| format!("failed to upload remote file {path}"))
+    with_retry(session, |session| match source {
+        FileSource::Path(local) => session.ops.upload(local, &temporary),
+        FileSource::Bytes(bytes) => session.ops.write(&temporary, bytes),
+    })?;
+    replace_remote(session.ops.as_mut(), &temporary, &target)
+        .with_context(|| format!("failed to upload remote file {path}"))
 }
 
 /// Retries `work` after reconnecting, for transient transport failures.
@@ -1069,40 +1156,60 @@ fn replace_remote(
     temporary: &RemotePath,
     target: &RemotePath,
 ) -> Result<()> {
-    if ops.rename(temporary, target).is_ok() {
-        return Ok(());
+    match ops.rename(temporary, target) {
+        Ok(()) => return Ok(()),
+        Err(error) if is_replace_conflict(&error) => {}
+        Err(error) => {
+            return Err(error).context(
+                "remote rename did not confirm whether it completed; remote filesystem may need reconciliation",
+            );
+        }
     }
 
-    // FTP and older SFTP servers cannot rename over an existing file: move
-    // the current file aside first so a mid-swap failure never leaves
-    // neither version.
+    // FTP and older SFTP servers cannot rename over an existing file. FTP
+    // also uses 550 when the source is missing, so verify both files before
+    // moving the existing target aside.
     let backup = target.with_suffix(".gale-backup");
+    let temporary_exists = ops.is_file(temporary)?;
+    ensure!(
+        temporary_exists,
+        "remote rename was refused while {temporary} was absent; remote filesystem may need reconciliation"
+    );
     let target_exists = ops.is_file(target)?;
+    ensure!(
+        target_exists,
+        "remote rename was refused while {target} was absent; remote filesystem may need reconciliation"
+    );
 
-    if target_exists {
-        if ops.is_file(&backup)? {
-            ops.delete_file(&backup)
-                .context("failed to clear stale remote backup")?;
-        }
-        if let Err(err) = ops.rename(target, &backup) {
-            let _ = ops.delete_file(temporary);
-            return Err(err).context("failed to back up existing remote file");
-        }
-    }
+    ensure!(
+        !ops.is_file(&backup)?,
+        "remote backup {backup} already exists; remote filesystem may need reconciliation"
+    );
+    ops.rename(target, &backup).context(
+        "could not confirm backing up the existing remote file; remote filesystem may need reconciliation",
+    )?;
 
-    if let Err(err) = ops.rename(temporary, target) {
-        if target_exists {
-            let _ = ops.rename(&backup, target);
-        }
-        let _ = ops.delete_file(temporary);
-        return Err(err).context("failed to move uploaded file into place");
-    }
+    ops.rename(temporary, target).context(
+        "could not confirm moving the uploaded file into place; remote filesystem may need reconciliation",
+    )?;
 
-    if target_exists {
-        let _ = ops.delete_file(&backup);
+    if let Err(error) = ops.delete_file(&backup) {
+        warn!(%error, path = %backup, "could not remove the previous remote file backup");
     }
 
     Ok(())
+}
+
+/// Only a definite file-exists response permits the backup-and-replace
+/// sequence. A lost reply may mean the first rename already happened.
+fn is_replace_conflict(error: &eyre::Report) -> bool {
+    matches!(
+        error.downcast_ref::<FtpError>(),
+        Some(FtpError::UnexpectedResponse(response)) if response.status == Status::FileUnavailable
+    ) || matches!(
+        error.downcast_ref::<ssh2::Error>(),
+        Some(error) if error.code() == ErrorCode::SFTP(11)
+    )
 }
 
 /// Writes the deployment state through a temporary file + rename.
@@ -1119,10 +1226,7 @@ fn replace_remote(
 /// transfer can never silently become the authoritative state.
 pub fn persist_state(session: &mut Session) -> Result<()> {
     let target = session.mapper.remote_path(&session.mapper.spec.state_path);
-    let legacy = session
-        .mapper
-        .remote_path(&session.mapper.spec.legacy_manifest_path);
-    let remote = state::read_state(session.ops.as_mut(), &session.mapper.spec, &target, &legacy)
+    let remote = read_authoritative_state(session.ops.as_mut(), &session.mapper)
         .context("failed to verify remote deployment state before writing")?;
     ensure!(
         remote.state.operation_seq == session.base_seq,
@@ -1155,9 +1259,12 @@ pub fn persist_state(session: &mut Session) -> Result<()> {
                 "temporary remote deployment state was written to {temporary} but cannot be read back"
             ),
         }
-        replace_remote(session.ops.as_mut(), &temporary, &target)
+        Ok(())
     })
     .context("failed to write remote deployment state")?;
+    replace_remote(session.ops.as_mut(), &temporary, &target).context(
+        "failed to replace remote deployment state; remote filesystem may need reconciliation",
+    )?;
 
     // The state file is authoritative for every later operation, so a
     // deployment only succeeds once its persistence is verified: the
@@ -1204,6 +1311,10 @@ pub fn set_config_policy(
     pinned_at: Option<&ContentHash>,
     meta: &OperationMeta,
 ) -> Result<()> {
+    ensure!(
+        session.mapper.spec.is_managed_config(path),
+        "unsupported server config path: {path}"
+    );
     let lease = lease::acquire(
         session.ops.as_mut(),
         &session.mapper.remote_path(&session.mapper.spec.lease_dir),
@@ -1512,6 +1623,51 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_rename_does_not_start_a_second_mutation_sequence() {
+        let mut remote = MemoryRemote::new();
+        remote.ftp_rename_semantics = true;
+        let target = RemotePathBuf::new("/srv/BepInEx/config/mod.cfg").unwrap();
+        let temporary = target.with_suffix(".gale-upload");
+        remote.put_file(target.as_str(), b"original");
+        // A missing temporary file can mean an earlier rename completed
+        // but its reply was lost. The old target and any backup stay put.
+        let error = replace_remote(&mut remote, &temporary, &target).unwrap_err();
+        assert!(format!("{error:#}").contains("may need reconciliation"));
+        assert!(format!("{error:#}").contains("was absent"));
+        assert_eq!(
+            remote.contents(target.as_str()),
+            Some(b"original".as_slice())
+        );
+        assert!(
+            remote
+                .contents(target.with_suffix(".gale-backup").as_str())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn definite_ftp_rename_conflict_replaces_via_backup() {
+        let mut remote = MemoryRemote::new();
+        remote.ftp_rename_semantics = true;
+        let target = RemotePathBuf::new("/srv/BepInEx/config/mod.cfg").unwrap();
+        let temporary = target.with_suffix(".gale-upload");
+        remote.put_file(target.as_str(), b"original");
+        remote.put_file(temporary.as_str(), b"updated");
+
+        replace_remote(&mut remote, &temporary, &target).unwrap();
+        assert_eq!(
+            remote.contents(target.as_str()),
+            Some(b"updated".as_slice())
+        );
+        assert!(remote.contents(temporary.as_str()).is_none());
+        assert!(
+            remote
+                .contents(target.with_suffix(".gale-backup").as_str())
+                .is_none()
+        );
+    }
+
+    #[test]
     fn payload_deploy_uploads_and_commits_state() {
         let fixture = mod_fixture();
         let publication = fixture.publication();
@@ -1565,7 +1721,7 @@ mod tests {
                 size: 9,
             })
         );
-        assert!(!state.restart_required);
+        assert!(state.restart_required);
         let record = state.last_operation.unwrap();
         assert_eq!(record.status, OperationStatus::Succeeded);
         assert_eq!(record.executor, ExecutorKind::Local);
@@ -1793,8 +1949,164 @@ mod tests {
             Some(ContentHash::from_hash(blake3::hash(b"v2")))
         );
         assert!(state.pending.is_empty());
-        // A configs-only deployment never sets restart_required.
-        assert!(!state.restart_required);
+        // A config write also requires a restart; NotRequired cannot clear it.
+        assert!(state.restart_required);
+    }
+
+    #[test]
+    fn deleted_published_config_is_restored_only_by_explicit_selection() {
+        let path = config_path("BepInEx/config/mod.cfg");
+        let file = config_file(b"published");
+        let mut fixture = mod_fixture();
+        fixture.config.insert(path.clone(), file.clone());
+        let publication = fixture.publication();
+        let memory = remote();
+        let mut previous = ServerDeploymentState {
+            version: state::VERSION,
+            ..Default::default()
+        };
+        previous.record_applied(&path, &file.hash);
+        {
+            let mut remote = memory.lock().unwrap();
+            remote.put_file(STATE_REMOTE, &state::serialize(&previous).unwrap());
+            remote.put_file("/srv/BepInEx/config/server-only.cfg", b"server-only");
+        }
+
+        let mut session = open(memory.clone()).unwrap();
+        let pending = preview(
+            &mut session,
+            &publication,
+            &DesiredDeployment::default(),
+            &selection(false, true),
+            &context(),
+            &meta(),
+        )
+        .unwrap();
+        assert_eq!(
+            pending.plan.conflicts[0].reason,
+            PendingConfigReason::DeletedLocally
+        );
+        assert!(pending.plan.uploads.is_empty());
+
+        let mut selected = selection(false, true);
+        selected.apply_configs.push(path.clone());
+        let still_pending = preview(
+            &mut session,
+            &publication,
+            &DesiredDeployment::default(),
+            &selected,
+            &context(),
+            &meta(),
+        )
+        .unwrap();
+        assert!(still_pending.plan.uploads.is_empty());
+
+        selected.restore_configs.push(path.clone());
+        let deployment = deploy(
+            &mut session,
+            no_connect,
+            &publication,
+            &DesiredDeployment::default(),
+            &selected,
+            &context(),
+            &meta(),
+            None,
+            false,
+            |_| {},
+        )
+        .unwrap();
+        finish(
+            &mut session,
+            deployment,
+            RestartOutcome::AwaitingManual,
+            &meta(),
+        )
+        .unwrap();
+        assert_eq!(
+            remote_contents(&memory, "/srv/BepInEx/config/mod.cfg"),
+            Some(b"published".to_vec())
+        );
+        assert_eq!(
+            remote_contents(&memory, "/srv/BepInEx/config/server-only.cfg"),
+            Some(b"server-only".to_vec())
+        );
+        assert_eq!(
+            open(memory).unwrap().state.config[&path].applied,
+            Some(file.hash)
+        );
+    }
+
+    #[test]
+    fn out_of_scope_published_text_does_not_write_or_recreate_config_records() {
+        let ordinary = config_path("BepInEx/config/mod.cfg");
+        let translation = config_path("BepInEx/plugins/Mod/translations/en.json");
+        let loader = config_path("doorstop_config.ini");
+        let mut fixture = mod_fixture();
+        for path in [&ordinary, &translation, &loader] {
+            fixture
+                .config
+                .insert(path.clone(), config_file(b"publication"));
+        }
+        let publication = fixture.publication();
+        let memory = remote();
+        let mut previous = ServerDeploymentState {
+            version: state::VERSION,
+            ..Default::default()
+        };
+        for path in [&translation, &loader] {
+            previous.config.insert(path.clone(), Default::default());
+        }
+        {
+            let mut remote = memory.lock().unwrap();
+            remote.put_file(STATE_REMOTE, &state::serialize(&previous).unwrap());
+            remote.put_file(
+                "/srv/BepInEx/plugins/Mod/translations/en.json",
+                b"server translation",
+            );
+            remote.put_file("/srv/doorstop_config.ini", b"host loader");
+        }
+
+        let mut session = open(memory.clone()).unwrap();
+        assert_eq!(session.warnings.len(), 1);
+        assert!(session.warnings[0].contains("ignored 2 out-of-scope"));
+        let mut selected = selection(false, true);
+        selected.apply_configs.push(ordinary.clone());
+        let deployment = deploy(
+            &mut session,
+            no_connect,
+            &publication,
+            &DesiredDeployment::default(),
+            &selected,
+            &context(),
+            &meta(),
+            None,
+            false,
+            |_| {},
+        )
+        .unwrap();
+        finish(
+            &mut session,
+            deployment,
+            RestartOutcome::AwaitingManual,
+            &meta(),
+        )
+        .unwrap();
+        assert_eq!(
+            remote_contents(&memory, "/srv/BepInEx/config/mod.cfg"),
+            Some(b"publication".to_vec())
+        );
+        assert_eq!(
+            remote_contents(&memory, "/srv/BepInEx/plugins/Mod/translations/en.json"),
+            Some(b"server translation".to_vec())
+        );
+        assert_eq!(
+            remote_contents(&memory, "/srv/doorstop_config.ini"),
+            Some(b"host loader".to_vec())
+        );
+        let reopened = open(memory).unwrap();
+        assert!(reopened.warnings.is_empty());
+        assert_eq!(reopened.state.config.len(), 1);
+        assert!(reopened.state.config.contains_key(&ordinary));
     }
 
     #[test]
@@ -2364,6 +2676,95 @@ mod tests {
     }
 
     #[test]
+    fn external_restart_requires_explicit_acknowledgment_under_the_lease() {
+        let memory = remote();
+        let state = ServerDeploymentState {
+            version: state::VERSION,
+            restart_required: true,
+            ..Default::default()
+        };
+        memory
+            .lock()
+            .unwrap()
+            .put_file(STATE_REMOTE, &state::serialize(&state).unwrap());
+        let mut session = open(memory.clone()).unwrap();
+        assert!(session.state.restart_required);
+
+        let acknowledged = acknowledge_external_restart(&mut session, &meta()).unwrap();
+        assert!(!acknowledged.restart_required);
+        assert_eq!(acknowledged.operation_seq, 1);
+        assert_eq!(
+            acknowledged.last_operation.unwrap().restart,
+            RestartOutcome::ExternallyAcknowledged
+        );
+        assert!(!remote_has_dir(&memory, LEASE_DIR_REMOTE));
+        assert!(!open(memory.clone()).unwrap().state.restart_required);
+        assert!(acknowledge_external_restart(&mut session, &meta()).is_err());
+
+        // A later no-change deployment cannot resurrect the old reminder.
+        let fixture = mod_fixture();
+        let deployment = deploy(
+            &mut session,
+            no_connect,
+            &fixture.publication(),
+            &DesiredDeployment::default(),
+            &selection(false, false),
+            &context(),
+            &meta(),
+            None,
+            false,
+            |_| {},
+        )
+        .unwrap();
+        let state = finish(
+            &mut session,
+            deployment,
+            RestartOutcome::NotRequired,
+            &meta(),
+        )
+        .unwrap();
+        assert!(!state.restart_required);
+    }
+
+    #[test]
+    fn only_a_confirmed_gale_restart_clears_an_outstanding_restart() {
+        for (outcome, required) in [
+            (RestartOutcome::Restarted, false),
+            (RestartOutcome::StartupUnverified, true),
+            (RestartOutcome::Failed, true),
+            (RestartOutcome::NotRequired, true),
+        ] {
+            let fixture = mod_fixture();
+            let memory = remote();
+            let mut session = open(memory).unwrap();
+            let deployment = deploy(
+                &mut session,
+                no_connect,
+                &fixture.publication(),
+                &desired_payload(),
+                &selection(true, false),
+                &context(),
+                &meta(),
+                None,
+                false,
+                |_| {},
+            )
+            .unwrap();
+            let state = finish(&mut session, deployment, outcome, &meta()).unwrap();
+            assert_eq!(state.restart_required, required, "{outcome:?}");
+        }
+    }
+
+    #[test]
+    fn running_status_without_an_observed_stop_does_not_confirm_restart() {
+        let mut saw_stopped = false;
+        assert!(!observed_restart(&mut saw_stopped, Some(true)));
+        assert!(!observed_restart(&mut saw_stopped, None));
+        assert!(!observed_restart(&mut saw_stopped, Some(false)));
+        assert!(observed_restart(&mut saw_stopped, Some(true)));
+    }
+
+    #[test]
     fn set_config_policy_persists_to_remote_state() {
         let memory = remote();
         let mut session = open(memory.clone()).unwrap();
@@ -2696,9 +3097,8 @@ mod tests {
             .iter()
             .filter(|command| command.starts_with("USER "))
             .count();
-        assert_eq!(
-            logins_after,
-            logins_before + 1,
+        assert!(
+            logins_after > logins_before,
             "lease release must reconnect after the reset"
         );
         drop(post_deploy);
@@ -3036,6 +3436,43 @@ mod tests {
             server.file("/BepInEx/config/.gale-server-state.json"),
             Some(serde_json::to_vec(&moved).unwrap())
         );
+    }
+
+    #[test]
+    fn authoritative_state_read_reconnects_before_persisting_exact_bytes() {
+        use remote::fake_ftp::{FakeFtp, Options};
+
+        let server = FakeFtp::valheim_host(Options {
+            tls: true,
+            ..Default::default()
+        });
+        let target = "/BepInEx/config/.gale-server-state.json";
+        let initial = ServerDeploymentState {
+            version: state::VERSION,
+            ..Default::default()
+        };
+        server.seed_file(target, &state::serialize(&initial).unwrap());
+        let mut session = open_ftps(&server).unwrap();
+        session.state.restart_required = true;
+        let expected = state::serialize(&session.state).unwrap();
+
+        // The first RETR is the pre-write authoritative read. A lost
+        // completion response must not prevent its safe fresh-connection retry.
+        server.reset_on_retr(1, false);
+        persist_state(&mut session).unwrap();
+        let mut fresh = ftps_connection(&server).unwrap();
+        assert_eq!(
+            fresh
+                .read(&RemotePathBuf::new(target).unwrap(), state::MAX_STATE_BYTES)
+                .unwrap(),
+            Some(expected)
+        );
+
+        // A changed sequence still defeats the guard after reconnection.
+        server.seed_file(target, br#"{"version":2,"operationSeq":4}"#);
+        server.reset_on_retr(1, false);
+        let error = persist_state(&mut session).unwrap_err();
+        assert!(format!("{error:#}").contains("changed during this operation"));
     }
 
     /// A store that truncates the state temp file but still answers `226`

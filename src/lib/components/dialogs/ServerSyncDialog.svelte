@@ -21,7 +21,7 @@
 		WorkerStatus
 	} from '$lib/types';
 	import { listen } from '@tauri-apps/api/event';
-	import { message } from '@tauri-apps/plugin-dialog';
+	import { confirm, message } from '@tauri-apps/plugin-dialog';
 	import { untrack } from 'svelte';
 	import { m } from '$lib/paraglide/messages';
 
@@ -52,11 +52,31 @@
 	let workerAutoMods = $state(false);
 	let savingWorker = $state(false);
 	let savingPolicy = $state(false);
-	const busy = $derived(previewing || deploying || savingWorker || savingPolicy);
+	let acknowledgingRestart = $state(false);
+	let reviewOnly = $state(false);
+	const busy = $derived(
+		previewing || deploying || savingWorker || savingPolicy || acknowledgingRestart
+	);
+	const remainingDecisions = $derived(
+		preview?.plan.configEntries.filter(
+			(entry) => entry.action === 'pending' && !decisions[entry.path]
+		).length ?? 0
+	);
+	const visibleConfigEntries = $derived.by(() => {
+		const entries = preview?.plan.configEntries ?? [];
+		return entries
+			.filter((entry) => !reviewOnly || entry.action === 'pending')
+			.sort((a, b) => {
+				const aNeedsDecision = a.action === 'pending' && !decisions[a.path];
+				const bNeedsDecision = b.action === 'pending' && !decisions[b.path];
+				return Number(bNeedsDecision) - Number(aNeedsDecision);
+			});
+	});
 
 	$effect(() => {
 		if (!open) {
 			decisions = {};
+			reviewOnly = false;
 			preview = null;
 			result = null;
 			progress = null;
@@ -151,6 +171,24 @@
 			await api.profile.server.setConfigPolicy(path, policy, remotePassword, workerToken);
 		} finally {
 			savingPolicy = false;
+		}
+	}
+
+	async function acknowledgeRestart() {
+		if (!(await confirm(m.serverSync_acknowledgeRestartConfirm()))) return;
+		acknowledgingRestart = true;
+		try {
+			await api.profile.server.acknowledgeExternalRestart(remotePassword, workerToken);
+			preview = null;
+			approvedInput = '';
+			await loadStatus(true);
+		} catch (error) {
+			await message(error instanceof Error ? error.message : String(error), {
+				title: m.serverSync_acknowledgeRestartFailed(),
+				kind: 'error'
+			});
+		} finally {
+			acknowledgingRestart = false;
 		}
 	}
 
@@ -296,9 +334,14 @@
 						})}
 					</span>
 					{#if status.server.restartRequired}
-						<span class="text-orange-600 dark:text-orange-400"
-							>{m.serverSync_restartRequired()}</span
-						>
+						<div class="flex flex-wrap items-center justify-between gap-2">
+							<span class="text-orange-600 dark:text-orange-400"
+								>{m.serverSync_restartRequired()}</span
+							>
+							<Button disabled={busy} loading={acknowledgingRestart} onclick={acknowledgeRestart}>
+								{m.serverSync_acknowledgeRestart()}
+							</Button>
+						</div>
 					{/if}
 					{#if status.server.pendingConfigs > 0}
 						<span>{m.serverSync_pendingCount({ count: status.server.pendingConfigs })}</span>
@@ -445,11 +488,23 @@
 					<summary class="text-primary-700 dark:text-primary-300 cursor-pointer font-medium">
 						{m.serverSync_configFiles({ count: preview.plan.configEntries.length })}
 					</summary>
+					<div class="mt-2 flex flex-wrap items-center justify-between gap-2 text-sm">
+						<span class="text-orange-600 dark:text-orange-400">
+							{m.serverSync_reviewRemaining({ count: remainingDecisions })}
+						</span>
+						<Button disabled={busy} onclick={() => (reviewOnly = !reviewOnly)}>
+							{reviewOnly ? m.serverSync_showAllConfigs() : m.serverSync_reviewOnly()}
+						</Button>
+					</div>
 					<div
 						class="border-primary-300 dark:border-primary-600 bg-primary-50 dark:bg-primary-900 mt-2 max-h-64 overflow-auto rounded-lg border p-3 text-sm"
 					>
-						{#each preview.plan.configEntries as entry}
-							<div class="flex items-center gap-2 py-1">
+						{#each visibleConfigEntries as entry (entry.path)}
+							<div
+								class="flex items-center gap-2 py-1"
+								data-testid="server-config-row"
+								data-path={entry.path}
+							>
 								<span class="text-primary-700 dark:text-primary-300 grow font-mono wrap-anywhere">
 									{entry.path}
 								</span>

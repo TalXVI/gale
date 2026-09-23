@@ -6,6 +6,7 @@ use super::{
     state,
 };
 use crate::game::mod_loader::ModLoader;
+use crate::profile::export::ConfigPath;
 
 /// Top-level names inside a profile directory that belong to Gale itself and
 /// are never deployed.
@@ -214,6 +215,13 @@ impl DeploymentSpec {
         self.is_config(path) && !self.is_gale_internal(path) && !self.is_excluded(path)
     }
 
+    /// Only files in the loader's config directories can be governed by
+    /// server config decisions. The client publication also contains text
+    /// files in plugin and loader trees; those are not config write authority.
+    pub fn is_managed_config(&self, path: &ConfigPath) -> bool {
+        DeployPathBuf::new(path.as_str()).is_ok_and(|path| self.is_config_seed(&path))
+    }
+
     /// Whether a recorded state entry may authorize deleting the remote file
     /// at `path`. This is the boundary that keeps a tampered state file from
     /// widening deletion authority: only payload-scope paths qualify.
@@ -328,6 +336,28 @@ mod tests {
         assert!(!spec.valid_owned_path(&path("BepInEx/config/mod.cfg")));
         assert!(!spec.deploys(&path("BepInEx/config/mod.cfg"), false));
         assert!(spec.is_config_seed(&path("BepInEx/config/mod.cfg")));
+    }
+
+    #[test]
+    fn supported_config_scope_covers_each_loader_config_directory_only() {
+        let spec = DeploymentSpec::for_loader(&ModLoader {
+            package_name: None,
+            file_target: None,
+            kind: crate::game::mod_loader::ModLoaderKind::BepisLoader {
+                extra_subdirs: Vec::new(),
+            },
+        })
+        .unwrap();
+        for supported in ["BepInEx/config/mod.cfg", "Renderer/BepInEx/config/mod.cfg"] {
+            assert!(spec.is_managed_config(&ConfigPath::try_from(supported).unwrap()));
+        }
+        for unsupported in [
+            "BepInEx/plugins/Mod/translations/en.json",
+            "doorstop_config.ini",
+            "BepInEx/config/.gale-server-state.json",
+        ] {
+            assert!(!spec.is_managed_config(&ConfigPath::try_from(unsupported).unwrap()));
+        }
     }
 
     #[test]

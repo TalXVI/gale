@@ -546,6 +546,40 @@ async fn set_policy(
     }
 }
 
+async fn acknowledge_external_restart(
+    State(ctx): State<Arc<WorkerContext>>,
+    headers: HeaderMap,
+) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    let Ok(guard) = ctx.operation_lock.try_lock() else {
+        return busy_response("this worker");
+    };
+
+    let worker = Arc::clone(&ctx);
+    let meta = ctx.meta(OperationKind::Manual);
+    let result = tokio::task::spawn_blocking(move || {
+        let mut session = worker.open_session()?;
+        engine::acknowledge_external_restart(&mut session, &meta)
+    })
+    .await;
+    drop(guard);
+
+    match result {
+        Ok(Ok(state)) => {
+            if let Some(record) = state.last_operation {
+                if let Err(error) = ctx.journal.record_operation(record).await {
+                    warn!(%error, "failed to journal external restart acknowledgment");
+                }
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(Err(error)) => error_response(&error),
+        Err(error) => error_response(&eyre::eyre!(error)),
+    }
+}
+
 async fn configure(
     State(ctx): State<Arc<WorkerContext>>,
     headers: HeaderMap,
@@ -909,6 +943,7 @@ pub async fn run(
         .route("/v1/preview", post(preview))
         .route("/v1/deploy", post(deploy))
         .route("/v1/policy", post(set_policy))
+        .route("/v1/restart-ack", post(acknowledge_external_restart))
         .route("/v1/config", post(configure))
         .route("/v1/health", get(|| async { StatusCode::NO_CONTENT }))
         .with_state(ctx.clone());

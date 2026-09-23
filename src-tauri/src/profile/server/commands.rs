@@ -771,6 +771,34 @@ pub async fn set_server_config_policy(
     Ok(())
 }
 
+/// Explicitly records that the user verified a restart outside Gale.
+/// Reading a running status cannot establish that a restart happened.
+#[command]
+pub async fn acknowledge_external_server_restart(
+    request: ServerSyncStatusRequest,
+    app: AppHandle,
+) -> Result<()> {
+    let target = sync_target(&app)?;
+    match resolve_executor(&target, &request.password, &request.worker_token)? {
+        Executor::Worker(client) => client.acknowledge_external_restart().await?,
+        Executor::Local(credential) => {
+            let settings = target.settings.clone();
+            let mod_loader = target.mod_loader;
+            let meta = OperationMeta::local(
+                &target.profile_id.to_string(),
+                crate::profile::server::state::OperationKind::Manual,
+            );
+            tokio::task::spawn_blocking(move || {
+                let mut session = open_session_blocking(&settings, &credential, mod_loader)?;
+                engine::acknowledge_external_restart(&mut session, &meta).map(|_| ())
+            })
+            .await
+            .map_err(|err| eyre::eyre!("restart acknowledgment failed: {err}"))??;
+        }
+    }
+    Ok(())
+}
+
 /// Updates the worker's automation toggles and mirrors the state it
 /// confirmed into the stored settings, so both dialogs reflect the
 /// worker's actual behavior. Returns the worker's confirmed status.

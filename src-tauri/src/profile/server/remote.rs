@@ -30,6 +30,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// client's FIN arrives, so exceeding this means the peer is holding the
 /// channel open — the upload must fail rather than stall the deployment.
 const FTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Live failures begin near 40 seconds or 170 transfers on one control
+/// connection. Retire it before either observed boundary.
+const FTP_MAX_CONNECTION_AGE: Duration = Duration::from_secs(30);
+const FTP_MAX_TRANSFERS: u64 = 100;
 const SSH_TIMEOUT: Duration = Duration::from_millis(15_000);
 const SFTP_NO_SUCH_FILE: i32 = 2;
 /// FTP servers do not always implement `SIZE` for directories.
@@ -111,6 +115,8 @@ pub struct RemoteConnection {
     pub encrypted: bool,
     connected_at: Instant,
     transfer_count: u64,
+    ftp_max_age: Duration,
+    ftp_max_transfers: u64,
 }
 
 pub struct RemoteEntry {
@@ -353,7 +359,20 @@ impl RemoteConnection {
             encrypted,
             connected_at: Instant::now(),
             transfer_count: 0,
+            ftp_max_age: FTP_MAX_CONNECTION_AGE,
+            ftp_max_transfers: FTP_MAX_TRANSFERS,
         }
+    }
+
+    fn renew_ftp_if_needed(&mut self) -> Result<()> {
+        if matches!(self.client, RemoteClient::Ftp(_))
+            && (self.connected_at.elapsed() >= self.ftp_max_age
+                || self.transfer_count >= self.ftp_max_transfers)
+        {
+            self.reconnect()
+                .context("failed to renew FTP control connection")?;
+        }
+        Ok(())
     }
 
     fn connect_ftp(
@@ -441,6 +460,7 @@ enum FtpConnectError {
 
 impl RemoteOps for RemoteConnection {
     fn is_dir(&mut self, path: &RemotePath) -> Result<bool> {
+        self.renew_ftp_if_needed()?;
         match &mut self.client {
             RemoteClient::Sftp { sftp, .. } => match sftp.stat(Path::new(path.as_str())) {
                 Ok(stat) => Ok(stat.is_dir()),
@@ -469,6 +489,7 @@ impl RemoteOps for RemoteConnection {
     }
 
     fn file_size(&mut self, path: &RemotePath) -> Result<Option<u64>> {
+        self.renew_ftp_if_needed()?;
         match &mut self.client {
             RemoteClient::Sftp { sftp, .. } => match sftp.stat(Path::new(path.as_str())) {
                 Ok(stat) if stat.is_dir() => Ok(None),
@@ -489,6 +510,7 @@ impl RemoteOps for RemoteConnection {
     }
 
     fn list(&mut self, dir: &RemotePath) -> Result<Vec<RemoteEntry>> {
+        self.renew_ftp_if_needed()?;
         match &mut self.client {
             RemoteClient::Sftp { sftp, .. } => match sftp.readdir(Path::new(dir.as_str())) {
                 Ok(entries) => Ok(entries
@@ -536,6 +558,8 @@ impl RemoteOps for RemoteConnection {
                 "remote file {path} is {size} bytes, exceeding the {max}-byte limit"
             );
         }
+
+        self.renew_ftp_if_needed()?;
 
         let transfer = if matches!(self.client, RemoteClient::Ftp(_)) {
             self.transfer_count += 1;
@@ -604,6 +628,7 @@ impl RemoteOps for RemoteConnection {
     }
 
     fn is_file(&mut self, path: &RemotePath) -> Result<bool> {
+        self.renew_ftp_if_needed()?;
         match &mut self.client {
             RemoteClient::Sftp { sftp, .. } => match sftp.stat(Path::new(path.as_str())) {
                 Ok(stat) => Ok(!stat.is_dir()),
@@ -619,6 +644,7 @@ impl RemoteOps for RemoteConnection {
     }
 
     fn write(&mut self, path: &RemotePath, bytes: &[u8]) -> Result<()> {
+        self.renew_ftp_if_needed()?;
         match &mut self.client {
             RemoteClient::Sftp { sftp, .. } => {
                 let mut file = sftp.create(Path::new(path.as_str()))?;
@@ -641,6 +667,7 @@ impl RemoteOps for RemoteConnection {
     }
 
     fn upload(&mut self, local: &Path, remote: &RemotePath) -> Result<()> {
+        self.renew_ftp_if_needed()?;
         let mut file = File::open(local)
             .with_context(|| format!("failed to read staged file {}", local.display()))?;
         let expected_len = file
@@ -670,6 +697,7 @@ impl RemoteOps for RemoteConnection {
     }
 
     fn rename(&mut self, from: &RemotePath, to: &RemotePath) -> Result<()> {
+        self.renew_ftp_if_needed()?;
         match &mut self.client {
             RemoteClient::Sftp { sftp, .. } => {
                 sftp.rename(
@@ -687,6 +715,7 @@ impl RemoteOps for RemoteConnection {
     }
 
     fn delete_file(&mut self, path: &RemotePath) -> Result<bool> {
+        self.renew_ftp_if_needed()?;
         let deleted = match &mut self.client {
             RemoteClient::Sftp { sftp, .. } => match sftp.unlink(Path::new(path.as_str())) {
                 Ok(()) => true,
@@ -706,6 +735,7 @@ impl RemoteOps for RemoteConnection {
     }
 
     fn delete_dir(&mut self, path: &RemotePath) -> Result<()> {
+        self.renew_ftp_if_needed()?;
         match &mut self.client {
             RemoteClient::Sftp { sftp, .. } => match sftp.rmdir(Path::new(path.as_str())) {
                 Ok(()) => Ok(()),
@@ -721,6 +751,7 @@ impl RemoteOps for RemoteConnection {
     }
 
     fn ensure_dir(&mut self, path: &RemotePath) -> Result<()> {
+        self.renew_ftp_if_needed()?;
         match &mut self.client {
             RemoteClient::Sftp { sftp, .. } => match sftp.stat(Path::new(path.as_str())) {
                 Ok(_) => Ok(()),
@@ -744,6 +775,7 @@ impl RemoteOps for RemoteConnection {
     }
 
     fn claim_dir(&mut self, path: &RemotePath) -> Result<bool> {
+        self.renew_ftp_if_needed()?;
         match &mut self.client {
             RemoteClient::Sftp { sftp, .. } => match sftp.mkdir(Path::new(path.as_str()), 0o755) {
                 Ok(()) => Ok(true),
@@ -1165,6 +1197,8 @@ pub(crate) mod memory {
         pub fail_always: BTreeSet<String>,
         /// Simulates a dropped transport: reads and directory checks fail.
         pub connection_dead: bool,
+        /// Return FTP 550 when rename cannot find its source or overwrite.
+        pub ftp_rename_semantics: bool,
         pub write_events: Option<std::sync::mpsc::Sender<()>>,
     }
 
@@ -1178,6 +1212,7 @@ pub(crate) mod memory {
                 fail_once: BTreeSet::new(),
                 fail_always: BTreeSet::new(),
                 connection_dead: false,
+                ftp_rename_semantics: false,
                 write_events: None,
             }
         }
@@ -1303,6 +1338,17 @@ pub(crate) mod memory {
         }
 
         fn rename(&mut self, from: &RemotePath, to: &RemotePath) -> Result<()> {
+            if self.ftp_rename_semantics
+                && (!self.files.contains_key(from.as_str()) || self.files.contains_key(to.as_str()))
+            {
+                return Err(
+                    suppaftp::FtpError::UnexpectedResponse(suppaftp::types::Response::new(
+                        suppaftp::Status::FileUnavailable,
+                        b"550 rename refused".to_vec(),
+                    ))
+                    .into(),
+                );
+            }
             let bytes = self
                 .files
                 .remove(from.as_str())
@@ -1526,7 +1572,7 @@ pub(crate) mod fake_ftp {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use suppaftp::rustls::{
         ServerConfig, ServerConnection, StreamOwned, pki_types::PrivatePkcs8KeyDer,
@@ -1568,6 +1614,10 @@ pub(crate) mod fake_ftp {
         /// handshake never sees EOF: a wedged server the drain bound
         /// must turn into an upload failure.
         pub hold_stor_eof: bool,
+        /// Expire an individual control connection after this age.
+        pub expire_control_after: Option<Duration>,
+        /// Expire an individual control connection after this many data transfers.
+        pub expire_control_after_transfers: Option<usize>,
     }
 
     /// A running fake server. `fs` is shared with every accepted
@@ -2031,6 +2081,8 @@ pub(crate) mod fake_ftp {
         // dropped when the control session ends.
         let mut held_data: Vec<DataSocket> = Vec::new();
         let mut line = String::new();
+        let connected_at = Instant::now();
+        let mut transfers = 0usize;
 
         /// Opens the pending passive data connection, if any, and wraps
         /// it in TLS when the session negotiated `PROT P`.
@@ -2071,6 +2123,15 @@ pub(crate) mod fake_ftp {
             }
             let command = line.trim_end().to_owned();
             commands.lock().unwrap().push(command.clone());
+            if options
+                .expire_control_after
+                .is_some_and(|age| connected_at.elapsed() >= age)
+                || options
+                    .expire_control_after_transfers
+                    .is_some_and(|limit| transfers >= limit)
+            {
+                return;
+            }
             let verb = command
                 .split(' ')
                 .next()
@@ -2194,6 +2255,7 @@ pub(crate) mod fake_ftp {
                         "550 refused".to_owned()
                     }
                     Some(bytes) => {
+                        transfers += 1;
                         if !send(&mut writer, "150 opening data connection") {
                             return;
                         }
@@ -2231,6 +2293,7 @@ pub(crate) mod fake_ftp {
                     }
                 },
                 "STOR" => {
+                    transfers += 1;
                     if !send(&mut writer, "150 opening data connection") {
                         return;
                     }
@@ -2305,6 +2368,7 @@ pub(crate) mod fake_ftp {
                             "550 no such directory".to_owned()
                         }
                         Some(lines) => {
+                            transfers += 1;
                             if !send(&mut writer, "150 opening data connection") {
                                 return;
                             }
@@ -2385,6 +2449,7 @@ pub(crate) mod fake_ftp {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use suppaftp::rustls::{
         RootCertStore, SignatureScheme,
@@ -2838,6 +2903,91 @@ mod tests {
 
     fn remote_path(path: &str) -> RemotePathBuf {
         RemotePathBuf::new(path).unwrap()
+    }
+
+    #[test]
+    fn ftps_renews_before_control_connection_expires_by_age() {
+        let server = FakeFtp::spawn(FakeFtpOptions {
+            tls: true,
+            expire_control_after: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
+        server.seed_file("/state.json", b"state");
+
+        let mut expired = ftps_connect(&server);
+        expired.ftp_max_age = Duration::from_secs(60);
+        std::thread::sleep(Duration::from_millis(270));
+        assert!(
+            expired
+                .read(remote_path("/state.json").as_path(), 64)
+                .is_err()
+        );
+        drop(expired);
+
+        let mut conn = ftps_connect(&server);
+        conn.ftp_max_age = Duration::from_millis(100);
+        std::thread::sleep(Duration::from_millis(270));
+
+        assert_eq!(
+            conn.read(remote_path("/state.json").as_path(), 64).unwrap(),
+            Some(b"state".to_vec())
+        );
+        assert_eq!(
+            server
+                .commands
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|line| line.starts_with("USER "))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn ftps_renews_before_control_connection_expires_by_transfer_count() {
+        let server = FakeFtp::spawn(FakeFtpOptions {
+            tls: true,
+            expire_control_after_transfers: Some(4),
+            ..Default::default()
+        });
+        server.seed_file("/state.json", b"state");
+
+        let mut expired = ftps_connect(&server);
+        expired.ftp_max_transfers = 100;
+        for _ in 0..4 {
+            assert_eq!(
+                expired
+                    .read(remote_path("/state.json").as_path(), 64)
+                    .unwrap(),
+                Some(b"state".to_vec())
+            );
+        }
+        assert!(
+            expired
+                .read(remote_path("/state.json").as_path(), 64)
+                .is_err()
+        );
+        drop(expired);
+
+        let mut conn = ftps_connect(&server);
+        conn.ftp_max_transfers = 4;
+        for _ in 0..5 {
+            assert_eq!(
+                conn.read(remote_path("/state.json").as_path(), 64).unwrap(),
+                Some(b"state".to_vec())
+            );
+        }
+        assert_eq!(
+            server
+                .commands
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|line| line.starts_with("USER "))
+                .count(),
+            3
+        );
     }
 
     #[test]

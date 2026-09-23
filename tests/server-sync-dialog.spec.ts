@@ -1,6 +1,49 @@
 import { test, expect } from '@playwright/test';
 
 for (const mode of ['local', 'worker']) {
+	test(`${mode}: unresolved configs lead the list and review focus preserves approval inputs`, async ({
+		page
+	}) => {
+		await page.goto(`/tests/dialog/?mode=${mode}&many=1`);
+		await page.getByRole('button', { name: 'Refresh', exact: true }).waitFor();
+		await page.getByRole('button', { name: 'Preview', exact: true }).click();
+		const rows = page.getByTestId('server-config-row');
+		await expect(rows).toHaveCount(133);
+		await expect(rows.first()).toHaveAttribute('data-path', 'BepInEx/config/file-003.cfg');
+		await expect(page.getByText('31 files still need a decision')).toBeVisible();
+		await page.getByRole('button', { name: 'Show files needing review' }).click();
+		await expect(rows).toHaveCount(31);
+		await rows.first().getByRole('button', { name: 'Apply' }).click();
+		await expect(page.getByText('30 files still need a decision')).toBeVisible();
+		await expect(page.getByRole('button', { name: 'Deploy', exact: true })).toBeDisabled();
+		await page.getByRole('button', { name: 'Preview', exact: true }).click();
+		await expect(page.getByRole('button', { name: 'Deploy', exact: true })).toBeEnabled();
+		await page.getByRole('button', { name: 'Show all config files' }).click();
+		await expect(rows).toHaveCount(133);
+		await expect(page.getByRole('button', { name: 'Deploy', exact: true })).toBeEnabled();
+		await expect(rows.filter({ hasText: 'file-000.cfg' })).toBeVisible();
+		const selected = await page.evaluate(
+			() =>
+				(window as any).calls.filter((call: any) => call.cmd === 'preview_server_sync').at(-1).args
+					.request.selection
+		);
+		expect(selected.applyConfigs).toEqual(['BepInEx/config/file-003.cfg']);
+	});
+
+	test(`${mode}: explicit restart confirmation clears the reminder`, async ({ page }) => {
+		await page.goto(`/tests/dialog/?mode=${mode}&restart=1`);
+		await page.getByRole('button', { name: 'Preview', exact: true }).click();
+		await expect(page.getByRole('button', { name: 'Deploy', exact: true })).toBeEnabled();
+		await page.getByRole('button', { name: 'I confirmed the restart' }).click();
+		await expect(page.getByRole('button', { name: 'I confirmed the restart' })).toHaveCount(0);
+		await expect(page.getByRole('button', { name: 'Deploy', exact: true })).toBeDisabled();
+		const calls = await page.evaluate(() => (window as any).calls);
+		expect(calls.some((call: any) => call.cmd === 'plugin:dialog|message')).toBe(true);
+		expect(calls.some((call: any) => call.cmd === 'acknowledge_external_server_restart')).toBe(
+			true
+		);
+	});
+
 	for (const operation of [
 		'preview_server_sync',
 		'deploy_server_sync',

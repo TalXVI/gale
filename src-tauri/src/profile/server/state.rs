@@ -73,12 +73,14 @@ pub enum RestartOutcome {
     /// Players were present or presence was unknown, so a WhenEmpty restart
     /// was deferred.
     AwaitingEmpty,
-    /// A restart was issued and verified to the extent the provider allows.
+    /// A restart was issued and the provider reported a stop then a start.
     Restarted,
     /// A restart was issued but its result could not be verified.
     StartupUnverified,
     /// The restart attempt itself failed.
     Failed,
+    /// The user explicitly confirmed a restart performed outside Gale.
+    ExternallyAcknowledged,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -179,6 +181,17 @@ pub struct LoadedState {
     pub migrated: bool,
 }
 
+/// A transport failure while fetching an authoritative state file. The
+/// engine may retry this on a fresh connection; parse and version failures
+/// must fail closed instead.
+#[derive(Debug, thiserror::Error)]
+#[error("remote state read failed for {path}: {source}")]
+pub struct StateReadError {
+    path: String,
+    #[source]
+    source: eyre::Report,
+}
+
 impl ServerDeploymentState {
     /// Validates the state's authority scope against the deployment spec.
     ///
@@ -203,22 +216,17 @@ impl ServerDeploymentState {
             valid
         });
 
-        let retain_config = |path: &ConfigPath| {
-            DeployPathBuf::new(path.as_str())
-                .map(|path| spec.is_config(path.as_path()))
-                .unwrap_or(false)
-        };
-
-        self.config.retain(|path, _| {
-            let valid = retain_config(path);
-            if !valid {
-                warnings.push(format!(
-                    "remote state config entry '{path}' is outside the config directories and was ignored"
-                ));
-            }
-            valid
-        });
-        self.pending.retain(|path, _| retain_config(path));
+        let before_config = self.config.len();
+        let before_pending = self.pending.len();
+        self.config.retain(|path, _| spec.is_managed_config(path));
+        self.pending.retain(|path, _| spec.is_managed_config(path));
+        let ignored = before_config - self.config.len();
+        let ignored_pending = before_pending - self.pending.len();
+        if ignored > 0 || ignored_pending > 0 {
+            warnings.push(format!(
+                "ignored {ignored} out-of-scope server config record(s) and {ignored_pending} pending decision(s); their remote files were left untouched"
+            ));
+        }
 
         Ok(self)
     }
@@ -290,7 +298,13 @@ pub fn read_state(
 ) -> Result<LoadedState> {
     let mut warnings = Vec::new();
 
-    if let Some(bytes) = ops.read(state_remote_path, MAX_STATE_BYTES)? {
+    if let Some(bytes) = ops
+        .read(state_remote_path, MAX_STATE_BYTES)
+        .map_err(|source| StateReadError {
+            path: state_remote_path.to_string(),
+            source,
+        })?
+    {
         let state: ServerDeploymentState =
             serde_json::from_slice(&bytes).context("remote Gale deployment state is invalid")?;
         let state = state.validate(spec, &mut warnings)?;
@@ -301,7 +315,12 @@ pub fn read_state(
         });
     }
 
-    match ops.read(legacy_remote_path, MAX_STATE_BYTES)? {
+    match ops
+        .read(legacy_remote_path, MAX_STATE_BYTES)
+        .map_err(|source| StateReadError {
+            path: legacy_remote_path.to_string(),
+            source,
+        })? {
         Some(bytes) => {
             let legacy: LegacyManifest = serde_json::from_slice(&bytes)
                 .context("remote Gale deployment manifest is invalid")?;
@@ -495,6 +514,24 @@ mod tests {
             config_path("BepInEx/plugins/ModA.dll"),
             AppliedFile::default(),
         );
+        state.config.insert(
+            config_path("BepInEx/plugins/Mod/translations/en.json"),
+            AppliedFile::default(),
+        );
+        state
+            .config
+            .insert(config_path("doorstop_config.ini"), AppliedFile::default());
+        let supported = config_path("BepInEx/config/mod.cfg");
+        state
+            .config
+            .insert(supported.clone(), AppliedFile::default());
+        state.files.insert(
+            deploy("BepInEx/plugins/Mod/translations/en.json"),
+            OwnedFile {
+                hash: "x".to_owned(),
+                size: 1,
+            },
+        );
         state.pending.insert(
             config_path("BepInEx/plugins/ModA.dll"),
             PendingConfigReason::ModifiedLocally,
@@ -504,10 +541,12 @@ mod tests {
         remote.put_file(STATE_PATH, &serialize(&state).unwrap());
         let loaded = read(&mut remote).unwrap();
 
-        assert!(loaded.state.files.is_empty());
-        assert!(loaded.state.config.is_empty());
+        assert_eq!(loaded.state.files.len(), 1);
+        assert_eq!(loaded.state.config.len(), 1);
+        assert!(loaded.state.config.contains_key(&supported));
         assert!(loaded.state.pending.is_empty());
-        assert!(loaded.warnings.len() >= 2);
+        assert_eq!(loaded.warnings.len(), 2);
+        assert!(loaded.warnings[1].contains("ignored 3 out-of-scope"));
     }
 
     #[test]
