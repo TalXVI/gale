@@ -28,7 +28,7 @@ use super::{
         PreviewRequest, StatusResponse, WorkerRunPhase, WorkerRunReport,
     },
     config::WorkerConfig,
-    journal::{Journal, PendingWork, WorkerJournal, busy_marker},
+    journal::{Journal, WorkerJournal, busy_marker},
     secrets::Secrets,
     sync_client::{PublicationProbe, SyncClient},
 };
@@ -988,8 +988,8 @@ pub async fn run(
 mod tests {
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
 
-    use super::{AutoAction, PendingWork, automatic_action, retry_delay};
-    use crate::worker::journal::WorkerJournal;
+    use super::{AutoAction, automatic_action, retry_delay};
+    use crate::worker::journal::{PendingWork, WorkerJournal};
 
     fn journal() -> WorkerJournal {
         WorkerJournal {
