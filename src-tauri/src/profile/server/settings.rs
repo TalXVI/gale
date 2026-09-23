@@ -54,6 +54,24 @@ pub enum RestartPolicy {
     WhenEmpty,
 }
 
+/// Client-local defaults for manual deployments from the Sync dialog.
+/// The worker's unattended restart policy remains `remote.restart_policy`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DeployScope {
+    Mods,
+    Configs,
+    #[default]
+    Both,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SyncDialogPreferences {
+    pub scope: DeployScope,
+    pub restart_policy: RestartPolicy,
+}
+
 /// Hosting provider integration used for restart and presence checks.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -116,6 +134,10 @@ pub struct ProfileServerSettings {
 
     #[serde(default)]
     pub remote: RemoteServerSettings,
+
+    /// Saved only in this client's profile database; never in publications.
+    #[serde(default)]
+    pub sync_dialog: SyncDialogPreferences,
 }
 
 /// Settings used when launching a dedicated server on this machine.
@@ -528,6 +550,25 @@ mod tests {
         assert_eq!(settings.local.server_name, "My Server");
         assert_eq!(settings.local.port, 2456);
         assert_eq!(settings.remote.host, "example.com");
+        assert_eq!(settings.sync_dialog, Default::default());
+    }
+
+    #[test]
+    fn manual_dialog_defaults_round_trip_per_local_profile() {
+        let mut first = ProfileServerSettings::default();
+        first.sync_dialog.scope = super::DeployScope::Configs;
+        first.sync_dialog.restart_policy = RestartPolicy::WhenEmpty;
+        first.remote.restart_policy = RestartPolicy::Immediate;
+        let second = ProfileServerSettings::default();
+
+        let first: ProfileServerSettings =
+            serde_json::from_str(&serde_json::to_string(&first).unwrap()).unwrap();
+        let second: ProfileServerSettings =
+            serde_json::from_str(&serde_json::to_string(&second).unwrap()).unwrap();
+        assert_eq!(first.sync_dialog.scope, super::DeployScope::Configs);
+        assert_eq!(first.sync_dialog.restart_policy, RestartPolicy::WhenEmpty);
+        assert_eq!(first.remote.restart_policy, RestartPolicy::Immediate);
+        assert_eq!(second.sync_dialog, Default::default());
     }
 
     /// `"ftps"` is a distinct protocol on the wire: it must not collapse
@@ -588,6 +629,7 @@ mod tests {
                 ..Default::default()
             },
             remote: RemoteServerSettings::default(),
+            sync_dialog: super::SyncDialogPreferences::default(),
         };
 
         let value = serde_json::to_value(&settings).unwrap();

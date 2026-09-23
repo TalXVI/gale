@@ -1,6 +1,68 @@
 import { test, expect } from '@playwright/test';
 
 for (const mode of ['local', 'worker']) {
+	test(`${mode}: decisions do not reorder or scroll a long review list`, async ({ page }) => {
+		await page.goto(`/tests/dialog/?mode=${mode}&many=1`);
+		await page.getByRole('button', { name: 'Preview', exact: true }).click();
+		await page.getByRole('button', { name: 'Show files needing review' }).click();
+		const rows = page.getByTestId('server-config-row');
+		const list = rows.first().locator('..');
+		const before = await rows.evaluateAll((elements) =>
+			elements.map((row) => row.getAttribute('data-path'))
+		);
+		const row = rows.nth(20);
+		await list.evaluate((element) => {
+			element.scrollTop = 500;
+		});
+		await row.scrollIntoViewIfNeeded();
+		const scrollTop = await list.evaluate((element) => element.scrollTop);
+		expect(scrollTop).toBeGreaterThan(0);
+		await row.getByRole('button', { name: 'Apply' }).click();
+		await expect(page.getByText('30 files still need a decision')).toBeVisible();
+		expect(
+			await rows.evaluateAll((elements) => elements.map((item) => item.getAttribute('data-path')))
+		).toEqual(before);
+		expect(await list.evaluate((element) => element.scrollTop)).toBe(scrollTop);
+		await row.getByRole('button', { name: 'Undo' }).click();
+		await expect(page.getByText('31 files still need a decision')).toBeVisible();
+		expect(
+			await rows.evaluateAll((elements) => elements.map((item) => item.getAttribute('data-path')))
+		).toEqual(before);
+		expect(await list.evaluate((element) => element.scrollTop)).toBe(scrollTop);
+	});
+
+	test(`${mode}: dialog defaults survive reopen and remain profile-specific`, async ({ page }) => {
+		await page.goto(`/tests/dialog/?mode=${mode}&profile=first`);
+		const scope = page.getByRole('button', { name: 'Mods and selected configs' });
+		await scope.click();
+		await page.getByRole('option', { name: 'Mods only', exact: true }).click();
+		await page.getByRole('button', { name: 'Never (manual)' }).click();
+		await page.getByRole('option', { name: 'When empty', exact: true }).click();
+		await page.getByRole('button', { name: 'Close', exact: true }).click();
+		await page.getByRole('button', { name: 'Reopen sync dialog' }).click();
+		await expect(page.getByRole('button', { name: 'Mods only', exact: true })).toBeVisible();
+		await expect(page.getByRole('button', { name: 'When empty', exact: true })).toBeVisible();
+		await page.reload();
+		await expect(page.getByRole('button', { name: 'Mods only', exact: true })).toBeVisible();
+		await expect(page.getByRole('button', { name: 'When empty', exact: true })).toBeVisible();
+		await page.goto(`/tests/dialog/?mode=${mode}&profile=second`);
+		await expect(page.getByRole('button', { name: 'Mods and selected configs' })).toBeVisible();
+		await expect(page.getByRole('button', { name: 'Never (manual)' })).toBeVisible();
+		await page.goto(`/tests/dialog/?mode=${mode}&profile=first`);
+		await expect(page.getByRole('button', { name: 'Mods only', exact: true })).toBeVisible();
+		await expect(page.getByRole('button', { name: 'When empty', exact: true })).toBeVisible();
+		if (mode === 'worker') {
+			await page.getByText('Worker automation', { exact: true }).click();
+			await page.getByRole('button', { name: 'Save automation' }).click();
+			const request = await page.evaluate(
+				() =>
+					(window as any).calls.filter((call: any) => call.cmd === 'configure_worker').at(-1).args
+						.request
+			);
+			expect(request.restartPolicy).toBe('manual');
+		}
+	});
+
 	test(`${mode}: unresolved configs lead the list and review focus preserves approval inputs`, async ({
 		page
 	}) => {
@@ -110,7 +172,8 @@ for (const mode of ['local', 'worker']) {
 				await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
 			}
 			await page.keyboard.press('Escape');
-			await expect(page.getByRole('dialog')).toBeVisible();
+			await expect(page.getByRole('dialog')).toHaveAttribute('data-state', 'open');
+			await expect(button('Preview')).toBeVisible();
 			await expect(page.getByRole('option')).toHaveCount(0);
 			await expect(password).toHaveValue('test-secret');
 			expect(await page.evaluate(() => (window as any).calls)).toEqual(before);

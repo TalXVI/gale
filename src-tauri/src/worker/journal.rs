@@ -48,6 +48,10 @@ pub struct WorkerJournal {
     /// deployed without opening a remote session.
     #[serde(default)]
     pub deployed_mods_revision: Option<ModRevision>,
+    /// Managed published configs last evaluated successfully, including
+    /// evaluations that needed no write or left user decisions pending.
+    #[serde(default)]
+    pub evaluated_config_revision: Option<String>,
     /// The current sync refresh token (rotated on each token grant).
     /// Seeded from `GALE_WORKER_REFRESH_TOKEN` on first run.
     pub refresh_token: Option<String>,
@@ -73,6 +77,7 @@ impl Default for WorkerJournal {
             pending: None,
             last_deployed_revision: None,
             deployed_mods_revision: None,
+            evaluated_config_revision: None,
             refresh_token: None,
             auto_sync: false,
             auto_mods: false,
@@ -133,14 +138,17 @@ fn owed() -> bool {
 impl PendingWork {
     /// Fresh work for a newly observed publication. `owed_mods` records
     /// the publication's mod revision when it is not the one the remote
-    /// state last reported deployed; `configs_pending` is always owed —
-    /// a new publication always gets one automatic config evaluation.
-    pub fn new(revision: DateTime<Utc>, owed_mods: Option<ModRevision>) -> Self {
+    /// state last reported deployed. Config work depends on its own revision.
+    pub fn new(
+        revision: DateTime<Utc>,
+        owed_mods: Option<ModRevision>,
+        configs_pending: bool,
+    ) -> Self {
         Self {
             revision,
             mods_pending: owed_mods.is_some(),
             owed_mods,
-            configs_pending: true,
+            configs_pending,
             attempts: 0,
             next_attempt_at: None,
             last_error: None,
@@ -154,6 +162,28 @@ impl PendingWork {
 }
 
 impl WorkerJournal {
+    /// Records the latest publication without treating its timestamp as
+    /// evidence that either deployment phase changed.
+    pub fn observe_publication(
+        &mut self,
+        revision: DateTime<Utc>,
+        mods_revision: &ModRevision,
+        config_revision: &str,
+    ) {
+        let owed_mods = (self.deployed_mods_revision.as_ref() != Some(mods_revision))
+            .then(|| mods_revision.clone());
+        let configs_pending = self.evaluated_config_revision.as_deref() != Some(config_revision);
+        self.last_seen_revision = Some(revision);
+        self.pending = if owed_mods.is_none() && !configs_pending {
+            None
+        } else {
+            Some(PendingWork::new(revision, owed_mods, configs_pending))
+        };
+        if self.pending.is_none() {
+            self.last_deployed_revision = Some(revision);
+        }
+    }
+
     /// Records a deployment against outstanding work. Clearing is
     /// phase-scoped: a deployment only discharges the phases it actually
     /// ran, and only for publications it covers (`pending.revision <=
@@ -173,8 +203,12 @@ impl WorkerJournal {
         mods_deployed: bool,
         configs_done: bool,
         remote_mods: Option<ModRevision>,
+        config_revision: &str,
     ) {
         self.deployed_mods_revision = remote_mods;
+        if configs_done {
+            self.evaluated_config_revision = Some(config_revision.to_owned());
+        }
 
         // `last_deployed_revision` only names a publication whose phases
         // are *both* confirmed applied: either this operation ran them,
@@ -374,6 +408,7 @@ mod tests {
             state.refresh_token = Some("rotated".to_owned());
             state.auto_sync = true;
             state.auto_mods = true;
+            state.evaluated_config_revision = Some("managed-configs".to_owned());
             state.automation_seeded = true;
             state.last_seen_revision = Some(Utc::now());
             journal.save(&state).unwrap();
@@ -384,6 +419,10 @@ mod tests {
         assert_eq!(state.refresh_token.as_deref(), Some("rotated"));
         assert!(state.auto_sync);
         assert!(state.auto_mods);
+        assert_eq!(
+            state.evaluated_config_revision.as_deref(),
+            Some("managed-configs")
+        );
         assert!(state.automation_seeded);
         assert!(state.last_seen_revision.is_some());
     }
@@ -438,6 +477,70 @@ mod tests {
         ModRevision::try_from(byte.to_string().repeat(64)).unwrap()
     }
 
+    #[test]
+    fn publication_phases_follow_mod_and_managed_config_revisions() {
+        let first = Utc::now();
+        let mut state = WorkerJournal {
+            deployed_mods_revision: Some(mod_rev('a')),
+            evaluated_config_revision: Some("configs-a".into()),
+            ..Default::default()
+        };
+
+        state.observe_publication(first, &mod_rev('b'), "configs-a");
+        let work = state.pending.as_ref().unwrap();
+        assert!(work.mods_pending);
+        assert!(!work.configs_pending);
+        state.acknowledge_deployment(first, true, false, Some(mod_rev('b')), "configs-a");
+        assert!(state.pending.is_none());
+        assert_eq!(state.last_deployed_revision, Some(first));
+
+        let second = first + chrono::Duration::seconds(1);
+        state.observe_publication(second, &mod_rev('b'), "configs-b");
+        let work = state.pending.as_ref().unwrap();
+        assert!(!work.mods_pending);
+        assert!(work.configs_pending);
+        state.acknowledge_deployment(second, false, true, Some(mod_rev('b')), "configs-b");
+        assert!(state.pending.is_none());
+
+        let third = second + chrono::Duration::seconds(1);
+        state.observe_publication(third, &mod_rev('c'), "configs-c");
+        let work = state.pending.as_ref().unwrap();
+        assert!(work.mods_pending);
+        assert!(work.configs_pending);
+        state.acknowledge_deployment(third, true, false, Some(mod_rev('c')), "configs-c");
+        assert!(state.pending.as_ref().unwrap().configs_pending);
+        state.acknowledge_deployment(third, false, true, Some(mod_rev('c')), "configs-c");
+        assert!(state.pending.is_none());
+    }
+
+    #[test]
+    fn first_run_and_migrated_journal_evaluate_configs_once() {
+        let revision = Utc::now();
+        let mut state = WorkerJournal::default();
+        state.deployed_mods_revision = Some(mod_rev('a'));
+        state.observe_publication(revision, &mod_rev('a'), "configs-a");
+        assert!(state.pending.as_ref().unwrap().configs_pending);
+        state.acknowledge_deployment(revision, false, true, Some(mod_rev('a')), "configs-a");
+        assert_eq!(
+            state.evaluated_config_revision.as_deref(),
+            Some("configs-a")
+        );
+
+        let migrated: WorkerJournal = serde_json::from_value(serde_json::json!({
+            "deployedModsRevision": mod_rev('a').as_str(),
+            "lastSeenRevision": revision,
+        }))
+        .unwrap();
+        assert!(migrated.evaluated_config_revision.is_none());
+        let mut migrated = migrated;
+        migrated.observe_publication(
+            revision + chrono::Duration::seconds(1),
+            &mod_rev('a'),
+            "configs-a",
+        );
+        assert!(migrated.pending.as_ref().unwrap().configs_pending);
+    }
+
     #[tokio::test]
     async fn acknowledge_deployed_clears_only_covered_pending_work() {
         let mut state = WorkerJournal::default();
@@ -446,19 +549,19 @@ mod tests {
         let newer = Utc::now();
 
         // A full deployment covering the pending revision clears it.
-        state.pending = Some(PendingWork::new(older, Some(mod_rev('a'))));
-        state.acknowledge_deployment(deployed, true, true, Some(mod_rev('b')));
+        state.pending = Some(PendingWork::new(older, Some(mod_rev('a')), true));
+        state.acknowledge_deployment(deployed, true, true, Some(mod_rev('b')), "config-a");
         assert!(state.pending.is_none());
         assert_eq!(state.last_deployed_revision, Some(deployed));
 
         // A newer pending publication survives, since the deployment
         // didn't reach it.
-        state.pending = Some(PendingWork::new(newer, Some(mod_rev('c'))));
-        state.acknowledge_deployment(deployed, true, true, Some(mod_rev('b')));
+        state.pending = Some(PendingWork::new(newer, Some(mod_rev('c')), true));
+        state.acknowledge_deployment(deployed, true, true, Some(mod_rev('b')), "config-a");
         assert_eq!(state.pending.as_ref().unwrap().revision, newer);
 
         // last_deployed_revision advances monotonically, never backwards.
-        state.acknowledge_deployment(older, true, true, Some(mod_rev('a')));
+        state.acknowledge_deployment(older, true, true, Some(mod_rev('a')), "config-a");
         assert_eq!(state.last_deployed_revision, Some(deployed));
     }
 
@@ -469,9 +572,9 @@ mod tests {
         let mut state = WorkerJournal::default();
         let revision = Utc::now();
         let owed = mod_rev('a');
-        state.pending = Some(PendingWork::new(revision, Some(owed.clone())));
+        state.pending = Some(PendingWork::new(revision, Some(owed.clone()), true));
 
-        state.acknowledge_deployment(revision, false, true, Some(mod_rev('0')));
+        state.acknowledge_deployment(revision, false, true, Some(mod_rev('0')), "config-a");
 
         let pending = state.pending.as_ref().expect("mod work remains owed");
         assert!(pending.mods_pending);
@@ -483,7 +586,7 @@ mod tests {
         );
 
         // The subsequent mods-only deployment discharges what remained.
-        state.acknowledge_deployment(revision, true, false, Some(owed.clone()));
+        state.acknowledge_deployment(revision, true, false, Some(owed.clone()), "config-a");
         assert!(state.pending.is_none());
         assert_eq!(state.last_deployed_revision, Some(revision));
         assert_eq!(state.deployed_mods_revision.as_ref(), Some(&owed));
@@ -495,9 +598,9 @@ mod tests {
         // the phase stays owed so the retry re-runs it.
         let mut state = WorkerJournal::default();
         let revision = Utc::now();
-        state.pending = Some(PendingWork::new(revision, None));
+        state.pending = Some(PendingWork::new(revision, None, true));
 
-        state.acknowledge_deployment(revision, false, false, None);
+        state.acknowledge_deployment(revision, false, false, None, "config-a");
 
         let pending = state.pending.as_ref().expect("config work remains owed");
         assert!(!pending.mods_pending);
@@ -513,7 +616,7 @@ mod tests {
         let mut state = WorkerJournal::default();
         let revision = Utc::now();
         let owed = mod_rev('a');
-        state.pending = Some(PendingWork::new(revision, Some(owed.clone())));
+        state.pending = Some(PendingWork::new(revision, Some(owed.clone()), true));
 
         state.observe_remote_mods(&Some(mod_rev('b')));
         assert!(
@@ -557,11 +660,11 @@ mod tests {
         let mut state = WorkerJournal::default();
         let older = Utc::now() - chrono::Duration::hours(1);
         let newer = Utc::now();
-        state.pending = Some(PendingWork::new(older, Some(mod_rev('a'))));
+        state.pending = Some(PendingWork::new(older, Some(mod_rev('a')), true));
 
         // A config-only deploy of the newer publication discharges the
         // old config debt but not its mods.
-        state.acknowledge_deployment(newer, false, true, Some(mod_rev('b')));
+        state.acknowledge_deployment(newer, false, true, Some(mod_rev('b')), "config-a");
         let pending = state.pending.as_ref().expect("mods stay owed");
         assert!(pending.mods_pending);
         assert!(!pending.configs_pending);
@@ -569,7 +672,7 @@ mod tests {
 
         // A full deploy of the newer publication clears everything it
         // covered — the older revision's leftover work is obsolete.
-        state.acknowledge_deployment(newer, true, true, Some(mod_rev('c')));
+        state.acknowledge_deployment(newer, true, true, Some(mod_rev('c')), "config-a");
         assert!(state.pending.is_none());
         assert_eq!(state.last_deployed_revision, Some(newer));
     }
@@ -585,8 +688,8 @@ mod tests {
             let journal = Journal::load(dir.path()).unwrap();
             let mut state = journal.state.lock().await;
             state.last_seen_revision = Some(revision);
-            state.pending = Some(PendingWork::new(revision, Some(owed.clone())));
-            state.acknowledge_deployment(revision, false, true, Some(mod_rev('0')));
+            state.pending = Some(PendingWork::new(revision, Some(owed.clone()), true));
+            state.acknowledge_deployment(revision, false, true, Some(mod_rev('0')), "config-a");
             journal.save(&state).unwrap();
         }
 

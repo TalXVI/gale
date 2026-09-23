@@ -1,10 +1,15 @@
 import { mockIPC } from '@tauri-apps/api/mocks';
 import { mount } from 'svelte';
+import '../../src/app.css';
 
 const workerMode = new URLSearchParams(location.search).get('mode') === 'worker';
 const manyConfigs = new URLSearchParams(location.search).has('many');
 let restartRequired = new URLSearchParams(location.search).has('restart');
 const worker = { autoSync: false, autoMods: false, restartPolicy: 'manual' };
+const profileId = new URLSearchParams(location.search).get('profile') ?? 'first';
+const preferences = JSON.parse(
+	sessionStorage.getItem('mock-profile-preferences') ?? '{}'
+) as Record<string, { scope: string; restartPolicy: string }>;
 const configEntries = manyConfigs
 	? Array.from({ length: 133 }, (_, index) => ({
 			path: `BepInEx/config/file-${String(index).padStart(3, '0')}.cfg`,
@@ -80,6 +85,12 @@ mockIPC(async (cmd, args) => {
 					: null,
 				warnings: []
 			};
+		case 'get_sync_dialog_preferences':
+			return preferences[profileId] ?? { scope: 'both', restartPolicy: 'manual' };
+		case 'set_sync_dialog_preferences':
+			preferences[profileId] = (args as any).preferences;
+			sessionStorage.setItem('mock-profile-preferences', JSON.stringify(preferences));
+			return;
 		case 'acknowledge_external_server_restart':
 			restartRequired = false;
 			return;

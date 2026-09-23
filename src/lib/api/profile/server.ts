@@ -8,6 +8,7 @@ import type {
 	RemoteConnectionTestResult,
 	RemoteServerSettings,
 	RestartPolicy,
+	SyncDialogPreferences,
 	ServerSyncPreview,
 	ServerSyncResult,
 	ServerSyncStatus,
@@ -17,6 +18,12 @@ import type {
 
 export const getSettings = () =>
 	invoke<ProfileServerSettings | null>('get_dedicated_server_settings');
+
+export const getSyncDialogPreferences = () =>
+	invoke<SyncDialogPreferences>('get_sync_dialog_preferences');
+
+export const setSyncDialogPreferences = (preferences: SyncDialogPreferences) =>
+	invoke('set_sync_dialog_preferences', { preferences });
 
 /// Persists settings and credentials together. Empty credential fields
 /// leave stored credentials untouched; `rememberCredentials = false`

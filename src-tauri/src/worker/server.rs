@@ -383,6 +383,7 @@ async fn run_deployment(
     };
 
     let (publication, desired) = ctx.publication(selection.include_mods).await?;
+    let config_revision = managed_config_revision(&publication, &ctx.spec);
 
     let meta = ctx.meta(kind);
     {
@@ -421,6 +422,7 @@ async fn run_deployment(
                     response.plan.mods_phase,
                     response.plan.configs_phase && response.failed_config_writes.is_empty(),
                     response.state.mods_revision.clone(),
+                    &config_revision,
                 );
             }
             Err(_) => {
@@ -544,6 +546,23 @@ async fn set_policy(
         Ok(Err(err)) => error_response(&err),
         Err(err) => error_response(&eyre::eyre!(err)),
     }
+}
+
+/// The publication's server-managed config set, independent of mod revisions
+/// and of files that the deployment spec does not allow on the server.
+fn managed_config_revision(publication: &FetchedPublication, spec: &DeploymentSpec) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for (path, file) in publication
+        .config
+        .iter()
+        .filter(|(path, _)| spec.is_managed_config(path))
+    {
+        for value in [path.as_str(), file.hash.as_str()] {
+            hasher.update(&(value.len() as u64).to_le_bytes());
+            hasher.update(value.as_bytes());
+        }
+    }
+    hasher.finalize().to_hex().to_string()
 }
 
 async fn acknowledge_external_restart(
@@ -701,35 +720,30 @@ fn retry_delay(attempts: u32) -> Duration {
 /// One poll cycle. Observes the newest publication, then drives pending
 /// work.
 async fn poll_once(ctx: &Arc<WorkerContext>) {
-    let last_seen = ctx.journal.state.lock().await.last_seen_revision;
+    let last_seen = {
+        let state = ctx.journal.state.lock().await;
+        // A journal written before config revision tracking may already
+        // have seen this publication. Fetch it once unless config work is
+        // already owed; after classification, the pending marker is durable.
+        if state.evaluated_config_revision.is_none()
+            && !state
+                .pending
+                .as_ref()
+                .is_some_and(|work| work.configs_pending)
+        {
+            None
+        } else {
+            state.last_seen_revision
+        }
+    };
     match ctx.sync.poll(&ctx.journal, last_seen).await {
         Ok(PublicationProbe::New(publication)) => {
             let revision = publication.revision;
+            let config_revision = managed_config_revision(&publication, &ctx.spec);
             info!(%revision, "observed new publication");
             let mut state = ctx.journal.state.lock().await;
 
-            // Owed mod work is decided against the remote state's last
-            // reported revision: a config-only publication does not mark
-            // unchanged mods as owed, and an unknown mirror stays owed
-            // until a deployment or a refreshed status read settles it.
-            let owed_mods =
-                if state.deployed_mods_revision.as_ref() == Some(&publication.mods_revision) {
-                    None
-                } else {
-                    Some(publication.mods_revision.clone())
-                };
-
-            state.last_seen_revision = Some(revision);
-            // A newer publication supersedes whatever was pending. The
-            // worker always moves to the latest revision and never
-            // finishes applying an older one after a restart. A revision
-            // already fully deployed — e.g. by a manual deployment
-            // between polls — gets no pending marker at all.
-            state.pending = if state.last_deployed_revision == Some(revision) {
-                None
-            } else {
-                Some(PendingWork::new(revision, owed_mods))
-            };
+            state.observe_publication(revision, &publication.mods_revision, &config_revision);
             if let Err(err) = ctx.journal.save(&state) {
                 warn!(%err, "failed to persist observed revision");
             }
@@ -989,13 +1003,48 @@ mod tests {
     }
 
     #[test]
+    fn managed_config_revision_uses_only_sorted_managed_paths_and_hashes() {
+        use crate::profile::{
+            export::{ConfigPath, ContentHash},
+            sync::{FetchedPublication, archive::ValidatedConfigFile},
+        };
+        let game = crate::game::bundled_from_slug("valheim").unwrap();
+        let spec =
+            crate::profile::server::spec::DeploymentSpec::for_loader(&game.mod_loader).unwrap();
+        let mut publication = FetchedPublication {
+            revision: Utc::now(),
+            manifest: pack_manifest(),
+            mods_revision: owed_mod(),
+            config: Default::default(),
+        };
+        let file = |byte: u8| ValidatedConfigFile {
+            hash: ContentHash::from_hash(blake3::hash(&[byte])),
+            bytes: vec![byte],
+        };
+        let managed = ConfigPath::try_from("BepInEx/config/mod.cfg".to_owned()).unwrap();
+        let unmanaged = ConfigPath::try_from("BepInEx/plugins/readme.txt".to_owned()).unwrap();
+        publication.config.insert(managed.clone(), file(1));
+        let first = super::managed_config_revision(&publication, &spec);
+        publication.mods_revision =
+            crate::profile::export::ModRevision::try_from("b".repeat(64)).unwrap();
+        publication.config.insert(unmanaged.clone(), file(2));
+        assert_eq!(super::managed_config_revision(&publication, &spec), first);
+        publication.config.insert(unmanaged, file(3));
+        assert_eq!(super::managed_config_revision(&publication, &spec), first);
+        publication.config.insert(managed.clone(), file(4));
+        assert_ne!(super::managed_config_revision(&publication, &spec), first);
+        publication.config.remove(&managed);
+        assert_ne!(super::managed_config_revision(&publication, &spec), first);
+    }
+
+    #[test]
     fn pending_work_deploys_only_when_enabled_and_due() {
         let mut state = journal();
 
         // Nothing pending, so the loop is idle, not deploying.
         assert_eq!(automatic_action(&state, Utc::now()), AutoAction::Idle);
 
-        state.pending = Some(PendingWork::new(Utc::now(), Some(owed_mod())));
+        state.pending = Some(PendingWork::new(Utc::now(), Some(owed_mod()), true));
         assert_eq!(automatic_action(&state, Utc::now()), AutoAction::Deploy);
 
         // Automation disabled: the pending work is retained for later,
@@ -1022,7 +1071,7 @@ mod tests {
         // must not be silently deployed either.
         let mut state = journal();
         state.auto_mods = false;
-        state.pending = Some(PendingWork::new(Utc::now(), Some(owed_mod())));
+        state.pending = Some(PendingWork::new(Utc::now(), Some(owed_mod()), true));
 
         // Both phases owed → the config pass deploys.
         assert_eq!(automatic_action(&state, Utc::now()), AutoAction::Deploy);
@@ -1120,6 +1169,38 @@ mod tests {
         assert_eq!(state.pending.as_ref().unwrap().revision, revision);
         assert_eq!(state.last_deployed_revision, None);
         assert_eq!(state.last_error, None);
+    }
+
+    #[tokio::test]
+    async fn migrated_journal_refetches_an_already_seen_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let revision = Utc::now();
+        let api = spawn_sync_api(pack_manifest(), revision).await;
+        let mut config = worker_config(dir.path(), "127.0.0.1:0".into());
+        config.profile_id = SYNC_PROFILE.into();
+        config.sync_url = Some(api.url.clone());
+        let journal = crate::worker::journal::Journal::load(dir.path()).unwrap();
+        {
+            let mut state = journal.state.lock().await;
+            state.last_seen_revision = Some(revision);
+            state.last_deployed_revision = Some(revision);
+            journal.save(&state).unwrap();
+        }
+        let ctx = std::sync::Arc::new(
+            super::WorkerContext::new(
+                config,
+                super::Secrets {
+                    refresh_token: Some("refresh-seed".into()),
+                    ..worker_secrets()
+                },
+                journal,
+            )
+            .unwrap(),
+        );
+        super::poll_once(&ctx).await;
+        let state = ctx.journal.state.lock().await;
+        assert!(state.pending.as_ref().unwrap().configs_pending);
+        assert!(state.evaluated_config_revision.is_none());
     }
 
     fn status_config(dir: &std::path::Path) -> super::WorkerConfig {
@@ -1702,6 +1783,56 @@ mod tests {
         assert!(
             remote_state["modsRevision"].is_string(),
             "the mods phase ran and recorded the deployed revision"
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluated_config_conflict_remains_in_authoritative_server_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let sync_api = spawn_sync_api(pack_manifest(), Utc::now()).await;
+        let ftp = FakeFtp::valheim_host(FtpOptions::default());
+        ftp.seed_file("/BepInEx/config/mod.cfg", b"server-customization");
+        let mut config = worker_config(dir.path(), "127.0.0.1:0".to_owned());
+        config.profile_id = SYNC_PROFILE.to_owned();
+        config.sync_url = Some(sync_api.url.clone());
+        config.remote = RemoteServerSettings {
+            protocol: RemoteProtocol::Ftp,
+            host: "127.0.0.1".to_owned(),
+            port: ftp.addr.port(),
+            username: "u".to_owned(),
+            server_directory: "/".to_owned(),
+            ..RemoteServerSettings::default()
+        };
+        let journal = crate::worker::journal::Journal::load(dir.path()).unwrap();
+        {
+            let mut state = journal.state.lock().await;
+            state.auto_sync = true;
+            state.auto_mods = false;
+        }
+        let ctx = std::sync::Arc::new(
+            super::WorkerContext::new(
+                config,
+                super::Secrets {
+                    remote_password: Some("pw".to_owned()),
+                    refresh_token: Some("refresh-seed".to_owned()),
+                    ..worker_secrets()
+                },
+                journal,
+            )
+            .unwrap(),
+        );
+        super::poll_once(&ctx).await;
+        let state = ctx.journal.state.lock().await;
+        assert!(!state.pending.as_ref().unwrap().configs_pending);
+        assert!(state.evaluated_config_revision.is_some());
+        drop(state);
+        let remote_state: serde_json::Value =
+            serde_json::from_slice(&ftp.file("/BepInEx/config/.gale-server-state.json").unwrap())
+                .unwrap();
+        assert!(remote_state["pending"]["BepInEx/config/mod.cfg"].is_string());
+        assert_eq!(
+            ftp.file("/BepInEx/config/mod.cfg").unwrap(),
+            b"server-customization"
         );
     }
 

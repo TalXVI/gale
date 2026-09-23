@@ -326,7 +326,11 @@ export type ProfileServerSettings = {
 	crossplay: boolean;
 	extraArgs: string;
 	remote: RemoteServerSettings;
+	syncDialog?: SyncDialogPreferences;
 };
+
+export type DeployScope = 'mods' | 'configs' | 'both';
+export type SyncDialogPreferences = { scope: DeployScope; restartPolicy: RestartPolicy };
 
 export type RemoteConnectionTestResult =
 	| { status: 'connected'; fingerprint: string | null; encrypted: boolean }

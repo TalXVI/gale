@@ -10,6 +10,7 @@
 	import * as api from '$lib/api';
 	import type {
 		DeploySelection,
+		DeployScope,
 		PlanConfigEntry,
 		RestartPolicy,
 		ServerSyncPreview,
@@ -28,11 +29,10 @@
 	type Props = { open?: boolean };
 	let { open = $bindable(false) }: Props = $props();
 
-	type Scope = 'mods' | 'configs' | 'both';
 	/// What the user decided for one config path.
 	type Decision = 'apply' | 'restore' | 'decline';
 
-	let scope = $state<Scope>('both');
+	let scope = $state<DeployScope>('both');
 	let decisions = $state<Record<string, Decision>>({});
 	let status = $state<ServerSyncStatus | null>(null);
 	let preview = $state<ServerSyncPreview | null>(null);
@@ -50,12 +50,20 @@
 	let workerToken = $state('');
 	let workerAutoSync = $state(false);
 	let workerAutoMods = $state(false);
+	let workerRestartPolicy = $state<RestartPolicy>('manual');
 	let savingWorker = $state(false);
 	let savingPolicy = $state(false);
 	let acknowledgingRestart = $state(false);
 	let reviewOnly = $state(false);
+	let loadingPreferences = $state(false);
+	let savingPreferences = $state(false);
 	const busy = $derived(
-		previewing || deploying || savingWorker || savingPolicy || acknowledgingRestart
+		previewing ||
+			deploying ||
+			savingWorker ||
+			savingPolicy ||
+			savingPreferences ||
+			acknowledgingRestart
 	);
 	const remainingDecisions = $derived(
 		preview?.plan.configEntries.filter(
@@ -66,11 +74,7 @@
 		const entries = preview?.plan.configEntries ?? [];
 		return entries
 			.filter((entry) => !reviewOnly || entry.action === 'pending')
-			.sort((a, b) => {
-				const aNeedsDecision = a.action === 'pending' && !decisions[a.path];
-				const bNeedsDecision = b.action === 'pending' && !decisions[b.path];
-				return Number(bNeedsDecision) - Number(aNeedsDecision);
-			});
+			.sort((a, b) => Number(b.action === 'pending') - Number(a.action === 'pending'));
 	});
 
 	$effect(() => {
@@ -86,7 +90,10 @@
 			workerToken = '';
 			return;
 		}
-		untrack(() => void loadStatus(false));
+		untrack(() => {
+			void loadPreferences();
+			void loadStatus(false);
+		});
 		const listeners = Promise.all([
 			listen<ServerSyncProgress>('server_sync_progress', (event) => {
 				if (deploying) progress = event.payload;
@@ -105,10 +112,43 @@
 			if (status.worker) {
 				workerAutoSync = status.worker.autoSync;
 				workerAutoMods = status.worker.autoMods;
-				restartPolicy = status.worker.restartPolicy;
+				workerRestartPolicy = status.worker.restartPolicy;
 			}
 		} finally {
 			loadingStatus = false;
+		}
+	}
+
+	async function loadPreferences() {
+		loadingPreferences = true;
+		try {
+			const preferences = await api.profile.server.getSyncDialogPreferences();
+			scope = preferences.scope;
+			restartPolicy = preferences.restartPolicy;
+		} finally {
+			loadingPreferences = false;
+		}
+	}
+
+	async function savePreferences(nextScope: DeployScope, nextRestartPolicy: RestartPolicy) {
+		const previous = { scope, restartPolicy };
+		scope = nextScope;
+		restartPolicy = nextRestartPolicy;
+		savingPreferences = true;
+		try {
+			await api.profile.server.setSyncDialogPreferences({
+				scope: nextScope,
+				restartPolicy: nextRestartPolicy
+			});
+		} catch (error) {
+			scope = previous.scope;
+			restartPolicy = previous.restartPolicy;
+			await message(error instanceof Error ? error.message : String(error), {
+				title: m.serverSync_title(),
+				kind: 'error'
+			});
+		} finally {
+			savingPreferences = false;
 		}
 	}
 
@@ -228,12 +268,12 @@
 			const confirmed = await api.profile.server.configureWorker(
 				workerAutoSync,
 				workerAutoMods,
-				restartPolicy,
+				workerRestartPolicy,
 				workerToken
 			);
 			workerAutoSync = confirmed.autoSync;
 			workerAutoMods = confirmed.autoMods;
-			restartPolicy = confirmed.restartPolicy;
+			workerRestartPolicy = confirmed.restartPolicy;
 			await loadStatus(false);
 		} catch {
 			// The push failed — snap the controls back to the worker's
@@ -241,7 +281,7 @@
 			if (status?.worker) {
 				workerAutoSync = status.worker.autoSync;
 				workerAutoMods = status.worker.autoMods;
-				restartPolicy = status.worker.restartPolicy;
+				workerRestartPolicy = status.worker.restartPolicy;
 			}
 		} finally {
 			savingWorker = false;
@@ -401,8 +441,9 @@
 		<Select
 			type="single"
 			triggerClass="mt-1 w-full"
-			bind:value={scope}
-			disabled={busy}
+			value={scope}
+			onValueChange={(value) => savePreferences(value as DeployScope, restartPolicy)}
+			disabled={busy || loadingPreferences}
 			items={[
 				{ value: 'both', label: m.serverSync_scopeBoth() },
 				{ value: 'mods', label: m.serverSync_scopeMods() },
@@ -640,8 +681,9 @@
 			<Select
 				type="single"
 				triggerClass="w-40"
-				bind:value={restartPolicy}
-				disabled={busy}
+				value={restartPolicy}
+				onValueChange={(value) => savePreferences(scope, value as RestartPolicy)}
+				disabled={busy || loadingPreferences}
 				items={[
 					{ value: 'manual', label: m.serverSync_restartManual() },
 					{ value: 'immediate', label: m.serverSync_restartImmediate() },

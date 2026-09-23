@@ -35,7 +35,7 @@ use crate::{
             secrets::{ServerSecret, ServerSecrets},
             settings::{
                 ProfileServerSettings, RemoteServerSettings, RestartPolicy, ServerLocation,
-                SyncMode,
+                SyncDialogPreferences, SyncMode,
             },
             spec::DeploymentSpec,
             stage::{self, CachePayloadSource},
@@ -188,6 +188,31 @@ pub fn get_dedicated_server_settings(app: AppHandle) -> Option<ProfileServerSett
 }
 
 #[command]
+pub fn get_sync_dialog_preferences(app: AppHandle) -> SyncDialogPreferences {
+    app.lock_manager()
+        .active_profile()
+        .server_settings
+        .as_ref()
+        .map(|settings| settings.sync_dialog.clone())
+        .unwrap_or_default()
+}
+
+#[command]
+pub fn set_sync_dialog_preferences(
+    preferences: SyncDialogPreferences,
+    app: AppHandle,
+) -> Result<()> {
+    let mut manager = app.lock_manager();
+    let profile = manager.active_profile();
+    let profile_id = profile.id;
+    let (_, profile) = manager.profile_by_id_mut(profile_id)?;
+    let mut settings = profile.server_settings.clone().unwrap_or_default();
+    settings.sync_dialog = preferences;
+    profile.server_settings = Some(settings);
+    Ok(profile.save(&app, true)?)
+}
+
+#[command]
 pub async fn set_dedicated_server_settings(
     request: SaveServerSettingsRequest,
     app: AppHandle,
@@ -205,6 +230,12 @@ pub async fn set_dedicated_server_settings(
     let secrets = ServerSecrets::for_profile(profile_id)?;
 
     let mut settings = request.settings;
+    // A settings dialog opened earlier must not overwrite newer Sync-dialog
+    // defaults. That dedicated command owns this client-local field.
+    settings.sync_dialog = stored
+        .as_ref()
+        .map(|settings| settings.sync_dialog.clone())
+        .unwrap_or_default();
     if settings.location == ServerLocation::Remote
         && settings.remote.sync_mode == SyncMode::Worker
         && worker_config_differs(stored.as_ref(), &settings)
@@ -1275,6 +1306,7 @@ mod tests {
         let mut new = stored.clone();
         new.remote.host = "example.com".to_owned();
         new.local.server_name = "Other".to_owned();
+        new.sync_dialog.restart_policy = RestartPolicy::WhenEmpty;
         assert!(!worker_config_differs(Some(&stored), &new));
 
         // A stored binding that never pointed at a worker differs, as
