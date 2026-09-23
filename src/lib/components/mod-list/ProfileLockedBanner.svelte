@@ -1,8 +1,10 @@
 <script lang="ts">
 	import Icon from '@iconify/svelte';
-	import type { ClassValue } from 'clsx';
+	import { clsx, type ClassValue } from 'clsx';
 	import Info from '../ui/Info.svelte';
 	import profiles from '$lib/state/profile.svelte';
+	import server from '$lib/state/server.svelte';
+	import LocalServerStatus from '../misc/LocalServerStatus.svelte';
 	import { m } from '$lib/paraglide/messages';
 
 	type Props = {
@@ -12,18 +14,27 @@
 	let { class: classProp }: Props = $props();
 </script>
 
-<div
-	class={[
-		classProp,
-		'bg-primary-700 dark:text-primary-300 flex items-center rounded-lg py-1.5 pr-1 pl-3 text-white'
-	]}
->
-	<Icon icon="mdi:lock" class="mr-2 text-xl" />
-	<span class="mr-auto">{m.profileLockedBanner_title()}</span>
-
-	<Info
-		>{m.profileLockedBanner_content({
-			name: profiles.active?.sync?.owner.displayName ?? m.unknown()
-		})}</Info
+{#if profiles.active && server.isProfileLocked(profiles.active.id)}
+	<div class={clsx(classProp)}>
+		<p class="text-primary-700 dark:text-primary-300 mb-2 font-medium">
+			{m.profileLockedBanner_server()}
+		</p>
+		<LocalServerStatus />
+	</div>
+{:else}
+	<div
+		class={[
+			classProp,
+			'bg-primary-700 dark:text-primary-300 flex items-center rounded-lg py-1.5 pr-1 pl-3 text-white'
+		]}
 	>
-</div>
+		<Icon icon="mdi:lock" class="mr-2 text-xl" />
+		<span class="mr-auto">{m.profileLockedBanner_title()}</span>
+
+		<Info
+			>{m.profileLockedBanner_content({
+				name: profiles.active?.sync?.owner.displayName ?? m.unknown()
+			})}</Info
+		>
+	</div>
+{/if}

@@ -2,8 +2,8 @@
 //!
 //! Two concerns are deliberately separate:
 //!
-//! - **Setup** (`set_dedicated_server_settings`, `test_*_connection`)
-//!   persists settings and credentials.
+//! - **Setup** saves settings and credentials explicitly. Connection tests
+//!   only verify the supplied connection details.
 //! - **Routine synchronization** (`get_server_sync_status`,
 //!   `preview_server_sync`, `deploy_server_sync`, `set_server_config_policy`,
 //!   `configure_worker`) uses the stored settings plus stored credentials,
@@ -69,6 +69,10 @@ pub struct LaunchDedicatedServerRequest {
 pub struct SaveServerSettingsRequest {
     pub settings: ProfileServerSettings,
     #[serde(default)]
+    pub game_password: String,
+    #[serde(default)]
+    pub remember_game_password: bool,
+    #[serde(default)]
     pub remote_password: String,
     #[serde(default)]
     pub worker_token: String,
@@ -86,10 +90,6 @@ pub struct RemoteServerRequest {
     pub password: String,
     #[serde(default)]
     pub worker_token: String,
-    #[serde(default)]
-    pub dat_host_password: String,
-    #[serde(default)]
-    pub remember_password: bool,
 }
 
 /// Routine remote requests use stored settings; the credential fields only
@@ -255,6 +255,15 @@ pub async fn set_dedicated_server_settings(
         settings.remote.worker.auto_sync = confirmed.auto_sync;
         settings.remote.worker.auto_mods = confirmed.auto_mods;
         settings.remote.restart_policy = confirmed.restart_policy;
+    }
+
+    if settings.location == ServerLocation::Local {
+        persist_credential(
+            &secrets,
+            Some(ServerSecret::GamePassword),
+            &request.game_password,
+            request.remember_game_password,
+        )?;
     }
 
     save_settings_for(&app, profile_id, settings.clone())?;
@@ -524,12 +533,6 @@ pub async fn test_remote_server_connection(
         .await
         .map_err(|err| eyre::eyre!("remote connection worker failed: {err}"))??;
 
-    if matches!(result, ConnectionTestResult::Connected { .. }) {
-        // Save into the profile the test was started for. The network
-        // call awaited, so the active profile may have changed.
-        save_tested_connection_for(&app, profile_id, &secrets, &request, &credential)?;
-    }
-
     Ok(result)
 }
 
@@ -543,8 +546,7 @@ pub async fn test_worker_connection(
     request.settings.validate()?;
 
     let secrets = ServerSecrets::for_profile(profile_id)?;
-    // The profile's sync identity is captured before the await, since an
-    // active-profile switch must not mix identities or redirect the save.
+    // Capture the profile identity before awaiting the connection test.
     let sync_id = sync_id_for(&app, profile_id);
     let client = worker_client(&secrets, &request.settings, &request.worker_token)?;
     let status = client.status(false).await?;
@@ -560,14 +562,6 @@ pub async fn test_worker_connection(
         )
         .into());
     }
-
-    save_remote_request_for(&app, profile_id, &secrets, &request, "")?;
-    persist_credential(
-        &secrets,
-        Some(ServerSecret::WorkerToken),
-        &request.worker_token,
-        request.remember_password,
-    )?;
 
     Ok(status)
 }
@@ -1172,69 +1166,7 @@ fn active_profile_id(app: &AppHandle) -> i64 {
     app.lock_manager().active_profile().id
 }
 
-/// Persists a tested remote configuration into the profile the operation
-/// started on. After an awaited network call the active profile may have
-/// changed, and writing through `active_profile_mut` here would combine one
-/// profile's credentials with another's settings (R03).
-fn save_remote_request_for(
-    app: &AppHandle,
-    profile_id: i64,
-    secrets: &ServerSecrets,
-    request: &RemoteServerRequest,
-    credential: &str,
-) -> eyre::Result<()> {
-    save_remote_settings_for(app, profile_id, request.settings.clone())?;
-    persist_request_credentials(secrets, request, credential)
-}
-
-/// Persists a successful connection test. The proven transport settings
-/// and credentials land on the profile the test started for, while the
-/// stored executor (`sync_mode`/`worker`) and host-control configuration
-/// stay untouched: the dialog's current sync-mode selection may name a
-/// worker that does not exist yet, and a test must not activate it.
-fn save_tested_connection_for(
-    app: &AppHandle,
-    profile_id: i64,
-    secrets: &ServerSecrets,
-    request: &RemoteServerRequest,
-    credential: &str,
-) -> eyre::Result<()> {
-    let stored_remote = {
-        let manager = app.lock_manager();
-        let (_, profile) = manager.profile_by_id(profile_id)?;
-        profile
-            .server_settings
-            .as_ref()
-            .map(|settings| settings.remote.clone())
-            .unwrap_or_default()
-    };
-
-    save_remote_settings_for(
-        app,
-        profile_id,
-        stored_remote.with_tested_transport(&request.settings),
-    )?;
-    persist_request_credentials(secrets, request, credential)
-}
-
-fn persist_request_credentials(
-    secrets: &ServerSecrets,
-    request: &RemoteServerRequest,
-    credential: &str,
-) -> eyre::Result<()> {
-    if let Some(secret) = remote_secret(&request.settings)
-        && (!credential.is_empty() || !request.remember_password)
-    {
-        secrets.persist(secret, credential, request.remember_password)?;
-    }
-    persist_credential(
-        secrets,
-        Some(ServerSecret::DatHostPassword),
-        &request.dat_host_password,
-        request.remember_password,
-    )
-}
-
+/// Saves into the profile captured before any asynchronous work.
 fn save_settings_for(
     app: &AppHandle,
     profile_id: i64,

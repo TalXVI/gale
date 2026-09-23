@@ -5,6 +5,8 @@ for (const mode of ['local', 'worker']) {
 		await page.goto(`/tests/dialog/?mode=${mode}&many=1`);
 		await page.getByRole('button', { name: 'Preview', exact: true }).click();
 		await page.getByRole('button', { name: 'Show files needing review' }).click();
+		// Wait for the review font before measuring decision-induced scrolling.
+		await page.evaluate(() => document.fonts.ready.then(() => undefined));
 		const rows = page.getByTestId('server-config-row');
 		const list = rows.first().locator('..');
 		const before = await rows.evaluateAll((elements) =>
@@ -33,24 +35,34 @@ for (const mode of ['local', 'worker']) {
 
 	test(`${mode}: dialog defaults survive reopen and remain profile-specific`, async ({ page }) => {
 		await page.goto(`/tests/dialog/?mode=${mode}&profile=first`);
-		const scope = page.getByRole('button', { name: 'Mods and selected configs' });
+		const scope = page.getByLabel('Deployment scope', { exact: true });
 		await scope.click();
 		await page.getByRole('option', { name: 'Mods only', exact: true }).click();
-		await page.getByRole('button', { name: 'Never (manual)' }).click();
+		await page.getByLabel('Restart after deploying', { exact: true }).click();
 		await page.getByRole('option', { name: 'When empty', exact: true }).click();
 		await page.getByRole('button', { name: 'Close', exact: true }).click();
 		await page.getByRole('button', { name: 'Reopen sync dialog' }).click();
-		await expect(page.getByRole('button', { name: 'Mods only', exact: true })).toBeVisible();
-		await expect(page.getByRole('button', { name: 'When empty', exact: true })).toBeVisible();
+		await expect(page.getByLabel('Deployment scope', { exact: true })).toHaveText('Mods only');
+		await expect(page.getByLabel('Restart after deploying', { exact: true })).toHaveText(
+			'When empty'
+		);
 		await page.reload();
-		await expect(page.getByRole('button', { name: 'Mods only', exact: true })).toBeVisible();
-		await expect(page.getByRole('button', { name: 'When empty', exact: true })).toBeVisible();
+		await expect(page.getByLabel('Deployment scope', { exact: true })).toHaveText('Mods only');
+		await expect(page.getByLabel('Restart after deploying', { exact: true })).toHaveText(
+			'When empty'
+		);
 		await page.goto(`/tests/dialog/?mode=${mode}&profile=second`);
-		await expect(page.getByRole('button', { name: 'Mods and selected configs' })).toBeVisible();
-		await expect(page.getByRole('button', { name: 'Never (manual)' })).toBeVisible();
+		await expect(page.getByLabel('Deployment scope', { exact: true })).toHaveText(
+			'Mods and selected configs'
+		);
+		await expect(page.getByLabel('Restart after deploying', { exact: true })).toHaveText(
+			'Never (manual)'
+		);
 		await page.goto(`/tests/dialog/?mode=${mode}&profile=first`);
-		await expect(page.getByRole('button', { name: 'Mods only', exact: true })).toBeVisible();
-		await expect(page.getByRole('button', { name: 'When empty', exact: true })).toBeVisible();
+		await expect(page.getByLabel('Deployment scope', { exact: true })).toHaveText('Mods only');
+		await expect(page.getByLabel('Restart after deploying', { exact: true })).toHaveText(
+			'When empty'
+		);
 		if (mode === 'worker') {
 			await page.getByText('Worker automation', { exact: true }).click();
 			await page.getByRole('button', { name: 'Save automation' }).click();
@@ -116,7 +128,17 @@ for (const mode of ['local', 'worker']) {
 			const errors: string[] = [];
 			page.on('pageerror', (error) => errors.push(error.message));
 			await page.goto(`/tests/dialog/?mode=${mode}`);
-			const button = (name: string) => page.getByRole('button', { name, exact: true });
+			const button = (name: string) => {
+				if (name === 'Mods and selected configs')
+					return page.getByLabel('Deployment scope', { exact: true });
+				if (name === 'Never (manual)')
+					return page.getByLabel('Restart after deploying', { exact: true });
+				if (['Ask each update', 'Always apply updates'].includes(name))
+					return page.getByLabel('Future updates for BepInEx/config/test.cfg', { exact: true });
+				if (['Restore', 'Undo'].includes(name))
+					return page.getByRole('button', { name: `${name} BepInEx/config/test.cfg`, exact: true });
+				return page.getByRole('button', { name, exact: true });
+			};
 			await button('Refresh').waitFor();
 			await page.getByText('Credentials', { exact: true }).click();
 			const password = page.locator('input[type=password]');

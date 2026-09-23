@@ -20,6 +20,8 @@
 		RestartPolicy
 	} from '$lib/types';
 	import games from '$lib/state/game.svelte';
+	import server from '$lib/state/server.svelte';
+	import LocalServerStatus from '../misc/LocalServerStatus.svelte';
 	import { Tabs } from 'bits-ui';
 	import { confirm, message, open as openDialog } from '@tauri-apps/plugin-dialog';
 	import { m } from '$lib/paraglide/messages';
@@ -32,6 +34,7 @@
 
 	type Props = { open?: boolean };
 	let { open = $bindable(false) }: Props = $props();
+	const formId = $props.id();
 
 	let gamePassword = $state('');
 	let rememberGamePassword = $state(true);
@@ -63,6 +66,10 @@
 	let provisioning = $state(false);
 	let workerBusy = $state(false);
 	let syncDialogOpen = $state(false);
+	let syncing = $state(false);
+	const busy = $derived(
+		saving || launching || testing || testingWorker || provisioning || workerBusy || syncing
+	);
 
 	$effect(() => {
 		if (!open) {
@@ -259,31 +266,16 @@
 		if (!current) return;
 		testing = true;
 		try {
-			let result = await api.profile.server.testRemoteConnection(
-				current.remote,
-				remotePassword,
-				datHostPassword,
-				rememberRemotePassword
-			);
+			let result = await api.profile.server.testRemoteConnection(current.remote, remotePassword);
 			if (result.status === 'hostKeyUntrusted') {
 				if (!(await trustHost(result.fingerprint))) return;
 				current.remote.trustedHostKey = form.remote.trustedHostKey;
-				result = await api.profile.server.testRemoteConnection(
-					current.remote,
-					remotePassword,
-					datHostPassword,
-					rememberRemotePassword
-				);
+				result = await api.profile.server.testRemoteConnection(current.remote, remotePassword);
 			}
 			if (result.status === 'certificateUntrusted') {
 				if (!(await trustInvalidCertificate(result.fingerprint))) return;
 				current.remote.trustedCertificate = form.remote.trustedCertificate;
-				result = await api.profile.server.testRemoteConnection(
-					current.remote,
-					remotePassword,
-					datHostPassword,
-					rememberRemotePassword
-				);
+				result = await api.profile.server.testRemoteConnection(current.remote, remotePassword);
 			}
 			if (result.status !== 'connected') return;
 			await message(
@@ -307,11 +299,7 @@
 		if (!current) return;
 		testingWorker = true;
 		try {
-			const status = await api.profile.server.testWorkerConnection(
-				current.remote,
-				workerToken,
-				rememberRemotePassword
-			);
+			const status = await api.profile.server.testWorkerConnection(current.remote, workerToken);
 			await message(
 				m.dedicatedServerDialog_workerConnected({
 					workerId: status.workerId,
@@ -336,7 +324,9 @@
 				remotePassword,
 				workerToken,
 				datHostPassword,
-				rememberRemotePassword
+				rememberRemotePassword,
+				gamePassword,
+				rememberGamePassword
 			);
 			// Automation toggles may have changed — re-read the worker's own
 			// state so the pending banner reflects what it will actually do.
@@ -498,444 +488,519 @@
 	async function syncServer() {
 		const current = await checkedSettings();
 		if (!current) return;
-		await api.profile.server.setSettings(
-			current,
-			remotePassword,
-			workerToken,
-			datHostPassword,
-			rememberRemotePassword
-		);
-		syncDialogOpen = true;
+		syncing = true;
+		try {
+			await api.profile.server.setSettings(
+				current,
+				remotePassword,
+				workerToken,
+				datHostPassword,
+				rememberRemotePassword
+			);
+			syncDialogOpen = true;
+		} finally {
+			syncing = false;
+		}
 	}
 </script>
 
-<Dialog title={m.dedicatedServerDialog_title()} bind:open large>
+<Dialog title={m.dedicatedServerDialog_title()} bind:open canClose={!busy} large>
 	<p class="text-primary-600 dark:text-primary-300 mt-1">
 		{m.dedicatedServerDialog_content()}
 	</p>
 
+	<div class="mt-3"><LocalServerStatus /></div>
 	{#if loadingSettings}
 		<div class="text-primary-500 mt-5">{m.dedicatedServerDialog_loading()}</div>
 	{:else}
-		<TabsMenu
-			bind:value={form.location}
-			options={[
-				{ value: 'local', label: m.dedicatedServerDialog_locationLocal() },
-				{ value: 'remote', label: m.dedicatedServerDialog_locationRemote() }
-			]}
-		>
-			<Tabs.Content value="local">
-				<div class="mt-4 flex flex-col gap-3">
-					<div>
-						<Label>{m.dedicatedServerDialog_serverName()}</Label><InputField
-							class="mt-1 w-full"
-							bind:value={form.serverName}
-							placeholder={m.dedicatedServerDialog_serverNamePlaceholder()}
-						/>
-					</div>
-					<div>
-						<Label>{m.dedicatedServerDialog_world()}</Label><InputField
-							class="mt-1 w-full"
-							bind:value={form.world}
-							placeholder={m.dedicatedServerDialog_worldPlaceholder()}
-						/>
-					</div>
-					<div>
-						<Label>{m.dedicatedServerDialog_password()}</Label><InputField
-							class="mt-1 w-full"
-							bind:value={gamePassword}
-							type="password"
-						/>
-						<p class="text-primary-500 mt-1 text-sm">{m.dedicatedServerDialog_savedPassword()}</p>
-					</div>
-					<div class="flex items-center">
-						<Label>{m.dedicatedServerDialog_rememberPassword()}</Label><Info
-							>{m.dedicatedServerDialog_credentialInfo()}</Info
-						><Checkbox bind:checked={rememberGamePassword} />
-					</div>
-					<div>
-						<Label>{m.dedicatedServerDialog_serverPort()}</Label><InputField
-							class="mt-1 w-full"
-							bind:value={port}
-							inputmode="numeric"
-						/>
-					</div>
-					<div class="flex items-center">
-						<Label>{m.dedicatedServerDialog_public()}</Label><Info
-							>{m.dedicatedServerDialog_publicInfo()}</Info
-						><Checkbox bind:checked={form.publicServer} />
-					</div>
-					<div class="flex items-center">
-						<Label>{m.dedicatedServerDialog_crossplay()}</Label><Info
-							>{m.dedicatedServerDialog_crossplayInfo()}</Info
-						><Checkbox bind:checked={form.crossplay} />
-					</div>
-				</div>
-			</Tabs.Content>
-
-			<Tabs.Content value="remote">
-				<div class="mt-4 flex flex-col gap-3">
-					<InfoBox type={form.remote.protocol === 'ftp' ? 'warning' : 'info'}
-						>{form.remote.protocol === 'sftp'
-							? m.dedicatedServerDialog_sftpInfo()
-							: form.remote.protocol === 'ftps'
-								? m.dedicatedServerDialog_ftpsInfo()
-								: m.dedicatedServerDialog_ftpInfo()}</InfoBox
-					>
-					<div>
-						<Label>{m.dedicatedServerDialog_protocol()}</Label>
-						<Select
-							type="single"
-							triggerClass="mt-1 w-full"
-							value={form.remote.protocol}
-							onValueChange={(value) => changeRemoteProtocol(value as RemoteProtocol)}
-							items={[
-								{ value: 'sftp', label: m.dedicatedServerDialog_protocolSftp() },
-								{ value: 'ftps', label: m.dedicatedServerDialog_protocolFtps() },
-								{ value: 'ftp', label: m.dedicatedServerDialog_protocolFtp() }
-							]}
-						/>
-					</div>
-					<div>
-						<Label>{m.dedicatedServerDialog_host()}</Label><InputField
-							class="mt-1 w-full"
-							bind:value={form.remote.host}
-							placeholder="example.com"
-						/>
-					</div>
-					<div class="grid grid-cols-2 gap-3">
+		<fieldset disabled={busy}>
+			<TabsMenu
+				bind:value={form.location}
+				options={[
+					{ value: 'local', label: m.dedicatedServerDialog_locationLocal() },
+					{ value: 'remote', label: m.dedicatedServerDialog_locationRemote() }
+				]}
+			>
+				<Tabs.Content value="local">
+					<div class="mt-4 flex flex-col gap-3">
 						<div>
-							<Label
-								>{form.remote.protocol === 'sftp'
-									? m.dedicatedServerDialog_sshPort()
-									: m.dedicatedServerDialog_ftpPort()}</Label
-							><InputField class="mt-1 w-full" bind:value={remotePort} inputmode="numeric" />
-						</div>
-						<div>
-							<Label>{m.dedicatedServerDialog_username()}</Label><InputField
+							<Label for={`${formId}-field-1`}>{m.dedicatedServerDialog_serverName()}</Label
+							><InputField
+								id={`${formId}-field-1`}
 								class="mt-1 w-full"
-								bind:value={form.remote.username}
+								bind:value={form.serverName}
+								placeholder={m.dedicatedServerDialog_serverNamePlaceholder()}
 							/>
 						</div>
-					</div>
-					{#if form.remote.protocol === 'sftp'}
 						<div>
-							<Label>{m.dedicatedServerDialog_authentication()}</Label>
+							<Label for={`${formId}-field-2`}>{m.dedicatedServerDialog_world()}</Label><InputField
+								id={`${formId}-field-2`}
+								class="mt-1 w-full"
+								bind:value={form.world}
+								placeholder={m.dedicatedServerDialog_worldPlaceholder()}
+							/>
+						</div>
+						<div>
+							<Label for={`${formId}-field-3`}>{m.dedicatedServerDialog_password()}</Label
+							><InputField
+								id={`${formId}-field-3`}
+								class="mt-1 w-full"
+								aria-describedby={`${formId}-password-help`}
+								bind:value={gamePassword}
+								type="password"
+							/>
+							<p id={`${formId}-password-help`} class="text-primary-500 mt-1 text-sm">
+								{rememberGamePassword
+									? m.dedicatedServerDialog_savedPassword()
+									: m.dedicatedServerDialog_sessionPassword()}
+							</p>
+						</div>
+						<div class="flex items-center">
+							<Label for={`${formId}-field-4`}>{m.dedicatedServerDialog_rememberPassword()}</Label
+							><Info>{m.dedicatedServerDialog_credentialInfo()}</Info><Checkbox
+								id={`${formId}-field-4`}
+								bind:checked={rememberGamePassword}
+							/>
+						</div>
+						<div>
+							<Label for={`${formId}-field-5`}>{m.dedicatedServerDialog_serverPort()}</Label
+							><InputField
+								id={`${formId}-field-5`}
+								class="mt-1 w-full"
+								bind:value={port}
+								inputmode="numeric"
+							/>
+						</div>
+						<div class="flex items-center">
+							<Label for={`${formId}-field-6`}>{m.dedicatedServerDialog_public()}</Label><Info
+								>{m.dedicatedServerDialog_publicInfo()}</Info
+							><Checkbox id={`${formId}-field-6`} bind:checked={form.publicServer} />
+						</div>
+						<div class="flex items-center">
+							<Label for={`${formId}-field-7`}>{m.dedicatedServerDialog_crossplay()}</Label><Info
+								>{m.dedicatedServerDialog_crossplayInfo()}</Info
+							><Checkbox id={`${formId}-field-7`} bind:checked={form.crossplay} />
+						</div>
+					</div>
+				</Tabs.Content>
+
+				<Tabs.Content value="remote">
+					<div class="mt-4 flex flex-col gap-3">
+						<InfoBox type={form.remote.protocol === 'ftp' ? 'warning' : 'info'}
+							>{form.remote.protocol === 'sftp'
+								? m.dedicatedServerDialog_sftpInfo()
+								: form.remote.protocol === 'ftps'
+									? m.dedicatedServerDialog_ftpsInfo()
+									: m.dedicatedServerDialog_ftpInfo()}</InfoBox
+						>
+						<div>
+							<Label for={`${formId}-field-8`}>{m.dedicatedServerDialog_protocol()}</Label>
 							<Select
+								id={`${formId}-field-8`}
 								type="single"
 								triggerClass="mt-1 w-full"
-								bind:value={form.remote.authentication}
+								value={form.remote.protocol}
+								onValueChange={(value) => changeRemoteProtocol(value as RemoteProtocol)}
 								items={[
-									{ value: 'password', label: m.dedicatedServerDialog_password() },
-									{ value: 'privateKey', label: m.dedicatedServerDialog_privateKeyFile() },
-									{ value: 'agent', label: m.dedicatedServerDialog_sshAgent() }
+									{ value: 'sftp', label: m.dedicatedServerDialog_protocolSftp() },
+									{ value: 'ftps', label: m.dedicatedServerDialog_protocolFtps() },
+									{ value: 'ftp', label: m.dedicatedServerDialog_protocolFtp() }
 								]}
 							/>
 						</div>
-					{/if}
-					{#if form.remote.protocol === 'sftp' && form.remote.authentication === 'privateKey'}
-						<PathField
-							label={m.dedicatedServerDialog_privateKey()}
-							bind:value={form.remote.privateKeyPath}
-							onclick={choosePrivateKey}
-							icon="mdi:file-key"
-						>
-							{m.dedicatedServerDialog_privateKeyInfo()}
-						</PathField>
-					{/if}
-					{#if form.remote.protocol !== 'sftp' || form.remote.authentication !== 'agent'}
 						<div>
-							<Label
-								>{form.remote.protocol !== 'sftp' || form.remote.authentication === 'password'
-									? m.dedicatedServerDialog_password()
-									: m.dedicatedServerDialog_keyPassphrase()}</Label
-							>
-							<InputField class="mt-1 w-full" bind:value={remotePassword} type="password" />
-							<p class="text-primary-500 mt-1 text-sm">
-								{form.remote.protocol !== 'sftp' || form.remote.authentication === 'password'
-									? m.dedicatedServerDialog_savedPassword()
-									: m.dedicatedServerDialog_remoteSavedPassphrase()}
-							</p>
+							<Label for={`${formId}-field-9`}>{m.dedicatedServerDialog_host()}</Label><InputField
+								id={`${formId}-field-9`}
+								class="mt-1 w-full"
+								bind:value={form.remote.host}
+								placeholder="example.com"
+							/>
 						</div>
-					{/if}
-					<div>
-						<Label>{m.dedicatedServerDialog_directory()}</Label><InputField
-							class="mt-1 w-full"
-							bind:value={form.remote.serverDirectory}
-							placeholder="/home/valheim/server"
-						/>
-					</div>
-					<div>
-						<Button
-							color="primary"
-							icon="mdi:lan-connect"
-							loading={testing}
-							onclick={testConnection}>{m.dedicatedServerDialog_test()}</Button
-						>
-					</div>
-
-					<div class="border-primary-300 dark:border-primary-600 mt-2 border-t pt-3">
-						<Label>{m.dedicatedServerDialog_syncMode()}</Label>
-						<Select
-							type="single"
-							triggerClass="mt-1 w-full"
-							bind:value={syncChoice}
-							items={[
-								{ value: 'local', label: m.dedicatedServerDialog_syncModeLocal() },
-								...(localWorker?.supported
-									? [
-											{
-												value: 'hostedWorker',
-												label: m.dedicatedServerDialog_syncModeHostedWorker()
-											}
-										]
-									: []),
-								{ value: 'worker', label: m.dedicatedServerDialog_syncModeWorker() }
-							]}
-						/>
-						<p class="text-primary-500 mt-1 text-sm">
-							{syncChoice === 'worker'
-								? m.dedicatedServerDialog_syncModeWorkerInfo()
-								: syncChoice === 'hostedWorker'
-									? m.dedicatedServerDialog_syncModeHostedWorkerInfo()
-									: m.dedicatedServerDialog_syncModeLocalInfo()}
-						</p>
-					</div>
-
-					{#if syncChoice === 'hostedWorker'}
-						{#if localWorker?.ownership === 'foreign'}
-							<InfoBox type="warning">{m.dedicatedServerDialog_localWorkerForeign()}</InfoBox>
-						{:else if localWorker === null || localWorker.service === 'notInstalled'}
-							<InfoBox type="info">{m.dedicatedServerDialog_localWorkerProvisionInfo()}</InfoBox>
+						<div class="grid grid-cols-2 gap-3">
 							<div>
-								<Button
-									color="primary"
-									icon="mdi:server-plus"
-									loading={provisioning}
-									onclick={provisionWorker}>{m.dedicatedServerDialog_localWorkerProvision()}</Button
-								>
+								<Label for={`${formId}-remote-port`}
+									>{form.remote.protocol === 'sftp'
+										? m.dedicatedServerDialog_sshPort()
+										: m.dedicatedServerDialog_ftpPort()}</Label
+								><InputField
+									id={`${formId}-remote-port`}
+									class="mt-1 w-full"
+									bind:value={remotePort}
+									inputmode="numeric"
+								/>
 							</div>
-							{#if provisioning}
-								<p class="text-primary-500 text-sm">
-									{m.dedicatedServerDialog_localWorkerProvisioning()}
-								</p>
-							{/if}
-						{:else}
-							<div class="flex flex-col gap-2">
-								<p class="text-primary-600 dark:text-primary-300 text-sm">
-									{m.dedicatedServerDialog_localWorkerStatus({
-										state: localWorkerStateLabel(localWorker.service)
-									})}
-									{#if localWorker.binding}
-										— {localWorker.binding.address}
-									{/if}
-								</p>
-								{#if localWorker.ownership === 'incomplete'}
-									<InfoBox type="warning">{m.dedicatedServerDialog_localWorkerIncomplete()}</InfoBox
-									>
-									<div>
-										<Button
-											color="primary"
-											icon="mdi:server-plus"
-											loading={provisioning}
-											onclick={provisionWorker}
-											>{m.dedicatedServerDialog_localWorkerFinishSetup()}</Button
-										>
-									</div>
-								{/if}
-								{#if localWorker.stoppedForShutdown}
-									<InfoBox type="info">{m.dedicatedServerDialog_localWorkerShutdown()}</InfoBox>
-								{:else if localWorker.service !== 'running' && localWorker.run?.phase === 'running'}
-									<InfoBox type="warning">{m.dedicatedServerDialog_localWorkerCrash()}</InfoBox>
-								{:else if localWorker.service !== 'running'}
-									<InfoBox type="info">{m.dedicatedServerDialog_localWorkerOffline()}</InfoBox>
-								{:else if localWorker.worker === null && localWorker.workerError}
-									<InfoBox type="warning">{localWorker.workerError}</InfoBox>
-								{/if}
-								{#if localWorker.pendingPublication}
-									<InfoBox type="info">{pendingLabel(localWorker.pendingPublication)}</InfoBox>
-								{/if}
-								{#if localWorker.updateAvailable}
-									<InfoBox type="info">{m.dedicatedServerDialog_localWorkerUpdateInfo()}</InfoBox>
-								{/if}
-								{#each localWorker.warnings as warning (warning)}
-									<InfoBox type="warning">{warning}</InfoBox>
-								{/each}
-								<div class="flex flex-wrap gap-2">
-									{#if localWorker.service === 'stopped'}
-										<Button
-											color="primary"
-											icon="mdi:play"
-											loading={workerBusy}
-											onclick={() => controlWorker('start')}
-											>{m.dedicatedServerDialog_localWorkerStart()}</Button
-										>
-									{:else if localWorker.service === 'running'}
-										<Button
-											color="primary"
-											icon="mdi:stop"
-											loading={workerBusy}
-											onclick={() => controlWorker('stop')}
-											>{m.dedicatedServerDialog_localWorkerStop()}</Button
-										>
-										<Button
-											color="primary"
-											icon="mdi:restart"
-											loading={workerBusy}
-											onclick={() => controlWorker('restart')}
-											>{m.dedicatedServerDialog_localWorkerRestart()}</Button
-										>
-									{/if}
-									{#if localWorker.updateAvailable}
-										<Button
-											color="primary"
-											icon="mdi:update"
-											loading={workerBusy}
-											onclick={updateWorker}>{m.dedicatedServerDialog_localWorkerUpdate()}</Button
-										>
-									{/if}
-									<Button
-										color="primary"
-										icon="mdi:delete"
-										loading={workerBusy}
-										onclick={uninstallWorker}
-										>{m.dedicatedServerDialog_localWorkerUninstall()}</Button
-									>
-								</div>
+							<div>
+								<Label for={`${formId}-field-10`}>{m.dedicatedServerDialog_username()}</Label
+								><InputField
+									id={`${formId}-field-10`}
+									class="mt-1 w-full"
+									bind:value={form.remote.username}
+								/>
+							</div>
+						</div>
+						{#if form.remote.protocol === 'sftp'}
+							<div>
+								<Label for={`${formId}-field-11`}>{m.dedicatedServerDialog_authentication()}</Label>
+								<Select
+									id={`${formId}-field-11`}
+									type="single"
+									triggerClass="mt-1 w-full"
+									bind:value={form.remote.authentication}
+									items={[
+										{ value: 'password', label: m.dedicatedServerDialog_password() },
+										{ value: 'privateKey', label: m.dedicatedServerDialog_privateKeyFile() },
+										{ value: 'agent', label: m.dedicatedServerDialog_sshAgent() }
+									]}
+								/>
 							</div>
 						{/if}
-					{:else if syncChoice === 'worker'}
+						{#if form.remote.protocol === 'sftp' && form.remote.authentication === 'privateKey'}
+							<PathField
+								label={m.dedicatedServerDialog_privateKey()}
+								bind:value={form.remote.privateKeyPath}
+								onclick={choosePrivateKey}
+								icon="mdi:file-key"
+							>
+								{m.dedicatedServerDialog_privateKeyInfo()}
+							</PathField>
+						{/if}
+						{#if form.remote.protocol !== 'sftp' || form.remote.authentication !== 'agent'}
+							<div>
+								<Label for={`${formId}-remote-password`}
+									>{form.remote.protocol !== 'sftp' || form.remote.authentication === 'password'
+										? m.dedicatedServerDialog_password()
+										: m.dedicatedServerDialog_keyPassphrase()}</Label
+								>
+								<InputField
+									id={`${formId}-remote-password`}
+									class="mt-1 w-full"
+									bind:value={remotePassword}
+									type="password"
+								/>
+								<p class="text-primary-500 mt-1 text-sm">
+									{form.remote.protocol !== 'sftp' || form.remote.authentication === 'password'
+										? m.dedicatedServerDialog_savedPassword()
+										: m.dedicatedServerDialog_remoteSavedPassphrase()}
+								</p>
+							</div>
+						{/if}
 						<div>
-							<Label>{m.dedicatedServerDialog_workerAddress()}</Label><InputField
+							<Label for={`${formId}-field-12`}>{m.dedicatedServerDialog_directory()}</Label
+							><InputField
+								id={`${formId}-field-12`}
 								class="mt-1 w-full"
-								bind:value={form.remote.worker.address}
-								placeholder="https://worker.example.com"
+								bind:value={form.remote.serverDirectory}
+								placeholder="/home/valheim/server"
 							/>
-						</div>
-						<div>
-							<Label>{m.dedicatedServerDialog_workerToken()}</Label><InputField
-								class="mt-1 w-full"
-								bind:value={workerToken}
-								type="password"
-							/>
-							<p class="text-primary-500 mt-1 text-sm">
-								{m.dedicatedServerDialog_savedPassword()}
-							</p>
 						</div>
 						<div>
 							<Button
 								color="primary"
 								icon="mdi:lan-connect"
-								loading={testingWorker}
-								onclick={testWorker}>{m.dedicatedServerDialog_testWorker()}</Button
+								loading={testing}
+								onclick={testConnection}>{m.dedicatedServerDialog_test()}</Button
 							>
 						</div>
-					{/if}
-					{#if syncChoice !== 'local'}
-						<div class="flex items-center">
-							<Label>{m.dedicatedServerDialog_workerAutoSync()}</Label><Info
-								>{m.dedicatedServerDialog_workerAutoSyncInfo()}</Info
-							><Checkbox bind:checked={form.remote.worker.autoSync} />
-						</div>
-						<div class="flex items-center">
-							<Label>{m.dedicatedServerDialog_workerAutoMods()}</Label><Info
-								>{m.dedicatedServerDialog_workerAutoModsInfo()}</Info
-							><Checkbox bind:checked={form.remote.worker.autoMods} />
-						</div>
-					{/if}
 
-					<div>
-						<Label>{m.dedicatedServerDialog_hostProvider()}</Label>
-						<Select
-							type="single"
-							triggerClass="mt-1 w-full"
-							bind:value={form.remote.hostControl.provider}
-							items={[
-								{ value: 'none', label: m.dedicatedServerDialog_hostProviderNone() },
-								{ value: 'datHost', label: 'DatHost' }
-							]}
-						/>
-						<p class="text-primary-500 mt-1 text-sm">
-							{m.dedicatedServerDialog_hostProviderInfo()}
+						<p class="text-primary-600 dark:text-primary-300 text-sm">
+							{m.dedicatedServerDialog_testUnsaved()}
 						</p>
-					</div>
-					{#if form.remote.hostControl.provider === 'datHost'}
-						<div>
-							<Label>{m.dedicatedServerDialog_datHostServerId()}</Label><InputField
-								class="mt-1 w-full"
-								bind:value={form.remote.hostControl.datHostServerId}
-							/>
-						</div>
-						<div>
-							<Label>{m.dedicatedServerDialog_datHostUsername()}</Label><InputField
-								class="mt-1 w-full"
-								bind:value={form.remote.hostControl.datHostUsername}
-								placeholder="you@example.com"
-							/>
-						</div>
-						<div>
-							<Label>{m.dedicatedServerDialog_datHostPassword()}</Label><InputField
-								class="mt-1 w-full"
-								bind:value={datHostPassword}
-								type="password"
+						<div class="border-primary-300 dark:border-primary-600 mt-2 border-t pt-3">
+							<Label for={`${formId}-field-13`}>{m.dedicatedServerDialog_syncMode()}</Label>
+							<Select
+								id={`${formId}-field-13`}
+								type="single"
+								triggerClass="mt-1 w-full"
+								bind:value={syncChoice}
+								items={[
+									{ value: 'local', label: m.dedicatedServerDialog_syncModeLocal() },
+									...(localWorker?.supported
+										? [
+												{
+													value: 'hostedWorker',
+													label: m.dedicatedServerDialog_syncModeHostedWorker()
+												}
+											]
+										: []),
+									{ value: 'worker', label: m.dedicatedServerDialog_syncModeWorker() }
+								]}
 							/>
 							<p class="text-primary-500 mt-1 text-sm">
-								{m.dedicatedServerDialog_savedPassword()}
+								{syncChoice === 'worker'
+									? m.dedicatedServerDialog_syncModeWorkerInfo()
+									: syncChoice === 'hostedWorker'
+										? m.dedicatedServerDialog_syncModeHostedWorkerInfo()
+										: m.dedicatedServerDialog_syncModeLocalInfo()}
 							</p>
 						</div>
-					{/if}
-					<div>
-						<Label>{m.dedicatedServerDialog_restartPolicy()}</Label>
-						<Select
-							type="single"
-							triggerClass="mt-1 w-full"
-							bind:value={form.remote.restartPolicy}
-							items={[
-								{ value: 'manual', label: m.dedicatedServerDialog_restartManual() },
-								{ value: 'immediate', label: m.dedicatedServerDialog_restartImmediate() },
-								{ value: 'whenEmpty', label: m.dedicatedServerDialog_restartWhenEmpty() }
-							]}
-						/>
-						<p class="text-primary-500 mt-1 text-sm">
-							{m.dedicatedServerDialog_restartPolicyInfo()}
-						</p>
-					</div>
-					<div class="flex items-center">
-						<Label>{m.dedicatedServerDialog_rememberPassword()}</Label>
-						<Info>{m.dedicatedServerDialog_credentialInfo()}</Info>
-						<Checkbox bind:checked={rememberRemotePassword} />
-					</div>
-				</div>
-			</Tabs.Content>
-		</TabsMenu>
 
-		<details class="mt-4">
-			<summary class="text-primary-600 dark:text-primary-300 cursor-pointer"
-				>{m.dedicatedServerDialog_advancedOptions()}</summary
-			>
-			<div class="mt-2">
-				<Label>{m.dedicatedServerDialog_additionalArgs()}</Label><InputField
-					class="mt-1 w-full"
-					bind:value={form.extraArgs}
-					placeholder="-savedir ..."
-				/>
-			</div>
-		</details>
+						{#if syncChoice === 'hostedWorker'}
+							{#if localWorker?.ownership === 'foreign'}
+								<InfoBox type="warning">{m.dedicatedServerDialog_localWorkerForeign()}</InfoBox>
+							{:else if localWorker === null || localWorker.service === 'notInstalled'}
+								<InfoBox type="info">{m.dedicatedServerDialog_localWorkerProvisionInfo()}</InfoBox>
+								<div>
+									<Button
+										color="primary"
+										icon="mdi:server-plus"
+										loading={provisioning}
+										onclick={provisionWorker}
+										>{m.dedicatedServerDialog_localWorkerProvision()}</Button
+									>
+								</div>
+								{#if provisioning}
+									<p class="text-primary-500 text-sm">
+										{m.dedicatedServerDialog_localWorkerProvisioning()}
+									</p>
+								{/if}
+							{:else}
+								<div class="flex flex-col gap-2">
+									<p class="text-primary-600 dark:text-primary-300 text-sm">
+										{m.dedicatedServerDialog_localWorkerStatus({
+											state: localWorkerStateLabel(localWorker.service)
+										})}
+										{#if localWorker.binding}
+											— {localWorker.binding.address}
+										{/if}
+									</p>
+									{#if localWorker.ownership === 'incomplete'}
+										<InfoBox type="warning"
+											>{m.dedicatedServerDialog_localWorkerIncomplete()}</InfoBox
+										>
+										<div>
+											<Button
+												color="primary"
+												icon="mdi:server-plus"
+												loading={provisioning}
+												onclick={provisionWorker}
+												>{m.dedicatedServerDialog_localWorkerFinishSetup()}</Button
+											>
+										</div>
+									{/if}
+									{#if localWorker.stoppedForShutdown}
+										<InfoBox type="info">{m.dedicatedServerDialog_localWorkerShutdown()}</InfoBox>
+									{:else if localWorker.service !== 'running' && localWorker.run?.phase === 'running'}
+										<InfoBox type="warning">{m.dedicatedServerDialog_localWorkerCrash()}</InfoBox>
+									{:else if localWorker.service !== 'running'}
+										<InfoBox type="info">{m.dedicatedServerDialog_localWorkerOffline()}</InfoBox>
+									{:else if localWorker.worker === null && localWorker.workerError}
+										<InfoBox type="warning">{localWorker.workerError}</InfoBox>
+									{/if}
+									{#if localWorker.pendingPublication}
+										<InfoBox type="info">{pendingLabel(localWorker.pendingPublication)}</InfoBox>
+									{/if}
+									{#if localWorker.updateAvailable}
+										<InfoBox type="info">{m.dedicatedServerDialog_localWorkerUpdateInfo()}</InfoBox>
+									{/if}
+									{#each localWorker.warnings as warning (warning)}
+										<InfoBox type="warning">{warning}</InfoBox>
+									{/each}
+									<div class="flex flex-wrap gap-2">
+										{#if localWorker.service === 'stopped'}
+											<Button
+												color="primary"
+												icon="mdi:play"
+												loading={workerBusy}
+												onclick={() => controlWorker('start')}
+												>{m.dedicatedServerDialog_localWorkerStart()}</Button
+											>
+										{:else if localWorker.service === 'running'}
+											<Button
+												color="primary"
+												icon="mdi:stop"
+												loading={workerBusy}
+												onclick={() => controlWorker('stop')}
+												>{m.dedicatedServerDialog_localWorkerStop()}</Button
+											>
+											<Button
+												color="primary"
+												icon="mdi:restart"
+												loading={workerBusy}
+												onclick={() => controlWorker('restart')}
+												>{m.dedicatedServerDialog_localWorkerRestart()}</Button
+											>
+										{/if}
+										{#if localWorker.updateAvailable}
+											<Button
+												color="primary"
+												icon="mdi:update"
+												loading={workerBusy}
+												onclick={updateWorker}>{m.dedicatedServerDialog_localWorkerUpdate()}</Button
+											>
+										{/if}
+										<Button
+											color="primary"
+											icon="mdi:delete"
+											loading={workerBusy}
+											onclick={uninstallWorker}
+											>{m.dedicatedServerDialog_localWorkerUninstall()}</Button
+										>
+									</div>
+								</div>
+							{/if}
+						{:else if syncChoice === 'worker'}
+							<div>
+								<Label for={`${formId}-field-14`}>{m.dedicatedServerDialog_workerAddress()}</Label
+								><InputField
+									id={`${formId}-field-14`}
+									class="mt-1 w-full"
+									bind:value={form.remote.worker.address}
+									placeholder="https://worker.example.com"
+								/>
+							</div>
+							<div>
+								<Label for={`${formId}-field-15`}>{m.dedicatedServerDialog_workerToken()}</Label
+								><InputField
+									id={`${formId}-field-15`}
+									class="mt-1 w-full"
+									bind:value={workerToken}
+									type="password"
+								/>
+								<p class="text-primary-500 mt-1 text-sm">
+									{m.dedicatedServerDialog_savedPassword()}
+								</p>
+							</div>
+							<div>
+								<Button
+									color="primary"
+									icon="mdi:lan-connect"
+									loading={testingWorker}
+									onclick={testWorker}>{m.dedicatedServerDialog_testWorker()}</Button
+								>
+							</div>
+						{/if}
+						{#if syncChoice !== 'local'}
+							<div class="flex items-center">
+								<Label for={`${formId}-field-16`}>{m.dedicatedServerDialog_workerAutoSync()}</Label
+								><Info>{m.dedicatedServerDialog_workerAutoSyncInfo()}</Info><Checkbox
+									id={`${formId}-field-16`}
+									bind:checked={form.remote.worker.autoSync}
+								/>
+							</div>
+							<div class="flex items-center">
+								<Label for={`${formId}-field-17`}>{m.dedicatedServerDialog_workerAutoMods()}</Label
+								><Info>{m.dedicatedServerDialog_workerAutoModsInfo()}</Info><Checkbox
+									id={`${formId}-field-17`}
+									bind:checked={form.remote.worker.autoMods}
+								/>
+							</div>
+						{/if}
+
+						<div>
+							<Label for={`${formId}-field-18`}>{m.dedicatedServerDialog_hostProvider()}</Label>
+							<Select
+								id={`${formId}-field-18`}
+								type="single"
+								triggerClass="mt-1 w-full"
+								bind:value={form.remote.hostControl.provider}
+								items={[
+									{ value: 'none', label: m.dedicatedServerDialog_hostProviderNone() },
+									{ value: 'datHost', label: 'DatHost' }
+								]}
+							/>
+							<p class="text-primary-500 mt-1 text-sm">
+								{m.dedicatedServerDialog_hostProviderInfo()}
+							</p>
+						</div>
+						{#if form.remote.hostControl.provider === 'datHost'}
+							<div>
+								<Label for={`${formId}-field-19`}>{m.dedicatedServerDialog_datHostServerId()}</Label
+								><InputField
+									id={`${formId}-field-19`}
+									class="mt-1 w-full"
+									bind:value={form.remote.hostControl.datHostServerId}
+								/>
+							</div>
+							<div>
+								<Label for={`${formId}-field-20`}>{m.dedicatedServerDialog_datHostUsername()}</Label
+								><InputField
+									id={`${formId}-field-20`}
+									class="mt-1 w-full"
+									bind:value={form.remote.hostControl.datHostUsername}
+									placeholder="you@example.com"
+								/>
+							</div>
+							<div>
+								<Label for={`${formId}-field-21`}>{m.dedicatedServerDialog_datHostPassword()}</Label
+								><InputField
+									id={`${formId}-field-21`}
+									class="mt-1 w-full"
+									bind:value={datHostPassword}
+									type="password"
+								/>
+								<p class="text-primary-500 mt-1 text-sm">
+									{m.dedicatedServerDialog_savedPassword()}
+								</p>
+							</div>
+						{/if}
+						<div>
+							<Label for={`${formId}-field-22`}>{m.dedicatedServerDialog_restartPolicy()}</Label>
+							<Select
+								id={`${formId}-field-22`}
+								type="single"
+								triggerClass="mt-1 w-full"
+								bind:value={form.remote.restartPolicy}
+								items={[
+									{ value: 'manual', label: m.dedicatedServerDialog_restartManual() },
+									{ value: 'immediate', label: m.dedicatedServerDialog_restartImmediate() },
+									{ value: 'whenEmpty', label: m.dedicatedServerDialog_restartWhenEmpty() }
+								]}
+							/>
+							<p class="text-primary-500 mt-1 text-sm">
+								{m.dedicatedServerDialog_restartPolicyInfo()}
+							</p>
+						</div>
+						<div class="flex items-center">
+							<Label for={`${formId}-field-23`}>{m.dedicatedServerDialog_rememberPassword()}</Label>
+							<Info>{m.dedicatedServerDialog_credentialInfo()}</Info>
+							<Checkbox id={`${formId}-field-23`} bind:checked={rememberRemotePassword} />
+						</div>
+					</div>
+				</Tabs.Content>
+			</TabsMenu>
+
+			<details class="mt-4">
+				<summary class="text-primary-600 dark:text-primary-300 cursor-pointer"
+					>{m.dedicatedServerDialog_advancedOptions()}</summary
+				>
+				<div class="mt-2">
+					<Label for={`${formId}-field-24`}>{m.dedicatedServerDialog_additionalArgs()}</Label
+					><InputField
+						id={`${formId}-field-24`}
+						class="mt-1 w-full"
+						bind:value={form.extraArgs}
+						placeholder="-savedir ..."
+					/>
+				</div>
+			</details>
+		</fieldset>
 	{/if}
 
-	<div class="mt-5 flex w-full items-center justify-end gap-2">
-		<Button color="primary" onclick={() => (open = false)}
+	<div class="mt-5 flex w-full flex-wrap items-center justify-end gap-2">
+		<Button color="primary" disabled={busy} onclick={() => (open = false)}
 			>{m.dedicatedServerDialog_cancel()}</Button
 		>
-		<Button color="primary" icon="mdi:content-save" loading={saving} onclick={save}
-			>{m.dedicatedServerDialog_save()}</Button
+		<Button
+			color="primary"
+			icon="mdi:content-save"
+			disabled={busy || loadingSettings}
+			loading={saving}
+			onclick={save}>{m.dedicatedServerDialog_save()}</Button
 		>
 		{#if form.location === 'local'}
-			<Button icon="mdi:server" loading={launching} onclick={launch}
-				>{m.dedicatedServerDialog_launch()}</Button
+			<Button
+				icon="mdi:server"
+				disabled={busy || loadingSettings || server.status.state === 'running'}
+				loading={launching}
+				onclick={launch}>{m.dedicatedServerDialog_launch()}</Button
 			>
 		{:else}
-			<Button icon="mdi:sync" onclick={syncServer}>{m.dedicatedServerDialog_sync()}</Button>
+			<Button
+				icon="mdi:sync"
+				disabled={busy || loadingSettings}
+				loading={syncing}
+				onclick={syncServer}>{m.dedicatedServerDialog_sync()}</Button
+			>
 		{/if}
 	</div>
 </Dialog>

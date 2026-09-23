@@ -314,27 +314,6 @@ impl RemoteServerSettings {
         )
     }
 
-    /// A copy with the file-transfer fields taken from `tested`, keeping
-    /// this settings' executor and host-control configuration.
-    ///
-    /// A successful connection test persists the proven transport this
-    /// way: it must not activate the executor the dialog happened to
-    /// hold, like an unprovisioned hosted worker or an incompletely
-    /// configured external one, nor change automation or restart policy.
-    pub fn with_tested_transport(&self, tested: &Self) -> Self {
-        let mut merged = self.clone();
-        merged.protocol = tested.protocol;
-        merged.host = tested.host.clone();
-        merged.port = tested.port;
-        merged.username = tested.username.clone();
-        merged.server_directory = tested.server_directory.clone();
-        merged.authentication = tested.authentication;
-        merged.private_key_path = tested.private_key_path.clone();
-        merged.trusted_host_key = tested.trusted_host_key.clone();
-        merged.trusted_certificate = tested.trusted_certificate.clone();
-        merged
-    }
-
     pub fn trust_host_key(&mut self, fingerprint: String) {
         self.trusted_host_key = Some(fingerprint);
     }
@@ -465,61 +444,6 @@ mod tests {
             assert!(broken.validate_connection().is_err());
             assert!(broken.validate().is_err());
         }
-    }
-
-    /// A successful connection test persists the proven transport onto
-    /// the stored settings; whatever executor the dialog held must not
-    /// leak in. With nothing stored, the merge cannot activate an
-    /// unprovisioned worker, and a stored worker keeps its binding.
-    #[test]
-    fn tested_transport_does_not_activate_unsaved_executor() {
-        let tested = RemoteServerSettings {
-            protocol: RemoteProtocol::Ftps,
-            host: "ftp.example.com".into(),
-            port: 21,
-            username: "u".into(),
-            server_directory: "/".into(),
-            trusted_certificate: Some("cert".into()),
-            sync_mode: SyncMode::Worker,
-            worker: WorkerSettings {
-                hosted: true,
-                auto_sync: true,
-                auto_mods: true,
-                ..Default::default()
-            },
-            restart_policy: RestartPolicy::Immediate,
-            ..Default::default()
-        };
-
-        let merged = RemoteServerSettings::default().with_tested_transport(&tested);
-        assert_eq!(merged.protocol, RemoteProtocol::Ftps);
-        assert_eq!(merged.host, "ftp.example.com");
-        assert_eq!(merged.trusted_certificate.as_deref(), Some("cert"));
-        assert_eq!(merged.sync_mode, SyncMode::Local);
-        assert!(!merged.worker.hosted);
-        assert!(!merged.worker.auto_sync);
-        assert_eq!(merged.restart_policy, RestartPolicy::Manual);
-        assert!(merged.validate().is_ok());
-
-        let stored = RemoteServerSettings {
-            sync_mode: SyncMode::Worker,
-            worker: WorkerSettings {
-                address: "http://127.0.0.1:8472".into(),
-                hosted: true,
-                auto_sync: true,
-                ..Default::default()
-            },
-            restart_policy: RestartPolicy::WhenEmpty,
-            ..Default::default()
-        };
-        let merged = stored.with_tested_transport(&tested);
-        assert_eq!(merged.host, "ftp.example.com");
-        assert_eq!(merged.sync_mode, SyncMode::Worker);
-        assert_eq!(merged.worker.address, "http://127.0.0.1:8472");
-        assert!(merged.worker.auto_sync);
-        assert!(!merged.worker.auto_mods);
-        assert_eq!(merged.restart_policy, RestartPolicy::WhenEmpty);
-        assert!(merged.validate().is_ok());
     }
 
     #[test]

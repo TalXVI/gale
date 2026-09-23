@@ -10,6 +10,8 @@ Open the dedicated server dialog from the arrow beside the profile launch button
 
 Choose **Local server**, enter the server name, world, port, and optional password, then select **Launch server**. Gale finds the game's dedicated server through its configured platform, prepares the mod loader, and starts the server with the active profile.
 
+Select **Save settings** to save the local settings and, when **Remember password** is selected, the game password. With that option off, launch from the dialog to use the password for this session only. While the server runs, Gale shows its status and locks the profile. Use the server console for a normal shutdown; **Force stop server** is available if it does not respond and warns that unsaved progress may be lost.
+
 The server must already be installed. Gale manages only the process it starts, so closing Gale never kills an unrelated server process.
 
 ### Remote server
@@ -21,7 +23,7 @@ Choose **Remote server** and enter the connection details supplied by the server
 - **FTP (automatic TLS, allows plaintext fallback)** tries encrypted FTPS first and falls back to plain FTP when the host does not support TLS. The same certificate-pinning rules apply while TLS is active.
 - **Server directory** is the directory exposed by the host and defaults to `/`, which fits accounts that already open at the server root.
 
-Use **Test connection** before syncing.
+Use **Test connection** before syncing. Tests do not save settings or credentials. Select **Save settings** to keep your changes, or **Sync server** to save and continue to deployment. **Cancel** discards edits that have not been saved.
 
 ## Selective server synchronization
 

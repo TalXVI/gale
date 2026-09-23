@@ -2,6 +2,9 @@ import { mockIPC } from '@tauri-apps/api/mocks';
 import { mount } from 'svelte';
 import '../../src/app.css';
 
+let settings: unknown = null;
+let serverRunning = new URLSearchParams(location.search).has('running');
+const cancelStop = new URLSearchParams(location.search).has('cancelStop');
 const workerMode = new URLSearchParams(location.search).get('mode') === 'worker';
 const manyConfigs = new URLSearchParams(location.search).has('many');
 let restartRequired = new URLSearchParams(location.search).has('restart');
@@ -62,6 +65,31 @@ mockIPC(async (cmd, args) => {
 			release = resolve;
 		});
 	switch (cmd) {
+		case 'get_dedicated_server_settings':
+			return settings;
+		case 'get_dedicated_server_status':
+			return serverRunning
+				? {
+						state: 'running',
+						profileId: 1,
+						gameSlug: 'valheim',
+						pid: 123,
+						serverDir: '/test',
+						stopping: false
+					}
+				: { state: 'stopped' };
+		case 'force_stop_dedicated_server':
+			serverRunning = false;
+			return;
+		case 'get_local_worker_status':
+			return { supported: true, service: 'notInstalled', ownership: 'none', warnings: [] };
+		case 'set_dedicated_server_settings':
+			settings = structuredClone((args as any).request.settings);
+			return;
+		case 'test_remote_server_connection':
+			return { status: 'connected', encrypted: true };
+		case 'test_worker_connection':
+			return { workerId: 'test-worker', autoSync: false };
 		case 'get_game_info':
 			return { active: null, all: [], favorites: [], lastUpdated: '' };
 		case 'plugin:event|listen':
@@ -69,7 +97,7 @@ mockIPC(async (cmd, args) => {
 		case 'plugin:event|unlisten':
 			return;
 		case 'plugin:dialog|message':
-			return 'Ok';
+			return cancelStop ? 'Cancel' : 'Ok';
 		case 'get_server_sync_status':
 			return {
 				mode: workerMode ? 'worker' : 'local',
@@ -96,8 +124,11 @@ mockIPC(async (cmd, args) => {
 			return;
 		case 'preview_server_sync':
 			return { plan, warnings: [] };
-		case 'set_server_config_policy':
+		case 'set_server_config_policy': {
+			const request = (args as any).request;
+			configEntries.find((entry) => entry.path === request.path)!.policy = request.policy;
 			return;
+		}
 		case 'configure_worker':
 			Object.assign(worker, (args as any).request);
 			return worker;

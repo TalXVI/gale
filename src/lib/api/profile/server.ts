@@ -33,10 +33,20 @@ export const setSettings = (
 	remotePassword: string,
 	workerToken: string,
 	datHostPassword: string,
-	rememberCredentials: boolean
+	rememberCredentials: boolean,
+	gamePassword = '',
+	rememberGamePassword = false
 ) =>
 	invoke('set_dedicated_server_settings', {
-		request: { settings, remotePassword, workerToken, datHostPassword, rememberCredentials }
+		request: {
+			settings,
+			remotePassword,
+			workerToken,
+			datHostPassword,
+			rememberCredentials,
+			gamePassword,
+			rememberGamePassword
+		}
 	});
 
 /// `settings: null` launches with the profile's stored settings, so an
@@ -51,26 +61,16 @@ export const launch = (
 		request: { settings, password, rememberPassword }
 	});
 
-/// Tests the remote transport. A successful test also persists the
-/// settings and credentials like `setSettings` does.
-export const testRemoteConnection = (
-	settings: RemoteServerSettings,
-	password: string,
-	datHostPassword: string,
-	rememberPassword: boolean
-) =>
+/// Tests the remote transport without saving settings or credentials.
+export const testRemoteConnection = (settings: RemoteServerSettings, password: string) =>
 	invoke<RemoteConnectionTestResult>('test_remote_server_connection', {
-		request: { settings, password, workerToken: '', datHostPassword, rememberPassword }
+		request: { settings, password, workerToken: '' }
 	});
 
 /// Tests the worker's reachability, bearer token, and profile binding.
-export const testWorkerConnection = (
-	settings: RemoteServerSettings,
-	workerToken: string,
-	rememberPassword: boolean
-) =>
+export const testWorkerConnection = (settings: RemoteServerSettings, workerToken: string) =>
 	invoke<WorkerStatus>('test_worker_connection', {
-		request: { settings, password: '', workerToken, datHostPassword: '', rememberPassword }
+		request: { settings, password: '', workerToken }
 	});
 
 export const getStatus = () => invoke<DedicatedServerStatus>('get_dedicated_server_status');

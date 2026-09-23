@@ -122,3 +122,89 @@ impl ServerSecrets {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profile::server::commands::persist_credential;
+    use keyring::mock::MockCredential;
+
+    fn in_memory_secrets() -> ServerSecrets {
+        let entry = || Entry::new_with_credential(Box::new(MockCredential::default()));
+        ServerSecrets {
+            game_password: entry(),
+            sftp_password: entry(),
+            ftp_password: entry(),
+            ssh_key_passphrase: entry(),
+            dat_host_password: entry(),
+            worker_token: entry(),
+        }
+    }
+
+    #[test]
+    fn saved_game_password_can_be_reused_replaced_and_forgotten() {
+        let secrets = in_memory_secrets();
+        let password = Some(ServerSecret::GamePassword);
+        secrets
+            .set(ServerSecret::WorkerToken, "unrelated-token")
+            .unwrap();
+
+        persist_credential(&secrets, password, "first-password", true).unwrap();
+        assert_eq!(
+            secrets.resolve(ServerSecret::GamePassword, "").unwrap(),
+            "first-password"
+        );
+        persist_credential(&secrets, password, "", true).unwrap();
+        assert_eq!(
+            secrets.resolve(ServerSecret::GamePassword, "").unwrap(),
+            "first-password"
+        );
+        persist_credential(&secrets, password, "replacement", true).unwrap();
+        assert_eq!(
+            secrets.resolve(ServerSecret::GamePassword, "").unwrap(),
+            "replacement"
+        );
+        persist_credential(&secrets, password, "session-only", false).unwrap();
+        assert_eq!(secrets.get(ServerSecret::GamePassword).unwrap(), None);
+        assert_eq!(
+            secrets
+                .resolve(ServerSecret::GamePassword, "session-only")
+                .unwrap(),
+            "session-only"
+        );
+        assert_eq!(
+            secrets.get(ServerSecret::WorkerToken).unwrap().as_deref(),
+            Some("unrelated-token")
+        );
+    }
+
+    #[test]
+    fn credential_storage_failure_is_reported_without_replacing_the_password() {
+        let secrets = in_memory_secrets();
+        secrets
+            .set(ServerSecret::GamePassword, "saved-password")
+            .unwrap();
+        secrets
+            .game_password
+            .get_credential()
+            .downcast_ref::<MockCredential>()
+            .unwrap()
+            .set_error(keyring::Error::NoStorageAccess(Box::new(
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            )));
+
+        assert!(
+            persist_credential(
+                &secrets,
+                Some(ServerSecret::GamePassword),
+                "new-password",
+                true
+            )
+            .is_err()
+        );
+        assert_eq!(
+            secrets.resolve(ServerSecret::GamePassword, "").unwrap(),
+            "saved-password"
+        );
+    }
+}

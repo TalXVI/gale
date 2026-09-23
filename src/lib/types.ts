@@ -626,6 +626,7 @@ export type DedicatedServerStatus =
 	| { state: 'stopped' }
 	| {
 		state: 'running';
+		stopping: boolean;
 		profileId: number;
 		gameSlug: string;
 		pid: number;

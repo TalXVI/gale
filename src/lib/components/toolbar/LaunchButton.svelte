@@ -5,6 +5,7 @@
 	import * as api from '$lib/api';
 	import Icon from '@iconify/svelte';
 	import games from '$lib/state/game.svelte';
+	import server from '$lib/state/server.svelte';
 	import { message } from '@tauri-apps/plugin-dialog';
 	import { m } from '$lib/paraglide/messages';
 	import type { LaunchOption } from '$lib/types';
@@ -44,7 +45,7 @@
 
 		if (games.active?.dedicatedServer) {
 			items.push({
-				label: labels.server,
+				label: server.status.state === 'running' ? m.dedicatedServerDialog_manage() : labels.server,
 				onclick: () => {
 					mode.current = 'server';
 					dedicatedServerDialogOpen = true;
@@ -104,6 +105,10 @@
 	/// An already-configured server launches immediately; first-time setup
 	/// opens the settings dialog instead.
 	async function launchServer() {
+		if (server.status.state === 'running') {
+			dedicatedServerDialogOpen = true;
+			return;
+		}
 		const settings = await api.profile.server.getSettings();
 
 		if (settings === null || settings.location === 'remote' || settings.serverName.trim() === '') {
@@ -145,7 +150,9 @@
 	<button onclick={() => launchGame()} class="flex items-center pr-2 pl-4">
 		<Icon icon="mdi:play-circle" class="mr-2 text-xl" />
 		<span>
-			{labels[mode.current]}
+			{mode.current === 'server' && server.status.state === 'running'
+				? m.dedicatedServerDialog_manage()
+				: labels[mode.current]}
 		</span>
 	</button>
 

@@ -28,6 +28,7 @@
 
 	type Props = { open?: boolean };
 	let { open = $bindable(false) }: Props = $props();
+	const formId = $props.id();
 
 	/// What the user decided for one config path.
 	type Decision = 'apply' | 'restore' | 'decline';
@@ -421,12 +422,12 @@
 				</summary>
 				<div class="mt-2 flex flex-col gap-3">
 					<div class="flex items-center">
-						<Label>{m.serverSync_autoSync()}</Label>
-						<Checkbox bind:checked={workerAutoSync} disabled={busy} />
+						<Label for={`${formId}-field-1`}>{m.serverSync_autoSync()}</Label>
+						<Checkbox id={`${formId}-field-1`} bind:checked={workerAutoSync} disabled={busy} />
 					</div>
 					<div class="flex items-center">
-						<Label>{m.serverSync_autoMods()}</Label>
-						<Checkbox bind:checked={workerAutoMods} disabled={busy} />
+						<Label for={`${formId}-field-2`}>{m.serverSync_autoMods()}</Label>
+						<Checkbox id={`${formId}-field-2`} bind:checked={workerAutoMods} disabled={busy} />
 					</div>
 					<Button color="primary" loading={savingWorker} disabled={busy} onclick={saveWorkerConfig}>
 						{m.serverSync_saveAutomation()}
@@ -437,8 +438,9 @@
 	{/if}
 
 	<div class="mt-4">
-		<Label>{m.serverSync_scope()}</Label>
+		<Label for={`${formId}-field-3`}>{m.serverSync_scope()}</Label>
 		<Select
+			id={`${formId}-field-3`}
 			type="single"
 			triggerClass="mt-1 w-full"
 			value={scope}
@@ -459,8 +461,9 @@
 		<div class="mt-2 flex flex-col gap-3">
 			{#if isWorker()}
 				<div>
-					<Label>{m.serverSync_workerToken()}</Label>
+					<Label for={`${formId}-field-4`}>{m.serverSync_workerToken()}</Label>
 					<InputField
+						id={`${formId}-field-4`}
 						class="mt-1 w-full"
 						bind:value={workerToken}
 						type="password"
@@ -470,8 +473,9 @@
 				</div>
 			{:else}
 				<div>
-					<Label>{m.dedicatedServerDialog_password()}</Label>
+					<Label for={`${formId}-field-5`}>{m.dedicatedServerDialog_password()}</Label>
 					<InputField
+						id={`${formId}-field-5`}
 						class="mt-1 w-full"
 						bind:value={remotePassword}
 						type="password"
@@ -537,52 +541,76 @@
 							{reviewOnly ? m.serverSync_showAllConfigs() : m.serverSync_reviewOnly()}
 						</Button>
 					</div>
+					<p class="text-primary-600 dark:text-primary-300 mt-2 text-sm">
+						{m.serverSync_policyHelp()}
+					</p>
 					<div
 						class="border-primary-300 dark:border-primary-600 bg-primary-50 dark:bg-primary-900 mt-2 max-h-64 overflow-auto rounded-lg border p-3 text-sm"
 					>
 						{#each visibleConfigEntries as entry (entry.path)}
 							<div
-								class="flex items-center gap-2 py-1"
+								class="flex flex-wrap items-center gap-2 py-2"
 								data-testid="server-config-row"
 								data-path={entry.path}
 							>
-								<span class="text-primary-700 dark:text-primary-300 grow font-mono wrap-anywhere">
+								<span
+									class="text-primary-700 dark:text-primary-300 min-w-0 grow basis-full font-mono wrap-anywhere xl:basis-40"
+								>
 									{entry.path}
 								</span>
 								<span class="text-primary-500 shrink-0">{actionLabel(entry)}</span>
-								<Select
-									type="single"
-									disabled={busy}
-									triggerClass="w-44 shrink-0"
-									value={entry.policy}
-									onValueChange={(value) => setPolicy(entry.path, value as SyncConfigUpdatePolicy)}
-									items={[
-										{ value: 'ask', label: m.serverSync_policyAsk() },
-										{ value: 'alwaysApply', label: m.serverSync_policyAlwaysApply() },
-										{ value: 'alwaysKeep', label: m.serverSync_policyAlwaysKeep() }
-									]}
-								/>
-								{#if decisions[entry.path]}
-									<span class="shrink-0 text-green-600 dark:text-green-400">
-										{decisions[entry.path] !== 'decline'
-											? m.serverSync_willApply()
-											: m.serverSync_willDecline()}
-									</span>
-									<Button disabled={busy} onclick={() => decide(entry.path, null)}>
-										{m.serverSync_undo()}
-									</Button>
-								{:else if entry.action !== 'markApplied' && entry.action !== 'write'}
-									{@const restore = entry.action === 'pending' && entry.reason === 'deletedLocally'}
-									<Button
-										disabled={busy}
-										onclick={() => decide(entry.path, restore ? 'restore' : 'apply')}
+								<div class="flex shrink-0 flex-col gap-1">
+									<span class="text-primary-600 dark:text-primary-300 text-xs" aria-hidden="true"
+										>{m.serverSync_futureUpdates()}</span
 									>
-										{restore ? m.serverSync_restore() : m.serverSync_apply()}
-									</Button>
-									<Button disabled={busy} onclick={() => decide(entry.path, 'decline')}>
-										{m.serverSync_decline()}
-									</Button>
-								{/if}
+									<Select
+										type="single"
+										disabled={busy}
+										triggerClass="w-52 shrink-0"
+										aria-label={m.serverSync_futurePolicy({ path: entry.path })}
+										value={entry.policy}
+										onValueChange={(value) =>
+											setPolicy(entry.path, value as SyncConfigUpdatePolicy)}
+										items={[
+											{ value: 'ask', label: m.serverSync_policyAsk() },
+											{ value: 'alwaysApply', label: m.serverSync_policyAlwaysApply() },
+											{ value: 'alwaysKeep', label: m.serverSync_policyAlwaysKeep() }
+										]}
+									/>
+								</div>
+								<div class="ml-auto flex shrink-0 items-center gap-2">
+									{#if decisions[entry.path]}
+										<span class="shrink-0 text-green-600 dark:text-green-400">
+											{decisions[entry.path] !== 'decline'
+												? m.serverSync_willApply()
+												: m.serverSync_willDecline()}
+										</span>
+										<Button
+											disabled={busy}
+											aria-label={`${m.serverSync_undo()} ${entry.path}`}
+											onclick={() => decide(entry.path, null)}
+										>
+											{m.serverSync_undo()}
+										</Button>
+									{:else if entry.action !== 'markApplied' && entry.action !== 'write'}
+										{@const restore =
+											entry.action === 'pending' && entry.reason === 'deletedLocally'}
+										<Button
+											disabled={busy}
+											aria-label={`${restore ? m.serverSync_restore() : m.serverSync_apply()} ${entry.path}`}
+											onclick={() => decide(entry.path, restore ? 'restore' : 'apply')}
+										>
+											{restore ? m.serverSync_restore() : m.serverSync_apply()}
+										</Button>
+										<Button
+											disabled={busy}
+											aria-label={`${m.serverSync_decline()} ${entry.path}`}
+											onclick={() => decide(entry.path, 'decline')}
+										>
+											{m.serverSync_decline()}
+										</Button>
+									{/if}
+								</div>
 							</div>
 						{/each}
 					</div>
@@ -669,16 +697,21 @@
 		</div>
 	{/if}
 
-	<div class="mt-5 flex w-full items-center justify-end gap-2">
-		<Button color="primary" disabled={busy} onclick={() => (open = false)}
+	<p class="text-primary-600 dark:text-primary-300 mt-4 min-h-5 text-sm" role="status">
+		{#if preview}
+			{dirty ? m.serverSync_dirtyHint() : m.serverSync_readyHint()}
+		{:else if !result}
+			{m.serverSync_previewHint()}
+		{/if}
+	</p>
+	<div class="mt-3 flex w-full flex-wrap items-center justify-end gap-3">
+		<Button class="mr-auto" color="primary" disabled={busy} onclick={() => (open = false)}
 			>{m.serverSync_close()}</Button
 		>
-		{#if dirty}
-			<span class="text-primary-500 mr-auto text-sm">{m.serverSync_dirtyHint()}</span>
-		{/if}
-		<div class="flex items-center gap-2">
-			<Label>{m.serverSync_restartPolicy()}</Label>
+		<div class="order-first flex w-full flex-wrap items-center gap-2">
+			<Label class="w-auto min-w-0" for={`${formId}-field-6`}>{m.serverSync_restartPolicy()}</Label>
 			<Select
+				id={`${formId}-field-6`}
 				type="single"
 				triggerClass="w-40"
 				value={restartPolicy}
