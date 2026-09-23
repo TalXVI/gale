@@ -9,6 +9,7 @@ use reqwest::StatusCode;
 
 use super::{
     plan::DeploySelection,
+    progress::SyncProgress,
     settings::{RemoteServerSettings, RestartPolicy},
 };
 use crate::{
@@ -100,15 +101,25 @@ impl WorkerClient {
         self.send(self.http.get(url)).await
     }
 
+    pub async fn progress(&self) -> Result<Option<SyncProgress>> {
+        self.send(
+            self.http
+                .get(format!("{}{}/progress", self.base, api::API_BASE)),
+        )
+        .await
+    }
+
     pub async fn preview(
         &self,
         selection: &DeploySelection,
         restart_policy: Option<RestartPolicy>,
+        run_id: &str,
     ) -> Result<PreviewResponse> {
         self.send(
             self.http
                 .post(format!("{}{}/preview", self.base, api::API_BASE))
                 .json(&PreviewRequest {
+                    run_id: run_id.to_owned(),
                     selection: selection.clone(),
                     restart_policy,
                 }),
@@ -122,11 +133,13 @@ impl WorkerClient {
         plan_hash: &str,
         restart_policy: Option<RestartPolicy>,
         force: bool,
+        run_id: &str,
     ) -> Result<DeployResponse> {
         self.send(
             self.http
                 .post(format!("{}{}/deploy", self.base, api::API_BASE))
                 .json(&DeployRequest {
+                    run_id: run_id.to_owned(),
                     selection: selection.clone(),
                     plan_hash: plan_hash.to_owned(),
                     restart_policy,

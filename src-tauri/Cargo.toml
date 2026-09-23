@@ -129,6 +129,7 @@ ashpd = { version = "0.13", features = ["settings"] }
 [dev-dependencies]
 # Certificate fixtures for the FTPS verifier tests.
 rcgen = "0.13"
+tokio = { version = "1", features = ["test-util"] }
 
 [[example]]
 name = "ftp-probe"

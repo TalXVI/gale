@@ -180,6 +180,7 @@ pub fn run() {
             profile::server::commands::test_remote_server_connection,
             profile::server::commands::test_worker_connection,
             profile::server::commands::get_server_sync_status,
+            profile::server::commands::get_server_sync_progress,
             profile::server::commands::preview_server_sync,
             profile::server::commands::deploy_server_sync,
             profile::server::commands::set_server_config_policy,

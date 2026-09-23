@@ -609,17 +609,37 @@ export type LocalWorkerStatus = {
 	warnings: string[];
 };
 
-export type ServerSyncProgress = {
-	completed: number;
-	total: number;
-	path: string;
-	operation: 'remove' | 'upload' | 'writeConfig';
-};
+export type ServerSyncPhase =
+	| 'fetchingPublication'
+	| 'stagingPayload'
+	| 'connecting'
+	| 'readingState'
+	| 'checkingLease'
+	| 'refreshingState'
+	| 'scanningPayload'
+	| 'verifyingPayload'
+	| 'checkingConfigs'
+	| 'buildingPlan'
+	| 'finalizingPreview'
+	| 'removingFiles'
+	| 'uploadingPayload'
+	| 'writingConfigs'
+	| 'persistingState'
+	| 'applyingRestart'
+	| 'releasingLease';
 
-export type ServerSyncStageProgress = {
+export type ServerSyncOperationProgress = {
+	runId: string;
+	operation: 'preview' | 'deploy';
+	status: 'running' | 'succeeded' | 'failed';
+	phase: ServerSyncPhase;
+	completedPhases: number;
+	totalPhases: number;
 	completed: number;
-	total: number;
-	mod: string;
+	total: number | null;
+	completedBytes: number | null;
+	totalBytes: number | null;
+	item: string | null;
 };
 
 export type DedicatedServerStatus =

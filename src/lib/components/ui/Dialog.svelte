@@ -13,6 +13,7 @@
 		title?: string | null;
 		confirmClose?: { message: string } | null;
 		canClose?: boolean;
+		closeOnOutside?: boolean;
 		large?: boolean;
 		onclose?: () => void;
 		children?: Snippet;
@@ -23,6 +24,7 @@
 		title = null,
 		confirmClose = null,
 		canClose = true,
+		closeOnOutside = true,
 		large = false,
 		onclose,
 		children
@@ -64,7 +66,12 @@
 			{/snippet}
 		</Dialog.Overlay>
 		<Dialog.Content
-			interactOutsideBehavior={canClose && confirmClose === null ? 'close' : 'ignore'}
+			interactOutsideBehavior={canClose && closeOnOutside && confirmClose === null
+				? 'close'
+				: 'ignore'}
+			onInteractOutside={(event) => {
+				if (!canClose || !closeOnOutside || confirmClose !== null) event.preventDefault();
+			}}
 			onEscapeKeydown={close}
 			class="pointer-events-none"
 		>

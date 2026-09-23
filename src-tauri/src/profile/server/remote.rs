@@ -1193,6 +1193,9 @@ pub(crate) mod memory {
         pub dirs: BTreeSet<String>,
         /// Paths whose next write/upload/delete fails once, then clears.
         pub fail_once: BTreeSet<String>,
+        /// Paths whose next read fails once, then succeeds after reconnect.
+        pub fail_read_once: BTreeSet<String>,
+        pub fail_read_always: BTreeSet<String>,
         /// Paths whose write/upload/delete always fails.
         pub fail_always: BTreeSet<String>,
         /// Simulates a dropped transport: reads and directory checks fail.
@@ -1210,6 +1213,8 @@ pub(crate) mod memory {
                 files: BTreeMap::new(),
                 dirs,
                 fail_once: BTreeSet::new(),
+                fail_read_once: BTreeSet::new(),
+                fail_read_always: BTreeSet::new(),
                 fail_always: BTreeSet::new(),
                 connection_dead: false,
                 ftp_rename_semantics: false,
@@ -1306,6 +1311,11 @@ pub(crate) mod memory {
         fn read(&mut self, path: &RemotePath, max: u64) -> Result<Option<Vec<u8>>> {
             if self.connection_dead {
                 bail!("connection is dead");
+            }
+            if self.fail_read_always.contains(path.as_str())
+                || self.fail_read_once.remove(path.as_str())
+            {
+                bail!("injected read failure on {}", path.as_str());
             }
             let Some(bytes) = self.files.get(path.as_str()) else {
                 return Ok(None);

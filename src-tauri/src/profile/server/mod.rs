@@ -13,6 +13,7 @@ pub(crate) mod local;
 pub(crate) mod local_worker;
 pub(crate) mod paths;
 pub(crate) mod plan;
+pub(crate) mod progress;
 pub(crate) mod remote;
 pub(crate) mod runtime;
 pub(crate) mod secrets;

@@ -39,6 +39,7 @@ use crate::{
             engine::{self, OperationMeta, Session},
             host,
             plan::{self, DeploySelection, Publication},
+            progress::{ProgressReporter, ProgressStatus, SyncOperation, SyncPhase, SyncProgress},
             remote::{ConnectionAttempt, RemoteConnection, RemoteOps},
             settings::RestartPolicy,
             spec::DeploymentSpec,
@@ -60,6 +61,7 @@ pub struct WorkerContext {
     /// the remote lease's job; this keeps a manual request and an automatic
     /// poll from racing in the same process.
     operation_lock: Mutex<()>,
+    progress: Arc<std::sync::Mutex<Option<SyncProgress>>>,
     token: String,
     cache_dir: std::path::PathBuf,
 }
@@ -88,6 +90,7 @@ impl WorkerContext {
             journal,
             spec,
             operation_lock: Mutex::new(()),
+            progress: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -112,6 +115,34 @@ impl WorkerContext {
 
     fn meta(&self, kind: OperationKind) -> OperationMeta {
         OperationMeta::worker(&self.config.worker_id, kind)
+    }
+
+    fn reporter(
+        &self,
+        run_id: String,
+        operation: SyncOperation,
+        selection: &DeploySelection,
+    ) -> ProgressReporter {
+        let current = self.progress.clone();
+        ProgressReporter::new(run_id, operation, selection, move |snapshot| {
+            if let Ok(mut slot) = current.lock() {
+                *slot = Some(snapshot);
+            }
+        })
+    }
+
+    fn clear_progress(&self) {
+        if let Ok(mut slot) = self.progress.lock() {
+            *slot = None;
+        }
+    }
+
+    fn fail_progress(&self) {
+        if let Ok(mut slot) = self.progress.lock() {
+            if let Some(snapshot) = slot.as_mut() {
+                snapshot.status = ProgressStatus::Failed;
+            }
+        }
     }
 
     /// The context the plan hash binds an approval to. The identity comes
@@ -140,6 +171,17 @@ impl WorkerContext {
         &self,
         include_mods: bool,
     ) -> Result<(FetchedPublication, plan::DesiredDeployment)> {
+        let mut progress =
+            ProgressReporter::silent(SyncOperation::Preview, &DeploySelection::default());
+        self.publication_with_progress(include_mods, &mut progress)
+            .await
+    }
+
+    async fn publication_with_progress(
+        &self,
+        include_mods: bool,
+        progress: &mut ProgressReporter,
+    ) -> Result<(FetchedPublication, plan::DesiredDeployment)> {
         let publication = match self.sync.poll(&self.journal, None).await? {
             PublicationProbe::New(publication) => publication,
             PublicationProbe::Unchanged(metadata) => {
@@ -153,6 +195,9 @@ impl WorkerContext {
                 bail!("profile has no published revision yet")
             }
         };
+        if include_mods {
+            progress.phase(SyncPhase::StagingPayload);
+        }
 
         let source = CachePayloadSource {
             root: self.cache_dir.clone(),
@@ -162,12 +207,22 @@ impl WorkerContext {
                 .mod_loader,
         };
 
+        let mut staging_total = None;
         let desired = stage::stage_publication(
             &Publication::from_fetched(&publication),
             &source,
             &self.spec,
             include_mods,
-            |_, _, _| {},
+            |completed, total, name| {
+                if staging_total.is_none() {
+                    progress.work(total, None);
+                    staging_total = Some(total);
+                }
+                if !name.is_empty() {
+                    progress.item(name);
+                }
+                progress.advance(completed, None);
+            },
         )
         .await?;
 
@@ -287,6 +342,15 @@ async fn status(
     .into_response()
 }
 
+/// The latest snapshot is bounded to one operation and lives only in this
+/// process. Polling it never waits for the remote operation lock.
+async fn operation_progress(State(ctx): State<Arc<WorkerContext>>, headers: HeaderMap) -> Response {
+    if !authorized(&ctx, &headers) {
+        return unauthorized();
+    }
+    Json(ctx.progress.lock().ok().and_then(|slot| slot.clone())).into_response()
+}
+
 async fn preview(
     State(ctx): State<Arc<WorkerContext>>,
     headers: HeaderMap,
@@ -296,14 +360,47 @@ async fn preview(
         return unauthorized();
     }
 
-    let selection = request.selection;
-    let (publication, desired) = match ctx.publication(selection.include_mods).await {
-        Ok(pair) => pair,
-        Err(err) => return error_response(&err),
+    // Keep a manual preview from overlapping a deployment in this worker.
+    let Ok(guard) = ctx.operation_lock.try_lock() else {
+        return busy_response("this worker");
     };
 
+    let selection = request.selection;
+    let run_id = if request.run_id.is_empty() {
+        uuid::Uuid::new_v4().simple().to_string()
+    } else {
+        request.run_id
+    };
+    let mut progress = ctx.reporter(run_id, SyncOperation::Preview, &selection);
+    let response = preview_inner(&ctx, selection, request.restart_policy, &mut progress).await;
+    match response {
+        Ok(preview) => {
+            progress.succeeded();
+            ctx.clear_progress();
+            drop(guard);
+            Json(preview).into_response()
+        }
+        Err(error) => {
+            progress.failed();
+            ctx.fail_progress();
+            drop(guard);
+            error_response(&error)
+        }
+    }
+}
+
+async fn preview_inner(
+    ctx: &Arc<WorkerContext>,
+    selection: DeploySelection,
+    restart_policy: Option<RestartPolicy>,
+    progress: &mut ProgressReporter,
+) -> Result<engine::Preview> {
+    let (publication, desired) = ctx
+        .publication_with_progress(selection.include_mods, progress)
+        .await?;
+
     // The plan hash binds the restart policy the deploy will use.
-    let policy = match request.restart_policy {
+    let policy = match restart_policy {
         Some(policy) => policy,
         None => ctx.journal.state.lock().await.restart_policy,
     };
@@ -311,23 +408,33 @@ async fn preview(
     let ctx2 = ctx.clone();
     let meta = ctx.meta(OperationKind::Manual);
     let context = ctx.plan_context(policy);
-    match tokio::task::spawn_blocking(move || {
-        let mut session = ctx2.open_session()?;
-        engine::preview(
-            &mut session,
-            &Publication::from_fetched(&publication),
-            &desired,
-            &selection,
-            &context,
-            &meta,
-        )
+    let mut blocking_progress = std::mem::replace(
+        progress,
+        ProgressReporter::silent(SyncOperation::Preview, &selection),
+    );
+    let (result, returned) = tokio::task::spawn_blocking(move || {
+        let result = (|| {
+            blocking_progress.phase(SyncPhase::Connecting);
+            let ops = ctx2.connect()?;
+            blocking_progress.phase(SyncPhase::ReadingState);
+            let mut session =
+                engine::open_session(ops, &ctx2.spec, ctx2.config.remote.server_directory()?)?;
+            engine::preview_with_progress(
+                &mut session,
+                &Publication::from_fetched(&publication),
+                &desired,
+                &selection,
+                &context,
+                &meta,
+                &mut blocking_progress,
+            )
+        })();
+        (result, blocking_progress)
     })
     .await
-    {
-        Ok(Ok(preview)) => Json(preview).into_response(),
-        Ok(Err(err)) => error_response(&err),
-        Err(err) => error_response(&eyre::eyre!(err)),
-    }
+    .context("preview task panicked")?;
+    *progress = returned;
+    result
 }
 
 async fn deploy(
@@ -352,6 +459,7 @@ async fn deploy(
         request.restart_policy,
         request.force,
         OperationKind::Manual,
+        Some(request.run_id),
     )
     .await
     {
@@ -372,6 +480,43 @@ async fn run_deployment(
     restart_policy: Option<RestartPolicy>,
     force: bool,
     kind: OperationKind,
+    run_id: Option<String>,
+) -> Result<DeployResponse> {
+    let meta = ctx.meta(kind);
+    let run_id = run_id
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| meta.id.clone());
+    let mut progress = ctx.reporter(run_id, SyncOperation::Deploy, &selection);
+    let result = run_deployment_inner(
+        ctx,
+        selection,
+        plan_hash,
+        restart_policy,
+        force,
+        kind,
+        &meta,
+        &mut progress,
+    )
+    .await;
+    if result.is_err() {
+        progress.failed();
+        ctx.fail_progress();
+    } else {
+        ctx.clear_progress();
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_deployment_inner(
+    ctx: &Arc<WorkerContext>,
+    selection: DeploySelection,
+    plan_hash: Option<String>,
+    restart_policy: Option<RestartPolicy>,
+    force: bool,
+    kind: OperationKind,
+    meta: &OperationMeta,
+    progress: &mut ProgressReporter,
 ) -> Result<DeployResponse> {
     // The restart policy is resolved before planning so the approval hash
     // binds the behavior the operation will actually apply.
@@ -382,10 +527,11 @@ async fn run_deployment(
         None => ctx.journal.state.lock().await.restart_policy,
     };
 
-    let (publication, desired) = ctx.publication(selection.include_mods).await?;
+    let (publication, desired) = ctx
+        .publication_with_progress(selection.include_mods, progress)
+        .await?;
     let config_revision = managed_config_revision(&publication, &ctx.spec);
 
-    let meta = ctx.meta(kind);
     {
         // Marks the in-flight operation so a crash mid-deployment is
         // visible through /v1/status after restart.
@@ -406,7 +552,8 @@ async fn run_deployment(
         policy,
         force,
         &context,
-        &meta,
+        meta,
+        progress,
     )
     .await;
 
@@ -455,6 +602,7 @@ async fn execute_deployment(
     force: bool,
     context: &plan::PlanContext,
     meta: &OperationMeta,
+    progress: &mut ProgressReporter,
 ) -> Result<DeployResponse> {
     let ctx2 = ctx.clone();
     let meta2 = meta.clone();
@@ -464,31 +612,46 @@ async fn execute_deployment(
         move || ctx3.connect()
     };
 
-    let (session, deployment) = tokio::task::spawn_blocking(move || {
-        let mut session = ctx2.open_session()?;
-        let deployment = engine::deploy(
-            &mut session,
-            connect,
-            &Publication::from_fetched(&publication),
-            &desired,
-            &selection,
-            &context2,
-            &meta2,
-            plan_hash.as_deref(),
-            force,
-            |_| {},
-        )?;
-        Ok::<_, eyre::Report>((session, deployment))
+    let mut blocking_progress = std::mem::replace(
+        progress,
+        ProgressReporter::silent(SyncOperation::Deploy, &selection),
+    );
+    let (result, returned) = tokio::task::spawn_blocking(move || {
+        let result = (|| {
+            blocking_progress.phase(SyncPhase::Connecting);
+            let ops = ctx2.connect()?;
+            blocking_progress.phase(SyncPhase::ReadingState);
+            let mut session =
+                engine::open_session(ops, &ctx2.spec, ctx2.config.remote.server_directory()?)?;
+            let deployment = engine::deploy_with_progress(
+                &mut session,
+                connect,
+                &Publication::from_fetched(&publication),
+                &desired,
+                &selection,
+                &context2,
+                &meta2,
+                plan_hash.as_deref(),
+                force,
+                &mut blocking_progress,
+                |_| {},
+            )?;
+            Ok::<_, eyre::Report>((session, deployment))
+        })();
+        (result, blocking_progress)
     })
     .await
-    .context("deployment task panicked")??;
+    .context("deployment task panicked")?;
+    *progress = returned;
+    let (session, deployment) = result?;
 
-    let response = engine::complete(
+    let response = engine::complete_with_progress(
         session,
         deployment,
         ctx.host().as_ref(),
         restart_policy,
         meta.clone(),
+        progress,
     )
     .await?;
     if let Some(record) = response.state.last_operation.clone() {
@@ -802,8 +965,16 @@ async fn poll_once(ctx: &Arc<WorkerContext>) {
                 }
             };
 
-            let result =
-                run_deployment(ctx, selection, None, None, false, OperationKind::Automatic).await;
+            let result = run_deployment(
+                ctx,
+                selection,
+                None,
+                None,
+                false,
+                OperationKind::Automatic,
+                None,
+            )
+            .await;
             drop(guard);
 
             let mut state = ctx.journal.state.lock().await;
@@ -954,6 +1125,7 @@ pub async fn run(
 
     let app = Router::new()
         .route("/v1/status", get(status))
+        .route("/v1/progress", get(operation_progress))
         .route("/v1/preview", post(preview))
         .route("/v1/deploy", post(deploy))
         .route("/v1/policy", post(set_policy))
@@ -986,10 +1158,18 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
 
-    use super::{AutoAction, automatic_action, retry_delay};
+    use super::{AutoAction, WorkerContext, automatic_action, operation_progress, retry_delay};
+    use crate::profile::server::{
+        plan::DeploySelection,
+        progress::{ProgressStatus, SyncOperation, SyncPhase, SyncProgress},
+    };
     use crate::worker::journal::{PendingWork, WorkerJournal};
+    use crate::worker::{config::WorkerConfig, journal::Journal, secrets::Secrets};
 
     fn journal() -> WorkerJournal {
         WorkerJournal {
@@ -1000,6 +1180,75 @@ mod tests {
 
     fn owed_mod() -> crate::profile::export::ModRevision {
         crate::profile::export::ModRevision::try_from("a".repeat(64)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn progress_endpoint_requires_bearer_and_exposes_only_the_latest_run() {
+        use axum::extract::State;
+
+        let directory = tempfile::tempdir().unwrap();
+        let config = WorkerConfig {
+            game: "valheim".to_owned(),
+            profile_id: "profile-1".to_owned(),
+            worker_id: "worker-1".to_owned(),
+            state_dir: directory.path().to_path_buf(),
+            ..Default::default()
+        };
+        let make_context = || {
+            Arc::new(
+                WorkerContext::new(
+                    config.clone(),
+                    Secrets {
+                        token: Some("private-token".to_owned()),
+                        ..Default::default()
+                    },
+                    Journal::load(directory.path()).unwrap(),
+                )
+                .unwrap(),
+            )
+        };
+        let ctx = make_context();
+        let unauthorized = operation_progress(State(ctx.clone()), HeaderMap::new()).await;
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer private-token"),
+        );
+        let read = |ctx: Arc<WorkerContext>, headers: HeaderMap| async move {
+            let response = operation_progress(State(ctx), headers).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<Option<SyncProgress>>(&body).unwrap()
+        };
+        assert!(read(ctx.clone(), headers.clone()).await.is_none());
+
+        let mut first = ctx.reporter(
+            "first".to_owned(),
+            SyncOperation::Preview,
+            &DeploySelection::default(),
+        );
+        first.phase(SyncPhase::Connecting);
+        assert_eq!(
+            read(ctx.clone(), headers.clone()).await.unwrap().run_id,
+            "first"
+        );
+        let mut second = ctx.reporter(
+            "second".to_owned(),
+            SyncOperation::Deploy,
+            &DeploySelection::default(),
+        );
+        second.phase(SyncPhase::Connecting);
+        ctx.fail_progress();
+        let snapshot = read(ctx.clone(), headers.clone()).await.unwrap();
+        assert_eq!(snapshot.run_id, "second");
+        assert_eq!(snapshot.status, ProgressStatus::Failed);
+        ctx.clear_progress();
+        assert!(read(ctx, headers.clone()).await.is_none());
+        assert!(read(make_context(), headers).await.is_none());
     }
 
     #[test]

@@ -2,8 +2,8 @@
 //!
 //! One deployment is three phases:
 //!
-//! 1. **Plan.** Snapshot the remote and run the pure planner ([`preview`],
-//!    or the re-plan inside [`deploy`]). The plan hash binds user approval
+//! 1. **Plan.** Snapshot the remote and run the pure planner ([`preview_with_progress`],
+//!    or the re-plan inside [`deploy_with_progress`]). The plan hash binds user approval
 //!    to exactly the actions that will run.
 //! 2. **Files.** Under the remote lease, apply removals, uploads, and
 //!    config writes; record every success in the deployment state and
@@ -29,6 +29,8 @@ use ssh2::ErrorCode;
 use suppaftp::{FtpError, Status};
 use tracing::{debug, info, warn};
 
+#[cfg(test)]
+use super::progress::SyncOperation;
 use super::{
     host::{HostCapabilities, HostControl, HostStatus},
     lease::{self, Lease, LeaseRecord, Ownership},
@@ -37,6 +39,7 @@ use super::{
         self, ConfigAction, DeploySelection, DeploymentPlan, DesiredDeployment, FileSource,
         PlanContext, Publication, RemoteLayout, RemoteSnapshot, UploadKind,
     },
+    progress::{ProgressReporter, SyncPhase},
     remote::RemoteOps,
     settings::RestartPolicy,
     spec::DeploymentSpec,
@@ -284,6 +287,7 @@ pub struct Preview {
 /// the deployment lease so the observed state cannot shift mid-read; when
 /// another executor holds the lease the plan is still computed (unlocked,
 /// advisory only) and the holder is reported through `busy`.
+#[cfg(test)]
 pub fn preview(
     session: &mut Session,
     publication: &Publication,
@@ -292,6 +296,28 @@ pub fn preview(
     context: &PlanContext,
     meta: &OperationMeta,
 ) -> Result<Preview> {
+    let mut progress = ProgressReporter::silent(SyncOperation::Preview, selection);
+    preview_with_progress(
+        session,
+        publication,
+        desired,
+        selection,
+        context,
+        meta,
+        &mut progress,
+    )
+}
+
+pub fn preview_with_progress(
+    session: &mut Session,
+    publication: &Publication,
+    desired: &DesiredDeployment,
+    selection: &DeploySelection,
+    context: &PlanContext,
+    meta: &OperationMeta,
+    progress: &mut ProgressReporter,
+) -> Result<Preview> {
+    progress.phase(SyncPhase::CheckingLease);
     let held = match lease::acquire(
         session.ops.as_mut(),
         &session.mapper.remote_path(&session.mapper.spec.lease_dir),
@@ -304,7 +330,8 @@ pub fn preview(
         Err(err) => match err.downcast::<lease::LeaseBusy>() {
             Ok(busy) => {
                 info!(phase = "preview.busy", owner = %busy.record.owner, stale = busy.stale, "preview found an existing deployment lease; taking a read-only snapshot");
-                let snapshot = take_snapshot(session, publication, desired, selection)?;
+                let snapshot = take_snapshot(session, publication, desired, selection, progress)?;
+                progress.phase(SyncPhase::BuildingPlan);
                 let plan = plan::build_plan(
                     publication,
                     desired,
@@ -313,6 +340,7 @@ pub fn preview(
                     context,
                     &session.mapper.spec,
                 )?;
+                progress.phase(SyncPhase::FinalizingPreview);
                 return Ok(Preview {
                     plan,
                     busy: Some(busy),
@@ -323,20 +351,23 @@ pub fn preview(
         },
     };
 
-    let snapshot = take_snapshot(session, publication, desired, selection);
+    let snapshot = take_snapshot(session, publication, desired, selection, progress);
     if let Some(lease) = held {
         lease.release(session.ops.as_mut());
     }
 
+    let snapshot = snapshot?;
+    progress.phase(SyncPhase::BuildingPlan);
     let plan = plan::build_plan(
         publication,
         desired,
-        &snapshot?,
+        &snapshot,
         selection,
         context,
         &session.mapper.spec,
     )?;
 
+    progress.phase(SyncPhase::FinalizingPreview);
     Ok(Preview {
         plan,
         busy: None,
@@ -345,7 +376,7 @@ pub fn preview(
 }
 
 /// The file phase of a deployment, completed with the lease still held.
-/// The caller decides the restart, then calls [`finish`].
+/// The caller decides the restart, then calls [`complete_with_progress`].
 pub struct Deployment {
     pub plan: DeploymentPlan,
     pub summary: OperationSummary,
@@ -368,22 +399,50 @@ pub struct DeploymentResult {
 }
 
 /// Completes the restart and records the result before releasing the lease.
-pub async fn complete(
+pub async fn complete_with_progress(
+    session: Session,
+    deployment: Deployment,
+    host: &dyn HostControl,
+    policy: RestartPolicy,
+    meta: OperationMeta,
+    progress: &mut ProgressReporter,
+) -> Result<DeploymentResult> {
+    complete_impl(session, deployment, host, policy, meta, Some(progress)).await
+}
+
+async fn complete_impl(
     mut session: Session,
     deployment: Deployment,
     host: &dyn HostControl,
     policy: RestartPolicy,
     meta: OperationMeta,
+    mut progress: Option<&mut ProgressReporter>,
 ) -> Result<DeploymentResult> {
-    let restart = apply_restart_policy(host, policy, session.state.restart_required).await;
+    if let Some(progress) = progress.as_deref_mut() {
+        progress.phase(SyncPhase::ApplyingRestart);
+    }
+    let restart = apply_restart_policy_reporting(
+        host,
+        policy,
+        session.state.restart_required,
+        progress.as_deref_mut(),
+    )
+    .await;
     let plan = deployment.plan.clone();
     let summary = deployment.summary.clone();
     let warnings = deployment.warnings.clone();
     let failed_config_writes = deployment.failed_config_writes.clone();
+    if let Some(progress) = progress.as_deref_mut() {
+        progress.phase(SyncPhase::ReleasingLease);
+    }
     let state =
         tokio::task::spawn_blocking(move || finish(&mut session, deployment, restart, &meta))
             .await
             .context("deployment finalization task failed")??;
+
+    if let Some(progress) = progress.as_deref_mut() {
+        progress.succeeded();
+    }
 
     Ok(DeploymentResult {
         plan,
@@ -409,6 +468,7 @@ pub async fn complete(
 /// `force` breaks a *stale foreign* lease, the documented recovery once
 /// the old executor is confirmed stopped. Live foreign leases always win.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn deploy(
     session: &mut Session,
     connect: impl FnMut() -> Result<Box<dyn RemoteOps>> + Send + 'static,
@@ -421,6 +481,37 @@ pub fn deploy(
     force: bool,
     mut report: impl FnMut(EngineProgress),
 ) -> Result<Deployment> {
+    let mut progress = ProgressReporter::silent(SyncOperation::Deploy, selection);
+    deploy_with_progress(
+        session,
+        connect,
+        publication,
+        desired,
+        selection,
+        context,
+        meta,
+        expected_plan_hash,
+        force,
+        &mut progress,
+        &mut report,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn deploy_with_progress(
+    session: &mut Session,
+    connect: impl FnMut() -> Result<Box<dyn RemoteOps>> + Send + 'static,
+    publication: &Publication,
+    desired: &DesiredDeployment,
+    selection: &DeploySelection,
+    context: &PlanContext,
+    meta: &OperationMeta,
+    expected_plan_hash: Option<&str>,
+    force: bool,
+    progress: &mut ProgressReporter,
+    mut report: impl FnMut(EngineProgress),
+) -> Result<Deployment> {
+    progress.phase(SyncPhase::CheckingLease);
     let mut lease = lease::acquire(
         session.ops.as_mut(),
         &session.mapper.remote_path(&session.mapper.spec.lease_dir),
@@ -434,7 +525,8 @@ pub fn deploy(
     // Under the lease, re-read the authoritative state and re-plan. The
     // approval must match what the remote looks like now.
     let plan = (|| -> Result<DeploymentPlan> {
-        let snapshot = take_snapshot(session, publication, desired, selection)?;
+        let snapshot = take_snapshot(session, publication, desired, selection, progress)?;
+        progress.phase(SyncPhase::BuildingPlan);
         let plan = plan::build_plan(
             publication,
             desired,
@@ -462,7 +554,15 @@ pub fn deploy(
         }
     };
 
-    let result = execute(session, &plan, desired, publication, &lease, &mut report);
+    let result = execute(
+        session,
+        &plan,
+        desired,
+        publication,
+        &lease,
+        progress,
+        &mut report,
+    );
 
     match result {
         Ok((summary, mut warnings, failed_config_writes)) => {
@@ -477,6 +577,7 @@ pub fn deploy(
             // correct ownership and revision records. Both guards fail
             // closed: losing the lease or seeing a newer remote state
             // aborts the operation.
+            progress.phase(SyncPhase::PersistingState);
             if let Err(err) = ensure_ownership(&lease, session).and_then(|_| persist_state(session))
             {
                 let recorded = fail_operation(session, &lease, meta, &plan, &err);
@@ -568,26 +669,59 @@ fn ensure_ownership(lease: &Lease, session: &mut Session) -> Result<()> {
 ///
 /// `NotRequired`/`Awaiting*` outcomes are recorded in the deployment state
 /// by [`finish`]; an unknown player count is never treated as empty.
+#[cfg(test)]
 pub async fn apply_restart_policy(
     host: &dyn HostControl,
     policy: RestartPolicy,
     requires_restart: bool,
 ) -> RestartOutcome {
+    apply_restart_policy_reporting(host, policy, requires_restart, None).await
+}
+
+async fn apply_restart_policy_reporting(
+    host: &dyn HostControl,
+    policy: RestartPolicy,
+    requires_restart: bool,
+    mut progress: Option<&mut ProgressReporter>,
+) -> RestartOutcome {
     if !requires_restart {
+        if let Some(progress) = progress.as_deref_mut() {
+            progress.item("No restart needed");
+        }
         return RestartOutcome::NotRequired;
     }
 
     let HostCapabilities { can_restart, .. } = host.capabilities();
     if !can_restart {
+        if let Some(progress) = progress.as_deref_mut() {
+            progress.item("Waiting for a manual restart");
+        }
         return RestartOutcome::AwaitingManual;
     }
 
     match policy {
-        RestartPolicy::Manual => RestartOutcome::AwaitingManual,
-        RestartPolicy::Immediate => do_restart(host, host.status().await.ok()).await,
+        RestartPolicy::Manual => {
+            if let Some(progress) = progress.as_deref_mut() {
+                progress.item("Waiting for a manual restart");
+            }
+            RestartOutcome::AwaitingManual
+        }
+        RestartPolicy::Immediate => {
+            if let Some(progress) = progress.as_deref_mut() {
+                progress.item("Checking server status");
+            }
+            do_restart(host, host.status().await.ok(), progress).await
+        }
         RestartPolicy::WhenEmpty => match host.status().await {
-            Ok(status) if status.players == Some(0) => do_restart(host, Some(status)).await,
-            _ => RestartOutcome::AwaitingEmpty,
+            Ok(status) if status.players == Some(0) => {
+                do_restart(host, Some(status), progress).await
+            }
+            _ => {
+                if let Some(progress) = progress.as_deref_mut() {
+                    progress.item("Waiting until the server is empty");
+                }
+                RestartOutcome::AwaitingEmpty
+            }
         },
     }
 }
@@ -599,8 +733,15 @@ fn observed_restart(saw_stopped: &mut bool, running: Option<bool>) -> bool {
     *saw_stopped && running == Some(true)
 }
 
-async fn do_restart(host: &dyn HostControl, before: Option<HostStatus>) -> RestartOutcome {
+async fn do_restart(
+    host: &dyn HostControl,
+    before: Option<HostStatus>,
+    mut progress: Option<&mut ProgressReporter>,
+) -> RestartOutcome {
     info!(host = host.name(), "restarting dedicated server");
+    if let Some(progress) = progress.as_deref_mut() {
+        progress.item("Requesting server restart");
+    }
     if host.restart().await.is_err() {
         return RestartOutcome::Failed;
     }
@@ -608,7 +749,14 @@ async fn do_restart(host: &dyn HostControl, before: Option<HostStatus>) -> Resta
     // A running response alone may still describe the old process. Only a
     // stop followed by a start confirms the requested restart took effect.
     let mut saw_stopped = before.is_some_and(|status| status.running == Some(false));
-    for _ in 0..RESTART_VERIFY_ATTEMPTS {
+    for attempt in 0..RESTART_VERIFY_ATTEMPTS {
+        if let Some(progress) = progress.as_deref_mut() {
+            progress.item(format!(
+                "Waiting for server to stop and start (check {} of {})",
+                attempt + 1,
+                RESTART_VERIFY_ATTEMPTS
+            ));
+        }
         tokio::time::sleep(RESTART_VERIFY_DELAY).await;
         match host.status().await {
             Ok(status) if observed_restart(&mut saw_stopped, status.running) => {
@@ -753,7 +901,9 @@ fn take_snapshot(
     publication: &Publication,
     desired: &DesiredDeployment,
     selection: &DeploySelection,
+    progress: &mut ProgressReporter,
 ) -> Result<RemoteSnapshot> {
+    progress.phase(SyncPhase::RefreshingState);
     refresh_state(session)?;
     info!(
         phase = "snapshot",
@@ -768,6 +918,8 @@ fn take_snapshot(
     let mut payload_hashes = BTreeMap::new();
 
     if selection.include_mods {
+        progress.phase(SyncPhase::ScanningPayload);
+        let mut scanned = 0;
         for dir in &spec.payload_dirs {
             collect_remote(
                 session.ops.as_mut(),
@@ -775,6 +927,8 @@ fn take_snapshot(
                 dir.as_path(),
                 &mut payload_files,
                 &mut payload_dirs,
+                progress,
+                &mut scanned,
             )?;
         }
 
@@ -784,12 +938,19 @@ fn take_snapshot(
         // Only files that are both owned and desired are read: hashing
         // foreign files gains nothing, and an owned file that is no longer
         // desired is being removed anyway.
+        progress.phase(SyncPhase::VerifyingPayload);
+        let to_hash: Vec<_> = desired
+            .payload
+            .iter()
+            .filter(|(path, staged)| {
+                session.state.files.contains_key(*path)
+                    && payload_files.get(*path) == Some(&staged.size)
+            })
+            .collect();
+        progress.work(to_hash.len(), None);
         let mut hashed = 0usize;
-        for (path, staged) in &desired.payload {
-            let owned = session.state.files.contains_key(path);
-            if !owned || payload_files.get(path) != Some(&staged.size) {
-                continue;
-            }
+        for (index, (path, staged)) in to_hash.iter().enumerate() {
+            progress.item(path.to_string());
             let remote = session.mapper.remote_path(path);
             debug!(phase = "snapshot.payload", path = %remote, hashed, "reading owned payload");
             match read_snapshot_file(
@@ -799,14 +960,17 @@ fn take_snapshot(
                 "snapshot.payload",
             )? {
                 Some(bytes) => {
-                    payload_hashes
-                        .insert(path.clone(), ContentHash::from_hash(blake3::hash(&bytes)));
+                    payload_hashes.insert(
+                        (*path).clone(),
+                        ContentHash::from_hash(blake3::hash(&bytes)),
+                    );
                     hashed += 1;
                 }
                 // A file removed after listing remains divergent. Transport
                 // failures are returned above and must not become uploads.
                 None => {}
             }
+            progress.advance(index + 1, None);
         }
         info!(
             phase = "snapshot.payload",
@@ -838,7 +1002,10 @@ fn take_snapshot(
             }
         }
 
-        for path in paths {
+        progress.phase(SyncPhase::CheckingConfigs);
+        progress.work(paths.len(), None);
+        for (index, path) in paths.into_iter().enumerate() {
+            progress.item(path.to_string());
             let deploy = DeployPathBuf::new(path.as_str())
                 .map_err(|_| eyre::eyre!("config path is not deployable: {path}"))?;
             let remote = session.mapper.remote_path(&deploy);
@@ -852,6 +1019,7 @@ fn take_snapshot(
                 None => None,
             };
             config_remote.insert(path, hash);
+            progress.advance(index + 1, None);
         }
     }
 
@@ -899,6 +1067,7 @@ fn execute(
     desired: &DesiredDeployment,
     publication: &Publication,
     lease: &Lease,
+    progress: &mut ProgressReporter,
     report: &mut impl FnMut(EngineProgress),
 ) -> Result<(OperationSummary, Vec<String>, Vec<ConfigPath>)> {
     let total = plan.removals.len() + plan.directory_removals.len() + plan.uploads.len();
@@ -909,10 +1078,17 @@ fn execute(
     };
     let mut warnings = Vec::new();
     let mut failed_config_writes = Vec::new();
+    let removals_total = plan.removals.len() + plan.directory_removals.len();
+    if removals_total > 0 {
+        progress.phase(SyncPhase::RemovingFiles);
+        progress.work(removals_total, None);
+    }
+    let mut removed = 0;
 
     // ---- Removals (payload only). Failures keep the ownership record so
     // the next deployment retries instead of forgetting the file.
     for path in &plan.removals {
+        progress.item(path.to_string());
         let remote = session.mapper.remote_path(path);
         if session
             .ops
@@ -924,6 +1100,8 @@ fn execute(
         }
         session.state.files.remove(path);
         completed += 1;
+        removed += 1;
+        progress.advance(removed, None);
         report(EngineProgress {
             completed,
             total,
@@ -933,11 +1111,14 @@ fn execute(
     }
 
     for dir in &plan.directory_removals {
+        progress.item(format!("{dir}/"));
         let remote = session.mapper.remote_path(dir);
         if let Err(error) = session.ops.delete_dir(&remote) {
             warnings.push(format!("could not remove {dir}/: {error}"));
         }
         completed += 1;
+        removed += 1;
+        progress.advance(removed, None);
         report(EngineProgress {
             completed,
             total,
@@ -949,8 +1130,33 @@ fn execute(
     // ---- Uploads: payload, seeds, then published config writes.
     ensure_ownership(lease, session)?;
     let mut ensured = BTreeSet::new();
+    let payload_uploads: Vec<_> = plan
+        .uploads
+        .iter()
+        .filter(|upload| upload.kind != UploadKind::Config)
+        .collect();
+    let payload_bytes: u64 = payload_uploads.iter().map(|upload| upload.size).sum();
+    let config_total = plan
+        .uploads
+        .iter()
+        .filter(|upload| upload.kind == UploadKind::Config)
+        .count();
+    if !payload_uploads.is_empty() {
+        progress.phase(SyncPhase::UploadingPayload);
+        progress.work(payload_uploads.len(), Some(payload_bytes));
+    }
+    let mut uploaded = 0;
+    let mut uploaded_bytes = 0;
+    let mut written_configs = 0;
+    let mut writing_configs = false;
 
     for upload in &plan.uploads {
+        if upload.kind == UploadKind::Config && !writing_configs {
+            progress.phase(SyncPhase::WritingConfigs);
+            progress.work(config_total, None);
+            writing_configs = true;
+        }
+        progress.item(upload.path.to_string());
         let result = match upload.kind {
             UploadKind::Payload | UploadKind::ConfigSeed => {
                 let staged = match upload.kind {
@@ -1012,6 +1218,14 @@ fn execute(
         }
 
         completed += 1;
+        if upload.kind == UploadKind::Config {
+            written_configs += 1;
+            progress.advance(written_configs, None);
+        } else {
+            uploaded += 1;
+            uploaded_bytes += upload.size;
+            progress.advance(uploaded, Some(uploaded_bytes));
+        }
         report(EngineProgress {
             completed,
             total,
@@ -1347,8 +1561,11 @@ fn collect_remote(
     dir: &DeployPath,
     files: &mut BTreeMap<DeployPathBuf, u64>,
     directories: &mut BTreeSet<DeployPathBuf>,
+    progress: &mut ProgressReporter,
+    scanned: &mut usize,
 ) -> Result<()> {
     let remote_dir = mapper.remote_path(dir);
+    progress.item(dir.to_string());
 
     for entry in ops
         .list(&remote_dir)
@@ -1364,9 +1581,22 @@ fn collect_remote(
 
         if entry.is_directory {
             directories.insert(relative.clone());
-            collect_remote(ops, mapper, &relative, files, directories)?;
+            *scanned += 1;
+            progress.advance(*scanned, None);
+            collect_remote(
+                ops,
+                mapper,
+                &relative,
+                files,
+                directories,
+                progress,
+                scanned,
+            )?;
         } else {
-            files.insert(relative, entry.size.unwrap_or(0));
+            files.insert(relative.clone(), entry.size.unwrap_or(0));
+            *scanned += 1;
+            progress.item(relative.to_string());
+            progress.advance(*scanned, None);
         }
     }
 
@@ -1439,6 +1669,7 @@ mod tests {
         profile::{
             export::{ConfigPath, ModRevision, R2Mod},
             server::{
+                host,
                 lease::LeaseRecord,
                 paths::RemotePathBuf,
                 plan::{Publication, StagedFile},
@@ -3618,6 +3849,385 @@ mod tests {
             second.state.config.get(&path).map(|r| r.policy),
             Some(ConfigUpdatePolicy::AlwaysKeep)
         );
+    }
+
+    #[test]
+    fn preview_reports_multifile_hashing_and_config_reads_after_a_reconnect() {
+        use crate::profile::server::progress::{ProgressStatus, SyncPhase};
+
+        let memory = remote();
+        let mut fixture = mod_fixture();
+        let mut desired = DesiredDeployment::default();
+        let mut state = ServerDeploymentState {
+            version: state::VERSION,
+            ..Default::default()
+        };
+        for index in 0..24 {
+            let path = deploy_path(&format!("BepInEx/plugins/Author-ModA/file-{index:02}.dll"));
+            let bytes = format!("payload-{index:02}");
+            desired
+                .payload
+                .insert(path.clone(), staged(bytes.as_bytes()));
+            state.files.insert(
+                path.clone(),
+                OwnedFile {
+                    hash: blake3::hash(bytes.as_bytes()).to_hex().to_string(),
+                    size: bytes.len() as u64,
+                },
+            );
+            memory
+                .lock()
+                .unwrap()
+                .put_file(&format!("{BASE}/{path}"), bytes.as_bytes());
+        }
+        for index in 0..12 {
+            let path = config_path(&format!("BepInEx/config/file-{index:02}.cfg"));
+            let bytes = format!("config-{index:02}");
+            fixture
+                .config
+                .insert(path.clone(), config_file(bytes.as_bytes()));
+            memory
+                .lock()
+                .unwrap()
+                .put_file(&format!("{BASE}/{path}"), bytes.as_bytes());
+        }
+        {
+            let mut remote = memory.lock().unwrap();
+            remote.put_file(STATE_REMOTE, &state::serialize(&state).unwrap());
+            remote
+                .fail_read_once
+                .insert(format!("{BASE}/BepInEx/plugins/Author-ModA/file-11.dll"));
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let mut progress = ProgressReporter::new(
+            "preview-run".to_owned(),
+            SyncOperation::Preview,
+            &selection(true, true),
+            move |snapshot| sink.lock().unwrap().push(snapshot),
+        );
+        let mut session = open(memory).unwrap();
+        let result = preview_with_progress(
+            &mut session,
+            &fixture.publication(),
+            &desired,
+            &selection(true, true),
+            &context(),
+            &meta(),
+            &mut progress,
+        );
+        assert!(result.is_ok(), "{result:?}");
+        progress.succeeded();
+
+        let events = events.lock().unwrap();
+        let mut phases: Vec<_> = events.iter().map(|event| event.phase).collect();
+        phases.dedup();
+        assert_eq!(
+            phases,
+            [
+                SyncPhase::FetchingPublication,
+                SyncPhase::CheckingLease,
+                SyncPhase::RefreshingState,
+                SyncPhase::ScanningPayload,
+                SyncPhase::VerifyingPayload,
+                SyncPhase::CheckingConfigs,
+                SyncPhase::BuildingPlan,
+                SyncPhase::FinalizingPreview,
+            ]
+        );
+        for (phase, total) in [
+            (SyncPhase::VerifyingPayload, 24),
+            (SyncPhase::CheckingConfigs, 12),
+        ] {
+            let updates: Vec<_> = events
+                .iter()
+                .filter(|event| event.phase == phase && event.total == Some(total))
+                .collect();
+            assert!(
+                updates.len() > total,
+                "every file should produce a visible update"
+            );
+            assert!(
+                updates
+                    .windows(2)
+                    .all(|pair| pair[0].completed <= pair[1].completed)
+            );
+            let mut completions: Vec<_> = updates.iter().map(|event| event.completed).collect();
+            completions.dedup();
+            assert_eq!(completions, (0..=total).collect::<Vec<_>>());
+        }
+        assert_eq!(events.last().unwrap().status, ProgressStatus::Succeeded);
+        assert_eq!(
+            events.last().unwrap().completed_phases,
+            events.last().unwrap().total_phases
+        );
+    }
+
+    #[test]
+    fn failed_preview_keeps_the_hashing_phase_and_last_path() {
+        use crate::profile::server::progress::{ProgressStatus, SyncPhase};
+
+        let memory = remote();
+        let path = deploy_path("BepInEx/plugins/Author-ModA/broken.dll");
+        let bytes = b"owned payload";
+        let mut desired = DesiredDeployment::default();
+        desired.payload.insert(path.clone(), staged(bytes));
+        let mut state = ServerDeploymentState {
+            version: state::VERSION,
+            ..Default::default()
+        };
+        state.files.insert(
+            path.clone(),
+            OwnedFile {
+                hash: blake3::hash(bytes).to_hex().to_string(),
+                size: bytes.len() as u64,
+            },
+        );
+        {
+            let mut remote = memory.lock().unwrap();
+            remote.put_file(&format!("{BASE}/{path}"), bytes);
+            remote.put_file(STATE_REMOTE, &state::serialize(&state).unwrap());
+            remote.fail_read_always.insert(format!("{BASE}/{path}"));
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let mut progress = ProgressReporter::new(
+            "failed-run".to_owned(),
+            SyncOperation::Preview,
+            &selection(true, false),
+            move |snapshot| sink.lock().unwrap().push(snapshot),
+        );
+        let mut session = open(memory).unwrap();
+        assert!(
+            preview_with_progress(
+                &mut session,
+                &mod_fixture().publication(),
+                &desired,
+                &selection(true, false),
+                &context(),
+                &meta(),
+                &mut progress,
+            )
+            .is_err()
+        );
+        progress.failed();
+        let events = events.lock().unwrap();
+        let last = events.last().unwrap();
+        assert_eq!(last.status, ProgressStatus::Failed);
+        assert_eq!(last.phase, SyncPhase::VerifyingPayload);
+        assert_eq!(last.item.as_deref(), Some(path.as_str()));
+        assert_eq!(last.completed, 0);
+        assert_eq!(last.total, Some(1));
+    }
+
+    #[tokio::test]
+    async fn deploy_reports_revalidation_mutations_bytes_and_completion() {
+        use crate::profile::server::progress::{ProgressStatus, SyncPhase};
+
+        let memory = remote();
+        let old = deploy_path("BepInEx/plugins/Old/old.dll");
+        let mut state = ServerDeploymentState {
+            version: state::VERSION,
+            ..Default::default()
+        };
+        state.files.insert(
+            old.clone(),
+            OwnedFile {
+                hash: blake3::hash(b"old").to_hex().to_string(),
+                size: 3,
+            },
+        );
+        {
+            let mut remote = memory.lock().unwrap();
+            remote.put_file(&format!("{BASE}/{old}"), b"old");
+            remote.put_file(STATE_REMOTE, &state::serialize(&state).unwrap());
+        }
+        let mut desired = DesiredDeployment::default();
+        for index in 0..4 {
+            let path = deploy_path(&format!("BepInEx/plugins/New/file-{index}.dll"));
+            desired
+                .payload
+                .insert(path, staged(&vec![index as u8; (index + 1) * 1024]));
+        }
+        let config = config_path("BepInEx/config/published.cfg");
+        let mut fixture = mod_fixture();
+        fixture
+            .config
+            .insert(config.clone(), config_file(b"published"));
+        let mut selected = selection(true, true);
+        selected.apply_configs.push(config);
+        let mut preview_session = open(memory.clone()).unwrap();
+        let approved = preview(
+            &mut preview_session,
+            &fixture.publication(),
+            &desired,
+            &selected,
+            &context(),
+            &meta(),
+        )
+        .unwrap();
+        let mut session = open(memory.clone()).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let mut progress = ProgressReporter::new(
+            "deploy-run".to_owned(),
+            SyncOperation::Deploy,
+            &selected,
+            move |snapshot| sink.lock().unwrap().push(snapshot),
+        );
+        let operation = meta();
+        let deployment = deploy_with_progress(
+            &mut session,
+            no_connect,
+            &fixture.publication(),
+            &desired,
+            &selected,
+            &context(),
+            &operation,
+            Some(&approved.plan.hash),
+            false,
+            &mut progress,
+            |_| {},
+        )
+        .unwrap();
+        let expected_uploads = deployment
+            .plan
+            .uploads
+            .iter()
+            .filter(|upload| upload.kind != UploadKind::Config)
+            .count();
+        let expected_bytes: u64 = deployment
+            .plan
+            .uploads
+            .iter()
+            .filter(|upload| upload.kind != UploadKind::Config)
+            .map(|upload| upload.size)
+            .sum();
+        let host = host::from_settings(&Default::default(), None);
+        complete_with_progress(
+            session,
+            deployment,
+            host.as_ref(),
+            RestartPolicy::Manual,
+            operation,
+            &mut progress,
+        )
+        .await
+        .unwrap();
+
+        let events = events.lock().unwrap();
+        let position = |phase| {
+            events
+                .iter()
+                .position(|event| event.phase == phase)
+                .unwrap()
+        };
+        assert!(position(SyncPhase::VerifyingPayload) < position(SyncPhase::RemovingFiles));
+        assert!(position(SyncPhase::CheckingConfigs) < position(SyncPhase::RemovingFiles));
+        assert!(position(SyncPhase::BuildingPlan) < position(SyncPhase::RemovingFiles));
+        assert!(position(SyncPhase::RemovingFiles) < position(SyncPhase::UploadingPayload));
+        assert!(position(SyncPhase::UploadingPayload) < position(SyncPhase::WritingConfigs));
+        assert!(position(SyncPhase::WritingConfigs) < position(SyncPhase::PersistingState));
+        assert!(position(SyncPhase::PersistingState) < position(SyncPhase::ApplyingRestart));
+        assert!(position(SyncPhase::ApplyingRestart) < position(SyncPhase::ReleasingLease));
+        let completed = |phase| {
+            events
+                .iter()
+                .filter(|event| event.phase == phase)
+                .last()
+                .unwrap()
+        };
+        let removal = completed(SyncPhase::RemovingFiles);
+        assert_eq!(removal.completed, removal.total.unwrap());
+        assert!(removal.completed >= 1);
+        let upload = completed(SyncPhase::UploadingPayload);
+        assert_eq!(upload.completed, expected_uploads);
+        assert_eq!(upload.completed_bytes, Some(expected_bytes));
+        assert_eq!(upload.total_bytes, Some(expected_bytes));
+        assert_eq!(completed(SyncPhase::WritingConfigs).completed, 1);
+        assert_eq!(events.last().unwrap().status, ProgressStatus::Succeeded);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn restart_reports_waiting_until_stop_and_start_are_observed() {
+        use std::collections::VecDeque;
+
+        use crate::profile::server::host::BoxFuture;
+
+        struct RestartHost(Mutex<VecDeque<HostStatus>>);
+
+        impl HostControl for RestartHost {
+            fn capabilities(&self) -> HostCapabilities {
+                HostCapabilities {
+                    can_restart: true,
+                    reports_players: false,
+                }
+            }
+
+            fn restart<'a>(&'a self) -> BoxFuture<'a, Result<()>> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn status<'a>(&'a self) -> BoxFuture<'a, Result<HostStatus>> {
+                Box::pin(async move {
+                    Ok(self
+                        .0
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .expect("expected status probe"))
+                })
+            }
+
+            fn name(&self) -> &'static str {
+                "test host"
+            }
+        }
+
+        let host = RestartHost(Mutex::new(VecDeque::from([
+            HostStatus {
+                running: Some(true),
+                players: None,
+            },
+            HostStatus {
+                running: Some(false),
+                players: None,
+            },
+            HostStatus {
+                running: Some(true),
+                players: None,
+            },
+        ])));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let mut progress = ProgressReporter::new(
+            "restart-run".to_owned(),
+            SyncOperation::Deploy,
+            &selection(true, true),
+            move |snapshot| sink.lock().unwrap().push(snapshot),
+        );
+        progress.phase(SyncPhase::ApplyingRestart);
+        let outcome = apply_restart_policy_reporting(
+            &host,
+            RestartPolicy::Immediate,
+            true,
+            Some(&mut progress),
+        )
+        .await;
+        assert!(matches!(outcome, RestartOutcome::Restarted));
+        let events = events.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| { event.item.as_deref() == Some("Requesting server restart") })
+        );
+        assert!(events.iter().any(|event| {
+            event
+                .item
+                .as_deref()
+                .is_some_and(|item| item.contains("check 2 of 12"))
+        }));
     }
 
     // --- remote accessors through the shared handle ---

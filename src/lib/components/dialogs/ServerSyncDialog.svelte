@@ -7,6 +7,7 @@
 	import InfoBox from '$lib/components/ui/InfoBox.svelte';
 	import InputField from '$lib/components/ui/InputField.svelte';
 	import DeploymentStats from './DeploymentStats.svelte';
+	import ServerSyncOperationProgress from './ServerSyncOperationProgress.svelte';
 	import * as api from '$lib/api';
 	import type {
 		DeploySelection,
@@ -14,9 +15,8 @@
 		PlanConfigEntry,
 		RestartPolicy,
 		ServerSyncPreview,
-		ServerSyncProgress,
+		ServerSyncOperationProgress as OperationProgress,
 		ServerSyncResult,
-		ServerSyncStageProgress,
 		ServerSyncStatus,
 		SyncConfigUpdatePolicy,
 		WorkerStatus
@@ -45,8 +45,14 @@
 	let loadingStatus = $state(false);
 	let previewing = $state(false);
 	let deploying = $state(false);
-	let progress = $state<ServerSyncProgress | null>(null);
-	let stageProgress = $state<ServerSyncStageProgress | null>(null);
+	let progress = $state<OperationProgress | null>(null);
+	let activeRun = $state<{ id: string; operation: 'preview' | 'deploy' } | null>(null);
+	let failedOperation = $state<'preview' | 'deploy' | null>(null);
+	let elapsedSeconds = $state(0);
+	let startedAt = 0;
+	let elapsedTimer: ReturnType<typeof setInterval> | null = null;
+	let workerTimer: ReturnType<typeof setInterval> | null = null;
+	let workerPollingRunId: string | null = null;
 	let remotePassword = $state('');
 	let workerToken = $state('');
 	let workerAutoSync = $state(false);
@@ -85,13 +91,15 @@
 
 	$effect(() => {
 		if (!open) {
+			stopProgressTimers();
+			activeRun = null;
+			failedOperation = null;
 			decisions = {};
 			reviewOnly = false;
 			preview = null;
 			policyOverrides = {};
 			result = null;
 			progress = null;
-			stageProgress = null;
 			approvedInput = '';
 			remotePassword = '';
 			workerToken = '';
@@ -101,16 +109,87 @@
 			void loadPreferences();
 			void loadStatus(false);
 		});
-		const listeners = Promise.all([
-			listen<ServerSyncProgress>('server_sync_progress', (event) => {
-				if (deploying) progress = event.payload;
-			}),
-			listen<ServerSyncStageProgress>('server_sync_stage_progress', (event) => {
-				if (previewing || deploying) stageProgress = event.payload;
-			})
-		]);
-		return () => void listeners.then((unlisten) => unlisten.forEach((fn) => fn()));
+		const listener = listen<OperationProgress>('server_sync_operation_progress', (event) => {
+			acceptProgress(event.payload);
+		});
+		return () => void listener.then((unlisten) => unlisten());
 	});
+
+	function stopProgressTimers() {
+		if (elapsedTimer) clearInterval(elapsedTimer);
+		if (workerTimer) clearInterval(workerTimer);
+		elapsedTimer = null;
+		workerTimer = null;
+	}
+
+	function acceptProgress(update: OperationProgress) {
+		if (!open || activeRun?.id !== update.runId || activeRun.operation !== update.operation) return;
+		if (progress?.status === 'failed' && update.status === 'running') return;
+		if (progress && update.completedPhases < progress.completedPhases) return;
+		if (
+			progress &&
+			update.completedPhases === progress.completedPhases &&
+			update.completed < progress.completed
+		)
+			return;
+		progress = update;
+	}
+
+	async function pollWorkerProgress(runId: string) {
+		if (workerPollingRunId === runId || activeRun?.id !== runId) return;
+		workerPollingRunId = runId;
+		try {
+			const update = await api.profile.server.getSyncProgress(workerToken);
+			if (update) acceptProgress(update);
+		} catch {
+			// Status delivery is observational. The operation request owns errors.
+		} finally {
+			if (workerPollingRunId === runId) workerPollingRunId = null;
+		}
+	}
+
+	function beginOperation(operation: 'preview' | 'deploy'): string {
+		stopProgressTimers();
+		const id = crypto.randomUUID();
+		activeRun = { id, operation };
+		failedOperation = null;
+		progress = null;
+		startedAt = Date.now();
+		elapsedSeconds = 0;
+		elapsedTimer = setInterval(() => {
+			if (activeRun?.id === id) elapsedSeconds = Math.floor((Date.now() - startedAt) / 1000);
+		}, 1000);
+		if (isWorker()) {
+			workerTimer = setInterval(() => void pollWorkerProgress(id), 500);
+		}
+		return id;
+	}
+
+	async function failOperation(id: string, operation: 'preview' | 'deploy') {
+		if (activeRun?.id !== id || !open) return;
+		if (isWorker()) {
+			try {
+				const final = await api.profile.server.getSyncProgress(workerToken);
+				if (final) acceptProgress(final);
+			} catch {
+				// Keep the last delivered phase if the status request fails.
+			}
+		}
+		if (activeRun?.id !== id || !open) return;
+		if (progress) progress = { ...progress, status: 'failed' };
+		failedOperation = operation;
+		activeRun = null;
+		stopProgressTimers();
+	}
+
+	function completeOperation(id: string) {
+		if (activeRun?.id !== id || !open) return false;
+		activeRun = null;
+		failedOperation = null;
+		progress = null;
+		stopProgressTimers();
+		return true;
+	}
 
 	async function loadStatus(refresh: boolean) {
 		loadingStatus = true;
@@ -189,6 +268,7 @@
 	}
 
 	async function previewSync() {
+		const runId = beginOperation('preview');
 		previewing = true;
 		result = null;
 		try {
@@ -196,12 +276,27 @@
 			const policy = restartPolicy;
 			// The restart policy is bound into the plan hash, so the approval
 			// is only valid while this selection stands.
-			preview = await api.profile.server.previewSync(selected, policy, remotePassword, workerToken);
+			const operation = api.profile.server.previewSync(
+				selected,
+				policy,
+				remotePassword,
+				workerToken,
+				runId
+			);
+			if (isWorker()) void pollWorkerProgress(runId);
+			const nextPreview = await operation;
+			if (!completeOperation(runId)) return;
+			preview = nextPreview;
 			policyOverrides = {};
 			approvedInput = JSON.stringify({ selection: selected, restartPolicy: policy });
+		} catch (error) {
+			await failOperation(runId, 'preview');
+			await message(error instanceof Error ? error.message : String(error), {
+				title: m.serverSync_preview(),
+				kind: 'error'
+			});
 		} finally {
 			previewing = false;
-			stageProgress = null;
 		}
 	}
 
@@ -257,29 +352,33 @@
 
 	async function deploy(force = false) {
 		if (!preview || dirty) return;
+		const runId = beginOperation('deploy');
 		deploying = true;
-		progress = null;
 		try {
-			result = await api.profile.server.deploySync(
+			const operation = api.profile.server.deploySync(
 				selection(),
 				preview.plan.hash,
 				restartPolicy,
 				force,
 				remotePassword,
-				workerToken
+				workerToken,
+				runId
 			);
+			if (isWorker()) void pollWorkerProgress(runId);
+			const nextResult = await operation;
+			if (!completeOperation(runId)) return;
+			result = nextResult;
 			decisions = {};
 			preview = null;
 			void loadStatus(false);
 		} catch (error) {
+			await failOperation(runId, 'deploy');
 			await message(error instanceof Error ? error.message : String(error), {
 				title: m.serverSync_deployFailedTitle(),
 				kind: 'error'
 			});
 		} finally {
 			deploying = false;
-			progress = null;
-			stageProgress = null;
 		}
 	}
 
@@ -367,8 +466,10 @@
 	}
 </script>
 
-<Dialog title={m.serverSync_title()} bind:open canClose={!busy} large>
-	<p class="text-primary-600 dark:text-primary-300 mt-1">{m.serverSync_content()}</p>
+<Dialog title={m.serverSync_title()} bind:open canClose={!busy} closeOnOutside={false} large>
+	{#if !previewing && !deploying}
+		<p class="text-primary-600 dark:text-primary-300 mt-1">{m.serverSync_content()}</p>
+	{/if}
 
 	{#if status}
 		<div
@@ -382,59 +483,61 @@
 					{m.serverSync_refresh()}
 				</Button>
 			</div>
-			<div class="text-primary-600 dark:text-primary-400 mt-2 flex flex-col gap-1">
-				<span>
-					{m.serverSync_publication({
-						revision: status.publicationRevision
-							? new Date(status.publicationRevision).toLocaleString()
-							: m.serverSync_noPublication()
-					})}
-				</span>
-				{#if status.server}
+			{#if !previewing && !deploying}
+				<div class="text-primary-600 dark:text-primary-400 mt-2 flex flex-col gap-1">
 					<span>
-						{m.serverSync_deployed({
-							revision: status.server.modsRevision ?? m.serverSync_neverDeployed()
+						{m.serverSync_publication({
+							revision: status.publicationRevision
+								? new Date(status.publicationRevision).toLocaleString()
+								: m.serverSync_noPublication()
 						})}
 					</span>
-					{#if status.server.restartRequired}
-						<div class="flex flex-wrap items-center justify-between gap-2">
-							<span class="text-orange-600 dark:text-orange-400"
-								>{m.serverSync_restartRequired()}</span
-							>
-							<Button disabled={busy} loading={acknowledgingRestart} onclick={acknowledgeRestart}>
-								{m.serverSync_acknowledgeRestart()}
-							</Button>
-						</div>
+					{#if status.server}
+						<span>
+							{m.serverSync_deployed({
+								revision: status.server.modsRevision ?? m.serverSync_neverDeployed()
+							})}
+						</span>
+						{#if status.server.restartRequired}
+							<div class="flex flex-wrap items-center justify-between gap-2">
+								<span class="text-orange-600 dark:text-orange-400"
+									>{m.serverSync_restartRequired()}</span
+								>
+								<Button disabled={busy} loading={acknowledgingRestart} onclick={acknowledgeRestart}>
+									{m.serverSync_acknowledgeRestart()}
+								</Button>
+							</div>
+						{/if}
+						{#if status.server.pendingConfigs > 0}
+							<span>{m.serverSync_pendingCount({ count: status.server.pendingConfigs })}</span>
+						{/if}
+						{#if status.server.lease}
+							<span class="text-orange-600 dark:text-orange-400">
+								{m.serverSync_leaseHeld({ owner: status.server.lease.owner })}
+							</span>
+						{/if}
 					{/if}
-					{#if status.server.pendingConfigs > 0}
-						<span>{m.serverSync_pendingCount({ count: status.server.pendingConfigs })}</span>
-					{/if}
-					{#if status.server.lease}
+					{#if status.worker?.busy}
 						<span class="text-orange-600 dark:text-orange-400">
-							{m.serverSync_leaseHeld({ owner: status.server.lease.owner })}
+							{m.serverSync_workerBusy()}
 						</span>
 					{/if}
-				{/if}
-				{#if status.worker?.busy}
-					<span class="text-orange-600 dark:text-orange-400">
-						{m.serverSync_workerBusy()}
-					</span>
-				{/if}
-				{#if status.worker?.pendingRevision}
-					<span class="text-orange-600 dark:text-orange-400">
-						{pendingScopeLabel(status.worker)}
-					</span>
-				{/if}
-				{#if status.worker?.lastError}
-					<span class="text-red-600 dark:text-red-400">{status.worker.lastError}</span>
-				{/if}
-				{#each status.warnings as warning}
-					<span class="text-orange-600 dark:text-orange-400">{warning}</span>
-				{/each}
-				{#if status.credentialRequired}
-					<span class="text-red-600 dark:text-red-400">{m.serverSync_credentialRequired()}</span>
-				{/if}
-			</div>
+					{#if status.worker?.pendingRevision}
+						<span class="text-orange-600 dark:text-orange-400">
+							{pendingScopeLabel(status.worker)}
+						</span>
+					{/if}
+					{#if status.worker?.lastError}
+						<span class="text-red-600 dark:text-red-400">{status.worker.lastError}</span>
+					{/if}
+					{#each status.warnings as warning}
+						<span class="text-orange-600 dark:text-orange-400">{warning}</span>
+					{/each}
+					{#if status.credentialRequired}
+						<span class="text-red-600 dark:text-red-400">{m.serverSync_credentialRequired()}</span>
+					{/if}
+				</div>
+			{/if}
 		</div>
 
 		{#if isWorker() && status.worker}
@@ -457,6 +560,14 @@
 				</div>
 			</details>
 		{/if}
+	{/if}
+	{#if activeRun || failedOperation}
+		<ServerSyncOperationProgress
+			operation={activeRun?.operation ?? failedOperation ?? progress?.operation ?? 'preview'}
+			{progress}
+			failed={failedOperation !== null}
+			{elapsedSeconds}
+		/>
 	{/if}
 
 	<div class="mt-4">
@@ -508,16 +619,6 @@
 			{/if}
 		</div>
 	</details>
-
-	{#if stageProgress}
-		<p class="text-primary-500 mt-3 text-sm">
-			{m.serverSync_staging({
-				mod: stageProgress.mod,
-				completed: stageProgress.completed,
-				total: stageProgress.total
-			})}
-		</p>
-	{/if}
 
 	{#if preview}
 		<div class="mt-4">
@@ -674,15 +775,6 @@
 					</div>
 				</details>
 			{/if}
-		</div>
-	{/if}
-
-	{#if deploying && progress}
-		<div class="mt-4 flex flex-col gap-1">
-			<div class="text-primary-600 dark:text-primary-300 flex justify-between gap-3 text-sm">
-				<span class="truncate">{progress.path}</span>
-				<span class="shrink-0">{progress.completed}/{progress.total}</span>
-			</div>
 		</div>
 	{/if}
 

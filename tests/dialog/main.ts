@@ -46,6 +46,31 @@ const unexpected: string[] = [];
 let held = '';
 let release: (() => void) | undefined;
 const failing = new Set<string>();
+let workerProgress: Record<string, unknown> | null = null;
+let progressPolls = 0;
+const progressListeners = new Set<number>();
+
+function latestRun() {
+	return calls.findLast((call) => ['preview_server_sync', 'deploy_server_sync'].includes(call.cmd));
+}
+
+function progressPayload(patch: Record<string, unknown>) {
+	const operation = latestRun();
+	return {
+		runId: operation?.args.request.runId ?? '',
+		operation: operation?.cmd === 'deploy_server_sync' ? 'deploy' : 'preview',
+		status: 'running',
+		phase: 'verifyingPayload',
+		completedPhases: 7,
+		totalPhases: 16,
+		completed: 0,
+		total: 24,
+		completedBytes: null,
+		totalBytes: null,
+		item: null,
+		...patch
+	};
+}
 
 Object.assign(window, {
 	calls,
@@ -62,10 +87,26 @@ Object.assign(window, {
 	},
 	unfail: (cmd: string) => {
 		failing.delete(cmd);
+	},
+	setWorkerProgress: (patch: Record<string, unknown> | null) => {
+		workerProgress = patch;
+	},
+	progressPolls: () => progressPolls,
+	emitProgress: (patch: Record<string, unknown>) => {
+		for (const handler of progressListeners) {
+			(window as any).__TAURI_INTERNALS__.runCallback(handler, {
+				event: 'server_sync_operation_progress',
+				payload: progressPayload(patch)
+			});
+		}
 	}
 });
 
 mockIPC(async (cmd, args) => {
+	if (cmd === 'get_server_sync_progress') {
+		progressPolls++;
+		return workerProgress ? progressPayload(workerProgress) : null;
+	}
 	calls.push({ cmd, args: structuredClone(args) });
 	if (cmd === held)
 		await new Promise<void>((resolve) => {
@@ -102,8 +143,13 @@ mockIPC(async (cmd, args) => {
 		case 'get_game_info':
 			return { active: null, all: [], favorites: [], lastUpdated: '' };
 		case 'plugin:event|listen':
+			if ((args as any).event === 'server_sync_operation_progress') {
+				progressListeners.add((args as any).handler);
+				return (args as any).handler;
+			}
 			return calls.length;
 		case 'plugin:event|unlisten':
+			progressListeners.delete((args as any).id);
 			return;
 		case 'plugin:dialog|message':
 			return cancelStop ? 'Cancel' : 'Ok';

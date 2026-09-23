@@ -26,6 +26,8 @@ pub const API_BASE: &str = "/v1";
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreviewRequest {
+    #[serde(default)]
+    pub run_id: String,
     pub selection: DeploySelection,
     /// The restart policy the subsequent deploy will use. Bound into the
     /// plan hash so a policy change after preview invalidates the approval.
@@ -39,6 +41,8 @@ pub struct PreviewRequest {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeployRequest {
+    #[serde(default)]
+    pub run_id: String,
     pub selection: DeploySelection,
     pub plan_hash: String,
     /// Restart behavior for this operation. `None` uses the worker's

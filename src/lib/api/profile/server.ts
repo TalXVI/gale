@@ -10,6 +10,7 @@ import type {
 	RestartPolicy,
 	SyncDialogPreferences,
 	ServerSyncPreview,
+	ServerSyncOperationProgress,
 	ServerSyncResult,
 	ServerSyncStatus,
 	SyncConfigUpdatePolicy,
@@ -86,16 +87,22 @@ export const getSyncStatus = (refresh: boolean, password = '', workerToken = '')
 		request: { refresh, password, workerToken }
 	});
 
+export const getSyncProgress = (workerToken = '') =>
+	invoke<ServerSyncOperationProgress | null>('get_server_sync_progress', {
+		request: { refresh: false, workerToken }
+	});
+
 /// The restart policy is bound into the plan hash. A preview only stays
 /// deployable while the selected policy is unchanged.
 export const previewSync = (
 	selection: DeploySelection,
 	restartPolicy: RestartPolicy | null,
 	password = '',
-	workerToken = ''
+	workerToken = '',
+	runId = ''
 ) =>
 	invoke<ServerSyncPreview>('preview_server_sync', {
-		request: { selection, restartPolicy, password, workerToken }
+		request: { selection, restartPolicy, password, workerToken, runId }
 	});
 
 /// `force` takes over a *stale* foreign lease after the old executor is
@@ -107,10 +114,11 @@ export const deploySync = (
 	restartPolicy: RestartPolicy | null,
 	force: boolean,
 	password = '',
-	workerToken = ''
+	workerToken = '',
+	runId = ''
 ) =>
 	invoke<ServerSyncResult>('deploy_server_sync', {
-		request: { selection, planHash, restartPolicy, force, password, workerToken }
+		request: { selection, planHash, restartPolicy, force, password, workerToken, runId }
 	});
 
 /// The backend derives the publication pin itself, so callers never
