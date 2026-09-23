@@ -63,8 +63,11 @@ pub struct WorkerJournal {
     /// the source of truth so runtime changes survive restarts.
     pub automation_seeded: bool,
     pub last_operation: Option<OperationRecord>,
-    /// The last poll/deploy error, reported through the status endpoint.
+    /// The last deployment failure, reported through the status endpoint.
+    /// Legacy journals also used this field for `poll failed: ...` errors.
     pub last_error: Option<String>,
+    /// The current publication-poll failure, cleared by the next successful poll.
+    pub poll_error: Option<String>,
     /// An operation that was in flight when the worker stopped. The remote
     /// lease is the real lock; this marker is diagnostic only.
     pub interrupted_operation: Option<BusyOperation>,
@@ -85,6 +88,7 @@ impl Default for WorkerJournal {
             automation_seeded: false,
             last_operation: None,
             last_error: None,
+            poll_error: None,
             interrupted_operation: None,
         }
     }
@@ -162,6 +166,29 @@ impl PendingWork {
 }
 
 impl WorkerJournal {
+    /// Separates poll errors written by older workers into their own field.
+    fn migrate_legacy_poll_error(&mut self) {
+        let Some(message) = self
+            .last_error
+            .as_deref()
+            .and_then(|error| error.strip_prefix("poll failed: "))
+        else {
+            return;
+        };
+        if self.poll_error.is_none() {
+            self.poll_error = Some(format!(
+                "Publication check failed: {}",
+                message.split(": ").next().unwrap_or(message)
+            ));
+        }
+        self.last_error = self
+            .pending
+            .as_ref()
+            .filter(|work| !work.resolved())
+            .and_then(|work| work.last_error.as_ref())
+            .map(|error| format!("automatic deployment failed: {error}"));
+    }
+
     /// Records the latest publication without treating its timestamp as
     /// evidence that either deployment phase changed.
     pub fn observe_publication(
@@ -283,13 +310,14 @@ pub struct Journal {
 impl Journal {
     pub fn load(state_dir: &std::path::Path) -> Result<Self> {
         let path = state_dir.join(JOURNAL_FILE);
-        let state = match std::fs::read(&path) {
+        let mut state: WorkerJournal = match std::fs::read(&path) {
             Ok(bytes) => {
                 serde_json::from_slice(&bytes).context("worker journal is not valid JSON")?
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => WorkerJournal::default(),
             Err(err) => return Err(err).context("failed to read worker journal"),
         };
+        state.migrate_legacy_poll_error();
 
         Ok(Self {
             path,
@@ -344,10 +372,10 @@ impl Journal {
         self.save(&state)
     }
 
-    /// Records an error for status reporting.
-    pub async fn record_error(&self, error: Option<String>) -> Result<()> {
+    /// Records a publication-poll error for status reporting.
+    pub async fn record_poll_error(&self, error: Option<String>) -> Result<()> {
         let mut state = self.state.lock().await;
-        state.last_error = error;
+        state.poll_error = error;
         self.save(&state)
     }
 }
@@ -453,17 +481,98 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_error_persists() {
+    async fn poll_and_deployment_errors_survive_restart_independently() {
         let dir = tempfile::tempdir().unwrap();
         let journal = Journal::load(dir.path()).unwrap();
+        {
+            let mut state = journal.state.lock().await;
+            state.last_error = Some("automatic deployment failed: upload failed".to_owned());
+            journal.save(&state).unwrap();
+        }
         journal
-            .record_error(Some("poll failed".to_owned()))
+            .record_poll_error(Some(
+                "Publication check failed: sync token request failed".to_owned(),
+            ))
             .await
             .unwrap();
 
         let journal = Journal::load(dir.path()).unwrap();
         let state = journal.state.lock().await;
-        assert_eq!(state.last_error.as_deref(), Some("poll failed"));
+        assert_eq!(
+            state.poll_error.as_deref(),
+            Some("Publication check failed: sync token request failed")
+        );
+        assert_eq!(
+            state.last_error.as_deref(),
+            Some("automatic deployment failed: upload failed")
+        );
+        drop(state);
+        journal.record_poll_error(None).await.unwrap();
+
+        let journal = Journal::load(dir.path()).unwrap();
+        let state = journal.state.lock().await;
+        assert!(state.poll_error.is_none());
+        assert!(state.last_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn legacy_poll_errors_migrate_without_erasing_pending_deployment_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut old = serde_json::to_value(WorkerJournal::default()).unwrap();
+        old.as_object_mut().unwrap().remove("pollError");
+        old["lastError"] = serde_json::json!(
+            "poll failed: sync token request failed: HTTP status server error (500 Internal Server Error) for url (https://example.test/api/auth/token)"
+        );
+        let mut work = PendingWork::new(Utc::now(), Some(mod_rev('a')), true);
+        work.last_error = Some("upload failed".to_owned());
+        old["pending"] = serde_json::to_value(work).unwrap();
+        std::fs::write(
+            dir.path().join(JOURNAL_FILE),
+            serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+
+        let journal = Journal::load(dir.path()).unwrap();
+        let state = journal.state.lock().await;
+        assert_eq!(
+            state.poll_error.as_deref(),
+            Some("Publication check failed: sync token request failed")
+        );
+        assert_eq!(
+            state.last_error.as_deref(),
+            Some("automatic deployment failed: upload failed")
+        );
+        assert_eq!(
+            state.pending.as_ref().unwrap().last_error.as_deref(),
+            Some("upload failed")
+        );
+        drop(state);
+        journal.record_poll_error(None).await.unwrap();
+
+        let reloaded = Journal::load(dir.path()).unwrap();
+        let state = reloaded.state.lock().await;
+        assert!(
+            state.poll_error.is_none(),
+            "a recovered legacy poll stays recovered"
+        );
+        assert!(state.last_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn legacy_deployment_error_stays_a_deployment_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(JOURNAL_FILE),
+            br#"{"lastError":"automatic deployment failed: upload failed"}"#,
+        )
+        .unwrap();
+        let journal = Journal::load(dir.path()).unwrap();
+        let state = journal.state.lock().await;
+        assert_eq!(
+            state.last_error.as_deref(),
+            Some("automatic deployment failed: upload failed")
+        );
+        assert!(state.poll_error.is_none());
     }
 
     #[test]

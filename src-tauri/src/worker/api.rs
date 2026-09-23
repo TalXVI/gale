@@ -89,8 +89,11 @@ pub struct StatusResponse {
     /// The operation currently in flight, if any.
     pub busy: Option<BusyOperation>,
     pub last_operation: Option<OperationRecord>,
-    /// The last poll/deploy failure the worker recorded.
+    /// The last deployment failure the worker recorded.
     pub last_error: Option<String>,
+    /// The current publication-poll failure. Absent on older workers.
+    #[serde(default)]
+    pub poll_error: Option<String>,
     /// Live remote state, present only for `?refresh=true` requests.
     pub server: Option<ServerStateSummary>,
 }

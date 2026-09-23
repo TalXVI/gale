@@ -530,6 +530,9 @@
 					{#if status.worker?.lastError}
 						<span class="text-red-600 dark:text-red-400">{status.worker.lastError}</span>
 					{/if}
+					{#if status.worker?.pollError}
+						<span class="text-red-600 dark:text-red-400">{status.worker.pollError}</span>
+					{/if}
 					{#each status.warnings as warning}
 						<span class="text-orange-600 dark:text-orange-400">{warning}</span>
 					{/each}

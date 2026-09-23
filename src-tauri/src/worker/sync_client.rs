@@ -228,7 +228,7 @@ impl SyncClient {
 pub(crate) mod tests {
     use std::sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU16, AtomicUsize, Ordering},
     };
 
     use axum::{
@@ -256,6 +256,7 @@ pub(crate) mod tests {
         pub(crate) meta: Option<SyncProfileMetadata>,
         pub(crate) archive: Vec<u8>,
         pub(crate) fail_auth: bool,
+        pub(crate) token_status: Arc<AtomicU16>,
         pub(crate) chunked: bool,
         pub(crate) violations: Arc<std::sync::Mutex<Vec<String>>>,
         pub(crate) token_hits: Arc<AtomicUsize>,
@@ -291,11 +292,15 @@ pub(crate) mod tests {
                 .push(format!("unexpected token request: {request}"));
             return HttpStatus::BAD_REQUEST.into_response();
         }
-        tokens.push(expected.to_owned());
         api.token_hits.fetch_add(1, Ordering::Relaxed);
         if api.fail_auth {
             return HttpStatus::UNAUTHORIZED.into_response();
         }
+        let status = api.token_status.load(Ordering::Relaxed);
+        if status != 0 {
+            return HttpStatus::from_u16(status).unwrap().into_response();
+        }
+        tokens.push(expected.to_owned());
         Json(json!({
             "accessToken": "access-1",
             "refreshToken": "refresh-rotated"
@@ -597,7 +602,44 @@ pub(crate) mod tests {
         let result = SyncClient::new(config(url.url.clone()), None)
             .poll(&journal, None)
             .await;
-        assert!(result.is_err());
+        let error = result.err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("sync refresh token was rejected")
+        );
+        assert_eq!(
+            journal.state.lock().await.refresh_token.as_deref(),
+            Some("refresh-seed")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_error_preserves_the_refresh_token_for_retry() {
+        let api = MockApi::default();
+        api.token_status.store(500, Ordering::Relaxed);
+        let server = serve(api.clone()).await;
+        let (_dir, journal) = journal().await;
+        let client = SyncClient::new(config(server.url.clone()), None);
+
+        let error = client.poll(&journal, None).await.err().unwrap();
+        assert_eq!(error.to_string(), "sync token request failed");
+        assert!(format!("{error:#}").contains("500 Internal Server Error"));
+        assert_eq!(
+            journal.state.lock().await.refresh_token.as_deref(),
+            Some("refresh-seed")
+        );
+
+        api.token_status.store(0, Ordering::Relaxed);
+        assert!(matches!(
+            client.poll(&journal, None).await.unwrap(),
+            PublicationProbe::None
+        ));
+        assert_eq!(
+            *api.refresh_tokens.lock().await,
+            ["refresh-seed"],
+            "the retry uses the existing credential"
+        );
     }
 
     #[tokio::test]

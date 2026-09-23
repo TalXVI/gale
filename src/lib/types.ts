@@ -514,7 +514,10 @@ export type WorkerStatus = {
 	lastDeployedRevision: string | null;
 	busy: BusyOperation | null;
 	lastOperation: OperationRecord | null;
+	/// The last deployment failure from this worker.
 	lastError: string | null;
+	/// The current publication-poll failure. Absent on older workers.
+	pollError?: string | null;
 	server: ServerStateSummary | null;
 };
 

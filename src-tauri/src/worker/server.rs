@@ -337,6 +337,7 @@ async fn status(
         busy: journal.interrupted_operation.clone(),
         last_operation: journal.last_operation.clone(),
         last_error: journal.last_error.clone(),
+        poll_error: journal.poll_error.clone(),
         server,
     })
     .into_response()
@@ -571,6 +572,11 @@ async fn run_deployment_inner(
                     response.state.mods_revision.clone(),
                     &config_revision,
                 );
+                // A manual deployment can settle failed automatic work too.
+                // Keep its error while any owed phase remains outstanding.
+                if response.failed_config_writes.is_empty() && state.pending.is_none() {
+                    state.last_error = None;
+                }
             }
             Err(_) => {
                 // `record_operation` clears the marker on success. On
@@ -899,31 +905,39 @@ async fn poll_once(ctx: &Arc<WorkerContext>) {
             state.last_seen_revision
         }
     };
-    match ctx.sync.poll(&ctx.journal, last_seen).await {
-        Ok(PublicationProbe::New(publication)) => {
-            let revision = publication.revision;
-            let config_revision = managed_config_revision(&publication, &ctx.spec);
-            info!(%revision, "observed new publication");
-            let mut state = ctx.journal.state.lock().await;
-
-            state.observe_publication(revision, &publication.mods_revision, &config_revision);
-            if let Err(err) = ctx.journal.save(&state) {
-                warn!(%err, "failed to persist observed revision");
-            }
-        }
-        Ok(PublicationProbe::Unchanged(_)) | Ok(PublicationProbe::None) => {}
+    let probe = match ctx.sync.poll(&ctx.journal, last_seen).await {
+        Ok(probe) => probe,
         Err(err) => {
-            warn!(error = %err, "publication poll failed");
+            warn!(error = %format_args!("{err:#}"), "publication poll failed");
             if let Err(save_err) = ctx
                 .journal
-                .record_error(Some(format!("poll failed: {err:#}")))
+                .record_poll_error(Some(format!("Publication check failed: {err}")))
                 .await
             {
                 warn!(%save_err, "failed to record poll error in journal");
             }
             return;
         }
+    };
+    let mut state = ctx.journal.state.lock().await;
+    let recovered = state.poll_error.take().is_some();
+    match probe {
+        PublicationProbe::New(publication) => {
+            let revision = publication.revision;
+            let config_revision = managed_config_revision(&publication, &ctx.spec);
+            info!(%revision, "observed new publication");
+            state.observe_publication(revision, &publication.mods_revision, &config_revision);
+            if let Err(err) = ctx.journal.save(&state) {
+                warn!(%err, "failed to persist observed revision");
+            }
+        }
+        PublicationProbe::Unchanged(_) | PublicationProbe::None => {
+            if recovered && let Err(err) = ctx.journal.save(&state) {
+                warn!(%err, "failed to persist recovered publication poll");
+            }
+        }
     }
+    drop(state);
 
     let action = {
         let state = ctx.journal.state.lock().await;
@@ -1420,6 +1434,203 @@ mod tests {
         assert_eq!(state.last_error, None);
     }
 
+    fn poll_test_context(dir: &std::path::Path, sync_url: String) -> Arc<WorkerContext> {
+        let mut config = worker_config(dir, "127.0.0.1:0".to_owned());
+        config.profile_id = SYNC_PROFILE.to_owned();
+        config.sync_url = Some(sync_url);
+        Arc::new(
+            WorkerContext::new(
+                config,
+                Secrets {
+                    refresh_token: Some("refresh-seed".to_owned()),
+                    ..worker_secrets()
+                },
+                Journal::load(dir).unwrap(),
+            )
+            .unwrap(),
+        )
+    }
+
+    async fn poll_status(ctx: Arc<WorkerContext>) -> crate::worker::api::StatusResponse {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer token"),
+        );
+        let response = super::status(
+            axum::extract::State(ctx),
+            headers,
+            axum::extract::Query(super::StatusQuery { refresh: None }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn unchanged_poll_clears_only_poll_error_and_persists_recovery() {
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let revision = Utc::now();
+        let api = crate::worker::sync_client::tests::MockApi {
+            meta: Some(crate::worker::sync_client::tests::metadata(
+                "valheim", revision,
+            )),
+            ..Default::default()
+        };
+        api.token_status.store(500, Ordering::Relaxed);
+        let server = crate::worker::sync_client::tests::serve(api.clone()).await;
+        let ctx = poll_test_context(dir.path(), server.url.clone());
+        {
+            let mut state = ctx.journal.state.lock().await;
+            state.last_seen_revision = Some(revision);
+            state.evaluated_config_revision = Some("already-evaluated".to_owned());
+            state.refresh_token = Some("refresh-seed".to_owned());
+            state.last_error = Some("automatic deployment failed: upload failed".to_owned());
+            ctx.journal.save(&state).unwrap();
+        }
+
+        super::poll_once(&ctx).await;
+        let failed = poll_status(ctx.clone()).await;
+        assert_eq!(
+            failed.poll_error.as_deref(),
+            Some("Publication check failed: sync token request failed")
+        );
+        assert_eq!(
+            failed.last_error.as_deref(),
+            Some("automatic deployment failed: upload failed")
+        );
+        assert_eq!(
+            ctx.journal.state.lock().await.refresh_token.as_deref(),
+            Some("refresh-seed"),
+            "HTTP 500 must not discard the refresh token"
+        );
+
+        api.token_status.store(0, Ordering::Relaxed);
+        super::poll_once(&ctx).await;
+        let recovered = poll_status(ctx.clone()).await;
+        assert!(recovered.poll_error.is_none());
+        assert_eq!(recovered.last_error, failed.last_error);
+        assert_eq!(api.archive_hits.load(Ordering::Relaxed), 0);
+        drop(ctx);
+
+        let journal = Journal::load(dir.path()).unwrap();
+        let state = journal.state.lock().await;
+        assert!(state.poll_error.is_none());
+        assert_eq!(state.last_error, failed.last_error);
+    }
+
+    #[tokio::test]
+    async fn new_publication_clears_a_failed_poll() {
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let revision = Utc::now();
+        let manifest = pack_manifest();
+        let api = crate::worker::sync_client::tests::MockApi {
+            meta: Some(crate::worker::sync_client::tests::metadata(
+                "valheim", revision,
+            )),
+            archive: publication_zip(&manifest),
+            ..Default::default()
+        };
+        api.token_status.store(500, Ordering::Relaxed);
+        let server = crate::worker::sync_client::tests::serve(api.clone()).await;
+        let ctx = poll_test_context(dir.path(), server.url.clone());
+
+        super::poll_once(&ctx).await;
+        assert!(poll_status(ctx.clone()).await.poll_error.is_some());
+        api.token_status.store(0, Ordering::Relaxed);
+        super::poll_once(&ctx).await;
+
+        let status = poll_status(ctx.clone()).await;
+        assert!(status.poll_error.is_none());
+        assert_eq!(status.observed_revision, Some(revision));
+        assert_eq!(status.pending_revision, Some(revision));
+        assert_eq!(api.archive_hits.load(Ordering::Relaxed), 1);
+        drop(ctx);
+        assert!(
+            Journal::load(dir.path())
+                .unwrap()
+                .state
+                .lock()
+                .await
+                .poll_error
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_manual_deployment_clears_only_the_deployment_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let revision = Utc::now();
+        let sync_api = spawn_sync_api(pack_manifest(), revision).await;
+        let ftp = FakeFtp::valheim_host(FtpOptions::default());
+        let mut config = worker_config(dir.path(), "127.0.0.1:0".to_owned());
+        config.profile_id = SYNC_PROFILE.to_owned();
+        config.sync_url = Some(sync_api.url.clone());
+        config.remote = RemoteServerSettings {
+            protocol: RemoteProtocol::Ftp,
+            host: "127.0.0.1".to_owned(),
+            port: ftp.addr.port(),
+            username: "u".to_owned(),
+            server_directory: "/".to_owned(),
+            ..RemoteServerSettings::default()
+        };
+        let journal = Journal::load(dir.path()).unwrap();
+        {
+            let mut state = journal.state.lock().await;
+            state.pending = Some(PendingWork::new(revision, None, true));
+            state.last_error = Some("automatic deployment failed: upload failed".to_owned());
+            state.poll_error =
+                Some("Publication check failed: sync token request failed".to_owned());
+            journal.save(&state).unwrap();
+        }
+        let ctx = Arc::new(
+            WorkerContext::new(
+                config,
+                Secrets {
+                    remote_password: Some("pw".to_owned()),
+                    refresh_token: Some("refresh-seed".to_owned()),
+                    ..worker_secrets()
+                },
+                journal,
+            )
+            .unwrap(),
+        );
+
+        super::run_deployment(
+            &ctx,
+            DeploySelection {
+                include_mods: false,
+                include_configs: true,
+                ..Default::default()
+            },
+            None,
+            None,
+            false,
+            crate::profile::server::state::OperationKind::Manual,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let status = poll_status(ctx.clone()).await;
+        assert!(status.last_error.is_none());
+        assert_eq!(
+            status.poll_error.as_deref(),
+            Some("Publication check failed: sync token request failed")
+        );
+        assert!(status.pending_revision.is_none());
+        drop(ctx);
+        let state = Journal::load(dir.path()).unwrap();
+        assert!(state.state.lock().await.poll_error.is_some());
+    }
+
     #[tokio::test]
     async fn migrated_journal_refetches_an_already_seen_publication() {
         let dir = tempfile::tempdir().unwrap();
@@ -1913,6 +2124,7 @@ mod tests {
             state.auto_sync = true;
             state.auto_mods = false;
             state.automation_seeded = true;
+            state.last_error = Some("automatic deployment failed: previous attempt".to_owned());
             journal.save(&state).unwrap();
         }
         let ctx = std::sync::Arc::new(

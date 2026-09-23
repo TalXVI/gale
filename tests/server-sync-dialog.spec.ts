@@ -1,5 +1,26 @@
 import { test, expect } from '@playwright/test';
 
+test('worker poll and deployment errors render independently', async ({ page }) => {
+	await page.goto('/tests/dialog/?mode=worker');
+	const pollError = 'Publication check failed: sync token request failed';
+	const deploymentError = 'automatic deployment failed: upload failed';
+	await page.evaluate(
+		([poll, deployment]) => (window as any).setWorkerErrors(poll, deployment),
+		[pollError, deploymentError]
+	);
+	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+	await expect(page.getByText(pollError)).toBeVisible();
+	await expect(page.getByText(deploymentError)).toBeVisible();
+
+	await page.evaluate(
+		(deployment) => (window as any).setWorkerErrors(null, deployment),
+		deploymentError
+	);
+	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+	await expect(page.getByText(pollError)).toHaveCount(0);
+	await expect(page.getByText(deploymentError)).toBeVisible();
+});
+
 for (const mode of ['local', 'worker']) {
 	test(`${mode}: decisions do not reorder or scroll a long review list`, async ({ page }) => {
 		await page.goto(`/tests/dialog/?mode=${mode}&many=1`);

@@ -8,7 +8,13 @@ const cancelStop = new URLSearchParams(location.search).has('cancelStop');
 const workerMode = new URLSearchParams(location.search).get('mode') === 'worker';
 const manyConfigs = new URLSearchParams(location.search).has('many');
 let restartRequired = new URLSearchParams(location.search).has('restart');
-const worker = { autoSync: false, autoMods: false, restartPolicy: 'manual' };
+const worker = {
+	autoSync: false,
+	autoMods: false,
+	restartPolicy: 'manual',
+	lastError: null as string | null,
+	pollError: null as string | null
+};
 const profileId = new URLSearchParams(location.search).get('profile') ?? 'first';
 const preferences = JSON.parse(
 	sessionStorage.getItem('mock-profile-preferences') ?? '{}'
@@ -90,6 +96,10 @@ Object.assign(window, {
 	},
 	setWorkerProgress: (patch: Record<string, unknown> | null) => {
 		workerProgress = patch;
+	},
+	setWorkerErrors: (pollError: string | null, lastError: string | null) => {
+		worker.pollError = pollError;
+		worker.lastError = lastError;
 	},
 	progressPolls: () => progressPolls,
 	emitProgress: (patch: Record<string, unknown>) => {

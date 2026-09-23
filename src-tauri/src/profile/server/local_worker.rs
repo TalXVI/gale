@@ -1303,6 +1303,7 @@ mod pending_tests {
             busy: None,
             last_operation: None,
             last_error: None,
+            poll_error: None,
             server: None,
         }
     }
