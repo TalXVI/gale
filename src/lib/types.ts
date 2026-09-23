@@ -424,6 +424,7 @@ export type OperationRecord = {
 	status: OperationStatus;
 	summary: OperationSummary;
 	restart: RestartOutcome;
+	externalRestartAcknowledged?: boolean;
 	error: string | null;
 	startedAt: string;
 	finishedAt: string;

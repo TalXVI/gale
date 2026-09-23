@@ -73,14 +73,13 @@ pub enum RestartOutcome {
     /// Players were present or presence was unknown, so a WhenEmpty restart
     /// was deferred.
     AwaitingEmpty,
-    /// A restart was issued and the provider reported a stop then a start.
+    /// A Gale-issued restart was observed, or the user acknowledged one
+    /// outside Gale. See `external_restart_acknowledged` on the operation.
     Restarted,
     /// A restart was issued but its result could not be verified.
     StartupUnverified,
     /// The restart attempt itself failed.
     Failed,
-    /// The user explicitly confirmed a restart performed outside Gale.
-    ExternallyAcknowledged,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -93,7 +92,7 @@ pub struct OperationSummary {
     pub unchanged_files: usize,
 }
 
-/// A completed deployment attempt recorded on the server.
+/// A completed deployment or restart acknowledgment recorded on the server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OperationRecord {
@@ -108,9 +107,18 @@ pub struct OperationRecord {
     pub status: OperationStatus,
     pub summary: OperationSummary,
     pub restart: RestartOutcome,
+    /// True only when the user confirmed a restart outside Gale. Optional
+    /// for older state files, and ignored by older executors that still
+    /// understand the existing `restarted` outcome.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub external_restart_acknowledged: bool,
     pub error: Option<String>,
     pub started_at: DateTime<Utc>,
     pub finished_at: DateTime<Utc>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// The authoritative record of what a dedicated server's managed content
@@ -604,6 +612,7 @@ mod tests {
             status: OperationStatus::Succeeded,
             summary: OperationSummary::default(),
             restart: RestartOutcome::NotRequired,
+            external_restart_acknowledged: false,
             error: None,
             started_at: Utc::now(),
             finished_at: Utc::now(),

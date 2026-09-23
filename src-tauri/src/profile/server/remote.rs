@@ -1341,13 +1341,13 @@ pub(crate) mod memory {
             if self.ftp_rename_semantics
                 && (!self.files.contains_key(from.as_str()) || self.files.contains_key(to.as_str()))
             {
-                return Err(
-                    suppaftp::FtpError::UnexpectedResponse(suppaftp::types::Response::new(
+                return Err(suppaftp::FtpError::UnexpectedResponse(
+                    suppaftp::types::Response::new(
                         suppaftp::Status::FileUnavailable,
                         b"550 rename refused".to_vec(),
-                    ))
-                    .into(),
-                );
+                    ),
+                )
+                .into());
             }
             let bytes = self
                 .files

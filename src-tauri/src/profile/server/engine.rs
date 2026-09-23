@@ -630,7 +630,7 @@ pub fn finish(
     meta: &OperationMeta,
 ) -> Result<ServerDeploymentState> {
     session.state.restart_required = match restart {
-        RestartOutcome::Restarted | RestartOutcome::ExternallyAcknowledged => false,
+        RestartOutcome::Restarted => false,
         RestartOutcome::NotRequired => session.state.restart_required,
         _ => true,
     };
@@ -654,6 +654,7 @@ pub fn finish(
         },
         summary: deployment.summary.clone(),
         restart,
+        external_restart_acknowledged: false,
         error: (!deployment.failed_config_writes.is_empty()).then(|| {
             format!(
                 "{} selected config file(s) could not be written",
@@ -702,7 +703,8 @@ pub fn acknowledge_external_restart(
             mods_revision: session.state.mods_revision.clone(),
             status: OperationStatus::Succeeded,
             summary: OperationSummary::default(),
-            restart: RestartOutcome::ExternallyAcknowledged,
+            restart: RestartOutcome::Restarted,
+            external_restart_acknowledged: true,
             error: None,
             started_at: meta.started_at,
             finished_at: Utc::now(),
@@ -734,6 +736,7 @@ fn fail_operation(
         status: OperationStatus::Failed,
         summary: OperationSummary::default(),
         restart: RestartOutcome::NotRequired,
+        external_restart_acknowledged: false,
         error: Some(error.to_string()),
         started_at: meta.started_at,
         finished_at: Utc::now(),
@@ -2693,10 +2696,16 @@ mod tests {
         let acknowledged = acknowledge_external_restart(&mut session, &meta()).unwrap();
         assert!(!acknowledged.restart_required);
         assert_eq!(acknowledged.operation_seq, 1);
-        assert_eq!(
-            acknowledged.last_operation.unwrap().restart,
-            RestartOutcome::ExternallyAcknowledged
-        );
+        let record = acknowledged.last_operation.unwrap();
+        assert_eq!(record.restart, RestartOutcome::Restarted);
+        assert!(record.external_restart_acknowledged);
+        #[derive(serde::Deserialize)]
+        struct PreviousOperationView {
+            restart: RestartOutcome,
+        }
+        let previous: PreviousOperationView =
+            serde_json::from_value(serde_json::to_value(&record).unwrap()).unwrap();
+        assert_eq!(previous.restart, RestartOutcome::Restarted);
         assert!(!remote_has_dir(&memory, LEASE_DIR_REMOTE));
         assert!(!open(memory.clone()).unwrap().state.restart_required);
         assert!(acknowledge_external_restart(&mut session, &meta()).is_err());

@@ -346,6 +346,7 @@ mod tests {
             status: OperationStatus::Succeeded,
             summary: OperationSummary::default(),
             restart: RestartOutcome::NotRequired,
+            external_restart_acknowledged: false,
             error: None,
             started_at: Utc::now(),
             finished_at: Utc::now(),
