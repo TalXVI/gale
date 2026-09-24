@@ -113,23 +113,17 @@ fn ownership_of(
     }
 }
 
-/// What the managed worker will do with a publication it has observed
-/// but not fully applied. Derived from the worker's live status — its
-/// journal is the authoritative automation state, since `/v1/config`
-/// writes persist across restarts while the install-time config only
-/// seeds them once.
+/// What the managed worker will do with a publication whose mod payload
+/// it still owes. Derived from the worker's live status — its journal is
+/// the authoritative automation state, since `/v1/config` writes persist
+/// across restarts while the install-time config only seeds them once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PendingPublicationMode {
-    /// Everything owed is covered by automation — `autoSync` plus
-    /// `autoMods`, or only configs remain owed.
+    /// `autoSync` plus `autoMods` — the owed mod payload deploys on its own.
     Automatic,
-    /// `autoSync` without `autoMods`, with config work owed — a
-    /// config-scoped pass deploys on its own; mod changes stay manual.
-    ConfigOnly,
-    /// `autoSync` without `autoMods`, and only the mod payload is owed —
-    /// nothing runs automatically until a manual deployment or the
-    /// setting changes.
+    /// `autoSync` without `autoMods` — nothing runs automatically until
+    /// a manual deployment or the setting changes.
     ModsManual,
     /// `autoSync` off — the pending revision is retained but nothing
     /// deploys until a manual request or the setting is re-enabled.
@@ -138,16 +132,12 @@ pub enum PendingPublicationMode {
 
 /// The pending-publication status the dialog shows. `retrying` marks
 /// that a previous automatic attempt failed and the worker is in its
-/// backoff delay. `modsOutstanding`/`configsOutstanding` report which
-/// phases of the pending publication remain owed — a completed
-/// config-only deployment leaves mods outstanding.
+/// backoff delay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingPublication {
     pub mode: PendingPublicationMode,
     pub retrying: bool,
-    pub mods_outstanding: bool,
-    pub configs_outstanding: bool,
 }
 
 /// Derives the pending banner's content from the worker's live status.
@@ -156,42 +146,26 @@ pub struct PendingPublication {
 /// worker-error boxes already explain that case, and a banner must never
 /// promise a deployment the worker cannot perform.
 ///
-/// `pending_revision` alone no longer means "deploys automatically":
-/// the worker tracks config and mod completion independently, so a
-/// publication whose config evaluation already landed still reports its
-/// owed mods here.
+/// A pending revision is always owed mod payload — the worker never
+/// owes config work — so the banner only needs the automation flags to
+/// say whether it will deploy on its own.
 fn pending_publication(worker: Option<&StatusResponse>) -> Option<PendingPublication> {
     let worker = worker?;
     worker.pending_revision?;
-
-    // A worker built before phase-scoped status omits both flags while
-    // reporting a pending revision — treat the whole publication as
-    // owed rather than claim nothing remains.
-    let flags_known = worker.pending_mods || worker.pending_configs;
-    let mods_outstanding = worker.pending_mods || !flags_known;
-    let configs_outstanding = worker.pending_configs || !flags_known;
 
     let mode = if !worker.auto_sync {
         PendingPublicationMode::Manual
     } else if worker.auto_mods {
         PendingPublicationMode::Automatic
-    } else if configs_outstanding {
-        PendingPublicationMode::ConfigOnly
     } else {
         PendingPublicationMode::ModsManual
     };
     Some(PendingPublication {
         mode,
-        mods_outstanding,
-        configs_outstanding,
         // `next_attempt_at` is only set after a failed attempt, and only
         // scheduled automation honors it — a stale value must not mark
         // manual-only work as retrying.
-        retrying: worker.next_attempt_at.is_some()
-            && matches!(
-                mode,
-                PendingPublicationMode::Automatic | PendingPublicationMode::ConfigOnly
-            ),
+        retrying: worker.next_attempt_at.is_some() && mode == PendingPublicationMode::Automatic,
     })
 }
 
@@ -1279,8 +1253,6 @@ mod pending_tests {
     struct Flags {
         auto_sync: bool,
         auto_mods: bool,
-        pending_mods: bool,
-        pending_configs: bool,
     }
 
     fn worker(
@@ -1296,11 +1268,8 @@ mod pending_tests {
             restart_policy: RestartPolicy::Manual,
             observed_revision: Some(Utc::now()),
             pending_revision: pending.then(Utc::now),
-            pending_mods: pending && flags.pending_mods,
-            pending_configs: pending && flags.pending_configs,
             next_attempt_at,
             last_deployed_revision: None,
-            last_config_sync_at: None,
             busy: None,
             last_operation: None,
             last_error: None,
@@ -1312,8 +1281,6 @@ mod pending_tests {
     const AUTO: Flags = Flags {
         auto_sync: true,
         auto_mods: true,
-        pending_mods: true,
-        pending_configs: true,
     };
 
     #[test]
@@ -1334,8 +1301,6 @@ mod pending_tests {
             Some(PendingPublication {
                 mode: PendingPublicationMode::Automatic,
                 retrying: false,
-                mods_outstanding: true,
-                configs_outstanding: true,
             })
         );
     }
@@ -1349,50 +1314,17 @@ mod pending_tests {
             Some(PendingPublication {
                 mode: PendingPublicationMode::Automatic,
                 retrying: true,
-                mods_outstanding: true,
-                configs_outstanding: true,
             })
         );
     }
 
     #[test]
-    fn config_only_automation_distinguishes_mod_deploys() {
-        // auto_mods off with both phases owed: the config pass is queued
-        // automatically while the mod payload stays manual.
+    fn owed_mods_without_auto_mods_stay_manual() {
+        // auto_mods off: the owed mod payload waits for a manual deploy —
+        // nothing runs automatically, and a stale backoff timestamp from
+        // earlier attempts must not mark it as retrying.
         let flags = Flags {
             auto_mods: false,
-            ..AUTO
-        };
-        let pending = pending_publication(Some(&worker(true, flags, None)));
-        assert_eq!(
-            pending,
-            Some(PendingPublication {
-                mode: PendingPublicationMode::ConfigOnly,
-                retrying: false,
-                mods_outstanding: true,
-                configs_outstanding: true,
-            })
-        );
-
-        let retry_at = Utc::now() + Duration::minutes(5);
-        assert_eq!(
-            pending_publication(Some(&worker(true, flags, Some(retry_at)))),
-            Some(PendingPublication {
-                mode: PendingPublicationMode::ConfigOnly,
-                retrying: true,
-                mods_outstanding: true,
-                configs_outstanding: true,
-            })
-        );
-    }
-
-    #[test]
-    fn a_config_only_deploy_leaves_mods_outstanding() {
-        // The worker's phase tracking reports a publication whose config
-        // evaluation already landed: only the mod payload remains owed.
-        let flags = Flags {
-            auto_mods: false,
-            pending_configs: false,
             ..AUTO
         };
         assert_eq!(
@@ -1400,42 +1332,15 @@ mod pending_tests {
             Some(PendingPublication {
                 mode: PendingPublicationMode::ModsManual,
                 retrying: false,
-                mods_outstanding: true,
-                configs_outstanding: false,
             })
         );
 
-        // A stale backoff timestamp from the earlier config attempts must
-        // not mark manual-only mod work as retrying.
         let retry_at = Utc::now() + Duration::minutes(5);
         assert_eq!(
             pending_publication(Some(&worker(true, flags, Some(retry_at)))),
             Some(PendingPublication {
                 mode: PendingPublicationMode::ModsManual,
                 retrying: false,
-                mods_outstanding: true,
-                configs_outstanding: false,
-            })
-        );
-    }
-
-    #[test]
-    fn an_old_worker_without_phase_flags_reports_the_whole_publication() {
-        // Workers built before phase-scoped status emit neither flag for
-        // a pending revision — the banner must not claim nothing is owed.
-        let flags = Flags {
-            auto_mods: false,
-            pending_mods: false,
-            pending_configs: false,
-            ..AUTO
-        };
-        assert_eq!(
-            pending_publication(Some(&worker(true, flags, None))),
-            Some(PendingPublication {
-                mode: PendingPublicationMode::ConfigOnly,
-                retrying: false,
-                mods_outstanding: true,
-                configs_outstanding: true,
             })
         );
     }
@@ -1448,7 +1353,6 @@ mod pending_tests {
         let flags = Flags {
             auto_sync: false,
             auto_mods: false,
-            ..AUTO
         };
         let pending = pending_publication(Some(&worker(true, flags, Some(retry_at))));
         assert_eq!(
@@ -1456,8 +1360,6 @@ mod pending_tests {
             Some(PendingPublication {
                 mode: PendingPublicationMode::Manual,
                 retrying: false,
-                mods_outstanding: true,
-                configs_outstanding: true,
             })
         );
         assert_eq!(
@@ -1472,8 +1374,6 @@ mod pending_tests {
             Some(PendingPublication {
                 mode: PendingPublicationMode::Manual,
                 retrying: false,
-                mods_outstanding: true,
-                configs_outstanding: true,
             }),
             "auto_mods is meaningless while auto_sync is off"
         );

@@ -320,7 +320,7 @@ async fn status(
     };
 
     let journal = ctx.journal.state.lock().await.clone();
-    let pending = journal.pending.as_ref().filter(|work| !work.resolved());
+    let pending = journal.pending.as_ref();
 
     Json(StatusResponse {
         worker_id: ctx.config.worker_id.clone(),
@@ -330,11 +330,8 @@ async fn status(
         restart_policy: journal.restart_policy,
         observed_revision: journal.last_seen_revision,
         pending_revision: pending.map(|work| work.revision),
-        pending_mods: pending.is_some_and(|work| work.mods_pending),
-        pending_configs: pending.is_some_and(|work| work.configs_pending),
         next_attempt_at: pending.and_then(|work| work.next_attempt_at),
         last_deployed_revision: journal.last_deployed_revision,
-        last_config_sync_at: journal.last_config_sync_at,
         busy: journal.interrupted_operation.clone(),
         last_operation: journal.last_operation.clone(),
         last_error: journal.last_error.clone(),
@@ -532,7 +529,6 @@ async fn run_deployment_inner(
     let (publication, desired) = ctx
         .publication_with_progress(selection.include_mods, progress)
         .await?;
-    let config_revision = managed_config_revision(&publication, &ctx.spec);
 
     {
         // Marks the in-flight operation so a crash mid-deployment is
@@ -563,18 +559,17 @@ async fn run_deployment_inner(
         let mut state = ctx.journal.state.lock().await;
         match &result {
             Ok(response) => {
-                // Any completed deployment discharges the outstanding
-                // phases it actually ran — a config-only pass never
-                // acknowledges mods it did not deploy.
+                // Only a deployment that ran the mods phase discharges
+                // owed work — an explicit config push never acknowledges
+                // a mod payload it did not deploy. A remote state that
+                // already reports the owed revision settles it too.
                 state.acknowledge_deployment(
                     response.plan.publication_revision,
                     response.plan.mods_phase,
-                    response.plan.configs_phase && response.failed_config_writes.is_empty(),
                     response.state.mods_revision.clone(),
-                    &config_revision,
                 );
                 // A manual deployment can settle failed automatic work too.
-                // Keep its error while any owed phase remains outstanding.
+                // Keep its error while owed work or failed writes remain.
                 if response.failed_config_writes.is_empty() && state.pending.is_none() {
                     state.last_error = None;
                 }
@@ -718,23 +713,6 @@ async fn set_policy(
     }
 }
 
-/// The publication's server-managed config set, independent of mod revisions
-/// and of files that the deployment spec does not allow on the server.
-fn managed_config_revision(publication: &FetchedPublication, spec: &DeploymentSpec) -> String {
-    let mut hasher = blake3::Hasher::new();
-    for (path, file) in publication
-        .config
-        .iter()
-        .filter(|(path, _)| spec.is_managed_config(path))
-    {
-        for value in [path.as_str(), file.hash.as_str()] {
-            hasher.update(&(value.len() as u64).to_le_bytes());
-            hasher.update(value.as_bytes());
-        }
-    }
-    hasher.finalize().to_hex().to_string()
-}
-
 async fn acknowledge_external_restart(
     State(ctx): State<Arc<WorkerContext>>,
     headers: HeaderMap,
@@ -804,13 +782,14 @@ async fn configure(
 
 /// Periodically checks for new publications and drives pending work when
 /// the journal's automation flags allow. The journal keeps distinct
-/// marks: `last_seen_revision` (newest observed), `pending` (publication
-/// work still owed, tracked per phase — config evaluation and the mod
-/// payload complete independently — and retried with backoff),
-/// `last_deployed_revision` (newest publication whose phases are both
-/// fully applied), and `deployed_mods_revision` (the remote state's last
-/// reported mod revision, mirrored for classifying new observations).
-/// Observing a publication never acknowledges deploying it.
+/// marks: `last_seen_revision` (newest observed), `pending` (a
+/// publication whose mod payload is still owed, retried with backoff),
+/// `last_deployed_revision` (newest publication whose mod payload is
+/// confirmed applied), and `deployed_mods_revision` (the remote state's
+/// last reported mod revision, mirrored for classifying new
+/// observations). Observing a publication never acknowledges deploying
+/// it, and config state never creates work: the server is authoritative
+/// for its config files, so only the mod payload is synchronized.
 async fn poll_loop(ctx: Arc<WorkerContext>, shutdown: CancellationToken) {
     let interval = Duration::from_secs(ctx.config.poll_interval_secs);
 
@@ -837,9 +816,8 @@ enum AutoAction {
     Idle,
     /// Work is pending but `autoSync` is off. Kept for later, not dropped.
     Disabled,
-    /// Only the mod payload is owed and `auto_mods` is off: it waits for
-    /// a manual deployment or for the setting to change. Repeating the
-    /// config evaluation would run the same no-op pass every tick.
+    /// The mod payload is owed but `auto_mods` is off: it waits for a
+    /// manual deployment or for the setting to change.
     AwaitingMods,
     /// Backoff from the last failure is still running.
     Waiting,
@@ -850,32 +828,23 @@ enum AutoAction {
 /// What to do with the journal's pending work this tick. Pure, so the
 /// durable-progress rules are testable without a running worker.
 ///
-/// The scope follows the outstanding phases: config evaluation runs
-/// whenever it is owed, while the mod payload deploys only when
-/// `auto_mods` permits. Mods owed under `auto_mods = false` wait
-/// explicitly instead of re-running an already-completed config pass.
+/// Pending work is always the mod payload — the only thing automatic
+/// sync deploys — so it deploys when `auto_sync` and `auto_mods` both
+/// permit and no backoff is running.
 fn automatic_action(state: &WorkerJournal, now: DateTime<Utc>) -> AutoAction {
     let Some(pending) = &state.pending else {
         return AutoAction::Idle;
     };
-    if pending.resolved() {
-        return AutoAction::Idle;
-    }
     if !state.auto_sync {
         return AutoAction::Disabled;
     }
-    // Backoff only paces work automation is actually allowed to run; a
-    // stale timer must not hold back mods that became deployable.
-    if let Some(next) = pending.next_attempt_at
-        && now < next
-        && (pending.configs_pending || state.auto_mods)
-    {
+    if !state.auto_mods {
+        return AutoAction::AwaitingMods;
+    }
+    if pending.next_attempt_at.is_some_and(|next| now < next) {
         return AutoAction::Waiting;
     }
-    if pending.configs_pending || (pending.mods_pending && state.auto_mods) {
-        return AutoAction::Deploy;
-    }
-    AutoAction::AwaitingMods
+    AutoAction::Deploy
 }
 
 /// Bounded exponential backoff between automatic retries.
@@ -890,22 +859,7 @@ fn retry_delay(attempts: u32) -> Duration {
 /// One poll cycle. Observes the newest publication, then drives pending
 /// work.
 async fn poll_once(ctx: &Arc<WorkerContext>) {
-    let last_seen = {
-        let state = ctx.journal.state.lock().await;
-        // A journal written before config revision tracking may already
-        // have seen this publication. Fetch it once unless config work is
-        // already owed; after classification, the pending marker is durable.
-        if state.evaluated_config_revision.is_none()
-            && !state
-                .pending
-                .as_ref()
-                .is_some_and(|work| work.configs_pending)
-        {
-            None
-        } else {
-            state.last_seen_revision
-        }
-    };
+    let last_seen = ctx.journal.state.lock().await.last_seen_revision;
     let probe = match ctx.sync.poll(&ctx.journal, last_seen).await {
         Ok(probe) => probe,
         Err(err) => {
@@ -925,9 +879,8 @@ async fn poll_once(ctx: &Arc<WorkerContext>) {
     match probe {
         PublicationProbe::New(publication) => {
             let revision = publication.revision;
-            let config_revision = managed_config_revision(&publication, &ctx.spec);
             info!(%revision, "observed new publication");
-            state.observe_publication(revision, &publication.mods_revision, &config_revision);
+            state.observe_publication(revision, &publication.mods_revision);
             if let Err(err) = ctx.journal.save(&state) {
                 warn!(%err, "failed to persist observed revision");
             }
@@ -957,27 +910,23 @@ async fn poll_once(ctx: &Arc<WorkerContext>) {
                 return;
             };
 
-            // Re-read the outstanding phases under the operation lock —
-            // the action check above may be stale. The selection mirrors
-            // them: owed config evaluation always runs so per-file
-            // persistent policies apply (`Ask` conflicts become pending
-            // decisions, not errors), while mods deploy only when owed
-            // and `auto_mods` permits.
-            let selection = {
+            // Re-check under the operation lock — the action check above
+            // may be stale. Owed work is always the mod payload, so the
+            // automatic selection is mods-only: configs are never part of
+            // unattended synchronization.
+            {
                 let state = ctx.journal.state.lock().await;
-                match state.pending.as_ref().filter(|work| !work.resolved()) {
-                    Some(work) => DeploySelection {
-                        include_mods: work.mods_pending && state.auto_mods,
-                        include_configs: work.configs_pending,
-                        apply_configs: Vec::new(),
-                        restore_configs: Vec::new(),
-                        decline_configs: Vec::new(),
-                    },
-                    None => {
-                        info!("pending work resolved before the automatic deployment ran");
-                        return;
-                    }
+                if state.pending.is_none() {
+                    info!("pending work resolved before the automatic deployment ran");
+                    return;
                 }
+            }
+            let selection = DeploySelection {
+                include_mods: true,
+                include_configs: false,
+                apply_configs: Vec::new(),
+                restore_configs: Vec::new(),
+                decline_configs: Vec::new(),
             };
 
             let result = run_deployment(
@@ -995,41 +944,13 @@ async fn poll_once(ctx: &Arc<WorkerContext>) {
             let mut state = ctx.journal.state.lock().await;
             match result {
                 Ok(response) => {
-                    // `run_deployment` already discharged the phases this
-                    // deployment covered and advanced
-                    // `last_deployed_revision` if nothing remains owed.
-                    if response.failed_config_writes.is_empty() {
-                        info!(
-                            revision = %response.plan.publication_revision,
-                            "automatic deployment completed"
-                        );
-                        state.last_error = None;
-                    } else {
-                        // Config writes that failed leave config work
-                        // owed — pace the retry like any other failure.
-                        let message = format!(
-                            "{} config file(s) could not be written",
-                            response.failed_config_writes.len()
-                        );
-                        error!(
-                            revision = %response.plan.publication_revision,
-                            %message,
-                            "automatic deployment partially failed"
-                        );
-                        if let Some(work) = state.pending.as_mut()
-                            && work.revision == response.plan.publication_revision
-                        {
-                            work.attempts = work.attempts.saturating_add(1);
-                            work.next_attempt_at = Some(
-                                Utc::now()
-                                    + chrono::Duration::from_std(retry_delay(work.attempts))
-                                        .unwrap_or_default(),
-                            );
-                            work.last_error = Some(message.clone());
-                        }
-                        state.last_error =
-                            Some(format!("automatic deployment partially failed: {message}"));
-                    }
+                    // `run_deployment` already discharged the owed mod
+                    // work and advanced `last_deployed_revision`.
+                    info!(
+                        revision = %response.plan.publication_revision,
+                        "automatic deployment completed"
+                    );
+                    state.last_error = None;
                 }
                 Err(err) => {
                     error!(error = %err, "automatic deployment failed");
@@ -1189,6 +1110,7 @@ mod tests {
     fn journal() -> WorkerJournal {
         WorkerJournal {
             auto_sync: true,
+            auto_mods: true,
             ..WorkerJournal::default()
         }
     }
@@ -1267,48 +1189,13 @@ mod tests {
     }
 
     #[test]
-    fn managed_config_revision_uses_only_sorted_managed_paths_and_hashes() {
-        use crate::profile::{
-            export::{ConfigPath, ContentHash},
-            sync::{FetchedPublication, archive::ValidatedConfigFile},
-        };
-        let game = crate::game::bundled_from_slug("valheim").unwrap();
-        let spec =
-            crate::profile::server::spec::DeploymentSpec::for_loader(&game.mod_loader).unwrap();
-        let mut publication = FetchedPublication {
-            revision: Utc::now(),
-            manifest: pack_manifest(),
-            mods_revision: owed_mod(),
-            config: Default::default(),
-        };
-        let file = |byte: u8| ValidatedConfigFile {
-            hash: ContentHash::from_hash(blake3::hash(&[byte])),
-            bytes: vec![byte],
-        };
-        let managed = ConfigPath::try_from("BepInEx/config/mod.cfg".to_owned()).unwrap();
-        let unmanaged = ConfigPath::try_from("BepInEx/plugins/readme.txt".to_owned()).unwrap();
-        publication.config.insert(managed.clone(), file(1));
-        let first = super::managed_config_revision(&publication, &spec);
-        publication.mods_revision =
-            crate::profile::export::ModRevision::try_from("b".repeat(64)).unwrap();
-        publication.config.insert(unmanaged.clone(), file(2));
-        assert_eq!(super::managed_config_revision(&publication, &spec), first);
-        publication.config.insert(unmanaged, file(3));
-        assert_eq!(super::managed_config_revision(&publication, &spec), first);
-        publication.config.insert(managed.clone(), file(4));
-        assert_ne!(super::managed_config_revision(&publication, &spec), first);
-        publication.config.remove(&managed);
-        assert_ne!(super::managed_config_revision(&publication, &spec), first);
-    }
-
-    #[test]
     fn pending_work_deploys_only_when_enabled_and_due() {
         let mut state = journal();
 
         // Nothing pending, so the loop is idle, not deploying.
         assert_eq!(automatic_action(&state, Utc::now()), AutoAction::Idle);
 
-        state.pending = Some(PendingWork::new(Utc::now(), Some(owed_mod()), true));
+        state.pending = Some(PendingWork::new(Utc::now(), owed_mod()));
         assert_eq!(automatic_action(&state, Utc::now()), AutoAction::Deploy);
 
         // Automation disabled: the pending work is retained for later,
@@ -1329,70 +1216,35 @@ mod tests {
     }
 
     #[test]
-    fn config_only_completion_leaves_mods_awaiting_permission() {
-        // autoSync on, autoMods off: after the config pass lands, the
-        // owed mod payload must not retrigger a deploy every tick — and
-        // must not be silently deployed either.
+    fn owed_mods_await_permission_when_auto_mods_is_off() {
+        // autoSync on, autoMods off: the owed mod payload must not
+        // retrigger a deploy every tick — and must not be silently
+        // deployed either. It waits for a manual deployment or for the
+        // setting to change.
         let mut state = journal();
         state.auto_mods = false;
-        state.pending = Some(PendingWork::new(Utc::now(), Some(owed_mod()), true));
+        state.pending = Some(PendingWork::new(Utc::now(), owed_mod()));
 
-        // Both phases owed → the config pass deploys.
-        assert_eq!(automatic_action(&state, Utc::now()), AutoAction::Deploy);
-
-        // The config pass landed; only mods remain. No auto work runs.
-        let work = state.pending.as_mut().unwrap();
-        work.configs_pending = false;
-        work.next_attempt_at = Some(Utc::now() - ChronoDuration::seconds(1));
-        assert_eq!(
-            automatic_action(&state, Utc::now()),
-            AutoAction::AwaitingMods,
-            "owed mods with auto_mods off must not redeploy configs"
-        );
-
-        // Enabling auto_mods reconsiders the outstanding mods without
-        // needing a new publication.
-        state.auto_mods = true;
-        assert_eq!(automatic_action(&state, Utc::now()), AutoAction::Deploy);
-    }
-
-    #[test]
-    fn stale_backoff_never_gates_manual_only_work() {
-        // A backoff timestamp left over from a failed config attempt
-        // must not hold mods owed under auto_mods=false in Waiting —
-        // nothing automatic would run anyway.
-        let mut state = journal();
-        state.auto_mods = false;
-        state.pending = Some(PendingWork {
-            revision: Utc::now(),
-            mods_pending: true,
-            owed_mods: Some(owed_mod()),
-            configs_pending: false,
-            attempts: 1,
-            next_attempt_at: Some(Utc::now() + ChronoDuration::minutes(5)),
-            last_error: Some("upload failed".to_owned()),
-        });
         assert_eq!(
             automatic_action(&state, Utc::now()),
             AutoAction::AwaitingMods
         );
-    }
 
-    #[test]
-    fn a_resolved_pending_marker_is_idle() {
-        // Defensive: a fully discharged marker must never deploy again,
-        // even if it somehow survives to the next tick.
-        let mut state = journal();
-        state.pending = Some(PendingWork {
-            revision: Utc::now(),
-            mods_pending: false,
-            owed_mods: None,
-            configs_pending: false,
-            attempts: 0,
-            next_attempt_at: None,
-            last_error: None,
-        });
-        assert_eq!(automatic_action(&state, Utc::now()), AutoAction::Idle);
+        // A stale backoff must not change the verdict — nothing
+        // automatic would run anyway.
+        state.pending.as_mut().unwrap().next_attempt_at =
+            Some(Utc::now() + ChronoDuration::minutes(5));
+        assert_eq!(
+            automatic_action(&state, Utc::now()),
+            AutoAction::AwaitingMods
+        );
+
+        // Enabling auto_mods reconsiders the outstanding mods without
+        // needing a new publication; backoff still applies.
+        state.auto_mods = true;
+        assert_eq!(automatic_action(&state, Utc::now()), AutoAction::Waiting);
+        state.pending.as_mut().unwrap().next_attempt_at = None;
+        assert_eq!(automatic_action(&state, Utc::now()), AutoAction::Deploy);
     }
 
     #[test]
@@ -1489,7 +1341,6 @@ mod tests {
         {
             let mut state = ctx.journal.state.lock().await;
             state.last_seen_revision = Some(revision);
-            state.evaluated_config_revision = Some("already-evaluated".to_owned());
             state.refresh_token = Some("refresh-seed".to_owned());
             state.last_error = Some("automatic deployment failed: upload failed".to_owned());
             ctx.journal.save(&state).unwrap();
@@ -1585,7 +1436,7 @@ mod tests {
         let journal = Journal::load(dir.path()).unwrap();
         {
             let mut state = journal.state.lock().await;
-            state.pending = Some(PendingWork::new(revision, None, true));
+            state.pending = Some(PendingWork::new(revision, owed_mod()));
             state.last_error = Some("automatic deployment failed: upload failed".to_owned());
             state.poll_error =
                 Some("Publication check failed: sync token request failed".to_owned());
@@ -1604,9 +1455,14 @@ mod tests {
             .unwrap(),
         );
 
+        // Pre-seeded payload cache keeps staging offline.
+        let staged = dir.path().join("cache").join("Author-Mod").join("1.0.0");
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(staged.join("mod.dll"), b"mod").unwrap();
+
         let selection = DeploySelection {
-            include_mods: false,
-            include_configs: true,
+            include_mods: true,
+            include_configs: false,
             ..Default::default()
         };
         super::run_deployment(
@@ -1623,21 +1479,22 @@ mod tests {
 
         let status = poll_status(ctx.clone()).await;
         assert!(status.last_error.is_none());
-        assert!(status.last_config_sync_at.is_some());
         assert_eq!(
             status.poll_error.as_deref(),
             Some("Publication check failed: sync token request failed")
         );
         assert!(status.pending_revision.is_none());
-        let previous = Utc::now() - ChronoDuration::hours(1);
-        {
-            let mut state = ctx.journal.state.lock().await;
-            state.last_config_sync_at = Some(previous);
-            ctx.journal.save(&state).unwrap();
-        }
+        assert_eq!(status.last_deployed_revision, Some(revision));
+
+        // An explicit config push afterwards is a no-op when nothing
+        // diverged, and it never re-opens settled publication work.
         let no_op = super::run_deployment(
             &ctx,
-            selection,
+            DeploySelection {
+                include_mods: false,
+                include_configs: true,
+                ..Default::default()
+            },
             None,
             None,
             false,
@@ -1652,14 +1509,19 @@ mod tests {
             &entry.action,
             crate::profile::server::plan::ConfigAction::Write
         )));
-        assert!(poll_status(ctx.clone()).await.last_config_sync_at.unwrap() > previous);
+        let status = poll_status(ctx.clone()).await;
+        assert!(status.pending_revision.is_none());
+        assert_eq!(status.last_deployed_revision, Some(revision));
         drop(ctx);
         let state = Journal::load(dir.path()).unwrap();
         assert!(state.state.lock().await.poll_error.is_some());
     }
 
     #[tokio::test]
-    async fn migrated_journal_refetches_an_already_seen_publication() {
+    async fn a_migrated_journal_keeps_a_seen_publication_settled() {
+        // A journal from the phase-scoped design may carry lastSeen and
+        // lastDeployed but no deployedModsRevision. The already-seen
+        // publication stays settled — config state can never re-debt it.
         let dir = tempfile::tempdir().unwrap();
         let revision = Utc::now();
         let api = spawn_sync_api(pack_manifest(), revision).await;
@@ -1686,8 +1548,8 @@ mod tests {
         );
         super::poll_once(&ctx).await;
         let state = ctx.journal.state.lock().await;
-        assert!(state.pending.as_ref().unwrap().configs_pending);
-        assert!(state.evaluated_config_revision.is_none());
+        assert!(state.pending.is_none());
+        assert_eq!(state.last_deployed_revision, Some(revision));
     }
 
     fn status_config(dir: &std::path::Path) -> super::WorkerConfig {
@@ -2116,10 +1978,11 @@ mod tests {
     }
 
     /// With `autoSync` on and `autoMods` off, observing a publication
-    /// runs one config evaluation and keeps the mod payload owed —
-    /// neither acknowledging it nor redeploying configs every tick.
+    /// records the owed mod payload and runs nothing — configs are never
+    /// evaluated, and no deployment happens until `auto_mods` allows the
+    /// mod payload.
     #[tokio::test]
-    async fn a_config_only_sync_leaves_mods_owed_and_does_not_repeat() {
+    async fn owed_mods_wait_for_auto_mods_without_touching_configs() {
         let dir = tempfile::tempdir().unwrap();
         let published_at = Utc::now();
         let sync_api = spawn_sync_api(pack_manifest(), published_at).await;
@@ -2163,53 +2026,34 @@ mod tests {
         {
             let state = ctx.journal.state.lock().await;
             let pending = state.pending.as_ref().expect("mod work stays owed");
-            assert!(pending.mods_pending);
             assert!(pending.owed_mods.is_some());
-            assert!(!pending.configs_pending, "the config pass completed");
             assert_eq!(
                 state.last_deployed_revision, None,
-                "a config-only pass must not mark the publication deployed"
+                "nothing ran, so nothing may be acknowledged"
             );
-            assert_eq!(state.last_error, None);
-            assert!(state.last_config_sync_at.is_some());
         }
 
-        let config_sync_at = ctx.journal.state.lock().await.last_config_sync_at;
-
-        // The remote state file was persisted with no mod revision —
-        // the mods phase never ran.
-        let state_file = ftp
-            .file("/BepInEx/config/.gale-server-state.json")
-            .expect("the deploy persisted remote state");
-        let remote_state: serde_json::Value = serde_json::from_slice(&state_file).unwrap();
-        assert!(remote_state["modsRevision"].is_null());
-
-        // The next tick observes the same publication, finds only mods
-        // owed under auto_mods=false, and must not redeploy.
-        let before = stor_count(&ftp);
-        super::poll_once(&ctx).await;
-        assert_eq!(
-            stor_count(&ftp),
-            before,
-            "a completed config pass must not redeploy every tick"
+        // No deployment ran at all: no uploads, no remote state file,
+        // and the published config never reached the server.
+        assert_eq!(stor_count(&ftp), 0);
+        assert!(
+            ftp.file("/BepInEx/config/.gale-server-state.json")
+                .is_none(),
+            "awaiting mods must not run a deployment"
         );
-        {
-            let state = ctx.journal.state.lock().await;
-            assert!(state.pending.as_ref().unwrap().mods_pending);
-            assert_eq!(state.last_config_sync_at, config_sync_at);
-        }
+        assert!(ftp.file("/BepInEx/config/mod.cfg").is_none());
+
+        // The next tick observes the same publication, finds the same
+        // owed work under auto_mods=false, and must not deploy.
+        super::poll_once(&ctx).await;
+        assert_eq!(stor_count(&ftp), 0, "owed mods must not deploy");
 
         // A restart preserves the owed work exactly — journal on disk.
         drop(ctx);
         let journal = crate::worker::journal::Journal::load(dir.path()).unwrap();
         {
             let state = journal.state.lock().await;
-            let pending = state
-                .pending
-                .as_ref()
-                .expect("owed work survives a restart");
-            assert!(pending.mods_pending);
-            assert!(!pending.configs_pending);
+            assert!(state.pending.is_some(), "owed work survives a restart");
         }
 
         // Enabling auto_mods reconsiders the owed mods without a new
@@ -2264,10 +2108,9 @@ mod tests {
             let state = ctx.journal.state.lock().await;
             assert!(
                 state.pending.is_none(),
-                "the owed mod phase deployed once auto_mods allowed it"
+                "the owed mod payload deployed once auto_mods allowed it"
             );
             assert_eq!(state.last_deployed_revision, Some(published_at));
-            assert_eq!(state.last_config_sync_at, config_sync_at);
         }
         let state_file = ftp
             .file("/BepInEx/config/.gale-server-state.json")
@@ -2277,12 +2120,18 @@ mod tests {
             remote_state["modsRevision"].is_string(),
             "the mods phase ran and recorded the deployed revision"
         );
+        // Even the mods deploy leaves the server's config files alone.
+        assert!(ftp.file("/BepInEx/config/mod.cfg").is_none());
     }
 
+    /// Unattended sync deploys the mod payload and nothing else: a
+    /// server-side config that diverges from the publication is neither
+    /// overwritten nor turned into a pending decision.
     #[tokio::test]
-    async fn evaluated_config_conflict_remains_in_authoritative_server_state() {
+    async fn automatic_sync_never_evaluates_or_writes_configs() {
         let dir = tempfile::tempdir().unwrap();
-        let sync_api = spawn_sync_api(pack_manifest(), Utc::now()).await;
+        let published_at = Utc::now();
+        let sync_api = spawn_sync_api(pack_manifest(), published_at).await;
         let ftp = FakeFtp::valheim_host(FtpOptions::default());
         ftp.seed_file("/BepInEx/config/mod.cfg", b"server-customization");
         let mut config = worker_config(dir.path(), "127.0.0.1:0".to_owned());
@@ -2300,8 +2149,11 @@ mod tests {
         {
             let mut state = journal.state.lock().await;
             state.auto_sync = true;
-            state.auto_mods = false;
+            state.auto_mods = true;
         }
+        let staged = dir.path().join("cache").join("Author-Mod").join("1.0.0");
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(staged.join("mod.dll"), b"mod").unwrap();
         let ctx = std::sync::Arc::new(
             super::WorkerContext::new(
                 config,
@@ -2314,15 +2166,26 @@ mod tests {
             )
             .unwrap(),
         );
+
         super::poll_once(&ctx).await;
+
         let state = ctx.journal.state.lock().await;
-        assert!(!state.pending.as_ref().unwrap().configs_pending);
-        assert!(state.evaluated_config_revision.is_some());
+        assert!(state.pending.is_none());
+        assert_eq!(state.last_deployed_revision, Some(published_at));
         drop(state);
+
+        // The mods phase ran and the divergent server config survived
+        // untouched — no pending decision was created for it either.
+        assert!(stor_count(&ftp) > 0);
         let remote_state: serde_json::Value =
             serde_json::from_slice(&ftp.file("/BepInEx/config/.gale-server-state.json").unwrap())
                 .unwrap();
-        assert!(remote_state["pending"]["BepInEx/config/mod.cfg"].is_string());
+        assert!(remote_state["modsRevision"].is_string());
+        assert_eq!(
+            remote_state["pending"],
+            serde_json::json!({}),
+            "automatic sync must not create config decisions"
+        );
         assert_eq!(
             ftp.file("/BepInEx/config/mod.cfg").unwrap(),
             b"server-customization"

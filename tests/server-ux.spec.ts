@@ -89,7 +89,8 @@ for (const cancel of [true, false]) {
 test('deployment actions stay inside the dialog at the default app size', async ({ page }) => {
 	await page.setViewportSize({ width: 900, height: 700 });
 	await page.goto('/tests/dialog/?many=1');
-	await page.getByRole('button', { name: 'Preview', exact: true }).click();
+	await page.getByText('Server config files', { exact: true }).click();
+	await page.getByRole('button', { name: 'Preview config changes', exact: true }).click();
 	await page
 		.getByTestId('server-config-row')
 		.first()
@@ -99,7 +100,7 @@ test('deployment actions stay inside the dialog at the default app size', async 
 	const panel = page.getByRole('dialog').locator('div.border').first();
 	const bounds = await panel.boundingBox();
 	expect(bounds).not.toBeNull();
-	for (const name of ['Close', 'Preview', 'Deploy']) {
+	for (const name of ['Close', 'Preview', 'Push configs']) {
 		const button = page.getByRole('button', { name, exact: true });
 		await button.scrollIntoViewIfNeeded();
 		const box = (await button.boundingBox())!;
@@ -111,13 +112,14 @@ test('deployment actions stay inside the dialog at the default app size', async 
 
 test('future config policies do not imply a current deployment decision', async ({ page }) => {
 	await page.goto('/tests/dialog/');
-	await page.getByRole('button', { name: 'Preview', exact: true }).click();
+	await page.getByText('Server config files', { exact: true }).click();
+	await page.getByRole('button', { name: 'Preview config changes', exact: true }).click();
 	await expect(page.getByText('This deployment:', { exact: false })).toBeVisible();
 	await page.getByLabel('Future updates for BepInEx/config/test.cfg', { exact: true }).click();
 	await page.getByRole('option', { name: 'Always keep my config', exact: true }).click();
 	await expect(page.getByText('1 files still need a decision')).toBeVisible();
-	await expect(page.getByRole('button', { name: 'Deploy', exact: true })).toBeDisabled();
-	await page.getByRole('button', { name: 'Preview', exact: true }).click();
+	await expect(page.getByRole('button', { name: 'Push configs', exact: true })).toBeDisabled();
+	await page.getByRole('button', { name: 'Preview config changes', exact: true }).click();
 	const selection = await page.evaluate(
 		() =>
 			(window as any).calls.filter((call: any) => call.cmd === 'preview_server_sync').at(-1).args

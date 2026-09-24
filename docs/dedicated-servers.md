@@ -31,11 +31,11 @@ The server is synchronized from the profile's **canonical publication**, the sam
 
 Open **Sync dedicated server** from the profile's server dialog.
 
-### Scope
+### What gets synchronized
 
-- **Mods only** deploys the published mod payload.
-- **Selected configs only** deploys only the config files you choose.
-- **Both** is the default.
+**Preview** and **Deploy** handle the published mod payload — the routine operation. Config files are a separate, explicit action. The server owns its config files after setup, because a mod can migrate or regenerate them when the server starts. A config difference between the publication and the server is not debt and never creates pending work.
+
+To seed a fresh server or intentionally replace a config file, open **Server config files** in the sync dialog and select **Preview config changes**, then **Push configs**. The push uses the same planner, lease, and approval rules as a mod deployment. Once it completes, Gale does not track the pushed files as outstanding work.
 
 ### What the planner does
 
@@ -49,13 +49,13 @@ The preview combines the live remote listing with Gale's recorded deployment sta
 
 ### Config decisions and policies
 
-For each revision, you can apply, decline, or leave each published config pending. If a config Gale deployed was deleted on the server, recreating it needs an explicit **Restore** decision.
+A config push lists every published config file with its planned action. You can apply, decline, or leave each conflicted config pending. If a config Gale deployed was deleted on the server, recreating it needs an explicit **Restore** decision.
 
 Each config also has a persistent policy stored in the remote deployment state: **Ask each update**, **Always apply updates**, or **Always keep my config**. The policy survives switching between Local and Worker execution. A policy set during revision A only applies to future revisions; it does not decide the current conflict.
 
 ### Preview and approval
 
-**Preview** computes the exact plan under the deployment lock: uploads, removals, config actions, and whether a restart is needed. **Deploy** runs it. The plan hash binds the approval, so if the remote state, the publication, the selection, or the restart policy changes between preview and deploy, Gale rejects the deploy and asks for a fresh preview. The dialog marks the approval stale automatically.
+**Preview** computes the exact mod plan under the deployment lock: uploads, removals, and whether a restart is needed. **Deploy** runs it. **Preview config changes** computes the same kind of plan for a config push, including per-file actions. The plan hash binds the approval, so if the remote state, the publication, the selection, or the restart policy changes between preview and deploy, Gale rejects the deploy and asks for a fresh preview. The dialog marks the approval stale automatically.
 
 ### Restart policy
 
@@ -90,7 +90,7 @@ Choose **Worker on this PC** as the sync mode and select **Set up worker**. Gale
 3. Stages a worker config and credentials file in a permission-restricted temp directory, then shows **one UAC elevation prompt** that installs and starts the `GaleWorker` Windows service.
 4. Points this profile's sync mode at the worker's loopback address and stores its bearer token.
 
-If setup stops after the service was installed but before the profile was linked — for example the settings save failed — the dialog reports the worker as *setup incomplete* instead of leaving it orphaned. Running **Set up worker** again signs in, reinstalls the worker, and finishes the link. Pending work and automation settings are retained when the profile and remote server are unchanged.
+If setup stops after the service was installed but before the profile was linked — for example the settings save failed — the dialog reports the worker as _setup incomplete_ instead of leaving it orphaned. Running **Set up worker** again signs in, reinstalls the worker, and finishes the link. Pending work and automation settings are retained when the profile and remote server are unchanged.
 
 Once installed, the service runs as LocalSystem and is independent of the Gale process: it starts with Windows before any user signs in, restarts automatically after a crash, and resumes queued deployments from its journal. The service only reports `Running` to Windows once its API is bound and serving — a start that fails during initialization ends in `Stopped` with a failure exit, so SCM recovery actions behave correctly. Start, Stop, and Restart use the service's configured control permissions. Update (available when Gale ships a newer worker) and Uninstall request UAC elevation.
 
@@ -175,13 +175,15 @@ In the remote settings, choose **Worker on another machine** as the sync mode an
 
 Manual **Deploy** through the worker works regardless of the `autoSync` toggle. You can change the automation toggles (`autoSync`, `autoMods`) and the restart policy from the dedicated-server dialog or the sync dialog — Gale pushes the values to the running worker, reads them back, and they persist across worker restarts.
 
-The worker tracks a publication's phases separately: config evaluation/deployment and the mod payload. With `autoSync` on but `autoMods` off, a config-only sync settles the config phase while the publication's mod changes stay outstanding until a manual deploy runs them or `autoMods` is enabled — which retries the owed mods without a new publication. A publication counts as fully deployed only once both phases are applied.
+The worker tracks only the publication's mod payload. A publication is pending when its mod revision differs from the revision recorded on the server, and settled once that mod revision is confirmed deployed — published config changes never create pending work, so a publication that changes only configs is observed and acknowledged without any deployment. With `autoSync` on but `autoMods` off, the worker observes each publication and keeps the owed mod payload pending until a manual deploy runs it or `autoMods` is enabled. Config files are never evaluated or written automatically; **Push configs** in the sync dialog is the only path that writes them, and it runs through the worker the same way a mod deploy does.
+
+Workers upgraded from builds that tracked config synchronization drop the old `configsPending`, `evaluatedConfigRevision`, and `lastConfigSyncAt` journal fields on load and never write them again. A pending publication that only owed config evaluation is discarded rather than deployed.
 
 #### Moving a managed worker to a VPS
 
 The managed worker's job queue and rotated credentials live in `%ProgramData%\Gale\worker\private`. To move hosting to an external machine without losing pending work or re-doing the sign-in:
 
-1. **Stop the old worker first.** In the dedicated-server dialog choose **Stop**, wait until the service reports `stopped`, and confirm the last `status.json` report is not `running`. Never run two workers against the same server at once — the remote lease prevents simultaneous *deployments*, but the old worker would keep polling and racing the new one.
+1. **Stop the old worker first.** In the dedicated-server dialog choose **Stop**, wait until the service reports `stopped`, and confirm the last `status.json` report is not `running`. Never run two workers against the same server at once — the remote lease prevents simultaneous _deployments_, but the old worker would keep polling and racing the new one.
 2. **Copy the durable state** to the VPS: `private\gale-worker-state.json` (journal: pending work, retry backoff, rotated refresh token) and `private\secrets.env` (API token and credentials). Copy `gale-worker.json` too as a starting point.
 3. On the VPS, write a new `gale-worker.json`: same `profileId` and `game`, the remote settings copied over, `stateDir` pointing at the copied journal, `listen` on an address Gale can reach. Put the copied secrets in `secretsFile` (or the environment), and `secrets.env`'s rotated token keeps the credential chain alive — do **not** reuse the desktop's sign-in for it.
 4. Start the external worker (systemd example above), then switch the profile's sync mode to **Worker on another machine** with the new address and the same bearer token.
@@ -228,7 +230,7 @@ The backend lives in `src-tauri/src/profile/server`:
 - `local_worker.rs`: desktop orchestration for the managed Windows worker — provisioning, elevated install/uninstall via `ShellExecuteExW`, SCM status/start/stop, ProgramData layout.
 - `runtime.rs`: the local server process and its profile lock, including the stopping state.
 - `worker_client.rs`: desktop client for the worker API (loopback-only plaintext rule).
-- `src-tauri/src/worker/`: the worker, with its HTTP API (`server.rs`), durable journal (`journal.rs`), config (`config.rs`), secrets-file loading (`secrets.rs`), sync client (`sync_client.rs`), shared wire types (`api.rs`), managed-service layout constants (`local.rs`), and the SCM service entry/install/uninstall (`service.rs`, Windows only).
+- `src-tauri/src/worker/`: the worker, with its HTTP API (`server.rs`), durable journal (`journal.rs`) — pending work there always means an owed mod payload — config (`config.rs`), secrets-file loading (`secrets.rs`), sync client (`sync_client.rs`), shared wire types (`api.rs`), managed-service layout constants (`local.rs`), and the SCM service entry/install/uninstall (`service.rs`, Windows only).
 
 Frontend bindings are in `src/lib/api/profile/server.ts`, the sync dialog is `src/lib/components/dialogs/ServerSyncDialog.svelte`, and user-facing text lives in `messages/en.json` via Paraglide.
 

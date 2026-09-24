@@ -69,26 +69,18 @@ pub struct StatusResponse {
     /// The newest publication revision the worker has observed.
     /// Observation alone is not deployment.
     pub observed_revision: Option<DateTime<Utc>>,
-    /// A publication revision awaiting successful completion, if any.
-    /// Completion is phase-scoped — see `pending_mods`/`pending_configs`
-    /// for what remains owed.
+    /// A publication revision whose mod payload is still owed, if any.
+    /// The worker never owes config work: the server is authoritative
+    /// for its config files after setup, so a pending revision always
+    /// means the mod payload has not been confirmed deployed.
     pub pending_revision: Option<DateTime<Utc>>,
-    /// The pending publication's mod payload is not yet recorded as
-    /// deployed — it awaits a manual deployment or `auto_mods`.
-    #[serde(default)]
-    pub pending_mods: bool,
-    /// Config evaluation is still owed for the pending publication.
-    #[serde(default)]
-    pub pending_configs: bool,
     /// When the pending work becomes eligible for its next attempt.
     pub next_attempt_at: Option<DateTime<Utc>>,
-    /// The newest publication revision whose mod payload *and* config
-    /// evaluation are both fully applied. A config-only deployment does
-    /// not advance it while that publication's mods remain owed.
+    /// The newest publication revision whose mod payload is confirmed
+    /// deployed on the server. Config state plays no part: the server
+    /// owns its config files, and an explicit config push never
+    /// advances this marker.
     pub last_deployed_revision: Option<DateTime<Utc>>,
-    /// When the config phase last completed successfully. Unknown on older workers.
-    #[serde(default)]
-    pub last_config_sync_at: Option<DateTime<Utc>>,
     /// The operation currently in flight, if any.
     pub busy: Option<BusyOperation>,
     pub last_operation: Option<OperationRecord>,

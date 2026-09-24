@@ -21,36 +21,65 @@ test('worker poll and deployment errors render independently', async ({ page }) 
 	await expect(page.getByText(deploymentError)).toBeVisible();
 });
 
-test('worker config sync history is neutral and pending decisions stay visible', async ({ page }) => {
+test('a pending publication is owed mods; routine status never reports config sync', async ({
+	page
+}) => {
 	await page.goto('/tests/dialog/?mode=worker&pendingDecisions=2');
-	await page.evaluate(() =>
-		(window as any).setWorkerConfigSync(null, '2026-09-23T12:00:00Z')
-	);
+	await page.evaluate(() => (window as any).setWorkerPending('2026-09-23T12:00:00Z'));
 	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
-	const history = page.getByText('Last config sync: Never');
-	await expect(history).toBeVisible();
-	const publication = page.getByText(/^Latest publication:/);
-	expect(await history.evaluate((element) => getComputedStyle(element).color)).toBe(
-		await publication.evaluate((element) => getComputedStyle(element).color)
-	);
+	// Remote pending config decisions stay actionable; routine config
+	// synchronization status does not exist.
 	await expect(page.getByText('2 config file(s) awaiting a decision')).toBeVisible();
-	await expect(page.getByText(/^Pending config sync:/)).toBeHidden();
+	await expect(page.getByText(/config sync/i)).toHaveCount(0);
 	await page.getByText('Worker automation', { exact: true }).click();
-	await expect(page.getByText(/^Pending config sync:/)).toBeVisible();
-
-	const at = '2026-09-23T13:45:00Z';
-	await page.evaluate((timestamp) => (window as any).setWorkerConfigSync(timestamp, null), at);
+	const formatted = await page.evaluate(
+		(revision) => new Date(revision).toLocaleString(),
+		'2026-09-23T12:00:00Z'
+	);
+	await expect(page.getByText(`Pending mod deployment: ${formatted}`)).toBeVisible();
+	await page.evaluate(() => (window as any).setWorkerPending(null));
 	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
-	const formatted = await page.evaluate((timestamp) => new Date(timestamp).toLocaleString(), at);
-	await expect(page.getByText(`Last config sync: ${formatted}`)).toBeVisible();
-	await expect(page.getByText(/^Pending config sync:/)).toHaveCount(0);
+	await expect(page.getByText(/^Pending mod deployment:/)).toHaveCount(0);
 });
 
 for (const mode of ['local', 'worker']) {
+	test(`${mode}: the primary sync flow deploys mods only`, async ({ page }) => {
+		await page.goto(`/tests/dialog/?mode=${mode}`);
+		await page.getByRole('button', { name: 'Preview', exact: true }).click();
+		await expect(page.getByRole('button', { name: 'Deploy', exact: true })).toBeEnabled();
+		await expect(page.getByTestId('server-config-row')).toHaveCount(0);
+		const modsSelection = await page.evaluate(
+			() =>
+				(window as any).calls.filter((call: any) => call.cmd === 'preview_server_sync').at(-1).args
+					.request.selection
+		);
+		expect(modsSelection).toEqual({
+			includeMods: true,
+			includeConfigs: false,
+			applyConfigs: [],
+			restoreConfigs: [],
+			declineConfigs: []
+		});
+		await page.getByRole('button', { name: 'Deploy', exact: true }).click();
+		await expect(page.getByText('Mod deployment finished.')).toBeVisible();
+		// Config deployment stays available as a separate explicit action.
+		await page.getByText('Server config files', { exact: true }).click();
+		await page.getByRole('button', { name: 'Preview config changes', exact: true }).click();
+		await expect(page.getByTestId('server-config-row')).toHaveCount(1);
+		const configSelection = await page.evaluate(
+			() =>
+				(window as any).calls.filter((call: any) => call.cmd === 'preview_server_sync').at(-1).args
+					.request.selection
+		);
+		expect(configSelection).toMatchObject({ includeMods: false, includeConfigs: true });
+		await expect(page.getByRole('button', { name: 'Push configs', exact: true })).toBeEnabled();
+	});
+
 	test(`${mode}: decisions do not reorder or scroll a long review list`, async ({ page }) => {
 		await page.setViewportSize({ width: 900, height: 650 });
 		await page.goto(`/tests/dialog/?mode=${mode}&many=1`);
-		await page.getByRole('button', { name: 'Preview', exact: true }).click();
+		await page.getByText('Server config files', { exact: true }).click();
+		await page.getByRole('button', { name: 'Preview config changes', exact: true }).click();
 		await page.getByRole('button', { name: 'Show files needing review' }).click();
 		// Wait for the review font before measuring decision-induced scrolling.
 		await page.evaluate(() => document.fonts.ready.then(() => undefined));
@@ -87,9 +116,7 @@ for (const mode of ['local', 'worker']) {
 			await expect(selectedRow.getByRole('button', { name: focusedAction })).toBeFocused();
 			expect(await positions()).toEqual(beforeScroll);
 			expect(
-				await rows.evaluateAll((elements) =>
-					elements.map((item) => item.getAttribute('data-path'))
-				)
+				await rows.evaluateAll((elements) => elements.map((item) => item.getAttribute('data-path')))
 			).toEqual(before);
 		};
 		await checkDecision(row, 'Apply', 'Undo', 30);
@@ -97,44 +124,37 @@ for (const mode of ['local', 'worker']) {
 		await checkDecision(row, 'Decline', 'Undo', 30);
 		await checkDecision(row, 'Undo', 'Decline', 31);
 		await checkDecision(restoreRow, 'Restore', 'Undo', 30);
-		await page.getByRole('button', { name: 'Preview', exact: true }).click();
-		await expect(page.getByRole('button', { name: 'Deploy', exact: true })).toBeEnabled();
+		await page.getByRole('button', { name: 'Preview config changes', exact: true }).click();
+		await expect(page.getByRole('button', { name: 'Push configs', exact: true })).toBeEnabled();
 		await checkDecision(restoreRow, 'Undo', 'Restore', 31);
-		await expect(page.getByRole('button', { name: 'Deploy', exact: true })).toBeDisabled();
+		await expect(page.getByRole('button', { name: 'Push configs', exact: true })).toBeDisabled();
 		await page.getByRole('button', { name: 'Show all config files' }).click();
 		await expect(rows).toHaveCount(133);
 		await page.getByRole('button', { name: 'Show files needing review' }).click();
 		await expect(rows).toHaveCount(31);
-		expect(await rows.evaluateAll((elements) => elements.map((item) => item.getAttribute('data-path')))).toEqual(before);
+		expect(
+			await rows.evaluateAll((elements) => elements.map((item) => item.getAttribute('data-path')))
+		).toEqual(before);
 	});
 
-	test(`${mode}: dialog defaults survive reopen and remain profile-specific`, async ({ page }) => {
+	test(`${mode}: restart preference survives reopen and stays profile-specific`, async ({
+		page
+	}) => {
 		await page.goto(`/tests/dialog/?mode=${mode}&profile=first`);
-		const scope = page.getByLabel('Deployment scope', { exact: true });
-		await scope.click();
-		await page.getByRole('option', { name: 'Mods only', exact: true }).click();
 		await page.getByLabel('Restart after deploying', { exact: true }).click();
 		await page.getByRole('option', { name: 'When empty', exact: true }).click();
 		await page.getByRole('button', { name: 'Close', exact: true }).click();
 		await page.getByRole('button', { name: 'Reopen sync dialog' }).click();
-		await expect(page.getByLabel('Deployment scope', { exact: true })).toHaveText('Mods only');
 		await expect(page.getByLabel('Restart after deploying', { exact: true })).toHaveText(
 			'When empty'
 		);
 		await page.reload();
-		await expect(page.getByLabel('Deployment scope', { exact: true })).toHaveText('Mods only');
 		await expect(page.getByLabel('Restart after deploying', { exact: true })).toHaveText(
 			'When empty'
 		);
 		await page.goto(`/tests/dialog/?mode=${mode}&profile=second`);
-		await expect(page.getByLabel('Deployment scope', { exact: true })).toHaveText(
-			'Mods and selected configs'
-		);
-		await expect(page.getByLabel('Restart after deploying', { exact: true })).toHaveText(
-			'Never'
-		);
+		await expect(page.getByLabel('Restart after deploying', { exact: true })).toHaveText('Never');
 		await page.goto(`/tests/dialog/?mode=${mode}&profile=first`);
-		await expect(page.getByLabel('Deployment scope', { exact: true })).toHaveText('Mods only');
 		await expect(page.getByLabel('Restart after deploying', { exact: true })).toHaveText(
 			'When empty'
 		);
@@ -155,7 +175,8 @@ for (const mode of ['local', 'worker']) {
 	}) => {
 		await page.goto(`/tests/dialog/?mode=${mode}&many=1`);
 		await page.getByRole('button', { name: 'Refresh', exact: true }).waitFor();
-		await page.getByRole('button', { name: 'Preview', exact: true }).click();
+		await page.getByText('Server config files', { exact: true }).click();
+		await page.getByRole('button', { name: 'Preview config changes', exact: true }).click();
 		const rows = page.getByTestId('server-config-row');
 		await expect(rows).toHaveCount(133);
 		await expect(rows.first()).toHaveAttribute('data-path', 'BepInEx/config/file-003.cfg');
@@ -164,19 +185,23 @@ for (const mode of ['local', 'worker']) {
 		await expect(rows).toHaveCount(31);
 		await rows.first().getByRole('button', { name: 'Apply' }).click();
 		await expect(page.getByText('30 files still need a decision')).toBeVisible();
-		await expect(page.getByRole('button', { name: 'Deploy', exact: true })).toBeDisabled();
-		await page.getByRole('button', { name: 'Preview', exact: true }).click();
-		await expect(page.getByRole('button', { name: 'Deploy', exact: true })).toBeEnabled();
+		await expect(page.getByRole('button', { name: 'Push configs', exact: true })).toBeDisabled();
+		await page.getByRole('button', { name: 'Preview config changes', exact: true }).click();
+		await expect(page.getByRole('button', { name: 'Push configs', exact: true })).toBeEnabled();
 		await page.getByRole('button', { name: 'Show all config files' }).click();
 		await expect(rows).toHaveCount(133);
-		await expect(page.getByRole('button', { name: 'Deploy', exact: true })).toBeEnabled();
+		await expect(page.getByRole('button', { name: 'Push configs', exact: true })).toBeEnabled();
 		await expect(rows.filter({ hasText: 'file-000.cfg' })).toBeVisible();
 		const selected = await page.evaluate(
 			() =>
 				(window as any).calls.filter((call: any) => call.cmd === 'preview_server_sync').at(-1).args
 					.request.selection
 		);
-		expect(selected.applyConfigs).toEqual(['BepInEx/config/file-003.cfg']);
+		expect(selected).toMatchObject({
+			includeMods: false,
+			includeConfigs: true,
+			applyConfigs: ['BepInEx/config/file-003.cfg']
+		});
 	});
 
 	test(`${mode}: explicit restart confirmation clears the reminder`, async ({ page }) => {
@@ -197,7 +222,8 @@ for (const mode of ['local', 'worker']) {
 		const errors: string[] = [];
 		page.on('pageerror', (error) => errors.push(error.message));
 		await page.goto(`/tests/dialog/?mode=${mode}&many=1`);
-		await page.getByRole('button', { name: 'Preview', exact: true }).click();
+		await page.getByText('Server config files', { exact: true }).click();
+		await page.getByRole('button', { name: 'Preview config changes', exact: true }).click();
 		const rows = page.getByTestId('server-config-row');
 		await expect(rows).toHaveCount(133);
 		const order = await rows.evaluateAll((elements) =>
@@ -214,7 +240,7 @@ for (const mode of ['local', 'worker']) {
 		// A future policy is not a current Apply/Decline decision — but it
 		// does invalidate the approved deployment inputs.
 		await expect(page.getByText('31 files still need a decision')).toBeVisible();
-		await expect(page.getByRole('button', { name: 'Deploy', exact: true })).toBeDisabled();
+		await expect(page.getByRole('button', { name: 'Push configs', exact: true })).toBeDisabled();
 		expect(
 			await rows.evaluateAll((elements) => elements.map((row) => row.getAttribute('data-path')))
 		).toEqual(order);
@@ -251,10 +277,7 @@ for (const mode of ['local', 'worker']) {
 			page.on('pageerror', (error) => errors.push(error.message));
 			await page.goto(`/tests/dialog/?mode=${mode}`);
 			const button = (name: string) => {
-				if (name === 'Mods and selected configs')
-					return page.getByLabel('Deployment scope', { exact: true });
-				if (name === 'Never')
-					return page.getByLabel('Restart after deploying', { exact: true });
+				if (name === 'Never') return page.getByLabel('Restart after deploying', { exact: true });
 				if (['Ask each update', 'Always apply updates'].includes(name))
 					return page.getByLabel('Future updates for BepInEx/config/test.cfg', { exact: true });
 				if (['Restore', 'Undo'].includes(name))
@@ -266,12 +289,13 @@ for (const mode of ['local', 'worker']) {
 			const password = page.locator('input[type=password]');
 			await password.fill('test-secret');
 			if (mode === 'worker') await page.getByText('Worker automation', { exact: true }).click();
-			await button('Preview').click();
+			await page.getByText('Server config files', { exact: true }).click();
+			await button('Preview config changes').click();
 			await button('Restore').waitFor();
 			await button('Restore').click();
-			await expect(button('Deploy')).toBeDisabled();
-			await button('Preview').click();
-			await expect(button('Deploy')).toBeEnabled();
+			await expect(button('Push configs')).toBeDisabled();
+			await button('Preview config changes').click();
+			await expect(button('Push configs')).toBeEnabled();
 			if (operation === 'configure_worker') {
 				await page.getByRole('checkbox').first().click();
 				await page.getByRole('checkbox').last().click();
@@ -284,18 +308,18 @@ for (const mode of ['local', 'worker']) {
 				await button(
 					operation === 'configure_worker'
 						? 'Save automation'
-						: operation === 'deploy_server_sync'
-							? 'Deploy'
-							: 'Preview'
+						: operation === 'preview_server_sync'
+							? 'Preview config changes'
+							: 'Push configs'
 				).click();
-			const scope = button('Mods and selected configs');
+			const configPreview = button('Preview config changes');
 			const restart = button('Never');
 			for (const control of [
-				scope,
+				configPreview,
 				restart,
 				password,
 				button('Preview'),
-				button('Deploy'),
+				button('Push configs'),
 				button('Close'),
 				button('Refresh'),
 				button('Undo'),
@@ -311,7 +335,7 @@ for (const mode of ['local', 'worker']) {
 			}
 			const before = await page.evaluate(() => structuredClone((window as any).calls));
 			// Physical pointer and keyboard attempts must not open selectors or submit again.
-			for (const control of [scope, restart, button('Preview'), button('Deploy')]) {
+			for (const control of [configPreview, restart, button('Preview'), button('Push configs')]) {
 				const box = (await control.boundingBox())!;
 				await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
 			}
@@ -326,7 +350,7 @@ for (const mode of ['local', 'worker']) {
 			expect(request[mode === 'worker' ? 'workerToken' : 'password']).toBe('test-secret');
 			if (request.selection)
 				expect(request.selection).toEqual({
-					includeMods: true,
+					includeMods: false,
 					includeConfigs: true,
 					applyConfigs: ['BepInEx/config/test.cfg'],
 					restoreConfigs: ['BepInEx/config/test.cfg'],
@@ -344,19 +368,19 @@ for (const mode of ['local', 'worker']) {
 			if (operation === 'deploy_server_sync')
 				expect(request).toMatchObject({ planHash: 'approved-plan', force: false });
 			await page.evaluate(() => (window as any).release());
-			await expect(scope).toBeEnabled();
+			await expect(configPreview).toBeEnabled();
 			await expect(password).toBeEnabled();
-			if (operation === 'set_server_config_policy') await expect(button('Deploy')).toBeDisabled();
+			if (operation === 'set_server_config_policy')
+				await expect(button('Push configs')).toBeDisabled();
 			if (mode === 'worker') {
 				for (const checkbox of await page.getByRole('checkbox').all())
 					await expect(checkbox).toBeEnabled();
 			}
 			await restart.click();
 			await page.getByRole('option', { name: 'Immediately', exact: true }).click();
-			await expect(button('Deploy')).toBeDisabled();
-			await scope.click();
-			await page.getByRole('option', { name: 'Selected configs only', exact: true }).click();
+			await expect(button('Push configs')).toBeDisabled();
 			await password.fill('next-secret');
+			// A mods preview is the primary flow again; configs stay out of it.
 			await button('Preview').click();
 			await expect(button('Deploy')).toBeEnabled();
 			const next = await page.evaluate(
@@ -366,7 +390,7 @@ for (const mode of ['local', 'worker']) {
 			);
 			expect(next).toMatchObject({
 				restartPolicy: 'immediate',
-				selection: { includeMods: false, includeConfigs: true },
+				selection: { includeMods: true, includeConfigs: false },
 				[mode === 'worker' ? 'workerToken' : 'password']: 'next-secret'
 			});
 			expect(await page.evaluate(() => (window as any).unexpected)).toEqual([]);

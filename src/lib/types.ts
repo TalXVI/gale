@@ -329,8 +329,7 @@ export type ProfileServerSettings = {
 	syncDialog?: SyncDialogPreferences;
 };
 
-export type DeployScope = 'mods' | 'configs' | 'both';
-export type SyncDialogPreferences = { scope: DeployScope; restartPolicy: RestartPolicy };
+export type SyncDialogPreferences = { restartPolicy: RestartPolicy };
 
 export type RemoteConnectionTestResult =
 	| { status: 'connected'; fingerprint: string | null; encrypted: boolean }
@@ -499,21 +498,15 @@ export type WorkerStatus = {
 	/// The newest publication revision the worker has observed.
 	/// Observation alone is not deployment.
 	observedRevision: string | null;
-	/// A publication revision awaiting successful completion, if any.
-	/// Completion is phase-scoped — see `pendingMods`/`pendingConfigs`.
+	/// A publication revision whose mod payload is still owed, if any.
+	/// Workers never owe config work: the server is authoritative for its
+	/// config files after setup.
 	pendingRevision: string | null;
-	/// The pending publication's mod payload is not yet recorded as
-	/// deployed. Absent on workers older than phase-scoped status.
-	pendingMods?: boolean;
-	/// Config evaluation is still owed for the pending publication.
-	pendingConfigs?: boolean;
 	/// When the pending work becomes eligible for its next attempt.
 	nextAttemptAt: string | null;
-	/// The newest publication revision whose mods and config evaluation
-	/// are both fully applied to the server.
+	/// The newest publication revision whose mod payload is confirmed
+	/// deployed on the server.
 	lastDeployedRevision: string | null;
-	/// The last successful config evaluation. Absent on older workers.
-	lastConfigSyncAt?: string | null;
 	busy: BusyOperation | null;
 	lastOperation: OperationRecord | null;
 	/// The last deployment failure from this worker.
@@ -581,16 +574,13 @@ export type LocalWorkerOwnership =
 
 /// What the worker will do with its pending publication, derived from
 /// its own reported automation flags — not the unsaved local checkboxes.
-export type PendingPublicationMode = 'automatic' | 'configOnly' | 'modsManual' | 'manual';
+/// Pending work is always the mod payload; configs are never owed.
+export type PendingPublicationMode = 'automatic' | 'modsManual' | 'manual';
 
 export type PendingPublication = {
 	mode: PendingPublicationMode;
 	/// A previous automatic attempt failed; a retry is scheduled.
 	retrying: boolean;
-	/// The pending publication's mod payload still awaits deployment.
-	modsOutstanding: boolean;
-	/// Config evaluation still awaits an automatic pass.
-	configsOutstanding: boolean;
 };
 
 export type LocalWorkerStatus = {
@@ -650,13 +640,13 @@ export type ServerSyncOperationProgress = {
 export type DedicatedServerStatus =
 	| { state: 'stopped' }
 	| {
-		state: 'running';
-		stopping: boolean;
-		profileId: number;
-		gameSlug: string;
-		pid: number;
-		serverDir: string;
-	};
+			state: 'running';
+			stopping: boolean;
+			profileId: number;
+			gameSlug: string;
+			pid: number;
+			serverDir: string;
+	  };
 
 export type Game = {
 	name: string;
@@ -824,12 +814,12 @@ export type Folder = {
 
 export type ListItem =
 	| {
-		type: 'mod';
-		mod: Mod;
-	}
+			type: 'mod';
+			mod: Mod;
+	  }
 	| {
-		type: 'folder';
-		folder: Folder;
-	};
+			type: 'folder';
+			folder: Folder;
+	  };
 
 export type RgbaColor = [number, number, number, number];

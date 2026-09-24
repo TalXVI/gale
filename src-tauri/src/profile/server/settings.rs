@@ -56,19 +56,9 @@ pub enum RestartPolicy {
 
 /// Client-local defaults for manual deployments from the Sync dialog.
 /// The worker's unattended restart policy remains `remote.restart_policy`.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum DeployScope {
-    Mods,
-    Configs,
-    #[default]
-    Both,
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct SyncDialogPreferences {
-    pub scope: DeployScope,
     pub restart_policy: RestartPolicy,
 }
 
@@ -98,8 +88,9 @@ pub struct WorkerSettings {
     /// Manual Deploy Now requests work regardless of this toggle.
     pub auto_sync: bool,
     /// When `auto_sync` is on, whether published mod revisions may deploy
-    /// automatically or always wait for a manual request. Config files keep
-    /// following their per-file policies either way.
+    /// automatically or always wait for a manual request. Config files
+    /// are never deployed automatically — the server owns them after
+    /// setup, so this flag only gates the mod payload.
     pub auto_mods: bool,
 }
 
@@ -480,7 +471,6 @@ mod tests {
     #[test]
     fn manual_dialog_defaults_round_trip_per_local_profile() {
         let mut first = ProfileServerSettings::default();
-        first.sync_dialog.scope = super::DeployScope::Configs;
         first.sync_dialog.restart_policy = RestartPolicy::WhenEmpty;
         first.remote.restart_policy = RestartPolicy::Immediate;
         let second = ProfileServerSettings::default();
@@ -489,10 +479,23 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&first).unwrap()).unwrap();
         let second: ProfileServerSettings =
             serde_json::from_str(&serde_json::to_string(&second).unwrap()).unwrap();
-        assert_eq!(first.sync_dialog.scope, super::DeployScope::Configs);
         assert_eq!(first.sync_dialog.restart_policy, RestartPolicy::WhenEmpty);
         assert_eq!(first.remote.restart_policy, RestartPolicy::Immediate);
         assert_eq!(second.sync_dialog, Default::default());
+    }
+
+    #[test]
+    fn a_legacy_scope_preference_is_ignored() {
+        // Settings written before the dialog dropped its scope selector
+        // still load — the field is simply forgotten.
+        let settings: ProfileServerSettings = serde_json::from_value(serde_json::json!({
+            "syncDialog": { "scope": "configs", "restartPolicy": "whenEmpty" }
+        }))
+        .unwrap();
+        assert_eq!(
+            settings.sync_dialog.restart_policy,
+            RestartPolicy::WhenEmpty
+        );
     }
 
     /// `"ftps"` is a distinct protocol on the wire: it must not collapse

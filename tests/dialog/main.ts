@@ -15,15 +15,12 @@ const worker = {
 	restartPolicy: 'manual',
 	lastError: null as string | null,
 	pollError: null as string | null,
-	lastConfigSyncAt: null as string | null,
-	pendingRevision: null as string | null,
-	pendingConfigs: false,
-	pendingMods: false
+	pendingRevision: null as string | null
 };
 const profileId = new URLSearchParams(location.search).get('profile') ?? 'first';
 const preferences = JSON.parse(
 	sessionStorage.getItem('mock-profile-preferences') ?? '{}'
-) as Record<string, { scope: string; restartPolicy: string }>;
+) as Record<string, { restartPolicy: string }>;
 const configEntries = manyConfigs
 	? Array.from({ length: 133 }, (_, index) => ({
 			path: `BepInEx/config/file-${String(index).padStart(3, '0')}.cfg`,
@@ -39,18 +36,25 @@ const configEntries = manyConfigs
 				policy: 'ask'
 			}
 		];
-const plan = {
-	hash: 'approved-plan',
-	uploads: [],
-	removals: [],
-	unmanaged: [],
-	uploadBytes: 0,
-	unchangedFiles: 0,
-	modsPhase: true,
-	configsPhase: true,
-	conflicts: configEntries.filter((entry) => entry.action === 'pending').map((entry) => entry.path),
-	configEntries
-};
+// The plan mirrors the requested selection: config entries only exist
+// when the preview targeted configs — a mods sync never computes them.
+function planFor(selection: { includeMods: boolean; includeConfigs: boolean }) {
+	return {
+		hash: 'approved-plan',
+		uploads: [],
+		removals: [],
+		unmanaged: [],
+		uploadBytes: 0,
+		unchangedFiles: 0,
+		modsPhase: selection.includeMods,
+		configsPhase: selection.includeConfigs,
+		requiresRestart: false,
+		conflicts: selection.includeConfigs
+			? configEntries.filter((entry) => entry.action === 'pending').map((entry) => entry.path)
+			: [],
+		configEntries: selection.includeConfigs ? configEntries : []
+	};
+}
 
 const calls: { cmd: string; args: any }[] = [];
 const unexpected: string[] = [];
@@ -106,10 +110,8 @@ Object.assign(window, {
 		worker.pollError = pollError;
 		worker.lastError = lastError;
 	},
-	setWorkerConfigSync: (lastConfigSyncAt: string | null, pendingRevision: string | null) => {
-		worker.lastConfigSyncAt = lastConfigSyncAt;
+	setWorkerPending: (pendingRevision: string | null) => {
 		worker.pendingRevision = pendingRevision;
-		worker.pendingConfigs = pendingRevision !== null;
 	},
 	progressPolls: () => progressPolls,
 	emitProgress: (patch: Record<string, unknown>) => {
@@ -179,19 +181,20 @@ mockIPC(async (cmd, args) => {
 			return {
 				mode: workerMode ? 'worker' : 'local',
 				worker: workerMode ? worker : null,
-				server: restartRequired || pendingDecisions > 0
-					? {
-							restartRequired,
-							pendingConfigs: pendingDecisions,
-							modsRevision: null,
-							lastOperation: null,
-							lease: null
-						}
-					: null,
+				server:
+					restartRequired || pendingDecisions > 0
+						? {
+								restartRequired,
+								pendingConfigs: pendingDecisions,
+								modsRevision: null,
+								lastOperation: null,
+								lease: null
+							}
+						: null,
 				warnings: []
 			};
 		case 'get_sync_dialog_preferences':
-			return preferences[profileId] ?? { scope: 'both', restartPolicy: 'manual' };
+			return preferences[profileId] ?? { restartPolicy: 'manual' };
 		case 'set_sync_dialog_preferences':
 			preferences[profileId] = (args as any).preferences;
 			sessionStorage.setItem('mock-profile-preferences', JSON.stringify(preferences));
@@ -200,7 +203,7 @@ mockIPC(async (cmd, args) => {
 			restartRequired = false;
 			return;
 		case 'preview_server_sync':
-			return { plan, warnings: [] };
+			return { plan: planFor((args as any).request.selection), warnings: [] };
 		case 'set_server_config_policy':
 			// The real command returns nothing; the dialog reflects the saved
 			// policy itself rather than waiting on a mutated preview.
@@ -210,7 +213,7 @@ mockIPC(async (cmd, args) => {
 			return worker;
 		case 'deploy_server_sync':
 			return {
-				plan,
+				plan: planFor((args as any).request.selection),
 				state: {},
 				summary: { uploadedFiles: 0, uploadedBytes: 0, removedFiles: 0, unchangedFiles: 0 },
 				restart: 'notRequired',

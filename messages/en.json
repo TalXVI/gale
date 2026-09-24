@@ -113,10 +113,6 @@
 	"dedicatedServerDialog_localWorkerIncomplete": "The worker is installed, but setup did not finish — this profile is not linked to it yet. Running setup again completes it.",
 	"dedicatedServerDialog_localWorkerOffline": "The worker is installed but not running.",
 	"dedicatedServerDialog_localWorkerPending": "A publication is queued and will deploy automatically.",
-	"dedicatedServerDialog_localWorkerPendingConfigOnly": "A publication is pending. Config changes will synchronize automatically; mod updates require a manual deployment.",
-	"dedicatedServerDialog_localWorkerPendingConfigOnlyRetry": "A publication is pending; the last automatic sync failed and will be retried. Mod updates require a manual deployment.",
-	"dedicatedServerDialog_localWorkerPendingConfigs": "A publication is pending. Config changes will synchronize automatically.",
-	"dedicatedServerDialog_localWorkerPendingConfigsRetry": "A publication is pending; the last automatic config sync failed and will be retried.",
 	"dedicatedServerDialog_localWorkerPendingManual": "A publication is pending. Deploy it manually, or enable automatic synchronization.",
 	"dedicatedServerDialog_localWorkerPendingModsManual": "A publication's mod changes are not on the server yet. Deploy them manually, or enable automatic mod deployment.",
 	"dedicatedServerDialog_localWorkerPendingRetry": "A publication is queued; the last automatic deployment failed and will be retried automatically.",
@@ -218,11 +214,14 @@
 	"serverSync_autoSync": "Sync new publications automatically",
 	"serverSync_close": "Close",
 	"serverSync_configFiles": "Published config files ({count})",
-	"serverSync_content": "Deploy the published profile to the dedicated server. Server-specific configuration is preserved unless you choose to apply a published file.",
+	"serverSync_configSection": "Server config files",
+	"serverSync_configSectionHelp": "The server owns its config files after setup — a mod may update them when the server starts. Push published configs only to seed a fresh server or intentionally replace a file.",
+	"serverSync_content": "Deploy the published mods to the dedicated server. Server-specific configuration is preserved unless you push a published config file below.",
 	"serverSync_credentialRequired": "Enter the remote password above to reach the server.",
 	"serverSync_credentials": "Credentials",
 	"serverSync_decline": "Decline",
 	"serverSync_deploy": "Deploy",
+	"serverSync_deployConfigs": "Push configs",
 	"serverSync_deployed": "Deployed mods: {revision}",
 	"serverSync_deployed_configsDone": "Config synchronization finished.",
 	"serverSync_deployed_done": "Deployment finished.",
@@ -233,23 +232,20 @@
 	"serverSync_futurePolicy": "Future updates for {path}",
 	"serverSync_futureUpdates": "Future updates",
 	"serverSync_leaseHeld": "A deployment is in progress on {owner}.",
-	"serverSync_lastConfigSync": "Last config sync: {when}",
 	"serverSync_modeLocal": "This device deploys directly",
 	"serverSync_modeWorker": "A worker deploys for this device",
 	"serverSync_neverDeployed": "never deployed",
-	"serverSync_neverConfigSync": "Never",
 	"serverSync_noPublication": "no publication yet",
 	"serverSync_partialDone": "Deployment partially applied. Some selected changes did not complete.",
-	"serverSync_pendingConfigs": "Pending config sync: {revision}",
 	"serverSync_pendingCount": "{count} config file(s) awaiting a decision",
 	"serverSync_pendingMods": "Pending mod deployment: {revision}",
-	"serverSync_pendingRevision": "Pending update: {revision}",
 	"serverSync_policyAlwaysApply": "Always apply updates",
 	"serverSync_policyAlwaysKeep": "Always keep my config",
 	"serverSync_policyAsk": "Ask each update",
 	"serverSync_policyHelp": "This deployment: Apply, Restore, or Decline decides the current file. Future updates: the dropdown saves a policy immediately for later publications; it does not decide this deployment.",
 	"serverSync_policyLabel": "On update",
 	"serverSync_preview": "Preview",
+	"serverSync_previewConfigs": "Preview config changes",
 	"serverSync_progressBuildingPlan": "Building deployment plan",
 	"serverSync_progressCheckingConfigs": "Checking published configs",
 	"serverSync_progressCheckingLease": "Checking deployment lease",
@@ -305,10 +301,6 @@
 	"serverSync_restore": "Restore",
 	"serverSync_savedCredential": "Leave blank to use the saved credential.",
 	"serverSync_saveAutomation": "Save automation",
-	"serverSync_scope": "Deployment scope",
-	"serverSync_scopeBoth": "Mods and selected configs",
-	"serverSync_scopeConfigs": "Selected configs only",
-	"serverSync_scopeMods": "Mods only",
 	"serverSync_staging": "Staging {mod} ({completed}/{total})",
 	"serverSync_takeover": "Take over stale lock",
 	"serverSync_title": "Sync dedicated server",
@@ -786,17 +778,12 @@
 	"updateAllBanner_button": "Update all",
 	"updateAllBanner_content": [
 		{
-			"declarations": [
-				"input count",
-				"local countPlural = count: plural"
-			],
+			"declarations": ["input count", "local countPlural = count: plural"],
 			"match": {
 				"countPlural=one": "There is one update available.",
 				"countPlural=other": "There are {count} updates available."
 			},
-			"selectors": [
-				"countPlural"
-			]
+			"selectors": ["countPlural"]
 		}
 	],
 	"updateAllBanner_dialog_button": "Update mods",

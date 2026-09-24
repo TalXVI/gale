@@ -11,15 +11,13 @@
 	import * as api from '$lib/api';
 	import type {
 		DeploySelection,
-		DeployScope,
 		PlanConfigEntry,
 		RestartPolicy,
 		ServerSyncPreview,
 		ServerSyncOperationProgress as OperationProgress,
 		ServerSyncResult,
 		ServerSyncStatus,
-		SyncConfigUpdatePolicy,
-		WorkerStatus
+		SyncConfigUpdatePolicy
 	} from '$lib/types';
 	import { listen } from '@tauri-apps/api/event';
 	import { confirm, message } from '@tauri-apps/plugin-dialog';
@@ -33,7 +31,11 @@
 	/// What the user decided for one config path.
 	type Decision = 'apply' | 'restore' | 'decline';
 
-	let scope = $state<DeployScope>('both');
+	/// Which payload the current preview targets. Mods are the routine
+	/// deployment; configs are a separate explicit push — the server owns
+	/// its config files after setup, so they are never bundled into the
+	/// primary sync operation.
+	let previewScope = $state<'mods' | 'configs'>('mods');
 	let decisions = $state<Record<string, Decision>>({});
 	let status = $state<ServerSyncStatus | null>(null);
 	let preview = $state<ServerSyncPreview | null>(null);
@@ -106,6 +108,7 @@
 			return;
 		}
 		untrack(() => {
+			previewScope = 'mods';
 			void loadPreferences();
 			void loadStatus(false);
 		});
@@ -209,26 +212,22 @@
 		loadingPreferences = true;
 		try {
 			const preferences = await api.profile.server.getSyncDialogPreferences();
-			scope = preferences.scope;
 			restartPolicy = preferences.restartPolicy;
 		} finally {
 			loadingPreferences = false;
 		}
 	}
 
-	async function savePreferences(nextScope: DeployScope, nextRestartPolicy: RestartPolicy) {
-		const previous = { scope, restartPolicy };
-		scope = nextScope;
+	async function savePreferences(nextRestartPolicy: RestartPolicy) {
+		const previous = restartPolicy;
 		restartPolicy = nextRestartPolicy;
 		savingPreferences = true;
 		try {
 			await api.profile.server.setSyncDialogPreferences({
-				scope: nextScope,
 				restartPolicy: nextRestartPolicy
 			});
 		} catch (error) {
-			scope = previous.scope;
-			restartPolicy = previous.restartPolicy;
+			restartPolicy = previous;
 			await message(error instanceof Error ? error.message : String(error), {
 				title: m.serverSync_title(),
 				kind: 'error'
@@ -259,15 +258,17 @@
 		}
 
 		return {
-			includeMods: scope !== 'configs',
-			includeConfigs: scope !== 'mods',
+			includeMods: previewScope === 'mods',
+			includeConfigs: previewScope === 'configs',
 			applyConfigs,
 			restoreConfigs,
 			declineConfigs
 		};
 	}
 
-	async function previewSync() {
+	async function previewSync(configs = false) {
+		previewScope = configs ? 'configs' : 'mods';
+		if (!configs) decisions = {};
 		const runId = beginOperation('preview');
 		previewing = true;
 		result = null;
@@ -410,25 +411,6 @@
 		}
 	}
 
-	/// What of the pending publication still needs to reach the server.
-	/// `pendingRevision` alone no longer implies a full deploy — a
-	/// config-only pass may already have run, leaving only mods owed.
-	function pendingScopeLabel(worker: WorkerStatus): string {
-		const revision = new Date(worker.pendingRevision!).toLocaleString();
-		// Workers built before phase-scoped status emit neither flag —
-		// show the generic pending line rather than guess a scope.
-		if (worker.pendingMods === undefined && worker.pendingConfigs === undefined) {
-			return m.serverSync_pendingRevision({ revision });
-		}
-		if (worker.pendingMods && worker.pendingConfigs) {
-			return m.serverSync_pendingRevision({ revision });
-		}
-		if (worker.pendingMods) {
-			return m.serverSync_pendingMods({ revision });
-		}
-		return m.serverSync_pendingConfigs({ revision });
-	}
-
 	function actionLabel(entry: PlanConfigEntry): string {
 		switch (entry.action) {
 			case 'write':
@@ -517,15 +499,6 @@
 							</span>
 						{/if}
 					{/if}
-					{#if status.worker}
-						<span>
-							{m.serverSync_lastConfigSync({
-								when: status.worker.lastConfigSyncAt
-									? new Date(status.worker.lastConfigSyncAt).toLocaleString()
-									: m.serverSync_neverConfigSync()
-							})}
-						</span>
-					{/if}
 					{#if status.worker?.busy}
 						<span class="text-orange-600 dark:text-orange-400">
 							{m.serverSync_workerBusy()}
@@ -555,7 +528,9 @@
 				<div class="mt-2 flex flex-col gap-3">
 					{#if status.worker.pendingRevision}
 						<p class="text-sm text-orange-600 dark:text-orange-400">
-							{pendingScopeLabel(status.worker)}
+							{m.serverSync_pendingMods({
+								revision: new Date(status.worker.pendingRevision).toLocaleString()
+							})}
 						</p>
 					{/if}
 					<div class="flex items-center">
@@ -582,22 +557,24 @@
 		/>
 	{/if}
 
-	<div class="mt-4">
-		<Label for={`${formId}-field-3`}>{m.serverSync_scope()}</Label>
-		<Select
-			id={`${formId}-field-3`}
-			type="single"
-			triggerClass="mt-1 w-full"
-			value={scope}
-			onValueChange={(value) => savePreferences(value as DeployScope, restartPolicy)}
-			disabled={busy || loadingPreferences}
-			items={[
-				{ value: 'both', label: m.serverSync_scopeBoth() },
-				{ value: 'mods', label: m.serverSync_scopeMods() },
-				{ value: 'configs', label: m.serverSync_scopeConfigs() }
-			]}
-		/>
-	</div>
+	<details class="mt-4">
+		<summary class="text-primary-600 dark:text-primary-300 cursor-pointer">
+			{m.serverSync_configSection()}
+		</summary>
+		<div class="mt-2 flex flex-col gap-3">
+			<p class="text-primary-600 dark:text-primary-300 text-sm">
+				{m.serverSync_configSectionHelp()}
+			</p>
+			<Button
+				icon="mdi:cloud-search"
+				loading={previewing && previewScope === 'configs'}
+				disabled={busy}
+				onclick={() => previewSync(true)}
+			>
+				{m.serverSync_previewConfigs()}
+			</Button>
+		</div>
+	</details>
 
 	<details class="mt-3">
 		<summary class="text-primary-600 dark:text-primary-300 cursor-pointer">
@@ -850,7 +827,7 @@
 				type="single"
 				triggerClass="w-40"
 				value={restartPolicy}
-				onValueChange={(value) => savePreferences(scope, value as RestartPolicy)}
+				onValueChange={(value) => savePreferences(value as RestartPolicy)}
 				disabled={busy || loadingPreferences}
 				items={[
 					{ value: 'manual', label: m.serverSync_restartManual() },
@@ -859,7 +836,12 @@
 				]}
 			/>
 		</div>
-		<Button icon="mdi:cloud-search" loading={previewing} disabled={busy} onclick={previewSync}>
+		<Button
+			icon="mdi:cloud-search"
+			loading={previewing && previewScope === 'mods'}
+			disabled={busy}
+			onclick={() => previewSync()}
+		>
 			{m.serverSync_preview()}
 		</Button>
 		{#if preview?.busy?.stale}
@@ -878,7 +860,7 @@
 				disabled={!preview || dirty || !!preview.busy || busy}
 				onclick={() => deploy()}
 			>
-				{m.serverSync_deploy()}
+				{previewScope === 'configs' ? m.serverSync_deployConfigs() : m.serverSync_deploy()}
 			</Button>
 		{/if}
 	</div>

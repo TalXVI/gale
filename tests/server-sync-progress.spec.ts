@@ -52,7 +52,9 @@ test('Local Preview and Deploy show snapshot, mutation, byte, and restart progre
 	const longItem = `BepInEx/plugins/${'deeply-nested-mod/'}${'very-long-file-name-'.repeat(12)}.dll`;
 	await emit(page, { completed: 83, total: 166, item: longItem });
 	await expect(progress.getByTitle(longItem)).toBeVisible();
-	expect(await progress.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
+	expect(await progress.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(
+		true
+	);
 	await emit(page, {
 		phase: 'checkingConfigs',
 		completedPhases: 8,
@@ -98,7 +100,7 @@ test('Local Preview and Deploy show snapshot, mutation, byte, and restart progre
 	await expect(progress).toContainText('check 2 of 12');
 	await release(page);
 	await expect(progress).toHaveCount(0);
-	await expect(page.getByText('Deployment finished.')).toBeVisible();
+	await expect(page.getByText('Mod deployment finished.')).toBeVisible();
 });
 
 test('Worker polls its run, ignores stale snapshots, and clears progress on success', async ({
