@@ -52,6 +52,10 @@ pub struct WorkerJournal {
     /// evaluations that needed no write or left user decisions pending.
     #[serde(default)]
     pub evaluated_config_revision: Option<String>,
+    /// When the config phase last completed successfully. Older journals
+    /// leave this unknown until the next successful evaluation.
+    #[serde(default)]
+    pub last_config_sync_at: Option<DateTime<Utc>>,
     /// The current sync refresh token (rotated on each token grant).
     /// Seeded from `GALE_WORKER_REFRESH_TOKEN` on first run.
     pub refresh_token: Option<String>,
@@ -81,6 +85,7 @@ impl Default for WorkerJournal {
             last_deployed_revision: None,
             deployed_mods_revision: None,
             evaluated_config_revision: None,
+            last_config_sync_at: None,
             refresh_token: None,
             auto_sync: false,
             auto_mods: false,
@@ -235,6 +240,7 @@ impl WorkerJournal {
         self.deployed_mods_revision = remote_mods;
         if configs_done {
             self.evaluated_config_revision = Some(config_revision.to_owned());
+            self.last_config_sync_at = Some(Utc::now());
         }
 
         // `last_deployed_revision` only names a publication whose phases
@@ -425,6 +431,7 @@ mod tests {
         assert!(!state.automation_seeded);
         assert!(state.refresh_token.is_none());
         assert!(state.last_operation.is_none());
+        assert!(state.last_config_sync_at.is_none());
     }
 
     #[tokio::test]
@@ -453,6 +460,7 @@ mod tests {
         );
         assert!(state.automation_seeded);
         assert!(state.last_seen_revision.is_some());
+        assert!(state.last_config_sync_at.is_none());
     }
 
     #[tokio::test]
@@ -641,6 +649,7 @@ mod tests {
         }))
         .unwrap();
         assert!(migrated.evaluated_config_revision.is_none());
+        assert!(migrated.last_config_sync_at.is_none());
         let mut migrated = migrated;
         migrated.observe_publication(
             revision + chrono::Duration::seconds(1),
@@ -648,6 +657,59 @@ mod tests {
             "configs-a",
         );
         assert!(migrated.pending.as_ref().unwrap().configs_pending);
+    }
+
+    #[test]
+    fn config_sync_time_tracks_only_successful_config_evaluations() {
+        let mut state = WorkerJournal::default();
+        let previous = Utc::now() - chrono::Duration::hours(1);
+        state.last_config_sync_at = Some(previous);
+        let revision = Utc::now();
+
+        state.acknowledge_deployment(revision, true, false, Some(mod_rev('a')), "configs-a");
+        assert_eq!(state.last_config_sync_at, Some(previous));
+        assert!(state.evaluated_config_revision.is_none());
+
+        // A partial/failed config phase is never acknowledged.
+        state.acknowledge_deployment(revision, false, false, Some(mod_rev('a')), "configs-a");
+        assert_eq!(state.last_config_sync_at, Some(previous));
+
+        state.acknowledge_deployment(revision, false, true, Some(mod_rev('a')), "configs-a");
+        let config_only = state.last_config_sync_at.unwrap();
+        assert!(config_only > previous);
+        assert_eq!(state.evaluated_config_revision.as_deref(), Some("configs-a"));
+
+        // Re-evaluating the same fingerprint with no owed work is still a
+        // successful config phase and records the time of that evaluation.
+        state.last_config_sync_at = Some(previous);
+        state.acknowledge_deployment(revision, false, true, Some(mod_rev('a')), "configs-a");
+        assert!(state.last_config_sync_at.unwrap() > previous);
+
+        state.last_config_sync_at = Some(previous);
+        state.acknowledge_deployment(revision, true, true, Some(mod_rev('a')), "configs-b");
+        assert!(state.last_config_sync_at.unwrap() > previous);
+        assert_eq!(state.evaluated_config_revision.as_deref(), Some("configs-b"));
+    }
+
+    #[tokio::test]
+    async fn config_sync_time_survives_restart_without_guessing_legacy_history() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(JOURNAL_FILE),
+            br#"{"evaluatedConfigRevision":"old-fingerprint"}"#,
+        )
+        .unwrap();
+        let journal = Journal::load(dir.path()).unwrap();
+        {
+            let mut state = journal.state.lock().await;
+            assert_eq!(state.evaluated_config_revision.as_deref(), Some("old-fingerprint"));
+            assert!(state.last_config_sync_at.is_none());
+            state.acknowledge_deployment(Utc::now(), false, true, None, "new-fingerprint");
+            journal.save(&state).unwrap();
+        }
+        let saved_at = journal.state.lock().await.last_config_sync_at;
+        let reloaded = Journal::load(dir.path()).unwrap();
+        assert_eq!(reloaded.state.lock().await.last_config_sync_at, saved_at);
     }
 
     #[tokio::test]

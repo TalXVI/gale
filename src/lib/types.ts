@@ -512,6 +512,8 @@ export type WorkerStatus = {
 	/// The newest publication revision whose mods and config evaluation
 	/// are both fully applied to the server.
 	lastDeployedRevision: string | null;
+	/// The last successful config evaluation. Absent on older workers.
+	lastConfigSyncAt?: string | null;
 	busy: BusyOperation | null;
 	lastOperation: OperationRecord | null;
 	/// The last deployment failure from this worker.

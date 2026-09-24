@@ -8,12 +8,17 @@ const cancelStop = new URLSearchParams(location.search).has('cancelStop');
 const workerMode = new URLSearchParams(location.search).get('mode') === 'worker';
 const manyConfigs = new URLSearchParams(location.search).has('many');
 let restartRequired = new URLSearchParams(location.search).has('restart');
+const pendingDecisions = Number(new URLSearchParams(location.search).get('pendingDecisions') ?? 0);
 const worker = {
 	autoSync: false,
 	autoMods: false,
 	restartPolicy: 'manual',
 	lastError: null as string | null,
-	pollError: null as string | null
+	pollError: null as string | null,
+	lastConfigSyncAt: null as string | null,
+	pendingRevision: null as string | null,
+	pendingConfigs: false,
+	pendingMods: false
 };
 const profileId = new URLSearchParams(location.search).get('profile') ?? 'first';
 const preferences = JSON.parse(
@@ -23,7 +28,7 @@ const configEntries = manyConfigs
 	? Array.from({ length: 133 }, (_, index) => ({
 			path: `BepInEx/config/file-${String(index).padStart(3, '0')}.cfg`,
 			action: index % 4 === 3 && index < 124 ? 'pending' : 'markApplied',
-			reason: 'modifiedLocally',
+			reason: index === 87 ? 'deletedLocally' : 'modifiedLocally',
 			policy: 'ask'
 		}))
 	: [
@@ -101,6 +106,11 @@ Object.assign(window, {
 		worker.pollError = pollError;
 		worker.lastError = lastError;
 	},
+	setWorkerConfigSync: (lastConfigSyncAt: string | null, pendingRevision: string | null) => {
+		worker.lastConfigSyncAt = lastConfigSyncAt;
+		worker.pendingRevision = pendingRevision;
+		worker.pendingConfigs = pendingRevision !== null;
+	},
 	progressPolls: () => progressPolls,
 	emitProgress: (patch: Record<string, unknown>) => {
 		for (const handler of progressListeners) {
@@ -169,10 +179,10 @@ mockIPC(async (cmd, args) => {
 			return {
 				mode: workerMode ? 'worker' : 'local',
 				worker: workerMode ? worker : null,
-				server: restartRequired
+				server: restartRequired || pendingDecisions > 0
 					? {
 							restartRequired,
-							pendingConfigs: 0,
+							pendingConfigs: pendingDecisions,
 							modsRevision: null,
 							lastOperation: null,
 							lease: null

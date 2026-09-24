@@ -1300,6 +1300,7 @@ mod pending_tests {
             pending_configs: pending && flags.pending_configs,
             next_attempt_at,
             last_deployed_revision: None,
+            last_config_sync_at: None,
             busy: None,
             last_operation: None,
             last_error: None,

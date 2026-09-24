@@ -21,8 +21,34 @@ test('worker poll and deployment errors render independently', async ({ page }) 
 	await expect(page.getByText(deploymentError)).toBeVisible();
 });
 
+test('worker config sync history is neutral and pending decisions stay visible', async ({ page }) => {
+	await page.goto('/tests/dialog/?mode=worker&pendingDecisions=2');
+	await page.evaluate(() =>
+		(window as any).setWorkerConfigSync(null, '2026-09-23T12:00:00Z')
+	);
+	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+	const history = page.getByText('Last config sync: Never');
+	await expect(history).toBeVisible();
+	const publication = page.getByText(/^Latest publication:/);
+	expect(await history.evaluate((element) => getComputedStyle(element).color)).toBe(
+		await publication.evaluate((element) => getComputedStyle(element).color)
+	);
+	await expect(page.getByText('2 config file(s) awaiting a decision')).toBeVisible();
+	await expect(page.getByText(/^Pending config sync:/)).toBeHidden();
+	await page.getByText('Worker automation', { exact: true }).click();
+	await expect(page.getByText(/^Pending config sync:/)).toBeVisible();
+
+	const at = '2026-09-23T13:45:00Z';
+	await page.evaluate((timestamp) => (window as any).setWorkerConfigSync(timestamp, null), at);
+	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+	const formatted = await page.evaluate((timestamp) => new Date(timestamp).toLocaleString(), at);
+	await expect(page.getByText(`Last config sync: ${formatted}`)).toBeVisible();
+	await expect(page.getByText(/^Pending config sync:/)).toHaveCount(0);
+});
+
 for (const mode of ['local', 'worker']) {
 	test(`${mode}: decisions do not reorder or scroll a long review list`, async ({ page }) => {
+		await page.setViewportSize({ width: 900, height: 650 });
 		await page.goto(`/tests/dialog/?mode=${mode}&many=1`);
 		await page.getByRole('button', { name: 'Preview', exact: true }).click();
 		await page.getByRole('button', { name: 'Show files needing review' }).click();
@@ -30,28 +56,56 @@ for (const mode of ['local', 'worker']) {
 		await page.evaluate(() => document.fonts.ready.then(() => undefined));
 		const rows = page.getByTestId('server-config-row');
 		const list = rows.first().locator('..');
+		const dialogScroll = page.getByRole('dialog').locator('div.overflow-y-auto').first();
 		const before = await rows.evaluateAll((elements) =>
 			elements.map((row) => row.getAttribute('data-path'))
 		);
 		const row = rows.nth(20);
+		const restoreRow = rows.filter({ hasText: 'file-087.cfg' });
+		await dialogScroll.evaluate((element) => {
+			element.scrollTop = element.scrollHeight / 2;
+		});
 		await list.evaluate((element) => {
 			element.scrollTop = 500;
 		});
-		await row.scrollIntoViewIfNeeded();
-		const scrollTop = await list.evaluate((element) => element.scrollTop);
-		expect(scrollTop).toBeGreaterThan(0);
-		await row.getByRole('button', { name: 'Apply' }).click();
-		await expect(page.getByText('30 files still need a decision')).toBeVisible();
-		expect(
-			await rows.evaluateAll((elements) => elements.map((item) => item.getAttribute('data-path')))
-		).toEqual(before);
-		expect(await list.evaluate((element) => element.scrollTop)).toBe(scrollTop);
-		await row.getByRole('button', { name: 'Undo' }).click();
-		await expect(page.getByText('31 files still need a decision')).toBeVisible();
-		expect(
-			await rows.evaluateAll((elements) => elements.map((item) => item.getAttribute('data-path')))
-		).toEqual(before);
-		expect(await list.evaluate((element) => element.scrollTop)).toBe(scrollTop);
+		const positions = async () => ({
+			inner: await list.evaluate((element) => element.scrollTop),
+			outer: await dialogScroll.evaluate((element) => element.scrollTop)
+		});
+		const checkDecision = async (
+			selectedRow: typeof row,
+			action: string,
+			focusedAction: string,
+			remaining: number
+		) => {
+			await selectedRow.scrollIntoViewIfNeeded();
+			const beforeScroll = await positions();
+			expect(beforeScroll.inner).toBeGreaterThan(0);
+			expect(beforeScroll.outer).toBeGreaterThan(0);
+			await selectedRow.getByRole('button', { name: action }).click();
+			await expect(page.getByText(`${remaining} files still need a decision`)).toBeVisible();
+			await expect(selectedRow.getByRole('button', { name: focusedAction })).toBeFocused();
+			expect(await positions()).toEqual(beforeScroll);
+			expect(
+				await rows.evaluateAll((elements) =>
+					elements.map((item) => item.getAttribute('data-path'))
+				)
+			).toEqual(before);
+		};
+		await checkDecision(row, 'Apply', 'Undo', 30);
+		await checkDecision(row, 'Undo', 'Apply', 31);
+		await checkDecision(row, 'Decline', 'Undo', 30);
+		await checkDecision(row, 'Undo', 'Decline', 31);
+		await checkDecision(restoreRow, 'Restore', 'Undo', 30);
+		await page.getByRole('button', { name: 'Preview', exact: true }).click();
+		await expect(page.getByRole('button', { name: 'Deploy', exact: true })).toBeEnabled();
+		await checkDecision(restoreRow, 'Undo', 'Restore', 31);
+		await expect(page.getByRole('button', { name: 'Deploy', exact: true })).toBeDisabled();
+		await page.getByRole('button', { name: 'Show all config files' }).click();
+		await expect(rows).toHaveCount(133);
+		await page.getByRole('button', { name: 'Show files needing review' }).click();
+		await expect(rows).toHaveCount(31);
+		expect(await rows.evaluateAll((elements) => elements.map((item) => item.getAttribute('data-path')))).toEqual(before);
 	});
 
 	test(`${mode}: dialog defaults survive reopen and remain profile-specific`, async ({ page }) => {

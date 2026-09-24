@@ -86,6 +86,9 @@ pub struct StatusResponse {
     /// evaluation are both fully applied. A config-only deployment does
     /// not advance it while that publication's mods remain owed.
     pub last_deployed_revision: Option<DateTime<Utc>>,
+    /// When the config phase last completed successfully. Unknown on older workers.
+    #[serde(default)]
+    pub last_config_sync_at: Option<DateTime<Utc>>,
     /// The operation currently in flight, if any.
     pub busy: Option<BusyOperation>,
     pub last_operation: Option<OperationRecord>,

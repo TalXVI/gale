@@ -334,6 +334,7 @@ async fn status(
         pending_configs: pending.is_some_and(|work| work.configs_pending),
         next_attempt_at: pending.and_then(|work| work.next_attempt_at),
         last_deployed_revision: journal.last_deployed_revision,
+        last_config_sync_at: journal.last_config_sync_at,
         busy: journal.interrupted_operation.clone(),
         last_operation: journal.last_operation.clone(),
         last_error: journal.last_error.clone(),
@@ -1603,13 +1604,14 @@ mod tests {
             .unwrap(),
         );
 
+        let selection = DeploySelection {
+            include_mods: false,
+            include_configs: true,
+            ..Default::default()
+        };
         super::run_deployment(
             &ctx,
-            DeploySelection {
-                include_mods: false,
-                include_configs: true,
-                ..Default::default()
-            },
+            selection.clone(),
             None,
             None,
             false,
@@ -1621,11 +1623,36 @@ mod tests {
 
         let status = poll_status(ctx.clone()).await;
         assert!(status.last_error.is_none());
+        assert!(status.last_config_sync_at.is_some());
         assert_eq!(
             status.poll_error.as_deref(),
             Some("Publication check failed: sync token request failed")
         );
         assert!(status.pending_revision.is_none());
+        let previous = Utc::now() - ChronoDuration::hours(1);
+        {
+            let mut state = ctx.journal.state.lock().await;
+            state.last_config_sync_at = Some(previous);
+            ctx.journal.save(&state).unwrap();
+        }
+        let no_op = super::run_deployment(
+            &ctx,
+            selection,
+            None,
+            None,
+            false,
+            crate::profile::server::state::OperationKind::Manual,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(no_op.failed_config_writes.is_empty());
+        assert!(no_op.plan.configs_phase);
+        assert!(no_op.plan.config_entries.iter().all(|entry| !matches!(
+            &entry.action,
+            crate::profile::server::plan::ConfigAction::Write
+        )));
+        assert!(poll_status(ctx.clone()).await.last_config_sync_at.unwrap() > previous);
         drop(ctx);
         let state = Journal::load(dir.path()).unwrap();
         assert!(state.state.lock().await.poll_error.is_some());
@@ -2144,7 +2171,10 @@ mod tests {
                 "a config-only pass must not mark the publication deployed"
             );
             assert_eq!(state.last_error, None);
+            assert!(state.last_config_sync_at.is_some());
         }
+
+        let config_sync_at = ctx.journal.state.lock().await.last_config_sync_at;
 
         // The remote state file was persisted with no mod revision —
         // the mods phase never ran.
@@ -2166,6 +2196,7 @@ mod tests {
         {
             let state = ctx.journal.state.lock().await;
             assert!(state.pending.as_ref().unwrap().mods_pending);
+            assert_eq!(state.last_config_sync_at, config_sync_at);
         }
 
         // A restart preserves the owed work exactly — journal on disk.
@@ -2236,6 +2267,7 @@ mod tests {
                 "the owed mod phase deployed once auto_mods allowed it"
             );
             assert_eq!(state.last_deployed_revision, Some(published_at));
+            assert_eq!(state.last_config_sync_at, config_sync_at);
         }
         let state_file = ftp
             .file("/BepInEx/config/.gale-server-state.json")

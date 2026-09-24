@@ -517,14 +517,18 @@
 							</span>
 						{/if}
 					{/if}
+					{#if status.worker}
+						<span>
+							{m.serverSync_lastConfigSync({
+								when: status.worker.lastConfigSyncAt
+									? new Date(status.worker.lastConfigSyncAt).toLocaleString()
+									: m.serverSync_neverConfigSync()
+							})}
+						</span>
+					{/if}
 					{#if status.worker?.busy}
 						<span class="text-orange-600 dark:text-orange-400">
 							{m.serverSync_workerBusy()}
-						</span>
-					{/if}
-					{#if status.worker?.pendingRevision}
-						<span class="text-orange-600 dark:text-orange-400">
-							{pendingScopeLabel(status.worker)}
 						</span>
 					{/if}
 					{#if status.worker?.lastError}
@@ -549,6 +553,11 @@
 					{m.serverSync_workerAutomation()}
 				</summary>
 				<div class="mt-2 flex flex-col gap-3">
+					{#if status.worker.pendingRevision}
+						<p class="text-sm text-orange-600 dark:text-orange-400">
+							{pendingScopeLabel(status.worker)}
+						</p>
+					{/if}
 					<div class="flex items-center">
 						<Label for={`${formId}-field-1`}>{m.serverSync_autoSync()}</Label>
 						<Checkbox id={`${formId}-field-1`} bind:checked={workerAutoSync} disabled={busy} />
@@ -711,29 +720,38 @@
 												? m.serverSync_willApply()
 												: m.serverSync_willDecline()}
 										</span>
-										<Button
-											disabled={busy}
-											aria-label={`${m.serverSync_undo()} ${entry.path}`}
-											onclick={() => decide(entry.path, null)}
-										>
-											{m.serverSync_undo()}
-										</Button>
-									{:else if entry.action !== 'markApplied' && entry.action !== 'write'}
+									{/if}
+									{#if entry.action !== 'markApplied' && entry.action !== 'write'}
 										{@const restore =
 											entry.action === 'pending' && entry.reason === 'deletedLocally'}
 										<Button
 											disabled={busy}
-											aria-label={`${restore ? m.serverSync_restore() : m.serverSync_apply()} ${entry.path}`}
-											onclick={() => decide(entry.path, restore ? 'restore' : 'apply')}
+											style={decisions[entry.path] === 'decline' ? 'display: none' : undefined}
+											aria-label={`${decisions[entry.path] ? m.serverSync_undo() : restore ? m.serverSync_restore() : m.serverSync_apply()} ${entry.path}`}
+											onclick={() =>
+												decide(
+													entry.path,
+													decisions[entry.path] ? null : restore ? 'restore' : 'apply'
+												)}
 										>
-											{restore ? m.serverSync_restore() : m.serverSync_apply()}
+											{decisions[entry.path]
+												? m.serverSync_undo()
+												: restore
+													? m.serverSync_restore()
+													: m.serverSync_apply()}
 										</Button>
 										<Button
 											disabled={busy}
-											aria-label={`${m.serverSync_decline()} ${entry.path}`}
-											onclick={() => decide(entry.path, 'decline')}
+											style={decisions[entry.path] && decisions[entry.path] !== 'decline'
+												? 'display: none'
+												: undefined}
+											aria-label={`${decisions[entry.path] === 'decline' ? m.serverSync_undo() : m.serverSync_decline()} ${entry.path}`}
+											onclick={() =>
+												decide(entry.path, decisions[entry.path] === 'decline' ? null : 'decline')}
 										>
-											{m.serverSync_decline()}
+											{decisions[entry.path] === 'decline'
+												? m.serverSync_undo()
+												: m.serverSync_decline()}
 										</Button>
 									{/if}
 								</div>
