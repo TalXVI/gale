@@ -7,6 +7,9 @@ let serverRunning = new URLSearchParams(location.search).has('running');
 const cancelStop = new URLSearchParams(location.search).has('cancelStop');
 const workerMode = new URLSearchParams(location.search).get('mode') === 'worker';
 const manyConfigs = new URLSearchParams(location.search).has('many');
+const plannedUploads = Number(new URLSearchParams(location.search).get('uploads') ?? '0');
+const plannedUnchanged = Number(new URLSearchParams(location.search).get('unchanged') ?? '0');
+const plannedUnmanaged = Number(new URLSearchParams(location.search).get('unmanaged') ?? '0');
 let restartRequired = new URLSearchParams(location.search).has('restart');
 const worker = {
 	autoSync: false,
@@ -40,11 +43,17 @@ const configEntries = manyConfigs
 function planFor(selection: { includeMods: boolean; includeConfigs: boolean }) {
 	return {
 		hash: 'approved-plan',
-		uploads: [],
+		uploads: selection.includeMods
+			? Array.from({ length: plannedUploads }, (_, index) => ({
+					path: `BepInEx/plugins/Author-Mod${index}/Mod${index}.dll`,
+					size: 1024,
+					kind: 'payload'
+				}))
+			: [],
 		removals: [],
-		unmanaged: [],
-		uploadBytes: 0,
-		unchangedFiles: 0,
+		unmanaged: Array.from({ length: plannedUnmanaged }, (_, index) => `Extra/file-${index}.dat`),
+		uploadBytes: plannedUploads * 1024,
+		unchangedFiles: selection.includeMods ? plannedUnchanged : 0,
 		modsPhase: selection.includeMods,
 		configsPhase: selection.includeConfigs,
 		requiresRestart: false,

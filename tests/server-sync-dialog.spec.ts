@@ -75,6 +75,33 @@ for (const mode of ['local', 'worker']) {
 		await expect(page.getByRole('button', { name: 'Push configs', exact: true })).toBeEnabled();
 	});
 
+	test(`${mode}: a zero-change preview says so explicitly and keeps Deploy`, async ({ page }) => {
+		await page.goto(`/tests/dialog/?mode=${mode}&unchanged=166&unmanaged=2`);
+		await page.getByRole('button', { name: 'Preview', exact: true }).click();
+		await expect(
+			page.getByText(
+				'No mod file changes found. The server already matches the published mod files.'
+			)
+		).toBeVisible();
+		// The generic review instruction must not imply changes to inspect.
+		await expect(page.getByText('Review the changes, then deploy.')).toHaveCount(0);
+		await expect(
+			page.getByText('Deploying records this publication as deployed without changing any files.')
+		).toBeVisible();
+		// Unmanaged files are reported separately; they are not changes.
+		await expect(
+			page.getByText('2 unmanaged file(s) on the server were left untouched.')
+		).toBeVisible();
+		// Deploy stays available: a zero-diff deploy still records the
+		// publication's mod revision as deployed on the server.
+		await expect(page.getByRole('button', { name: 'Deploy', exact: true })).toBeEnabled();
+
+		await page.goto(`/tests/dialog/?mode=${mode}&uploads=2&unchanged=164`);
+		await page.getByRole('button', { name: 'Preview', exact: true }).click();
+		await expect(page.getByText('No mod file changes found')).toHaveCount(0);
+		await expect(page.getByText('Review the changes, then deploy.')).toBeVisible();
+	});
+
 	test(`${mode}: decisions do not reorder or scroll a long review list`, async ({ page }) => {
 		await page.setViewportSize({ width: 900, height: 650 });
 		await page.goto(`/tests/dialog/?mode=${mode}&many=1`);

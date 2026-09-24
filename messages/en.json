@@ -235,6 +235,8 @@
 	"serverSync_modeLocal": "This device deploys directly",
 	"serverSync_modeWorker": "A worker deploys for this device",
 	"serverSync_neverDeployed": "never deployed",
+	"serverSync_noChanges": "No mod file changes found. The server already matches the published mod files.",
+	"serverSync_noChangesHint": "Deploying records this publication as deployed without changing any files.",
 	"serverSync_noPublication": "no publication yet",
 	"serverSync_partialDone": "Deployment partially applied. Some selected changes did not complete.",
 	"serverSync_pendingMods": "Pending mod deployment: {revision}",

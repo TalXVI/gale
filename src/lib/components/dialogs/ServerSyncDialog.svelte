@@ -84,6 +84,12 @@
 			(entry) => entry.action === 'pending' && !decisions[entry.path]
 		).length ?? 0
 	);
+	const noChanges = $derived(
+		previewScope === 'mods' &&
+			preview != null &&
+			preview.plan.uploads.length === 0 &&
+			preview.plan.removals.length === 0
+	);
 	const visibleConfigEntries = $derived.by(() => {
 		const entries = preview?.plan.configEntries ?? [];
 		return entries
@@ -619,6 +625,9 @@
 				unchanged={preview.plan.unchangedFiles}
 			/>
 
+			{#if noChanges}
+				<InfoBox type="info" class="mt-3">{m.serverSync_noChanges()}</InfoBox>
+			{/if}
 			{#if preview.busy}
 				<InfoBox type="warning" class="mt-3">
 					{m.serverSync_leaseHeld({ owner: preview.busy.record.owner })}
@@ -812,7 +821,13 @@
 
 	<p class="text-primary-600 dark:text-primary-300 mt-4 min-h-5 text-sm" role="status">
 		{#if preview}
-			{dirty ? m.serverSync_dirtyHint() : m.serverSync_readyHint()}
+			{#if dirty}
+				{m.serverSync_dirtyHint()}
+			{:else if noChanges}
+				{m.serverSync_noChangesHint()}
+			{:else}
+				{m.serverSync_readyHint()}
+			{/if}
 		{:else if !result}
 			{m.serverSync_previewHint()}
 		{/if}
