@@ -49,6 +49,17 @@ impl DeploySelection {
         published: &BTreeMap<ConfigPath, ValidatedConfigFile>,
         spec: &DeploymentSpec,
     ) -> Result<()> {
+        // A mods-only selection must be config-free, not just config-
+        // ignoring: silently dropping caller-supplied config decisions
+        // would hide intent. Reject them so an incoherent selection
+        // fails loudly instead.
+        ensure!(
+            self.include_configs
+                || (self.apply_configs.is_empty()
+                    && self.restore_configs.is_empty()
+                    && self.decline_configs.is_empty()),
+            "config selections require the config phase"
+        );
         let mut seen = BTreeSet::new();
         for path in &self.apply_configs {
             ensure!(seen.insert(path), "duplicate selected config path: {path}");
@@ -160,7 +171,9 @@ pub struct RemoteSnapshot {
     /// nothing.
     pub payload_hashes: BTreeMap<DeployPathBuf, ContentHash>,
     /// Remote content hash for every config path a decision is needed on
-    /// (published ∪ recorded ∪ seeded); `None` = absent remotely.
+    /// (published ∪ recorded ∪ explicitly selected); `None` = absent
+    /// remotely. Empty when the selection skips the config phase — a
+    /// mods-only operation never reads remote configs.
     pub config_remote: BTreeMap<ConfigPath, Option<ContentHash>>,
     pub host_managed: bool,
     pub layout: RemoteLayout,
@@ -270,7 +283,7 @@ pub struct DeploymentPlan {
     pub unchanged_files: usize,
     /// Every published config file and its decided fate.
     pub config_entries: Vec<PlanConfigEntry>,
-    /// Seed/published files the plan cannot write without a decision.
+    /// Published config files the plan cannot write without a decision.
     pub conflicts: Vec<PlanConflict>,
     /// Payload changes require a server restart to take effect.
     pub requires_restart: bool,
@@ -544,8 +557,8 @@ fn decide_config(
             }
         }
         (Some(remote_hash), ConfigUpdatePolicy::Ask) => {
-            // Content we seeded ourselves and nobody touched may update
-            // without asking.
+            // Content Gale wrote and nobody modified on the server may
+            // update without asking.
             let written = record.and_then(|r| r.written.as_ref());
             if record.is_none_or(|r| r.applied.is_none() && r.declined.is_none())
                 && written == Some(remote_hash)
@@ -767,6 +780,29 @@ mod tests {
         assert!(plan.mods_phase);
         assert!(!plan.configs_phase);
         assert!(plan.requires_restart);
+    }
+
+    #[test]
+    fn mods_only_selection_rejects_config_decisions() {
+        // A mods-only selection carrying config decisions is incoherent:
+        // silently ignoring them would hide caller intent, so validation
+        // fails loudly instead.
+        let fixture = fixture();
+        let mut selected = selection(true, false);
+        selected
+            .apply_configs
+            .push(config_path("BepInEx/config/mod.cfg"));
+        assert!(
+            build_plan(
+                &fixture.publication(),
+                &payload(b"dll-bytes"),
+                &empty_snapshot(),
+                &selected,
+                &context(),
+                &spec(),
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -1119,7 +1119,7 @@ fn execute(
         });
     }
 
-    // ---- Uploads: payload, seeds, then published config writes.
+    // ---- Uploads: payload first, then published config writes.
     ensure_ownership(lease, session)?;
     let mut ensured = BTreeSet::new();
     let payload_uploads: Vec<_> = plan

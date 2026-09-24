@@ -56,13 +56,14 @@ test('Local Preview and Deploy show snapshot, mutation, byte, and restart progre
 		true
 	);
 	await emit(page, {
-		phase: 'checkingConfigs',
+		phase: 'buildingPlan',
 		completedPhases: 8,
-		completed: 37,
-		total: 133,
-		item: 'BepInEx/config/file-037.cfg'
+		completed: 0,
+		total: null,
+		item: null
 	});
-	await expect(progress).toContainText('37 / 133 files');
+	await expect(progress).toContainText('Building deployment plan');
+	await expect(progress).not.toContainText('83 / 166');
 	await release(page);
 	await expect(progress).toHaveCount(0);
 	await expect(page.getByRole('button', { name: 'Deploy', exact: true })).toBeEnabled();
@@ -73,7 +74,7 @@ test('Local Preview and Deploy show snapshot, mutation, byte, and restart progre
 	await expect(progress).toContainText('Verifying deployed mods');
 	await emit(page, {
 		phase: 'removingFiles',
-		completedPhases: 10,
+		completedPhases: 9,
 		completed: 3,
 		total: 5,
 		item: 'BepInEx/plugins/Old/old.dll'
@@ -81,7 +82,7 @@ test('Local Preview and Deploy show snapshot, mutation, byte, and restart progre
 	await expect(progress).toContainText('3 / 5 items');
 	await emit(page, {
 		phase: 'uploadingPayload',
-		completedPhases: 11,
+		completedPhases: 10,
 		completed: 12,
 		total: 24,
 		completedBytes: 18_400_000,
@@ -91,7 +92,7 @@ test('Local Preview and Deploy show snapshot, mutation, byte, and restart progre
 	await expect(progress).toContainText('12 / 24 files · 18.4 MB / 52.1 MB');
 	await emit(page, {
 		phase: 'applyingRestart',
-		completedPhases: 14,
+		completedPhases: 12,
 		completed: 0,
 		total: null,
 		item: 'Waiting for server to stop and start (check 2 of 12)'
@@ -139,7 +140,7 @@ test('Worker polls its run, ignores stale snapshots, and clears progress on succ
 			(window as any).setWorkerProgress({
 				runId,
 				phase: 'uploadingPayload',
-				completedPhases: 11,
+				completedPhases: 10,
 				completed: 12,
 				total: 24
 			}),
@@ -153,7 +154,7 @@ test('Worker polls its run, ignores stale snapshots, and clears progress on succ
 		(value) =>
 			(window as any).setWorkerProgress({
 				phase: 'uploadingPayload',
-				completedPhases: 11,
+				completedPhases: 10,
 				completed: 12,
 				total: 24,
 				completedBytes: 18_400_000,

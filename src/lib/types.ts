@@ -346,7 +346,7 @@ export type DeploySelection = {
 	declineConfigs: string[];
 };
 
-export type UploadKind = 'payload' | 'configSeed' | 'config';
+export type UploadKind = 'payload' | 'config';
 export type RemoteLayout = 'standard' | 'mirrorRoot';
 
 export type PlanUpload = {

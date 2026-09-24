@@ -43,8 +43,8 @@ pub struct DeploymentSpec {
     pub payload_dirs: Vec<DeployPathBuf>,
 
     /// Config directories governed by selective config synchronization.
-    /// Their contents are never removed and only written through config
-    /// apply rules (selected/policies) or package-default seeding.
+    /// Their contents are never removed and only written through the
+    /// explicit config push (selections and policies).
     pub config_dirs: Vec<DeployPathBuf>,
 
     /// Deploy paths that identify the mod loader's own payload in the
@@ -209,17 +209,13 @@ impl DeploymentSpec {
         self.is_loader_owned(path) && !host_managed
     }
 
-    /// Whether a package-bundled file under a config dir may seed a server
-    /// config when absent (never overwriting existing content).
-    pub fn is_config_seed(&self, path: &DeployPath) -> bool {
-        self.is_config(path) && !self.is_gale_internal(path) && !self.is_excluded(path)
-    }
-
     /// Only files in the loader's config directories can be governed by
     /// server config decisions. The client publication also contains text
     /// files in plugin and loader trees; those are not config write authority.
     pub fn is_managed_config(&self, path: &ConfigPath) -> bool {
-        DeployPathBuf::new(path.as_str()).is_ok_and(|path| self.is_config_seed(&path))
+        DeployPathBuf::new(path.as_str()).is_ok_and(|path| {
+            self.is_config(&path) && !self.is_gale_internal(&path) && !self.is_excluded(&path)
+        })
     }
 
     /// Whether a recorded state entry may authorize deleting the remote file
@@ -335,7 +331,9 @@ mod tests {
         // its deletion: configs live under policy, not payload mirroring.
         assert!(!spec.valid_owned_path(&path("BepInEx/config/mod.cfg")));
         assert!(!spec.deploys(&path("BepInEx/config/mod.cfg"), false));
-        assert!(spec.is_config_seed(&path("BepInEx/config/mod.cfg")));
+        assert!(spec.is_managed_config(
+            &ConfigPath::try_from("BepInEx/config/mod.cfg".to_owned()).unwrap()
+        ));
     }
 
     #[test]

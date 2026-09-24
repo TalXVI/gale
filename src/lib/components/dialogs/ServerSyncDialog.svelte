@@ -246,14 +246,18 @@
 		const restoreConfigs: string[] = [];
 		const declineConfigs: string[] = [];
 
-		for (const [path, decision] of Object.entries(decisions)) {
-			if (decision === 'decline') {
-				declineConfigs.push(path);
-			} else {
-				applyConfigs.push(path);
-				// Restoring recreates a file the server side deleted; the
-				// planner requires the extra authorization for that case.
-				if (decision === 'restore') restoreConfigs.push(path);
+		// A mods operation must serialize as literally config-free. Only
+		// the config workflow may carry decisions into the selection.
+		if (previewScope === 'configs') {
+			for (const [path, decision] of Object.entries(decisions)) {
+				if (decision === 'decline') {
+					declineConfigs.push(path);
+				} else {
+					applyConfigs.push(path);
+					// Restoring recreates a file the server side deleted; the
+					// planner requires the extra authorization for that case.
+					if (decision === 'restore') restoreConfigs.push(path);
+				}
 			}
 		}
 

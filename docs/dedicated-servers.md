@@ -194,7 +194,7 @@ If you skip step 2, the new worker simply starts with an empty journal and the d
 
 ## Deployment coordination
 
-Concurrent deployers coordinate through a lease directory claimed atomically on the remote (`/.gale-deploy.lock`). The holder keeps its lease alive with heartbeats while it works. Release and heartbeat both verify the record still belongs to that operation, so a stale executor cannot delete a newer executor's lease.
+Concurrent deployers coordinate through a lease directory claimed atomically on the remote (`BepInEx/config/.gale-deploy.lock`, or `config/.gale-deploy.lock` in restricted-root layouts). The holder keeps its lease alive with heartbeats while it works. Release and heartbeat both verify the record still belongs to that operation, so a stale executor cannot delete a newer executor's lease.
 
 Guarantees:
 
@@ -211,7 +211,7 @@ A deployment only reports success once its state file reads back byte-identical.
 
 ## What is preserved
 
-The deployment state file (`.gale-server-state.json` in the server directory, or under `config/` in restricted-root layouts) records owned files, content hashes, applied config revisions, per-file policies, operation history, and restart state. It is the authority for what Gale may remove. A file absent from the publication but never recorded as deployed stays put.
+The deployment state file (`BepInEx/config/.gale-server-state.json`, or `config/.gale-server-state.json` in restricted-root layouts) records owned files, content hashes, applied config revisions, per-file policies, operation history, and restart state. It is the authority for what Gale may remove. A file absent from the publication but never recorded as deployed stays put.
 
 The existing protections apply in both modes: managed vs host-managed BepInEx installations, restricted-root layouts, validated state-path adoption, retried removals, and server-config preservation during mods-only updates.
 

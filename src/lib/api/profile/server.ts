@@ -89,7 +89,7 @@ export const getSyncStatus = (refresh: boolean, password = '', workerToken = '')
 
 export const getSyncProgress = (workerToken = '') =>
 	invoke<ServerSyncOperationProgress | null>('get_server_sync_progress', {
-		request: { refresh: false, workerToken }
+		request: { workerToken }
 	});
 
 /// The restart policy is bound into the plan hash. A preview only stays
@@ -153,8 +153,7 @@ export const configureWorker = (
 // ---------- managed local worker ("host worker on this PC") ----------
 
 /// SCM state + status file + live API status for the managed worker.
-export const getLocalWorkerStatus = () =>
-	invoke<LocalWorkerStatus>('get_local_worker_status');
+export const getLocalWorkerStatus = () => invoke<LocalWorkerStatus>('get_local_worker_status');
 
 /// Provisions and installs the managed worker: a second Gale sign-in
 /// gives the worker its own credentials, then one UAC-elevated step
@@ -169,10 +168,8 @@ export const controlLocalWorker = (action: LocalWorkerAction) =>
 
 /// Reinstalls the service with the bundled worker binary, keeping the
 /// installed config, credentials, and journal.
-export const updateLocalWorker = () =>
-	invoke<LocalWorkerStatus>('update_local_worker');
+export const updateLocalWorker = () => invoke<LocalWorkerStatus>('update_local_worker');
 
 /// Stops and removes the service and its state; the profile falls back
 /// to Local sync when it still points at the managed worker.
-export const uninstallLocalWorker = () =>
-	invoke<LocalWorkerStatus>('uninstall_local_worker');
+export const uninstallLocalWorker = () => invoke<LocalWorkerStatus>('uninstall_local_worker');

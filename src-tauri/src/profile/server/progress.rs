@@ -212,6 +212,37 @@ mod tests {
     use crate::profile::server::plan::DeploySelection;
 
     #[test]
+    fn mods_only_operations_have_no_config_phases() {
+        // The phase list is part of the zero-config boundary: a mods-only
+        // operation must never surface a config phase to the user.
+        let mods_only = ProgressReporter::new(
+            "run".to_owned(),
+            SyncOperation::Deploy,
+            &DeploySelection {
+                include_mods: true,
+                ..Default::default()
+            },
+            |_| {},
+        );
+        assert!(!mods_only.phases.contains(&SyncPhase::CheckingConfigs));
+        assert!(!mods_only.phases.contains(&SyncPhase::WritingConfigs));
+
+        let configs_only = ProgressReporter::new(
+            "run".to_owned(),
+            SyncOperation::Deploy,
+            &DeploySelection {
+                include_configs: true,
+                ..Default::default()
+            },
+            |_| {},
+        );
+        assert!(configs_only.phases.contains(&SyncPhase::CheckingConfigs));
+        assert!(configs_only.phases.contains(&SyncPhase::WritingConfigs));
+        assert!(!configs_only.phases.contains(&SyncPhase::ScanningPayload));
+        assert!(!configs_only.phases.contains(&SyncPhase::UploadingPayload));
+    }
+
+    #[test]
     fn repeated_phase_and_late_total_do_not_regress_completed_work() {
         let snapshots = Arc::new(Mutex::new(Vec::new()));
         let sink = snapshots.clone();

@@ -49,7 +49,9 @@ function planFor(selection: { includeMods: boolean; includeConfigs: boolean }) {
 		configsPhase: selection.includeConfigs,
 		requiresRestart: false,
 		conflicts: selection.includeConfigs
-			? configEntries.filter((entry) => entry.action === 'pending').map((entry) => entry.path)
+			? configEntries
+					.filter((entry) => entry.action === 'pending')
+					.map((entry) => ({ path: entry.path, reason: entry.reason }))
 			: [],
 		configEntries: selection.includeConfigs ? configEntries : []
 	};
@@ -76,7 +78,7 @@ function progressPayload(patch: Record<string, unknown>) {
 		status: 'running',
 		phase: 'verifyingPayload',
 		completedPhases: 7,
-		totalPhases: 16,
+		totalPhases: operation?.cmd === 'deploy_server_sync' ? 14 : 10,
 		completed: 0,
 		total: 24,
 		completedBytes: null,
