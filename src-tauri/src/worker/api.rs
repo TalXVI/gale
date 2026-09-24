@@ -102,12 +102,14 @@ pub struct BusyOperation {
 }
 
 /// A projection of the remote deployment state for status displays.
+/// Config reconciliation is not part of routine synchronization, so no
+/// config-pending count exists here: undecided configs are surfaced by
+/// an explicit config preview, never as background work.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerStateSummary {
     pub mods_revision: Option<ModRevision>,
     pub restart_required: bool,
-    pub pending_configs: usize,
     pub last_operation: Option<OperationRecord>,
     /// A live lease held by any executor.
     pub lease: Option<LeaseRecord>,

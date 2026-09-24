@@ -8,7 +8,6 @@ const cancelStop = new URLSearchParams(location.search).has('cancelStop');
 const workerMode = new URLSearchParams(location.search).get('mode') === 'worker';
 const manyConfigs = new URLSearchParams(location.search).has('many');
 let restartRequired = new URLSearchParams(location.search).has('restart');
-const pendingDecisions = Number(new URLSearchParams(location.search).get('pendingDecisions') ?? 0);
 const worker = {
 	autoSync: false,
 	autoMods: false,
@@ -181,16 +180,14 @@ mockIPC(async (cmd, args) => {
 			return {
 				mode: workerMode ? 'worker' : 'local',
 				worker: workerMode ? worker : null,
-				server:
-					restartRequired || pendingDecisions > 0
-						? {
-								restartRequired,
-								pendingConfigs: pendingDecisions,
-								modsRevision: null,
-								lastOperation: null,
-								lease: null
-							}
-						: null,
+				server: restartRequired
+					? {
+							restartRequired,
+							modsRevision: null,
+							lastOperation: null,
+							lease: null
+						}
+					: null,
 				warnings: []
 			};
 		case 'get_sync_dialog_preferences':

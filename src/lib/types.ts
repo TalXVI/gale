@@ -372,7 +372,6 @@ export type PlanConfigEntry = {
 export type PlanConflict = {
 	path: string;
 	reason: PendingSyncConfigReason;
-	seed: boolean;
 };
 
 export type DeploymentPlan = {
@@ -456,7 +455,6 @@ export type ServerDeploymentState = {
 	operationSeq: number;
 	modsRevision: string | null;
 	restartRequired: boolean;
-	pending: Record<string, PendingSyncConfigReason>;
 	lastOperation: OperationRecord | null;
 };
 
@@ -484,7 +482,6 @@ export type BusyOperation = {
 export type ServerStateSummary = {
 	modsRevision: string | null;
 	restartRequired: boolean;
-	pendingConfigs: number;
 	lastOperation: OperationRecord | null;
 	lease: LeaseRecord | null;
 };

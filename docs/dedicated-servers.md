@@ -44,7 +44,7 @@ The preview combines the live remote listing with Gale's recorded deployment sta
 - Gale updates the payload files it deployed to the published revision, and removes them when the publication drops them. If an owned file's contents changed on the server, Gale re-uploads it.
 - Gale never deletes files it did not deploy. A manually installed `ServerOnly.dll` survives every sync and shows up as _unmanaged_ in the preview.
 - Gale leaves world data, saves, logs, host-managed files, and anything outside the managed directories alone.
-- Package-default configs only fill in files that are absent; they never overwrite a config the server already has.
+- Config files bundled inside mod packages are never deployed. The running server generates or migrates its own configs, and only an explicit config push writes them.
 - Disabling a mod produces `.old` files locally; Gale does not upload them.
 
 ### Config decisions and policies

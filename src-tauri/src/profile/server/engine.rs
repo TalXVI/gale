@@ -979,28 +979,20 @@ fn take_snapshot(
     }
 
     // Hash every config path a decision could touch: published files,
-    // recorded ones, and package-default seeds.
+    // recorded ones, and explicitly selected paths. A mods-only operation
+    // never reads config files — the server owns them.
     let mut config_remote = BTreeMap::new();
-    if selection.include_configs || selection.include_mods {
+    if selection.include_configs {
         let mut paths: BTreeSet<ConfigPath> = BTreeSet::new();
-        if selection.include_configs {
-            paths.extend(
-                publication
-                    .config
-                    .keys()
-                    .filter(|path| spec.is_managed_config(path))
-                    .cloned(),
-            );
-            paths.extend(session.state.config.keys().cloned());
-            paths.extend(selection.apply_configs.iter().cloned());
-        }
-        if selection.include_mods {
-            for path in desired.package_defaults.keys() {
-                if let Ok(path) = ConfigPath::try_from(path.as_str().to_owned()) {
-                    paths.insert(path);
-                }
-            }
-        }
+        paths.extend(
+            publication
+                .config
+                .keys()
+                .filter(|path| spec.is_managed_config(path))
+                .cloned(),
+        );
+        paths.extend(session.state.config.keys().cloned());
+        paths.extend(selection.apply_configs.iter().cloned());
 
         progress.phase(SyncPhase::CheckingConfigs);
         progress.work(paths.len(), None);
@@ -1158,12 +1150,8 @@ fn execute(
         }
         progress.item(upload.path.to_string());
         let result = match upload.kind {
-            UploadKind::Payload | UploadKind::ConfigSeed => {
-                let staged = match upload.kind {
-                    UploadKind::Payload => desired.payload.get(&upload.path),
-                    _ => desired.package_defaults.get(&upload.path),
-                }
-                .ok_or_else(|| {
+            UploadKind::Payload => {
+                let staged = desired.payload.get(&upload.path).ok_or_else(|| {
                     eyre::eyre!("planned upload missing staged content: {}", upload.path)
                 });
 
@@ -1196,7 +1184,7 @@ fn execute(
         match result {
             Ok(()) => {
                 session.state.restart_required = true;
-                if matches!(upload.kind, UploadKind::Payload | UploadKind::ConfigSeed) {
+                if matches!(upload.kind, UploadKind::Payload) {
                     summary.uploaded_files += 1;
                     summary.uploaded_bytes += upload.size;
                 }
@@ -1251,17 +1239,10 @@ fn execute(
             match &entry.action {
                 ConfigAction::MarkApplied => session.state.record_applied(&entry.path, hash),
                 ConfigAction::Decline => session.state.record_declined(&entry.path, hash),
-                ConfigAction::Pending { reason } => {
-                    session.state.record_pending(&entry.path, hash, *reason)
-                }
-                ConfigAction::Keep => {
-                    session.state.pending.remove(&entry.path);
-                }
-                ConfigAction::Write | ConfigAction::Unapplied => {}
+                ConfigAction::Pending { .. } => session.state.record_conflict(&entry.path, hash),
+                ConfigAction::Keep | ConfigAction::Write | ConfigAction::Unapplied => {}
             }
         }
-
-        session.state.retain_published(&published);
     }
 
     // ---- Advance the recorded revision: reaching this point means the
@@ -1274,29 +1255,16 @@ fn execute(
     Ok((summary, warnings, failed_config_writes))
 }
 
-/// Records a successful payload/seed upload in the deployment state.
+/// Records a successful payload upload in the deployment state.
 fn record_staged(session: &mut Session, upload: &plan::PlanUpload, staged: &plan::StagedFile) {
-    match upload.kind {
-        UploadKind::Payload => {
-            session.state.files.insert(
-                upload.path.clone(),
-                OwnedFile {
-                    hash: staged.hash.clone(),
-                    size: staged.size,
-                },
-            );
-        }
-        UploadKind::ConfigSeed => {
-            if let Ok((config_path, hash)) = ConfigPath::try_from(upload.path.as_str().to_owned())
-                .and_then(|path| {
-                    ContentHash::try_from(staged.hash.clone()).map(|hash| (path, hash))
-                })
-            {
-                let record = session.state.config.entry(config_path).or_default();
-                record.written = Some(hash);
-            }
-        }
-        UploadKind::Config => {}
+    if upload.kind == UploadKind::Payload {
+        session.state.files.insert(
+            upload.path.clone(),
+            OwnedFile {
+                hash: staged.hash.clone(),
+                size: staged.size,
+            },
+        );
     }
 }
 
@@ -1761,10 +1729,7 @@ mod tests {
             deploy_path("BepInEx/plugins/Author-ModA/ModA.dll"),
             staged(b"dll-bytes"),
         );
-        DesiredDeployment {
-            payload,
-            package_defaults: BTreeMap::new(),
-        }
+        DesiredDeployment { payload }
     }
 
     fn selection(mods: bool, configs: bool) -> DeploySelection {
@@ -2077,7 +2042,6 @@ mod tests {
         // Desired payload does not include the stale owned file.
         let desired = DesiredDeployment {
             payload: BTreeMap::new(),
-            package_defaults: BTreeMap::new(),
         };
 
         let memory = remote();
@@ -2182,7 +2146,6 @@ mod tests {
             state.config[&config_path("BepInEx/config/mod.cfg")].applied,
             Some(ContentHash::from_hash(blake3::hash(b"v2")))
         );
-        assert!(state.pending.is_empty());
         // A config write also requires a restart; NotRequired cannot clear it.
         assert!(state.restart_required);
     }
@@ -2383,30 +2346,73 @@ mod tests {
             remote_contents(&memory, "/srv/BepInEx/config/mod.cfg"),
             Some(b"custom".to_vec())
         );
-        assert_eq!(
-            state.pending[&config_path("BepInEx/config/mod.cfg")],
-            PendingConfigReason::ModifiedLocally
-        );
+        // The conflict is recorded for the next preview: nothing applied,
+        // nothing declined, the file is still undecided.
+        let record = &state.config[&config_path("BepInEx/config/mod.cfg")];
+        assert!(record.applied.is_none() && record.written.is_none());
+        assert!(record.declined.is_none());
     }
 
     #[test]
-    fn package_default_seeds_only_absent_configs() {
-        let fixture = mod_fixture();
+    fn mods_only_never_reads_writes_or_records_configs() {
+        // The hard boundary: includeMods without includeConfigs performs
+        // literally zero config interaction — no reconciliation reads, no
+        // writes, no entries, no conflicts, no config state mutation.
+        let mut fixture = mod_fixture();
+        fixture.config.insert(
+            config_path("BepInEx/config/published.cfg"),
+            config_file(b"v2"),
+        );
         let publication = fixture.publication();
-        let mut desired = desired_payload();
-        desired.package_defaults.insert(
-            deploy_path("BepInEx/config/packaged.cfg"),
-            staged(b"packaged"),
+
+        let memory = remote();
+        {
+            let mut remote = memory.lock().unwrap();
+            remote.put_file("/srv/BepInEx/config/server.cfg", b"server-owned");
+            remote.put_file("/srv/BepInEx/config/published.cfg", b"old");
+            // Any config reconciliation read must fail the operation.
+            remote
+                .fail_read_always
+                .insert("/srv/BepInEx/config/server.cfg".to_owned());
+            remote
+                .fail_read_always
+                .insert("/srv/BepInEx/config/published.cfg".to_owned());
+            // A legacy pending-decision record from the continuous-config
+            // design is inert: ignored on load, dropped on persist.
+            remote.put_file(
+                STATE_REMOTE,
+                format!(
+                    r#"{{"version": {}, "operationSeq": 0, "pending": {{"BepInEx/config/published.cfg": "modifiedLocally"}}}}"#,
+                    state::VERSION
+                )
+                .as_bytes(),
+            );
+        }
+        let mut session = open(memory.clone()).unwrap();
+        let preview = preview(
+            &mut session,
+            &publication,
+            &desired_payload(),
+            &selection(true, false),
+            &context(),
+            &meta(),
+        )
+        .unwrap();
+        assert!(preview.plan.config_entries.is_empty());
+        assert!(preview.plan.conflicts.is_empty());
+        assert!(
+            preview
+                .plan
+                .uploads
+                .iter()
+                .all(|upload| upload.kind == UploadKind::Payload)
         );
 
-        // Absent: the seed is uploaded and recorded as written.
-        let memory = remote();
-        let mut session = open(memory.clone()).unwrap();
         let deployment = deploy(
             &mut session,
             no_connect,
             &publication,
-            &desired,
+            &desired_payload(),
             &selection(true, false),
             &context(),
             &meta(),
@@ -2422,39 +2428,56 @@ mod tests {
             &meta(),
         )
         .unwrap();
-        assert_eq!(
-            remote_contents(&memory, "/srv/BepInEx/config/packaged.cfg"),
-            Some(b"packaged".to_vec())
-        );
-        assert_eq!(
-            state.config[&config_path("BepInEx/config/packaged.cfg")].written,
-            Some(ContentHash::from_hash(blake3::hash(b"packaged")))
-        );
 
-        // Present: a second deployment leaves the server's file alone.
-        let memory = remote();
-        memory
-            .lock()
-            .unwrap()
-            .put_file("/srv/BepInEx/config/packaged.cfg", b"server-edited");
-        let mut again = open(memory.clone()).unwrap();
-        let deployment = deploy(
-            &mut again,
-            no_connect,
-            &publication,
-            &desired,
-            &selection(true, false),
-            &context(),
-            &meta(),
-            None,
-            false,
-            |_| {},
-        )
-        .unwrap();
-        finish(&mut again, deployment, RestartOutcome::NotRequired, &meta()).unwrap();
+        // Nothing read, nothing written, nothing recorded.
         assert_eq!(
-            remote_contents(&memory, "/srv/BepInEx/config/packaged.cfg"),
-            Some(b"server-edited".to_vec())
+            remote_contents(&memory, "/srv/BepInEx/config/server.cfg"),
+            Some(b"server-owned".to_vec())
+        );
+        assert_eq!(
+            remote_contents(&memory, "/srv/BepInEx/config/published.cfg"),
+            Some(b"old".to_vec())
+        );
+        assert!(state.config.is_empty());
+        let persisted = remote_contents(&memory, STATE_REMOTE).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&persisted).contains("pending"),
+            "legacy pending bookkeeping must not be persisted again"
+        );
+    }
+
+    #[test]
+    fn config_preview_reads_the_remote_configs_it_evaluates() {
+        // The same boundary from the other side: an explicit config
+        // preview does reconcile remote config content, so a refused
+        // read fails the operation rather than silently skipping it.
+        let mut fixture = mod_fixture();
+        fixture.config.insert(
+            config_path("BepInEx/config/published.cfg"),
+            config_file(b"v2"),
+        );
+        let publication = fixture.publication();
+
+        let memory = remote();
+        {
+            let mut remote = memory.lock().unwrap();
+            remote.put_file("/srv/BepInEx/config/published.cfg", b"old");
+            remote
+                .fail_read_always
+                .insert("/srv/BepInEx/config/published.cfg".to_owned());
+        }
+        let mut session = open(memory.clone()).unwrap();
+        assert!(
+            preview(
+                &mut session,
+                &publication,
+                &desired_payload(),
+                &selection(false, true),
+                &context(),
+                &meta(),
+            )
+            .is_err(),
+            "an explicit config preview must read the configs it evaluates"
         );
     }
 
@@ -3235,7 +3258,6 @@ mod tests {
         });
         let mut desired = DesiredDeployment {
             payload: BTreeMap::new(),
-            package_defaults: BTreeMap::new(),
         };
         for index in 0..164 {
             let path = deploy_path(&format!("BepInEx/plugins/Author-ModA/mod-{index:03}.dll"));
@@ -3459,7 +3481,6 @@ mod tests {
             &empty.publication(),
             &DesiredDeployment {
                 payload: BTreeMap::new(),
-                package_defaults: BTreeMap::new(),
             },
             &selection(true, false),
             &context(),

@@ -153,11 +153,7 @@ pub async fn stage_publication(
     }
     progress(total, total, "");
 
-    info!(
-        payload = desired.payload.len(),
-        defaults = desired.package_defaults.len(),
-        "staged published mod set"
-    );
+    info!(payload = desired.payload.len(), "staged published mod set");
 
     Ok(desired)
 }
@@ -184,11 +180,10 @@ fn collect_tree(root: &Path, spec: &DeploymentSpec, desired: &mut DesiredDeploym
             continue;
         }
 
+        // Config-dir files inside packages are server-owned territory:
+        // the running server generates or migrates them, and only an
+        // explicit config push writes configs. They are never payload.
         if spec.is_config(&relative) {
-            if spec.is_config_seed(&relative) {
-                let file = staged_file(entry.path(), &relative)?;
-                desired.package_defaults.insert(relative, file);
-            }
             continue;
         }
 
@@ -321,6 +316,62 @@ mod tests {
             .unwrap();
 
         assert!(desired.payload.is_empty());
-        assert!(desired.package_defaults.is_empty());
+    }
+
+    /// Serves a prepared package tree from disk.
+    struct StaticSource(std::path::PathBuf);
+
+    impl PayloadSource for StaticSource {
+        fn stage<'a>(
+            &'a self,
+            _ident: &'a VersionIdent,
+            _backend: Backend,
+        ) -> BoxFuture<'a, eyre::Result<std::path::PathBuf>> {
+            let root = self.0.clone();
+            Box::pin(async move { Ok(root) })
+        }
+    }
+
+    #[tokio::test]
+    async fn packaged_config_files_are_never_staged() {
+        // A mod package can bundle files under config dirs. Those are
+        // server-owned territory — the running server generates or
+        // migrates them — so they must not enter the deployment set even
+        // when the payload is staged for a mods deployment.
+        let package = tempfile::tempdir().unwrap();
+        let config_dir = package.path().join("BepInEx/config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("default.cfg"), b"package-default").unwrap();
+        let plugin_dir = package.path().join("BepInEx/plugins/Mod");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(plugin_dir.join("Mod.dll"), b"dll").unwrap();
+
+        let mods = [R2Mod {
+            ident: PackageIdent::from(("Author", "Mod")),
+            version: semver::Version::new(1, 0, 0).into(),
+            enabled: true,
+            source: Backend::Thunderstore,
+        }];
+        let config: BTreeMap<ConfigPath, ValidatedConfigFile> = BTreeMap::new();
+        let publication = Publication {
+            revision: Utc::now(),
+            mods_revision: ModRevision::from_hash(blake3::hash(b"rev")),
+            mods: &mods,
+            config: &config,
+        };
+        let source = StaticSource(package.path().to_path_buf());
+
+        let desired = stage_publication(&publication, &source, &spec(), true, |_, _, _| {})
+            .await
+            .unwrap();
+
+        assert_eq!(desired.payload.len(), 1);
+        assert!(
+            desired
+                .payload
+                .keys()
+                .all(|path| path.as_str() == "BepInEx/plugins/Mod/Mod.dll"),
+            "the bundled config must not enter the deployment set"
+        );
     }
 }

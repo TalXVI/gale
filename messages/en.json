@@ -237,7 +237,6 @@
 	"serverSync_neverDeployed": "never deployed",
 	"serverSync_noPublication": "no publication yet",
 	"serverSync_partialDone": "Deployment partially applied. Some selected changes did not complete.",
-	"serverSync_pendingCount": "{count} config file(s) awaiting a decision",
 	"serverSync_pendingMods": "Pending mod deployment: {revision}",
 	"serverSync_policyAlwaysApply": "Always apply updates",
 	"serverSync_policyAlwaysKeep": "Always keep my config",

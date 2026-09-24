@@ -303,7 +303,6 @@ async fn status(
                 Some(super::api::ServerStateSummary {
                     mods_revision: session.state.mods_revision.clone(),
                     restart_required: session.state.restart_required,
-                    pending_configs: session.state.pending.len(),
                     last_operation: session.state.last_operation.clone(),
                     lease: session.lease,
                 })
@@ -1747,7 +1746,6 @@ mod tests {
         let server = status
             .server
             .expect("a refresh request must return remote state");
-        assert_eq!(server.pending_configs, 0);
         assert!(server.lease.is_none());
 
         // The endpoint still requires the bearer token.
@@ -2181,14 +2179,82 @@ mod tests {
             serde_json::from_slice(&ftp.file("/BepInEx/config/.gale-server-state.json").unwrap())
                 .unwrap();
         assert!(remote_state["modsRevision"].is_string());
-        assert_eq!(
-            remote_state["pending"],
-            serde_json::json!({}),
-            "automatic sync must not create config decisions"
+        assert!(
+            remote_state["pending"].is_null() && remote_state["config"] == serde_json::json!({}),
+            "automatic sync must not create config decisions: {remote_state}"
         );
         assert_eq!(
             ftp.file("/BepInEx/config/mod.cfg").unwrap(),
             b"server-customization"
+        );
+    }
+
+    /// A config file bundled inside a mod package is server-owned
+    /// territory: automatic synchronization deploys the mod payload and
+    /// never produces a config upload, seed, or record for it.
+    #[tokio::test]
+    async fn automatic_deployment_never_deploys_packaged_configs() {
+        let dir = tempfile::tempdir().unwrap();
+        let published_at = Utc::now();
+        let sync_api = spawn_sync_api(pack_manifest(), published_at).await;
+        let ftp = FakeFtp::valheim_host(FtpOptions::default());
+        let mut config = worker_config(dir.path(), "127.0.0.1:0".to_owned());
+        config.profile_id = SYNC_PROFILE.to_owned();
+        config.sync_url = Some(sync_api.url.clone());
+        config.remote = RemoteServerSettings {
+            protocol: RemoteProtocol::Ftp,
+            host: "127.0.0.1".to_owned(),
+            port: ftp.addr.port(),
+            username: "u".to_owned(),
+            server_directory: "/".to_owned(),
+            ..RemoteServerSettings::default()
+        };
+        let journal = crate::worker::journal::Journal::load(dir.path()).unwrap();
+        {
+            let mut state = journal.state.lock().await;
+            state.auto_sync = true;
+            state.auto_mods = true;
+        }
+        // The staged package tree carries a bundled config alongside the
+        // payload; the pre-seeded cache keeps staging offline.
+        let staged = dir.path().join("cache").join("Author-Mod").join("1.0.0");
+        std::fs::create_dir_all(staged.join("BepInEx/config")).unwrap();
+        std::fs::write(staged.join("mod.dll"), b"mod").unwrap();
+        std::fs::write(
+            staged.join("BepInEx/config/packaged.cfg"),
+            b"package-default",
+        )
+        .unwrap();
+        let ctx = std::sync::Arc::new(
+            super::WorkerContext::new(
+                config,
+                super::Secrets {
+                    remote_password: Some("pw".to_owned()),
+                    refresh_token: Some("refresh-seed".to_owned()),
+                    ..worker_secrets()
+                },
+                journal,
+            )
+            .unwrap(),
+        );
+
+        super::poll_once(&ctx).await;
+
+        let state = ctx.journal.state.lock().await;
+        assert!(state.pending.is_none());
+        assert_eq!(state.last_deployed_revision, Some(published_at));
+        drop(state);
+
+        assert!(
+            ftp.file("/BepInEx/config/packaged.cfg").is_none(),
+            "automatic sync must never write config files"
+        );
+        let remote_state: serde_json::Value =
+            serde_json::from_slice(&ftp.file("/BepInEx/config/.gale-server-state.json").unwrap())
+                .unwrap();
+        assert!(
+            remote_state["pending"].is_null() && remote_state["config"] == serde_json::json!({}),
+            "a mods-only deploy must not record config state: {remote_state}"
         );
     }
 

@@ -21,15 +21,15 @@ test('worker poll and deployment errors render independently', async ({ page }) 
 	await expect(page.getByText(deploymentError)).toBeVisible();
 });
 
-test('a pending publication is owed mods; routine status never reports config sync', async ({
+test('a pending publication is owed mods; routine status never reports config work', async ({
 	page
 }) => {
-	await page.goto('/tests/dialog/?mode=worker&pendingDecisions=2');
+	await page.goto('/tests/dialog/?mode=worker&restart');
 	await page.evaluate(() => (window as any).setWorkerPending('2026-09-23T12:00:00Z'));
 	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
-	// Remote pending config decisions stay actionable; routine config
-	// synchronization status does not exist.
-	await expect(page.getByText('2 config file(s) awaiting a decision')).toBeVisible();
+	// Config divergence is server-owned state, never routine pending
+	// work: even a populated status summary carries no config lines.
+	await expect(page.getByText(/config file\(s\) awaiting a decision/)).toHaveCount(0);
 	await expect(page.getByText(/config sync/i)).toHaveCount(0);
 	await page.getByText('Worker automation', { exact: true }).click();
 	const formatted = await page.evaluate(

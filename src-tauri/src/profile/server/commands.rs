@@ -687,7 +687,6 @@ pub async fn get_server_sync_status(
                     status.server = Some(ServerStateSummary {
                         mods_revision: session.state.mods_revision.clone(),
                         restart_required: session.state.restart_required,
-                        pending_configs: session.state.pending.len(),
                         last_operation: session.state.last_operation.clone(),
                         lease: session.lease.clone(),
                     });

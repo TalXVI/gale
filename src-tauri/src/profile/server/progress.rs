@@ -89,7 +89,7 @@ impl ProgressReporter {
         if selection.include_mods {
             phases.extend([SyncPhase::ScanningPayload, SyncPhase::VerifyingPayload]);
         }
-        if selection.include_mods || selection.include_configs {
+        if selection.include_configs {
             phases.push(SyncPhase::CheckingConfigs);
         }
         phases.push(SyncPhase::BuildingPlan);

@@ -122,12 +122,12 @@ pub enum FileSource {
 }
 
 /// The published content offered to the planner, in deploy-path space.
+/// Config-dir files inside packages are never staged: the server owns its
+/// config files, and only an explicit config push writes them.
 #[derive(Debug, Default)]
 pub struct DesiredDeployment {
     /// Mod payload files (outside config dirs).
     pub payload: BTreeMap<DeployPathBuf, StagedFile>,
-    /// Package-bundled config files that may seed the server when absent.
-    pub package_defaults: BTreeMap<DeployPathBuf, StagedFile>,
 }
 
 /// Identity and behavior options the plan hash binds. An approval is
@@ -185,8 +185,6 @@ pub enum RemoteLayout {
 pub enum UploadKind {
     /// Mod payload file.
     Payload,
-    /// Package-bundled config seeded because no file exists remotely.
-    ConfigSeed,
     /// Published config applied by selection or policy.
     Config,
 }
@@ -240,8 +238,6 @@ pub struct PlanConfigEntry {
 pub struct PlanConflict {
     pub path: ConfigPath,
     pub reason: PendingConfigReason,
-    /// `true` for package-bundled defaults, `false` for published configs.
-    pub seed: bool,
 }
 
 /// The complete, approved description of one deployment. It runs exactly
@@ -381,59 +377,6 @@ pub fn build_plan(
             .cloned()
             .collect();
         directory_removals.sort_by(|a, b| b.cmp(a));
-
-        // ---- Package-default configs: seed only when absent, never
-        // overwrite or delete server configuration.
-        for (path, staged) in &desired.package_defaults {
-            ensure!(
-                spec.is_config_seed(path),
-                "package default is outside supported server config scope: {path}"
-            );
-            let config_path = ConfigPath::try_from(path.as_str())
-                .map_err(|_| eyre::eyre!("package default has an unsafe path: {path}"))?;
-            if publication.config.contains_key(&config_path) {
-                continue; // published configs are governed by the config phase
-            }
-
-            let remote = snapshot.config_remote.get(&config_path).cloned().flatten();
-            let record = state.config.get(&config_path);
-
-            match remote {
-                Some(remote_hash) if remote_hash.as_str() == staged.hash => {
-                    unchanged_files += 1;
-                }
-                Some(remote_hash) => {
-                    // Only overwrite content we know is unmodified ours.
-                    if record.and_then(|r| r.written.as_ref()) == Some(&remote_hash) {
-                        uploads.push(PlanUpload {
-                            path: path.clone(),
-                            size: staged.size,
-                            kind: UploadKind::ConfigSeed,
-                        });
-                    }
-                    // Otherwise the file was customized on the server: keep.
-                }
-                None => {
-                    if record.and_then(|r| r.written.as_ref()).is_some()
-                        && !selection.restore_configs.contains(&config_path)
-                    {
-                        // A file Gale seeded was deleted remotely: honor the
-                        // deletion, but surface it.
-                        conflicts.push(PlanConflict {
-                            path: config_path,
-                            reason: PendingConfigReason::DeletedLocally,
-                            seed: true,
-                        });
-                    } else {
-                        uploads.push(PlanUpload {
-                            path: path.clone(),
-                            size: staged.size,
-                            kind: UploadKind::ConfigSeed,
-                        });
-                    }
-                }
-            }
-        }
     }
 
     // ---- Config phase: selective application of published config files.
@@ -467,7 +410,6 @@ pub fn build_plan(
                 conflicts.push(PlanConflict {
                     path: path.clone(),
                     reason,
-                    seed: false,
                 });
             }
 
@@ -800,12 +742,11 @@ mod tests {
             payload: [(deploy("BepInEx/plugins/ModA/ModA.dll"), staged(bytes))]
                 .into_iter()
                 .collect(),
-            package_defaults: BTreeMap::new(),
         }
     }
 
     #[test]
-    fn mods_only_deploys_payload_and_skips_configs() {
+    fn mods_only_deploys_payload_and_never_touches_configs() {
         let fixture = fixture();
         let plan = build_plan(
             &fixture.publication(),
@@ -817,8 +758,12 @@ mod tests {
         )
         .unwrap();
 
+        // A mods-only plan is literally config-free: no config uploads,
+        // entries, or conflicts exist for it to act on.
         assert_eq!(plan.uploads.len(), 1);
-        assert_eq!(plan.uploads[0].kind, UploadKind::Payload);
+        assert!(plan.uploads.iter().all(|u| u.kind == UploadKind::Payload));
+        assert!(plan.config_entries.is_empty());
+        assert!(plan.conflicts.is_empty());
         assert!(plan.mods_phase);
         assert!(!plan.configs_phase);
         assert!(plan.requires_restart);
@@ -1136,7 +1081,6 @@ mod tests {
             vec![PlanConflict {
                 path: path.clone(),
                 reason: PendingConfigReason::ModifiedLocally,
-                seed: false,
             }]
         );
 
@@ -1336,71 +1280,6 @@ mod tests {
                 .is_err()
             );
         }
-        let mut desired = DesiredDeployment::default();
-        desired.package_defaults.insert(
-            deploy("BepInEx/plugins/Mod/translations/en.json"),
-            staged(b"package"),
-        );
-        assert!(
-            build_plan(
-                &fixture.publication(),
-                &desired,
-                &empty_snapshot(),
-                &selection(true, false),
-                &context(),
-                &spec(),
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn package_defaults_seed_absent_configs_only() {
-        let fixture = fixture();
-        let mut desired = payload(b"dll");
-        desired.package_defaults.insert(
-            deploy("BepInEx/config/seeded.cfg"),
-            staged(b"default-content"),
-        );
-
-        // Absent remotely: the seed is uploaded.
-        let plan = build_plan(
-            &fixture.publication(),
-            &desired,
-            &empty_snapshot(),
-            &selection(true, false),
-            &context(),
-            &spec(),
-        )
-        .unwrap();
-        assert!(
-            plan.uploads
-                .iter()
-                .any(|u| u.kind == UploadKind::ConfigSeed)
-        );
-
-        // Present remotely with different content: nothing is uploaded,
-        // so the server's customization is never clobbered by a default.
-        let mut snapshot = empty_snapshot();
-        snapshot.config_remote.insert(
-            config_path("BepInEx/config/seeded.cfg"),
-            Some(hash_of(b"server-customized")),
-        );
-        let plan = build_plan(
-            &fixture.publication(),
-            &desired,
-            &snapshot,
-            &selection(true, false),
-            &context(),
-            &spec(),
-        )
-        .unwrap();
-        assert!(
-            !plan
-                .uploads
-                .iter()
-                .any(|u| u.kind == UploadKind::ConfigSeed)
-        );
     }
 
     #[test]

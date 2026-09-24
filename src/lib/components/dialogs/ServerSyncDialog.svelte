@@ -490,9 +490,6 @@
 								</Button>
 							</div>
 						{/if}
-						{#if status.server.pendingConfigs > 0}
-							<span>{m.serverSync_pendingCount({ count: status.server.pendingConfigs })}</span>
-						{/if}
 						{#if status.server.lease}
 							<span class="text-orange-600 dark:text-orange-400">
 								{m.serverSync_leaseHeld({ owner: status.server.lease.owner })}

@@ -11,7 +11,7 @@ use super::{
 };
 use crate::profile::{
     export::{ConfigPath, ContentHash, ModRevision, R2Mod},
-    sync::{AppliedFile, ConfigUpdatePolicy, PendingConfigReason},
+    sync::{AppliedFile, ConfigUpdatePolicy},
 };
 
 pub const FILE_NAME: &str = ".gale-server-state.json";
@@ -127,8 +127,8 @@ fn is_false(value: &bool) -> bool {
 /// Both executors (Local mode and workers) read and update this single
 /// record, so switching modes never loses synchronization history. It is
 /// deliberately not a single timestamp: mod and per-file config revisions
-/// are tracked independently, as are pending/declined decisions, ownership
-/// of deployed payload files, and recent operation results.
+/// are tracked independently, as are declined decisions, ownership of
+/// deployed payload files, and recent operation results.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerDeploymentState {
@@ -152,14 +152,10 @@ pub struct ServerDeploymentState {
     pub files: BTreeMap<DeployPathBuf, OwnedFile>,
     /// Per-config application records mirroring the client-side
     /// [`AppliedFile`] semantics: the applied published revision, what Gale
-    /// last wrote (also used for package-default seeds), the declined
-    /// revision, and the file's persistent update policy.
+    /// last wrote, the declined revision, and the file's persistent update
+    /// policy.
     #[serde(default)]
     pub config: BTreeMap<ConfigPath, AppliedFile>,
-    /// Published configs awaiting a decision because applying them would
-    /// overwrite a remote modification or recreate a remote deletion.
-    #[serde(default)]
-    pub pending: BTreeMap<ConfigPath, PendingConfigReason>,
     /// Whether deployed payload changes still need a server restart.
     #[serde(default)]
     pub restart_required: bool,
@@ -225,14 +221,11 @@ impl ServerDeploymentState {
         });
 
         let before_config = self.config.len();
-        let before_pending = self.pending.len();
         self.config.retain(|path, _| spec.is_managed_config(path));
-        self.pending.retain(|path, _| spec.is_managed_config(path));
         let ignored = before_config - self.config.len();
-        let ignored_pending = before_pending - self.pending.len();
-        if ignored > 0 || ignored_pending > 0 {
+        if ignored > 0 {
             warnings.push(format!(
-                "ignored {ignored} out-of-scope server config record(s) and {ignored_pending} pending decision(s); their remote files were left untouched"
+                "ignored {ignored} out-of-scope server config record(s); their remote files were left untouched"
             ));
         }
 
@@ -247,13 +240,11 @@ impl ServerDeploymentState {
         record.written = Some(hash.clone());
         record.declined = None;
         record.policy_set_at = None;
-        self.pending.remove(path);
     }
 
     /// Records that the published `hash` of `path` was declined. Declines
     /// are revision-keyed, so a newer publication requires a fresh decision.
     pub fn record_declined(&mut self, path: &ConfigPath, hash: &ContentHash) {
-        self.pending.remove(path);
         let record = self.config.entry(path.clone()).or_default();
         if record.declined.as_ref() != Some(hash) {
             record.declined = Some(hash.clone());
@@ -261,27 +252,17 @@ impl ServerDeploymentState {
         }
     }
 
-    /// Records that `path` awaits a decision for `reason`. A persistent
-    /// policy set while pending is pinned at the conflicting revision so it
+    /// Records that `path`'s published `hash` conflicts with the remote
+    /// file and awaits a decision. A persistent policy set while a
+    /// conflict is undecided is pinned at the conflicting revision so it
     /// governs future updates rather than the current conflict, matching
     /// `preserve_pending_policy_boundaries` on the client.
-    pub fn record_pending(
-        &mut self,
-        path: &ConfigPath,
-        hash: &ContentHash,
-        reason: PendingConfigReason,
-    ) {
-        self.pending.insert(path.clone(), reason);
+    pub fn record_conflict(&mut self, path: &ConfigPath, hash: &ContentHash) {
         let record = self.config.entry(path.clone()).or_default();
         record.declined = None;
         if record.policy != ConfigUpdatePolicy::Ask && record.policy_set_at.is_none() {
             record.policy_set_at = Some(hash.clone());
         }
-    }
-
-    /// Drops pending entries for files no longer published.
-    pub fn retain_published(&mut self, published: &BTreeMap<ConfigPath, ContentHash>) {
-        self.pending.retain(|path, _| published.contains_key(path));
     }
 
     pub fn record_operation(&mut self, record: OperationRecord) {
@@ -540,10 +521,6 @@ mod tests {
                 size: 1,
             },
         );
-        state.pending.insert(
-            config_path("BepInEx/plugins/ModA.dll"),
-            PendingConfigReason::ModifiedLocally,
-        );
 
         let mut remote = MemoryRemote::new();
         remote.put_file(STATE_PATH, &serialize(&state).unwrap());
@@ -552,9 +529,33 @@ mod tests {
         assert_eq!(loaded.state.files.len(), 1);
         assert_eq!(loaded.state.config.len(), 1);
         assert!(loaded.state.config.contains_key(&supported));
-        assert!(loaded.state.pending.is_empty());
         assert_eq!(loaded.warnings.len(), 2);
         assert!(loaded.warnings[1].contains("ignored 3 out-of-scope"));
+    }
+
+    #[test]
+    fn legacy_pending_decisions_are_inert_and_dropped_on_persist() {
+        // State files written by the continuous-config design carry a
+        // `pending` map of undecided configs. That bookkeeping no longer
+        // exists: it is ignored on load and absent from the next write,
+        // so historical automatic-config debt can never surface as work.
+        let mut remote = MemoryRemote::new();
+        remote.put_file(
+            STATE_PATH,
+            format!(
+                r#"{{"version": {VERSION}, "operationSeq": 4, "pending": {{"BepInEx/config/mod.cfg": "modifiedLocally", "BepInEx/config/other.cfg": "deletedLocally"}}}}"#
+            )
+            .as_bytes(),
+        );
+
+        let loaded = read(&mut remote).unwrap();
+        assert_eq!(loaded.state.operation_seq, 4);
+
+        let persisted = String::from_utf8(serialize(&loaded.state).unwrap()).unwrap();
+        assert!(
+            !persisted.contains("pending"),
+            "state must not resurrect removed bookkeeping: {persisted}"
+        );
     }
 
     #[test]
@@ -568,33 +569,31 @@ mod tests {
 
         state.record_declined(&path, &hash);
         assert_eq!(state.config[&path].declined, Some(hash.clone()));
-        assert!(state.pending.is_empty());
     }
 
     #[test]
-    fn record_pending_pins_policy_at_conflicting_revision() {
+    fn record_conflict_pins_policy_at_conflicting_revision() {
         let mut state = ServerDeploymentState::default();
         let path = config_path("BepInEx/config/mod.cfg");
         let v1 = hash_of("v1");
         let v2 = hash_of("v2");
 
-        // Establish a persistent policy while a conflict is pending: the
-        // policy is pinned at v1 so it governs later updates, not this one.
+        // Establish a persistent policy while a conflict is undecided:
+        // the policy is pinned at v1 so it governs later updates, not
+        // this one.
         let record = state.config.entry(path.clone()).or_default();
         record.policy = ConfigUpdatePolicy::AlwaysApply;
-        state.record_pending(&path, &v1, PendingConfigReason::ModifiedLocally);
+        state.record_conflict(&path, &v1);
 
         let record = &state.config[&path];
         assert_eq!(record.policy_set_at, Some(v1.clone()));
-        assert_eq!(state.pending[&path], PendingConfigReason::ModifiedLocally);
 
         // A new conflicting revision doesn't move the pin.
-        state.record_pending(&path, &v2, PendingConfigReason::ModifiedLocally);
+        state.record_conflict(&path, &v2);
         assert_eq!(state.config[&path].policy_set_at, Some(v1));
 
-        // Resolving clears pending and the pin.
+        // Resolving clears the pin.
         state.record_applied(&path, &v2);
-        assert!(state.pending.is_empty());
         assert_eq!(state.config[&path].policy_set_at, None);
         assert_eq!(state.config[&path].declined, None);
     }
