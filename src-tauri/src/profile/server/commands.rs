@@ -1362,6 +1362,7 @@ pub(crate) fn save_remote_settings_for(
 
 #[cfg(test)]
 mod tests {
+    use super::super::settings::ServerLocation;
     use super::*;
 
     /// Remote settings in worker mode bound to a worker address.
