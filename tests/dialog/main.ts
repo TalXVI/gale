@@ -2,24 +2,71 @@ import { mockIPC } from '@tauri-apps/api/mocks';
 import { mount } from 'svelte';
 import '../../src/app.css';
 
-let settings: unknown = null;
-let serverRunning = new URLSearchParams(location.search).has('running');
-const cancelStop = new URLSearchParams(location.search).has('cancelStop');
-const workerMode = new URLSearchParams(location.search).get('mode') === 'worker';
-const manyConfigs = new URLSearchParams(location.search).has('many');
-const plannedUploads = Number(new URLSearchParams(location.search).get('uploads') ?? '0');
-const plannedUnchanged = Number(new URLSearchParams(location.search).get('unchanged') ?? '0');
-const plannedUnmanaged = Number(new URLSearchParams(location.search).get('unmanaged') ?? '0');
-let restartRequired = new URLSearchParams(location.search).has('restart');
+const params = new URLSearchParams(location.search);
+const saved = params.has('saved');
+const workerMode = params.get('mode') === 'worker';
+const hostedWorker = params.get('mode') === 'hosted';
+const statusCase = params.get('status') ?? '';
+let settings: unknown = params.has('unset')
+	? null
+	: {
+			location: params.has('local') ? 'local' : 'remote',
+			serverName: 'Test server',
+			world: 'Dedicated',
+			port: 2456,
+			publicServer: true,
+			crossplay: false,
+			extraArgs: '',
+			remote: {
+				protocol: 'sftp',
+				host: 'example.test',
+				port: 22,
+				username: 'test-user',
+				serverDirectory: '/srv/server',
+				authentication: 'password',
+				privateKeyPath: '',
+				trustedHostKey: null,
+				trustedCertificate: null,
+				syncMode: workerMode || hostedWorker ? 'worker' : 'local',
+				worker: {
+					address: workerMode
+						? 'https://worker.example.test'
+						: hostedWorker
+							? 'http://127.0.0.1:8472'
+							: '',
+					hosted: hostedWorker,
+					autoSync: false,
+					autoMods: false
+				},
+				hostControl: { provider: 'none', datHostServerId: '', datHostUsername: '' },
+				restartPolicy: 'manual'
+			}
+		};
+let serverRunning = params.has('running');
+const cancelStop = params.has('cancelStop');
+const manyConfigs = params.has('many');
+const plannedUploads = Number(params.get('uploads') ?? '0');
+const plannedUnchanged = Number(params.get('unchanged') ?? '0');
+const plannedUnmanaged = Number(params.get('unmanaged') ?? '0');
+let restartRequired = params.has('restart');
 const worker = {
+	workerId: 'test-worker',
+	profileId: 'sync-1',
 	autoSync: false,
 	autoMods: false,
 	restartPolicy: 'manual',
+	observedRevision: null as string | null,
 	lastError: null as string | null,
 	pollError: null as string | null,
-	pendingRevision: null as string | null
+	pendingRevision: null as string | null,
+	nextAttemptAt: null as string | null,
+	lastDeployedRevision: null as string | null,
+	busy: null,
+	lastOperation: null,
+	server: null
 };
-const profileId = new URLSearchParams(location.search).get('profile') ?? 'first';
+const profileId = params.get('profile') ?? 'first';
+let activeId = 1;
 const preferences = JSON.parse(
 	sessionStorage.getItem('mock-profile-preferences') ?? '{}'
 ) as Record<string, { restartPolicy: string }>;
@@ -66,14 +113,107 @@ function planFor(selection: { includeMods: boolean; includeConfigs: boolean }) {
 	};
 }
 
+// Local-mode server states the status panel reports in plain language.
+function serverState() {
+	switch (statusCase) {
+		case 'upToDate':
+			return {
+				modsRevision: '2026-09-22T00:00:00Z',
+				restartRequired,
+				lastOperation: {
+					id: 'op-1',
+					executor: 'local',
+					kind: 'manual',
+					workerId: null,
+					publicationRevision: '2026-09-22T00:00:00Z',
+					modsRevision: '2026-09-22T00:00:00Z',
+					status: 'succeeded',
+					summary: {
+						uploadedFiles: 3,
+						uploadedBytes: 3072,
+						removedFiles: 0,
+						configWrites: 0,
+						unchangedFiles: 160
+					},
+					restart: 'notRequired',
+					error: null,
+					startedAt: '2026-09-22T00:00:00Z',
+					finishedAt: '2026-09-22T00:01:00Z'
+				},
+				lease: null
+			};
+		case 'pending':
+			return {
+				modsRevision: '2026-09-20T00:00:00Z',
+				restartRequired,
+				lastOperation: {
+					id: 'op-1',
+					executor: 'local',
+					kind: 'manual',
+					workerId: null,
+					publicationRevision: '2026-09-20T00:00:00Z',
+					modsRevision: '2026-09-20T00:00:00Z',
+					status: 'succeeded',
+					summary: {
+						uploadedFiles: 3,
+						uploadedBytes: 3072,
+						removedFiles: 0,
+						configWrites: 0,
+						unchangedFiles: 160
+					},
+					restart: 'notRequired',
+					error: null,
+					startedAt: '2026-09-20T00:00:00Z',
+					finishedAt: '2026-09-20T00:01:00Z'
+				},
+				lease: null
+			};
+		case 'never':
+			return { modsRevision: null, restartRequired, lastOperation: null, lease: null };
+		default:
+			return restartRequired
+				? { restartRequired, modsRevision: null, lastOperation: null, lease: null }
+				: null;
+	}
+}
+
 const calls: { cmd: string; args: any }[] = [];
 const unexpected: string[] = [];
 let held = '';
 let release: (() => void) | undefined;
 const failing = new Set<string>();
+if (params.has('failStatus')) failing.add('get_server_sync_status');
 let workerProgress: Record<string, unknown> | null = null;
 let progressPolls = 0;
 const progressListeners = new Set<number>();
+let localWorker: Record<string, unknown> = {
+	supported: true,
+	service: hostedWorker ? 'running' : 'notInstalled',
+	binding: hostedWorker
+		? {
+				workerId: 'local-worker',
+				profileId: 'sync-1',
+				listen: '127.0.0.1:8472',
+				address: 'http://127.0.0.1:8472'
+			}
+		: null,
+	ownership: hostedWorker ? 'owned' : 'none',
+	run: hostedWorker
+		? {
+				workerId: 'local-worker',
+				profileId: 'sync-1',
+				pid: 456,
+				phase: 'running',
+				at: '2026-09-25T00:00:00Z'
+			}
+		: null,
+	worker: null,
+	pendingPublication: null,
+	workerError: null,
+	stoppedForShutdown: false,
+	updateAvailable: false,
+	warnings: []
+};
 
 function latestRun() {
 	return calls.findLast((call) => ['preview_server_sync', 'deploy_server_sync'].includes(call.cmd));
@@ -147,8 +287,65 @@ mockIPC(async (cmd, args) => {
 	if (failing.has(cmd))
 		throw { message: `Simulated failure: ${cmd}`, detail: `Simulated failure: ${cmd}` };
 	switch (cmd) {
+		case 'get_game_info':
+			return {
+				active: {
+					name: 'Valheim',
+					slug: 'valheim',
+					platforms: ['steam'],
+					favorite: false,
+					modLoader: 'BepInEx',
+					popular: false,
+					backends: ['Thunderstore'],
+					dedicatedServer: { platforms: ['steam'], defaultPort: 2456 }
+				},
+				all: [],
+				favorites: [],
+				lastUpdated: ''
+			};
+		case 'get_profile_info':
+			return {
+				profiles: [
+					{
+						id: 1,
+						name: 'Test profile',
+						modCount: 3,
+						sync: {
+							id: 'sync-1',
+							owner: { discordId: '1', name: 'owner', displayName: 'Owner', avatar: null },
+							syncedAt: '2026-01-01T00:00:00Z',
+							updatedAt: '2026-09-22T00:00:00Z',
+							missing: false
+						},
+						customArgs: '',
+						missing: false
+					},
+					{
+						id: 2,
+						name: 'Second profile',
+						modCount: 0,
+						sync: null,
+						customArgs: '',
+						missing: false
+					}
+				],
+				activeId
+			};
+		case 'get_categories':
+			return [];
+		case 'get_user':
+			return null;
 		case 'get_dedicated_server_settings':
 			return settings;
+		case 'get_saved_server_credentials':
+			return {
+				gamePassword: saved,
+				sftpPassword: saved,
+				ftpPassword: saved,
+				sshKeyPassphrase: saved,
+				datHostPassword: saved,
+				workerToken: saved
+			};
 		case 'get_dedicated_server_status':
 			return serverRunning
 				? {
@@ -163,8 +360,51 @@ mockIPC(async (cmd, args) => {
 		case 'force_stop_dedicated_server':
 			serverRunning = false;
 			return;
+		case 'launch_dedicated_server':
+			serverRunning = true;
+			return {
+				state: 'running',
+				profileId: 1,
+				gameSlug: 'valheim',
+				pid: 123,
+				serverDir: '/test',
+				stopping: false
+			};
 		case 'get_local_worker_status':
-			return { supported: true, service: 'notInstalled', ownership: 'none', warnings: [] };
+			return localWorker;
+		case 'provision_local_worker':
+			localWorker = {
+				...localWorker,
+				service: 'running',
+				ownership: 'owned',
+				binding: {
+					workerId: 'local-worker',
+					profileId: 'sync-1',
+					listen: '127.0.0.1:8472',
+					address: 'http://127.0.0.1:8472'
+				},
+				run: {
+					workerId: 'local-worker',
+					profileId: 'sync-1',
+					pid: 456,
+					phase: 'running',
+					at: '2026-09-25T00:00:00Z'
+				},
+				worker: { ...worker, workerId: 'local-worker' }
+			};
+			return localWorker;
+		case 'control_local_worker':
+			localWorker = {
+				...localWorker,
+				service: (args as any).request.action === 'stop' ? 'stopped' : 'running'
+			};
+			return localWorker;
+		case 'update_local_worker':
+			localWorker = { ...localWorker, updateAvailable: false };
+			return localWorker;
+		case 'uninstall_local_worker':
+			localWorker = { ...localWorker, service: 'notInstalled', ownership: 'none', binding: null };
+			return localWorker;
 		case 'set_dedicated_server_settings':
 			settings = structuredClone((args as any).request.settings);
 			return;
@@ -172,8 +412,6 @@ mockIPC(async (cmd, args) => {
 			return { status: 'connected', encrypted: true };
 		case 'test_worker_connection':
 			return { workerId: 'test-worker', autoSync: false };
-		case 'get_game_info':
-			return { active: null, all: [], favorites: [], lastUpdated: '' };
 		case 'plugin:event|listen':
 			if ((args as any).event === 'server_sync_operation_progress') {
 				progressListeners.add((args as any).handler);
@@ -185,20 +423,39 @@ mockIPC(async (cmd, args) => {
 			return;
 		case 'plugin:dialog|message':
 			return cancelStop ? 'Cancel' : 'Ok';
+		case 'plugin:store|load':
+			return;
+		case 'plugin:store|entries':
+			return [];
+		case 'plugin:store|set':
+		case 'plugin:store|save':
+			return;
 		case 'log_err':
 			return;
 		case 'get_server_sync_status':
+			// The second profile has never been published or deployed —
+			// a profile switch must show its state, not profile 1's.
+			if (activeId === 2)
+				return {
+					mode: 'local',
+					worker: null,
+					publicationRevision: null,
+					server: null,
+					credentialRequired: false,
+					warnings: []
+				};
 			return {
-				mode: workerMode ? 'worker' : 'local',
-				worker: workerMode ? worker : null,
-				server: restartRequired
-					? {
-							restartRequired,
-							modsRevision: null,
-							lastOperation: null,
-							lease: null
-						}
-					: null,
+				mode: workerMode || hostedWorker ? 'worker' : 'local',
+				worker: workerMode || hostedWorker ? worker : null,
+				// A publication normally exists — `nopub` models a profile
+				// that has never been published.
+				publicationRevision: params.has('nopub')
+					? null
+					: statusCase === 'pending'
+						? '2026-09-25T00:00:00Z'
+						: '2026-09-22T00:00:00Z',
+				server: serverState(),
+				credentialRequired: false,
 				warnings: []
 			};
 		case 'get_sync_dialog_preferences':
@@ -213,7 +470,7 @@ mockIPC(async (cmd, args) => {
 		case 'preview_server_sync':
 			return { plan: planFor((args as any).request.selection), warnings: [] };
 		case 'set_server_config_policy':
-			// The real command returns nothing; the dialog reflects the saved
+			// The real command returns nothing; the page reflects the saved
 			// policy itself rather than waiting on a mutated preview.
 			return;
 		case 'configure_worker':
@@ -223,7 +480,13 @@ mockIPC(async (cmd, args) => {
 			return {
 				plan: planFor((args as any).request.selection),
 				state: {},
-				summary: { uploadedFiles: 0, uploadedBytes: 0, removedFiles: 0, unchangedFiles: 0 },
+				summary: {
+					uploadedFiles: 0,
+					uploadedBytes: 0,
+					removedFiles: 0,
+					configWrites: 0,
+					unchangedFiles: 0
+				},
 				restart: 'notRequired',
 				failedConfigWrites: [],
 				warnings: []
@@ -234,6 +497,16 @@ mockIPC(async (cmd, args) => {
 	}
 });
 
+// Screenshots run in dark mode; pass ?light to preview the light theme.
+if (!params.has('light')) document.documentElement.classList.add('dark');
+
 // Install IPC before importing the application's event subscriptions.
 const { default: Harness } = await import('./Harness.svelte');
+const { default: profiles } = await import('$lib/state/profile.svelte');
+Object.assign(window, {
+	switchProfile: async (id: number) => {
+		activeId = id;
+		await profiles.refresh();
+	}
+});
 mount(Harness, { target: document.getElementById('app')! });

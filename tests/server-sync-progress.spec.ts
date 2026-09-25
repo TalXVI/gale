@@ -168,7 +168,7 @@ test('Worker polls its run, ignores stale snapshots, and clears progress on succ
 	await expect(progress).toHaveCount(0);
 });
 
-test('failed progress keeps its phase and closing the dialog discards old events', async ({
+test('failed progress keeps its phase and leaving the tab discards old events', async ({
 	page
 }) => {
 	await page.goto('/tests/dialog/?mode=local');
@@ -190,8 +190,10 @@ test('failed progress keeps its phase and closing the dialog discards old events
 	await expect(progress).toContainText('2 / 3 files');
 	await release(page);
 	await expect(progress).toHaveCount(0);
-	await page.getByRole('button', { name: 'Close', exact: true }).click();
-	await page.getByRole('button', { name: 'Reopen sync dialog' }).click();
+	// Switching tabs unmounts the status panel; a stale event emitted while
+	// it is gone must not resurrect progress when it remounts.
+	await page.getByRole('tab', { name: 'This computer' }).click();
 	await emit(page, { runId: oldRun, completed: 100, total: 166, item: 'stale' });
+	await page.getByRole('tab', { name: 'Remote server' }).click();
 	await expect(progress).toHaveCount(0);
 });

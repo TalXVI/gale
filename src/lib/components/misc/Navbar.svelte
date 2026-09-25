@@ -2,11 +2,27 @@
 	import NavbarLink from './NavbarLink.svelte';
 	import { m } from '$lib/paraglide/messages';
 	import games from '$lib/state/game.svelte';
+	import profiles from '$lib/state/profile.svelte';
+	import server from '$lib/state/server.svelte';
+	import serverSync from '$lib/state/serverSync.svelte';
 	import { loaderSupportsModpacks } from '$lib/util';
 
 	const modpacksDisabled = $derived(
 		!games.active || !loaderSupportsModpacks(games.active.modLoader)
 	);
+
+	// The background poll only makes sense once a game with dedicated
+	// servers is active; it retargets itself on profile changes.
+	$effect(() => {
+		serverSync.start(games.active?.dedicatedServer ? profiles.activeId : null);
+	});
+
+	const serverBadge = $derived.by(() => {
+		if (!games.active?.dedicatedServer) return undefined;
+		if (server.status.state === 'running') return 'running' as const;
+		if (serverSync.pending) return 'pending' as const;
+		return undefined;
+	});
 
 	const links = $derived([
 		{
@@ -24,6 +40,16 @@
 			icon: 'mdi:file-cog',
 			tooltip: m.navBar_link_config()
 		},
+		...(games.active?.dedicatedServer
+			? [
+					{
+						to: '/server',
+						icon: 'mdi:server',
+						tooltip: m.navBar_link_server(),
+						badge: serverBadge
+					}
+				]
+			: []),
 		{
 			to: '/modpack',
 			icon: 'mdi:package-variant',

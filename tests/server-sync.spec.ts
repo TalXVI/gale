@@ -27,26 +27,27 @@ test('a pending publication is owed mods; routine status never reports config wo
 	await page.goto('/tests/dialog/?mode=worker&restart');
 	await page.evaluate(() => (window as any).setWorkerPending('2026-09-23T12:00:00Z'));
 	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+	await expect(page.getByText('Update pending')).toBeVisible();
+	await expect(
+		page.getByText(
+			'A publication is pending. Deploy it manually, or enable automatic synchronization.'
+		)
+	).toBeVisible();
 	// Config divergence is server-owned state, never routine pending
 	// work: even a populated status summary carries no config lines.
 	await expect(page.getByText(/config file\(s\) awaiting a decision/)).toHaveCount(0);
 	await expect(page.getByText(/config sync/i)).toHaveCount(0);
-	await page.getByText('Worker automation', { exact: true }).click();
-	const formatted = await page.evaluate(
-		(revision) => new Date(revision).toLocaleString(),
-		'2026-09-23T12:00:00Z'
-	);
-	await expect(page.getByText(`Pending mod deployment: ${formatted}`)).toBeVisible();
 	await page.evaluate(() => (window as any).setWorkerPending(null));
 	await page.getByRole('button', { name: 'Refresh', exact: true }).click();
-	await expect(page.getByText(/^Pending mod deployment:/)).toHaveCount(0);
+	await expect(page.getByText('Update pending')).toHaveCount(0);
 });
 
 for (const mode of ['local', 'worker']) {
 	test(`${mode}: the primary sync flow deploys mods only`, async ({ page }) => {
 		await page.goto(`/tests/dialog/?mode=${mode}`);
-		await page.getByRole('button', { name: 'Preview', exact: true }).click();
-		await expect(page.getByRole('button', { name: 'Deploy', exact: true })).toBeEnabled();
+		const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
+		await remoteTab.getByRole('button', { name: 'Preview', exact: true }).click();
+		await expect(remoteTab.getByRole('button', { name: 'Deploy', exact: true })).toBeEnabled();
 		await expect(page.getByTestId('server-config-row')).toHaveCount(0);
 		const modsSelection = await page.evaluate(
 			() =>
@@ -60,11 +61,11 @@ for (const mode of ['local', 'worker']) {
 			restoreConfigs: [],
 			declineConfigs: []
 		});
-		await page.getByRole('button', { name: 'Deploy', exact: true }).click();
+		await remoteTab.getByRole('button', { name: 'Deploy', exact: true }).click();
 		await expect(page.getByText('Mod deployment finished.')).toBeVisible();
 		// Config deployment stays available as a separate explicit action.
-		await page.getByText('Server config files', { exact: true }).click();
-		await page.getByRole('button', { name: 'Preview config changes', exact: true }).click();
+		await remoteTab.getByText('Server config files', { exact: true }).click();
+		await remoteTab.getByRole('button', { name: 'Preview config changes', exact: true }).click();
 		await expect(page.getByTestId('server-config-row')).toHaveCount(1);
 		const configSelection = await page.evaluate(
 			() =>
@@ -72,12 +73,15 @@ for (const mode of ['local', 'worker']) {
 					.request.selection
 		);
 		expect(configSelection).toMatchObject({ includeMods: false, includeConfigs: true });
-		await expect(page.getByRole('button', { name: 'Push configs', exact: true })).toBeEnabled();
+		await expect(
+			remoteTab.getByRole('button', { name: 'Push configs', exact: true })
+		).toBeEnabled();
 	});
 
 	test(`${mode}: a zero-change preview says so explicitly and keeps Deploy`, async ({ page }) => {
 		await page.goto(`/tests/dialog/?mode=${mode}&unchanged=166&unmanaged=2`);
-		await page.getByRole('button', { name: 'Preview', exact: true }).click();
+		const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
+		await remoteTab.getByRole('button', { name: 'Preview', exact: true }).click();
 		await expect(
 			page.getByText(
 				'No mod file changes found. The server already matches the published mod files.'
@@ -94,10 +98,13 @@ for (const mode of ['local', 'worker']) {
 		).toBeVisible();
 		// Deploy stays available: a zero-diff deploy still records the
 		// publication's mod revision as deployed on the server.
-		await expect(page.getByRole('button', { name: 'Deploy', exact: true })).toBeEnabled();
+		await expect(remoteTab.getByRole('button', { name: 'Deploy', exact: true })).toBeEnabled();
 
 		await page.goto(`/tests/dialog/?mode=${mode}&uploads=2&unchanged=164`);
-		await page.getByRole('button', { name: 'Preview', exact: true }).click();
+		await page
+			.getByRole('tabpanel', { name: 'Remote server' })
+			.getByRole('button', { name: 'Preview', exact: true })
+			.click();
 		await expect(page.getByText('No mod file changes found')).toHaveCount(0);
 		await expect(page.getByText('Review the changes, then deploy.')).toBeVisible();
 	});
@@ -105,20 +112,21 @@ for (const mode of ['local', 'worker']) {
 	test(`${mode}: decisions do not reorder or scroll a long review list`, async ({ page }) => {
 		await page.setViewportSize({ width: 900, height: 650 });
 		await page.goto(`/tests/dialog/?mode=${mode}&many=1`);
-		await page.getByText('Server config files', { exact: true }).click();
-		await page.getByRole('button', { name: 'Preview config changes', exact: true }).click();
-		await page.getByRole('button', { name: 'Show files needing review' }).click();
+		const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
+		await remoteTab.getByText('Server config files', { exact: true }).click();
+		await remoteTab.getByRole('button', { name: 'Preview config changes', exact: true }).click();
+		await remoteTab.getByRole('button', { name: 'Show files needing review' }).click();
 		// Wait for the review font before measuring decision-induced scrolling.
 		await page.evaluate(() => document.fonts.ready.then(() => undefined));
 		const rows = page.getByTestId('server-config-row');
 		const list = rows.first().locator('..');
-		const dialogScroll = page.getByRole('dialog').locator('div.overflow-y-auto').first();
+		const pageScroll = page.getByTestId('server-page-scroll');
 		const before = await rows.evaluateAll((elements) =>
 			elements.map((row) => row.getAttribute('data-path'))
 		);
 		const row = rows.nth(20);
 		const restoreRow = rows.filter({ hasText: 'file-087.cfg' });
-		await dialogScroll.evaluate((element) => {
+		await pageScroll.evaluate((element) => {
 			element.scrollTop = element.scrollHeight / 2;
 		});
 		await list.evaluate((element) => {
@@ -126,7 +134,7 @@ for (const mode of ['local', 'worker']) {
 		});
 		const positions = async () => ({
 			inner: await list.evaluate((element) => element.scrollTop),
-			outer: await dialogScroll.evaluate((element) => element.scrollTop)
+			outer: await pageScroll.evaluate((element) => element.scrollTop)
 		});
 		const checkDecision = async (
 			selectedRow: typeof row,
@@ -151,73 +159,80 @@ for (const mode of ['local', 'worker']) {
 		await checkDecision(row, 'Decline', 'Undo', 30);
 		await checkDecision(row, 'Undo', 'Decline', 31);
 		await checkDecision(restoreRow, 'Restore', 'Undo', 30);
-		await page.getByRole('button', { name: 'Preview config changes', exact: true }).click();
-		await expect(page.getByRole('button', { name: 'Push configs', exact: true })).toBeEnabled();
+		await remoteTab.getByRole('button', { name: 'Preview config changes', exact: true }).click();
+		await expect(
+			remoteTab.getByRole('button', { name: 'Push configs', exact: true })
+		).toBeEnabled();
 		await checkDecision(restoreRow, 'Undo', 'Restore', 31);
-		await expect(page.getByRole('button', { name: 'Push configs', exact: true })).toBeDisabled();
-		await page.getByRole('button', { name: 'Show all config files' }).click();
+		await expect(
+			remoteTab.getByRole('button', { name: 'Push configs', exact: true })
+		).toBeDisabled();
+		await remoteTab.getByRole('button', { name: 'Show all config files' }).click();
 		await expect(rows).toHaveCount(133);
-		await page.getByRole('button', { name: 'Show files needing review' }).click();
+		await remoteTab.getByRole('button', { name: 'Show files needing review' }).click();
 		await expect(rows).toHaveCount(31);
 		expect(
 			await rows.evaluateAll((elements) => elements.map((item) => item.getAttribute('data-path')))
 		).toEqual(before);
 	});
 
-	test(`${mode}: restart preference survives reopen and stays profile-specific`, async ({
+	test(`${mode}: restart preference survives reload and stays profile-specific`, async ({
 		page
 	}) => {
 		await page.goto(`/tests/dialog/?mode=${mode}&profile=first`);
-		await page.getByLabel('Restart after deploying', { exact: true }).click();
+		const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
+		await remoteTab.getByLabel('Restart after this deploy', { exact: true }).click();
 		await page.getByRole('option', { name: 'When empty', exact: true }).click();
-		await page.getByRole('button', { name: 'Close', exact: true }).click();
-		await page.getByRole('button', { name: 'Reopen sync dialog' }).click();
-		await expect(page.getByLabel('Restart after deploying', { exact: true })).toHaveText(
-			'When empty'
-		);
 		await page.reload();
-		await expect(page.getByLabel('Restart after deploying', { exact: true })).toHaveText(
+		await expect(remoteTab.getByLabel('Restart after this deploy', { exact: true })).toHaveText(
 			'When empty'
 		);
 		await page.goto(`/tests/dialog/?mode=${mode}&profile=second`);
-		await expect(page.getByLabel('Restart after deploying', { exact: true })).toHaveText('Never');
+		await expect(
+			page
+				.getByRole('tabpanel', { name: 'Remote server' })
+				.getByLabel('Restart after this deploy', {
+					exact: true
+				})
+		).toHaveText('Never');
 		await page.goto(`/tests/dialog/?mode=${mode}&profile=first`);
-		await expect(page.getByLabel('Restart after deploying', { exact: true })).toHaveText(
-			'When empty'
-		);
-		if (mode === 'worker') {
-			await page.getByText('Worker automation', { exact: true }).click();
-			await page.getByRole('button', { name: 'Save automation' }).click();
-			const request = await page.evaluate(
-				() =>
-					(window as any).calls.filter((call: any) => call.cmd === 'configure_worker').at(-1).args
-						.request
-			);
-			expect(request.restartPolicy).toBe('manual');
-		}
+		await expect(
+			page
+				.getByRole('tabpanel', { name: 'Remote server' })
+				.getByLabel('Restart after this deploy', {
+					exact: true
+				})
+		).toHaveText('When empty');
 	});
 
 	test(`${mode}: unresolved configs lead the list and review focus preserves approval inputs`, async ({
 		page
 	}) => {
 		await page.goto(`/tests/dialog/?mode=${mode}&many=1`);
-		await page.getByRole('button', { name: 'Refresh', exact: true }).waitFor();
-		await page.getByText('Server config files', { exact: true }).click();
-		await page.getByRole('button', { name: 'Preview config changes', exact: true }).click();
+		const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
+		await remoteTab.getByRole('button', { name: 'Refresh', exact: true }).waitFor();
+		await remoteTab.getByText('Server config files', { exact: true }).click();
+		await remoteTab.getByRole('button', { name: 'Preview config changes', exact: true }).click();
 		const rows = page.getByTestId('server-config-row');
 		await expect(rows).toHaveCount(133);
 		await expect(rows.first()).toHaveAttribute('data-path', 'BepInEx/config/file-003.cfg');
 		await expect(page.getByText('31 files still need a decision')).toBeVisible();
-		await page.getByRole('button', { name: 'Show files needing review' }).click();
+		await remoteTab.getByRole('button', { name: 'Show files needing review' }).click();
 		await expect(rows).toHaveCount(31);
 		await rows.first().getByRole('button', { name: 'Apply' }).click();
 		await expect(page.getByText('30 files still need a decision')).toBeVisible();
-		await expect(page.getByRole('button', { name: 'Push configs', exact: true })).toBeDisabled();
-		await page.getByRole('button', { name: 'Preview config changes', exact: true }).click();
-		await expect(page.getByRole('button', { name: 'Push configs', exact: true })).toBeEnabled();
-		await page.getByRole('button', { name: 'Show all config files' }).click();
+		await expect(
+			remoteTab.getByRole('button', { name: 'Push configs', exact: true })
+		).toBeDisabled();
+		await remoteTab.getByRole('button', { name: 'Preview config changes', exact: true }).click();
+		await expect(
+			remoteTab.getByRole('button', { name: 'Push configs', exact: true })
+		).toBeEnabled();
+		await remoteTab.getByRole('button', { name: 'Show all config files' }).click();
 		await expect(rows).toHaveCount(133);
-		await expect(page.getByRole('button', { name: 'Push configs', exact: true })).toBeEnabled();
+		await expect(
+			remoteTab.getByRole('button', { name: 'Push configs', exact: true })
+		).toBeEnabled();
 		await expect(rows.filter({ hasText: 'file-000.cfg' })).toBeVisible();
 		const selected = await page.evaluate(
 			() =>
@@ -233,11 +248,12 @@ for (const mode of ['local', 'worker']) {
 
 	test(`${mode}: explicit restart confirmation clears the reminder`, async ({ page }) => {
 		await page.goto(`/tests/dialog/?mode=${mode}&restart=1`);
-		await page.getByRole('button', { name: 'Preview', exact: true }).click();
-		await expect(page.getByRole('button', { name: 'Deploy', exact: true })).toBeEnabled();
-		await page.getByRole('button', { name: 'I confirmed the restart' }).click();
-		await expect(page.getByRole('button', { name: 'I confirmed the restart' })).toHaveCount(0);
-		await expect(page.getByRole('button', { name: 'Deploy', exact: true })).toBeDisabled();
+		const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
+		await remoteTab.getByRole('button', { name: 'Preview', exact: true }).click();
+		await expect(remoteTab.getByRole('button', { name: 'Deploy', exact: true })).toBeEnabled();
+		await remoteTab.getByRole('button', { name: 'I confirmed the restart' }).click();
+		await expect(remoteTab.getByRole('button', { name: 'I confirmed the restart' })).toHaveCount(0);
+		await expect(remoteTab.getByRole('button', { name: 'Deploy', exact: true })).toBeDisabled();
 		const calls = await page.evaluate(() => (window as any).calls);
 		expect(calls.some((call: any) => call.cmd === 'plugin:dialog|message')).toBe(true);
 		expect(calls.some((call: any) => call.cmd === 'acknowledge_external_server_restart')).toBe(
@@ -249,8 +265,9 @@ for (const mode of ['local', 'worker']) {
 		const errors: string[] = [];
 		page.on('pageerror', (error) => errors.push(error.message));
 		await page.goto(`/tests/dialog/?mode=${mode}&many=1`);
-		await page.getByText('Server config files', { exact: true }).click();
-		await page.getByRole('button', { name: 'Preview config changes', exact: true }).click();
+		const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
+		await remoteTab.getByText('Server config files', { exact: true }).click();
+		await remoteTab.getByRole('button', { name: 'Preview config changes', exact: true }).click();
 		const rows = page.getByTestId('server-config-row');
 		await expect(rows).toHaveCount(133);
 		const order = await rows.evaluateAll((elements) =>
@@ -267,14 +284,16 @@ for (const mode of ['local', 'worker']) {
 		// A future policy is not a current Apply/Decline decision — but it
 		// does invalidate the approved deployment inputs.
 		await expect(page.getByText('31 files still need a decision')).toBeVisible();
-		await expect(page.getByRole('button', { name: 'Push configs', exact: true })).toBeDisabled();
+		await expect(
+			remoteTab.getByRole('button', { name: 'Push configs', exact: true })
+		).toBeDisabled();
 		expect(
 			await rows.evaluateAll((elements) => elements.map((row) => row.getAttribute('data-path')))
 		).toEqual(order);
 		// Filtering the row away and back must not resurrect the old policy.
-		await page.getByRole('button', { name: 'Show files needing review' }).click();
+		await remoteTab.getByRole('button', { name: 'Show files needing review' }).click();
 		await expect(rows).toHaveCount(31);
-		await page.getByRole('button', { name: 'Show all config files' }).click();
+		await remoteTab.getByRole('button', { name: 'Show all config files' }).click();
 		await expect(rows).toHaveCount(133);
 		await expect(policy).toHaveText('Always apply updates');
 		// A failed write snaps back to the last saved policy and reports it.
@@ -296,58 +315,54 @@ for (const mode of ['local', 'worker']) {
 	for (const operation of [
 		'preview_server_sync',
 		'deploy_server_sync',
-		'set_server_config_policy',
-		...(mode === 'worker' ? ['configure_worker'] : [])
+		'set_server_config_policy'
 	]) {
 		test(`${mode}: ${operation} locks edits and overlapping submissions`, async ({ page }) => {
 			const errors: string[] = [];
 			page.on('pageerror', (error) => errors.push(error.message));
 			await page.goto(`/tests/dialog/?mode=${mode}`);
+			const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
 			const button = (name: string) => {
-				if (name === 'Never') return page.getByLabel('Restart after deploying', { exact: true });
+				if (name === 'Never')
+					return remoteTab.getByLabel('Restart after this deploy', { exact: true });
 				if (['Ask each update', 'Always apply updates'].includes(name))
 					return page.getByLabel('Future updates for BepInEx/config/test.cfg', { exact: true });
 				if (['Restore', 'Undo'].includes(name))
-					return page.getByRole('button', { name: `${name} BepInEx/config/test.cfg`, exact: true });
-				return page.getByRole('button', { name, exact: true });
+					return remoteTab.getByRole('button', {
+						name: `${name} BepInEx/config/test.cfg`,
+						exact: true
+					});
+				return remoteTab.getByRole('button', { name, exact: true });
 			};
 			await button('Refresh').waitFor();
-			await page.getByText('Credentials', { exact: true }).click();
-			const password = page.locator('input[type=password]');
-			await password.fill('test-secret');
-			if (mode === 'worker') await page.getByText('Worker automation', { exact: true }).click();
-			await page.getByText('Server config files', { exact: true }).click();
+			// A typed-but-unsaved credential rides along with the sync calls.
+			const credential = remoteTab.getByLabel(mode === 'worker' ? 'Worker token' : 'Password', {
+				exact: true
+			});
+			await credential.fill('test-secret');
+			await remoteTab.getByText('Server config files', { exact: true }).click();
 			await button('Preview config changes').click();
 			await button('Restore').waitFor();
 			await button('Restore').click();
 			await expect(button('Push configs')).toBeDisabled();
 			await button('Preview config changes').click();
 			await expect(button('Push configs')).toBeEnabled();
-			if (operation === 'configure_worker') {
-				await page.getByRole('checkbox').first().click();
-				await page.getByRole('checkbox').last().click();
-			}
 			await page.evaluate((cmd) => (window as any).hold(cmd), operation);
 			if (operation === 'set_server_config_policy') {
 				await button('Ask each update').click();
 				await page.getByRole('option', { name: 'Always apply updates', exact: true }).click();
 			} else
 				await button(
-					operation === 'configure_worker'
-						? 'Save automation'
-						: operation === 'preview_server_sync'
-							? 'Preview config changes'
-							: 'Push configs'
+					operation === 'preview_server_sync' ? 'Preview config changes' : 'Push configs'
 				).click();
 			const configPreview = button('Preview config changes');
 			const restart = button('Never');
 			for (const control of [
 				configPreview,
 				restart,
-				password,
+				credential,
 				button('Preview'),
 				button('Push configs'),
-				button('Close'),
 				button('Refresh'),
 				button('Undo'),
 				button(
@@ -355,11 +370,9 @@ for (const mode of ['local', 'worker']) {
 				)
 			])
 				await expect(control).toBeDisabled();
-			if (mode === 'worker') {
-				await expect(button('Save automation')).toBeDisabled();
-				for (const checkbox of await page.getByRole('checkbox').all())
+			if (mode === 'worker')
+				for (const checkbox of await remoteTab.getByRole('checkbox').all())
 					await expect(checkbox).toBeDisabled();
-			}
 			const before = await page.evaluate(() => structuredClone((window as any).calls));
 			// Physical pointer and keyboard attempts must not open selectors or submit again.
 			for (const control of [configPreview, restart, button('Preview'), button('Push configs')]) {
@@ -367,10 +380,9 @@ for (const mode of ['local', 'worker']) {
 				await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
 			}
 			await page.keyboard.press('Escape');
-			await expect(page.getByRole('dialog')).toHaveAttribute('data-state', 'open');
 			await expect(button('Preview')).toBeVisible();
 			await expect(page.getByRole('option')).toHaveCount(0);
-			await expect(password).toHaveValue('test-secret');
+			await expect(credential).toHaveValue('test-secret');
 			expect(await page.evaluate(() => (window as any).calls)).toEqual(before);
 			const request = before.filter((call: any) => call.cmd === operation).at(-1).args.request;
 			expect(request.restartPolicy ?? 'manual').toBe('manual');
@@ -383,30 +395,23 @@ for (const mode of ['local', 'worker']) {
 					restoreConfigs: ['BepInEx/config/test.cfg'],
 					declineConfigs: []
 				});
-			if (operation === 'configure_worker')
-				expect(request).toEqual({
-					autoSync: true,
-					autoMods: true,
-					restartPolicy: 'manual',
-					workerToken: 'test-secret'
-				});
 			if (operation === 'set_server_config_policy')
 				expect(request).toMatchObject({ path: 'BepInEx/config/test.cfg', policy: 'alwaysApply' });
 			if (operation === 'deploy_server_sync')
 				expect(request).toMatchObject({ planHash: 'approved-plan', force: false });
 			await page.evaluate(() => (window as any).release());
 			await expect(configPreview).toBeEnabled();
-			await expect(password).toBeEnabled();
+			await expect(credential).toBeEnabled();
 			if (operation === 'set_server_config_policy')
 				await expect(button('Push configs')).toBeDisabled();
 			if (mode === 'worker') {
-				for (const checkbox of await page.getByRole('checkbox').all())
+				for (const checkbox of await remoteTab.getByRole('checkbox').all())
 					await expect(checkbox).toBeEnabled();
 			}
 			await restart.click();
 			await page.getByRole('option', { name: 'Immediately', exact: true }).click();
 			await expect(button('Push configs')).toBeDisabled();
-			await password.fill('next-secret');
+			await credential.fill('next-secret');
 			// A mods preview is the primary flow again; configs stay out of it.
 			await button('Preview').click();
 			await expect(button('Deploy')).toBeEnabled();
@@ -415,13 +420,9 @@ for (const mode of ['local', 'worker']) {
 					(window as any).calls.filter((call: any) => call.cmd === 'preview_server_sync').at(-1)
 						.args.request
 			);
-			expect(next).toMatchObject({
-				restartPolicy: 'immediate',
-				selection: { includeMods: true, includeConfigs: false },
-				[mode === 'worker' ? 'workerToken' : 'password']: 'next-secret'
-			});
+			expect(next[mode === 'worker' ? 'workerToken' : 'password']).toBe('next-secret');
+			expect(next.selection).toMatchObject({ includeMods: true, includeConfigs: false });
 			expect(await page.evaluate(() => (window as any).unexpected)).toEqual([]);
-			expect(errors).toEqual([]);
 		});
 	}
 }

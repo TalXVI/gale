@@ -5,7 +5,6 @@
 	import * as api from '$lib/api';
 	import Icon from '@iconify/svelte';
 	import games from '$lib/state/game.svelte';
-	import server from '$lib/state/server.svelte';
 	import { message } from '@tauri-apps/plugin-dialog';
 	import { m } from '$lib/paraglide/messages';
 	import type { LaunchOption } from '$lib/types';
@@ -14,15 +13,12 @@
 	import ContextMenuContent from '../ui/ContextMenuContent.svelte';
 	import { type ContextItem } from '$lib/types';
 	import { PersistedState } from '$lib/state/persisted-state.svelte';
-	import DedicatedServerDialog from '$lib/components/dialogs/DedicatedServerDialog.svelte';
-	import { pushInfoToast } from '$lib/toast';
 
-	type Mode = 'vanilla' | 'modded' | 'server';
+	type Mode = 'vanilla' | 'modded';
 
 	const labels: Record<Mode, string> = {
 		vanilla: m.toolBar_launch_vanilla(),
-		modded: m.toolBar_launch_modded(),
-		server: m.toolBar_launch_server()
+		modded: m.toolBar_launch_modded()
 	};
 
 	const launchDropdownItems = $derived.by(() => {
@@ -43,23 +39,12 @@
 			}
 		];
 
-		if (games.active?.dedicatedServer) {
-			items.push({
-				label: server.status.state === 'running' ? m.dedicatedServerDialog_manage() : labels.server,
-				onclick: () => {
-					mode.current = 'server';
-					dedicatedServerDialogOpen = true;
-				}
-			});
-		}
-
 		return items;
 	});
 
 	let launchDialogOpen = $state(false);
 	let launchDropdownOpen = $state(false);
 	let launchOptionsDialogOpen = $state(false);
-	let dedicatedServerDialogOpen = $state(false);
 	let launchOptions = $state<LaunchOption[]>([]);
 
 	const mode = new PersistedState<Mode>('launchMode', 'modded');
@@ -67,11 +52,6 @@
 	const activeGameName = $derived(games.active?.name ?? m.unknown());
 
 	async function launchGame() {
-		if (mode.current === 'server') {
-			await launchServer();
-			return;
-		}
-
 		if (await api.profile.install.hasPendingInstallations()) {
 			await message(m.toolBar_launchGame_message());
 			return;
@@ -102,28 +82,6 @@
 		await doLaunch();
 	}
 
-	/// An already-configured server launches immediately; first-time setup
-	/// opens the settings dialog instead.
-	async function launchServer() {
-		if (server.status.state === 'running') {
-			dedicatedServerDialogOpen = true;
-			return;
-		}
-		const settings = await api.profile.server.getSettings();
-
-		if (settings === null || settings.location === 'remote' || settings.serverName.trim() === '') {
-			dedicatedServerDialogOpen = true;
-			return;
-		}
-
-		try {
-			await api.profile.server.launch(null, '', true);
-			pushInfoToast({ message: m.toolBar_launchServer_started() });
-		} catch {
-			// invoke already reports the failure as an error toast.
-		}
-	}
-
 	async function doLaunch(args?: string) {
 		launchDialogOpen = true;
 		try {
@@ -137,8 +95,9 @@
 		doLaunch(args);
 	}
 
+	// 'server' was a launch mode before the dedicated server page replaced it.
 	$effect(() => {
-		if (mode.current === 'server' && !games.active?.dedicatedServer) {
+		if ((mode.current as string) === 'server') {
 			mode.current = 'modded';
 		}
 	});
@@ -150,9 +109,7 @@
 	<button onclick={() => launchGame()} class="flex items-center pr-2 pl-4">
 		<Icon icon="mdi:play-circle" class="mr-2 text-xl" />
 		<span>
-			{mode.current === 'server' && server.status.state === 'running'
-				? m.dedicatedServerDialog_manage()
-				: labels[mode.current]}
+			{labels[mode.current as Mode] ?? labels.modded}
 		</span>
 	</button>
 
@@ -189,5 +146,3 @@
 	gameName={games.active?.name ?? ''}
 	onselect={handleLaunchOptionSelect}
 />
-
-<DedicatedServerDialog bind:open={dedicatedServerDialogOpen} />
