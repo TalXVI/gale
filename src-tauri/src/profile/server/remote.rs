@@ -2,6 +2,7 @@ use std::{
     fs::File,
     io::{Cursor, ErrorKind, Read, Write},
     net::{Shutdown, TcpStream, ToSocketAddrs},
+    ops::DerefMut,
     path::Path,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -86,6 +87,37 @@ pub trait RemoteOps: Send {
     /// File contents, bounded to `max` bytes. Implementations must refuse to
     /// download files larger than `max` instead of truncating them.
     fn read(&mut self, path: &RemotePath, max: u64) -> Result<Option<Vec<u8>>>;
+    /// Streams the file at `path` into `sink`, bounded to `listed_size`
+    /// bytes from the listing that supplied it. `Ok(false)` means the file
+    /// is absent; `Ok(true)` means bytes were written (fewer than
+    /// `listed_size` if the file shrank — the caller detects divergence
+    /// through the hash). A file larger than its listed size is an error.
+    ///
+    /// The default implementation buffers through [`Self::read`]:
+    /// semantically identical, just without streaming. Transports override
+    /// it to skip the redundant metadata probe — the listing already
+    /// reported the size — and to hash the bytes as they arrive.
+    fn read_listed(
+        &mut self,
+        path: &RemotePath,
+        listed_size: u64,
+        sink: &mut dyn Write,
+    ) -> Result<bool> {
+        match self.read(path, listed_size)? {
+            Some(bytes) => {
+                sink.write_all(&bytes)
+                    .with_context(|| format!("failed to consume remote file {path}"))?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+    /// A factory for extra read-only connections used by snapshot scanning
+    /// and verification. `None` means this transport cannot open helpers —
+    /// the snapshot falls back to the authoritative connection.
+    fn reader_connector(&self) -> Option<ReaderConnector> {
+        None
+    }
     /// Writes bytes to `path`, creating or truncating it.
     fn write(&mut self, path: &RemotePath, bytes: &[u8]) -> Result<()>;
     /// Uploads a local file to `path`, streaming its contents.
@@ -105,6 +137,54 @@ pub trait RemoteOps: Send {
     fn claim_dir(&mut self, path: &RemotePath) -> Result<bool>;
     /// Re-establishes the underlying transport after an error.
     fn reconnect(&mut self) -> Result<()>;
+}
+
+/// Read-only operations used by snapshot helper connections. No mutating
+/// methods exist, so a helper connection cannot change the server.
+pub trait RemoteReader: Send {
+    /// See [`RemoteOps::list`].
+    fn list(&mut self, dir: &RemotePath) -> Result<Vec<RemoteEntry>>;
+    /// See [`RemoteOps::read_listed`].
+    fn read_listed(
+        &mut self,
+        path: &RemotePath,
+        listed_size: u64,
+        sink: &mut dyn Write,
+    ) -> Result<bool>;
+    /// See [`RemoteOps::reconnect`].
+    fn reconnect(&mut self) -> Result<()>;
+}
+
+/// Opens another read-only connection to the same server.
+pub type ReaderConnector = Arc<dyn Fn() -> Result<Box<dyn RemoteReader>> + Send + Sync>;
+
+/// Exposes only the read-only subset of a [`RemoteOps`]. Wraps anything
+/// that dereferences to one: an owned `Box<dyn RemoteOps>` for helper
+/// connections, or `&mut dyn RemoteOps` to lend the authoritative
+/// connection to the serial fallback path.
+pub struct ReadOnly<T>(pub T);
+
+impl<T, R> RemoteReader for ReadOnly<T>
+where
+    T: DerefMut<Target = R> + Send,
+    R: RemoteOps + ?Sized,
+{
+    fn list(&mut self, dir: &RemotePath) -> Result<Vec<RemoteEntry>> {
+        self.0.list(dir)
+    }
+
+    fn read_listed(
+        &mut self,
+        path: &RemotePath,
+        listed_size: u64,
+        sink: &mut dyn Write,
+    ) -> Result<bool> {
+        self.0.read_listed(path, listed_size, sink)
+    }
+
+    fn reconnect(&mut self) -> Result<()> {
+        self.0.reconnect()
+    }
 }
 
 pub struct RemoteConnection {
@@ -625,6 +705,102 @@ impl RemoteOps for RemoteConnection {
         }
 
         Ok(result)
+    }
+
+    /// The streaming payload read used by snapshot verification. Unlike
+    /// [`Self::read`] it does not probe the file first — the listing that
+    /// selected this file already reported its size — and it hashes the
+    /// data channel straight into `sink` instead of a buffer.
+    fn read_listed(
+        &mut self,
+        path: &RemotePath,
+        listed_size: u64,
+        sink: &mut dyn Write,
+    ) -> Result<bool> {
+        self.renew_ftp_if_needed()?;
+
+        let transfer = if matches!(self.client, RemoteClient::Ftp(_)) {
+            self.transfer_count += 1;
+            Some((self.transfer_count, self.connected_at.elapsed().as_millis()))
+        } else {
+            None
+        };
+
+        let result: Option<u64> = match &mut self.client {
+            RemoteClient::Sftp { sftp, .. } => match sftp.open(Path::new(path.as_str())) {
+                Ok(file) => Some(
+                    std::io::copy(&mut file.take(listed_size.saturating_add(1)), sink)
+                        .with_context(|| format!("SFTP read failed for {path}"))?,
+                ),
+                Err(err) if is_sftp_not_found(&err) => None,
+                Err(err) => return Err(err.into()),
+            },
+            RemoteClient::Ftp(ftp) => match ftp.retr_as_stream(path.as_str()) {
+                Ok(mut stream) => {
+                    let (transfer_count, connection_age_ms) = transfer.unwrap();
+                    debug!(phase = "verify.data", command = "RETR", path = %path, transfer_count, connection_age_ms, "FTP data transfer started");
+                    let transfer_started = Instant::now();
+                    let read =
+                        std::io::copy(&mut (&mut stream).take(listed_size.saturating_add(1)), sink);
+                    let finalize = ftp.finalize_retr_stream(stream);
+                    if let Err(err) = &read {
+                        warn!(phase = "verify.data", command = "RETR", path = %path, transfer_count, connection_age_ms, transfer_duration_ms = transfer_started.elapsed().as_millis(), error = %err, "FTP data channel read failed");
+                    }
+                    if let Err(err) = &finalize {
+                        warn!(phase = "verify.completion", command = "RETR", path = %path, transfer_count, connection_age_ms, transfer_duration_ms = transfer_started.elapsed().as_millis(), error = %err, "FTP control channel did not confirm transfer completion");
+                    }
+                    let copied =
+                        read.with_context(|| format!("FTP RETR data read failed for {path}"))?;
+                    finalize.with_context(|| format!("FTP RETR completion failed for {path}"))?;
+                    debug!(phase = "verify.completion", command = "RETR", path = %path, transfer_count, connection_age_ms, transfer_duration_ms = transfer_started.elapsed().as_millis(), bytes = copied, "FTP control channel confirmed transfer completion");
+                    Some(copied)
+                }
+                Err(err) if is_ftp_not_found(&err) => None,
+                Err(err) => {
+                    let (transfer_count, connection_age_ms) = transfer.unwrap();
+                    warn!(phase = "verify.start", command = "RETR", path = %path, transfer_count, connection_age_ms, error = %err, "FTP transfer command failed");
+                    return Err(err).with_context(|| format!("FTP RETR failed for {path}"));
+                }
+            },
+        };
+
+        // A file that grew past its listing since the snapshot was taken
+        // is remote drift, not a truncated download.
+        if let Some(copied) = result {
+            ensure!(
+                copied <= listed_size,
+                "remote file {path} grew past its listed {listed_size} bytes"
+            );
+            return Ok(true);
+        }
+
+        // Same RETR 550 ambiguity as `read`: cross-check existence so a
+        // refused read cannot masquerade as absence.
+        if matches!(self.client, RemoteClient::Ftp(_)) && self.is_file(path)? {
+            bail!("remote server refuses to return the existing file {path}");
+        }
+
+        Ok(false)
+    }
+
+    /// Snapshot helpers are full connections to the same server, cloned
+    /// from this one's settings; each keeps its own proactive renewal and
+    /// reconnect handling. Trust prompts fail the helper rather than
+    /// silently sending credentials.
+    fn reader_connector(&self) -> Option<ReaderConnector> {
+        let settings = self.settings.clone();
+        let password = self.password.clone();
+        Some(Arc::new(move || {
+            match Self::connect(&settings, &password)? {
+                ConnectionAttempt::Connected(conn) => {
+                    Ok(Box::new(ReadOnly(Box::new(conn))) as Box<dyn RemoteReader>)
+                }
+                ConnectionAttempt::HostKeyUntrusted { .. }
+                | ConnectionAttempt::CertificateUntrusted { .. } => {
+                    bail!("server trust verification failed while opening a snapshot reader")
+                }
+            }
+        }))
     }
 
     fn is_file(&mut self, path: &RemotePath) -> Result<bool> {
@@ -1183,7 +1359,7 @@ pub(crate) mod memory {
 
     use eyre::{Context, Result, bail};
 
-    use super::{RemoteEntry, RemoteOps};
+    use super::{ReadOnly, ReaderConnector, RemoteEntry, RemoteOps, RemoteReader};
     use crate::profile::server::paths::RemotePath;
 
     /// In-memory `RemoteOps` for engine/state/lease tests. Supplies remote
@@ -1203,6 +1379,13 @@ pub(crate) mod memory {
         /// Return FTP 550 when rename cannot find its source or overwrite.
         pub ftp_rename_semantics: bool,
         pub write_events: Option<std::sync::mpsc::Sender<()>>,
+        /// Whether `reader_connector` offers helper readers. Off by
+        /// default so existing tests keep the serial snapshot path.
+        pub allow_readers: bool,
+        /// Reader connects fail instead of opening a helper.
+        pub fail_reader_connect: bool,
+        /// Helper readers opened through `reader_connector`.
+        pub readers_opened: usize,
     }
 
     impl MemoryRemote {
@@ -1219,6 +1402,9 @@ pub(crate) mod memory {
                 connection_dead: false,
                 ftp_rename_semantics: false,
                 write_events: None,
+                allow_readers: false,
+                fail_reader_connect: false,
+                readers_opened: 0,
             }
         }
 
@@ -1512,6 +1698,28 @@ pub(crate) mod memory {
     /// A shared handle so tests can keep observing the remote after it is
     /// boxed into a [`crate::profile::server::engine::Session`].
     impl RemoteOps for std::sync::Arc<std::sync::Mutex<MemoryRemote>> {
+        /// Helpers are another handle onto the same shared remote, so
+        /// they see identical state through the read-only interface.
+        fn reader_connector(&self) -> Option<ReaderConnector> {
+            if !self.lock().unwrap().allow_readers {
+                return None;
+            }
+            let inner = self.clone();
+            Some(std::sync::Arc::new(move || {
+                {
+                    let mut remote = inner.lock().unwrap();
+                    if remote.fail_reader_connect {
+                        bail!("injected reader connection failure");
+                    }
+                    remote.readers_opened += 1;
+                }
+                Ok(
+                    Box::new(ReadOnly(Box::new(inner.clone()) as Box<dyn RemoteOps>))
+                        as Box<dyn RemoteReader>,
+                )
+            }))
+        }
+
         fn is_dir(&mut self, path: &RemotePath) -> Result<bool> {
             self.lock().unwrap().is_dir(path)
         }
@@ -1628,6 +1836,21 @@ pub(crate) mod fake_ftp {
         pub expire_control_after: Option<Duration>,
         /// Expire an individual control connection after this many data transfers.
         pub expire_control_after_transfers: Option<usize>,
+        /// Simulated round-trip time: the server sleeps this long after
+        /// reading each command line, and once more before accepting the
+        /// data connection a transfer command opens. Initial value; can be
+        /// changed later through [`FakeFtp::set_latency`].
+        pub latency: Option<Duration>,
+    }
+
+    /// A path-scoped RETR interruption armed by
+    /// [`FakeFtp::reset_on_retr_of`]: the next `remaining` RETRs of exactly
+    /// `path` kill their control connection, either before or after the
+    /// `226` completion reply.
+    struct PathReset {
+        path: String,
+        remaining: usize,
+        after_completion: bool,
     }
 
     /// A running fake server. `fs` is shared with every accepted
@@ -1642,6 +1865,12 @@ pub(crate) mod fake_ftp {
         reset_retr_at: Arc<std::sync::atomic::AtomicUsize>,
         reset_retr_remaining: Arc<std::sync::atomic::AtomicUsize>,
         reset_after_completion: Arc<std::sync::atomic::AtomicBool>,
+        path_reset: Arc<Mutex<Option<PathReset>>>,
+        /// The most control connections the server has held at once.
+        peak_connection_count: Arc<std::sync::atomic::AtomicUsize>,
+        /// Current simulated round-trip time; shared so tests can turn it
+        /// on after setup work that should run at full speed.
+        latency: Arc<Mutex<Option<Duration>>>,
         /// The blake3 fingerprint of the self-signed certificate the
         /// server presents when `Options::tls` is on; `None` otherwise.
         certificate_fingerprint: Option<String>,
@@ -1775,6 +2004,10 @@ pub(crate) mod fake_ftp {
             let reset_retr_at = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
             let reset_retr_remaining = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let reset_after_completion = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let path_reset = Arc::new(Mutex::new(None));
+            let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let peak_connection_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let latency = Arc::new(Mutex::new(options.latency));
             let tls = options
                 .tls
                 .then(|| tls_identity(options.abort_stor_after_tls_handshake));
@@ -1794,6 +2027,10 @@ pub(crate) mod fake_ftp {
                 let reset_retr_at = reset_retr_at.clone();
                 let reset_retr_remaining = reset_retr_remaining.clone();
                 let reset_after_completion = reset_after_completion.clone();
+                let path_reset = path_reset.clone();
+                let active_connections = active_connections.clone();
+                let peak_connection_count = peak_connection_count.clone();
+                let latency = latency.clone();
                 std::thread::spawn(move || {
                     let mut sockets = Vec::new();
                     let mut threads = Vec::new();
@@ -1812,11 +2049,20 @@ pub(crate) mod fake_ftp {
                                 let reset_retr_at = reset_retr_at.clone();
                                 let reset_retr_remaining = reset_retr_remaining.clone();
                                 let reset_after_completion = reset_after_completion.clone();
+                                let path_reset = path_reset.clone();
+                                let active_connections = active_connections.clone();
+                                let latency = latency.clone();
                                 let stop = stopping.clone();
                                 let tls = tls.as_ref().map(|(tls, _)| Tls {
                                     control: tls.control.clone(),
                                     data: tls.data.clone(),
                                 });
+                                peak_connection_count.fetch_max(
+                                    active_connections
+                                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                                        + 1,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                );
                                 threads.push(std::thread::spawn(move || {
                                     let shutdown = stream.try_clone().unwrap();
                                     serve(
@@ -1831,8 +2077,12 @@ pub(crate) mod fake_ftp {
                                         &reset_retr_at,
                                         &reset_retr_remaining,
                                         &reset_after_completion,
+                                        &path_reset,
+                                        &latency,
                                     );
                                     let _ = shutdown.shutdown(std::net::Shutdown::Both);
+                                    active_connections
+                                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                                 }));
                             }
                             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1859,6 +2109,9 @@ pub(crate) mod fake_ftp {
                 reset_retr_at,
                 reset_retr_remaining,
                 reset_after_completion,
+                path_reset,
+                peak_connection_count,
+                latency,
                 certificate_fingerprint,
                 fs,
                 stop,
@@ -1908,6 +2161,55 @@ pub(crate) mod fake_ftp {
             self.reset_after_completion.store(after_completion, SeqCst);
             self.reset_retr_at.store(nth, SeqCst);
             self.reset_retr_remaining.store(count, SeqCst);
+        }
+
+        /// Break the control connection on the next `count` RETRs of
+        /// exactly `path` — the path-scoped counterpart of
+        /// [`Self::reset_on_retrs`], which cannot identify a file once
+        /// payload reads run on parallel connections.
+        pub fn reset_on_retr_of(&self, path: &str, count: usize, after_completion: bool) {
+            assert!(count > 0);
+            *self.path_reset.lock().unwrap() = Some(PathReset {
+                path: normalize(path),
+                remaining: count,
+                after_completion,
+            });
+        }
+
+        /// The most control connections the server has held at once.
+        pub fn peak_connections(&self) -> usize {
+            self.peak_connection_count
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// How many received command lines start with `prefix`
+        /// (e.g. `RETR ` — include the trailing space to exclude
+        /// similarly-named commands).
+        pub fn count(&self, prefix: &str) -> usize {
+            self.commands
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|line| line.starts_with(prefix))
+                .count()
+        }
+
+        /// Clears the command log so counts can be attributed to a single
+        /// phase of a test.
+        pub fn clear_commands(&self) {
+            self.commands.lock().unwrap().clear();
+        }
+
+        /// Overrides `Options::latency` after spawn, so benchmark setup
+        /// can run at full speed before the timed phase pays for latency.
+        pub fn set_latency(&self, latency: Option<Duration>) {
+            *self.latency.lock().unwrap() = latency;
+        }
+
+        /// Removes a seeded file — the remote-side delete a staleness
+        /// test performs between Preview and Deploy.
+        pub fn remove_file(&self, path: &str) {
+            self.fs.lock().unwrap().files.remove(&normalize(path));
         }
 
         pub fn has_dir(&self, path: &str) -> bool {
@@ -2075,6 +2377,8 @@ pub(crate) mod fake_ftp {
         reset_retr_at: &std::sync::atomic::AtomicUsize,
         reset_retr_remaining: &std::sync::atomic::AtomicUsize,
         reset_after_completion: &std::sync::atomic::AtomicBool,
+        path_reset: &Arc<Mutex<Option<PathReset>>>,
+        latency: &Arc<Mutex<Option<Duration>>>,
     ) {
         // `socket` keeps a handle to the control connection so `AUTH TLS`
         // can upgrade it in place; the reader/writer work on clones until
@@ -2097,7 +2401,14 @@ pub(crate) mod fake_ftp {
         /// Opens the pending passive data connection, if any, and wraps
         /// it in TLS when the session negotiated `PROT P`.
         macro_rules! data {
-            () => {
+            () => {{
+                // The data channel costs a round trip of its own to set
+                // up. Drop the guard before sleeping so connections stay
+                // concurrent.
+                let round_trip = *latency.lock().unwrap();
+                if let Some(round_trip) = round_trip {
+                    std::thread::sleep(round_trip);
+                }
                 passive
                     .take()
                     .and_then(|listener| accept_data(listener, stop))
@@ -2106,7 +2417,7 @@ pub(crate) mod fake_ftp {
                             .map(|conn| DataSocket::Tls(StreamOwned::new(conn, stream))),
                         _ => Some(DataSocket::Plain(stream)),
                     })
-            };
+            }};
         }
 
         /// The client connects the passive data socket before reading
@@ -2133,6 +2444,13 @@ pub(crate) mod fake_ftp {
             }
             let command = line.trim_end().to_owned();
             commands.lock().unwrap().push(command.clone());
+            // One round trip per command. The guard must drop before the
+            // sleep or every connection's round trips would serialize on
+            // the latency lock.
+            let round_trip = *latency.lock().unwrap();
+            if let Some(round_trip) = round_trip {
+                std::thread::sleep(round_trip);
+            }
             if options
                 .expire_control_after
                 .is_some_and(|age| connected_at.elapsed() >= age)
@@ -2281,16 +2599,28 @@ pub(crate) mod fake_ftp {
                         }
                         let sequence =
                             retr_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                        if sequence >= reset_retr_at.load(std::sync::atomic::Ordering::SeqCst)
+                        let mut reset = (sequence
+                            >= reset_retr_at.load(std::sync::atomic::Ordering::SeqCst)
                             && reset_retr_remaining
                                 .fetch_update(
                                     std::sync::atomic::Ordering::SeqCst,
                                     std::sync::atomic::Ordering::SeqCst,
                                     |remaining| remaining.checked_sub(1),
                                 )
-                                .is_ok()
-                        {
-                            if reset_after_completion.load(std::sync::atomic::Ordering::SeqCst) {
+                                .is_ok())
+                        .then(|| reset_after_completion.load(std::sync::atomic::Ordering::SeqCst));
+                        if reset.is_none() {
+                            let mut guard = path_reset.lock().unwrap();
+                            if let Some(armed) = guard.as_mut()
+                                && armed.path == path
+                                && armed.remaining > 0
+                            {
+                                armed.remaining -= 1;
+                                reset = Some(armed.after_completion);
+                            }
+                        }
+                        if let Some(after_completion) = reset {
+                            if after_completion {
                                 let _ = send(&mut writer, "226 transfer complete");
                             }
                             return;
@@ -3190,6 +3520,154 @@ mod tests {
             !conn
                 .delete_file(remote_path("/BepInEx/config/missing.dat").as_path())
                 .unwrap()
+        );
+    }
+
+    /// `read_listed` trusts the listing's size: it streams RETR straight
+    /// into the sink without the MLST probe `read` performs first.
+    #[test]
+    fn ftps_read_listed_streams_without_a_metadata_probe() {
+        let server = FakeFtp::valheim_host(FakeFtpOptions {
+            tls: true,
+            ..Default::default()
+        });
+        server.seed_file("/BepInEx/plugins/Mod.dll", b"payload-bytes");
+
+        let mut conn = ftps_connect(&server);
+        server.clear_commands();
+        let mut sink = Vec::new();
+        assert!(
+            conn.read_listed(
+                remote_path("/BepInEx/plugins/Mod.dll").as_path(),
+                13,
+                &mut sink
+            )
+            .unwrap()
+        );
+        assert_eq!(sink, b"payload-bytes");
+        assert_eq!(server.count("MLST"), 0);
+    }
+
+    /// An absent path reports `false`; the only MLST is the post-550
+    /// existence cross-check, which runs after RETR — never before it.
+    #[test]
+    fn ftps_read_listed_reports_absent_without_probing_first() {
+        let server = FakeFtp::valheim_host(FakeFtpOptions {
+            tls: true,
+            ..Default::default()
+        });
+
+        let mut conn = ftps_connect(&server);
+        server.clear_commands();
+        let mut sink = Vec::new();
+        assert!(
+            !conn
+                .read_listed(
+                    remote_path("/BepInEx/plugins/Missing.dll").as_path(),
+                    4,
+                    &mut sink
+                )
+                .unwrap()
+        );
+        assert!(sink.is_empty());
+
+        let commands = server.commands.lock().unwrap();
+        let retr = commands
+            .iter()
+            .position(|command| command == "RETR /BepInEx/plugins/Missing.dll")
+            .expect("the absent path must still be attempted with RETR");
+        assert!(
+            !commands[..retr]
+                .iter()
+                .any(|command| command.starts_with("MLST")),
+            "read_listed must not probe metadata before RETR"
+        );
+        assert!(
+            commands[retr..]
+                .iter()
+                .any(|command| command == "MLST /BepInEx/plugins/Missing.dll"),
+            "the 550 ambiguity must be resolved by an existence check"
+        );
+    }
+
+    /// A host that refuses to RETR an existing file must fail closed:
+    /// `Ok(false)` is reserved for confirmed absence.
+    #[test]
+    fn ftps_read_listed_fails_closed_when_retr_is_refused() {
+        let server = FakeFtp::valheim_host(FakeFtpOptions {
+            tls: true,
+            refuse_retr: true,
+            ..Default::default()
+        });
+        server.seed_file("/BepInEx/plugins/Mod.dll", b"payload-bytes");
+
+        let mut conn = ftps_connect(&server);
+        let mut sink = Vec::new();
+        let error = conn
+            .read_listed(
+                remote_path("/BepInEx/plugins/Mod.dll").as_path(),
+                13,
+                &mut sink,
+            )
+            .unwrap_err();
+        assert!(format!("{error}").contains("refuses to return"));
+    }
+
+    /// Remote drift is an error, not a truncated hash: a file larger than
+    /// its listing size is refused; a smaller one streams what arrived so
+    /// the caller's hash comparison reports divergence.
+    #[test]
+    fn ftps_read_listed_bounds_the_stream_to_the_listed_size() {
+        let server = FakeFtp::valheim_host(FakeFtpOptions {
+            tls: true,
+            ..Default::default()
+        });
+        server.seed_file("/BepInEx/plugins/Grew.dll", b"0123456789");
+        server.seed_file("/BepInEx/plugins/Shrank.dll", b"12345");
+
+        let mut conn = ftps_connect(&server);
+        let mut sink = Vec::new();
+        let error = conn
+            .read_listed(
+                remote_path("/BepInEx/plugins/Grew.dll").as_path(),
+                5,
+                &mut sink,
+            )
+            .unwrap_err();
+        assert!(format!("{error}").contains("grew past its listed 5 bytes"));
+
+        let mut sink = Vec::new();
+        assert!(
+            conn.read_listed(
+                remote_path("/BepInEx/plugins/Shrank.dll").as_path(),
+                10,
+                &mut sink
+            )
+            .unwrap()
+        );
+        assert_eq!(sink, b"12345");
+    }
+
+    /// A dropped control connection mid-RETR surfaces as an error; the
+    /// engine-level retry reconnects separately.
+    #[test]
+    fn ftps_read_listed_surfaces_a_control_reset_during_transfer() {
+        let server = FakeFtp::valheim_host(FakeFtpOptions {
+            tls: true,
+            ..Default::default()
+        });
+        server.seed_file("/BepInEx/plugins/Mod.dll", b"payload-bytes");
+        server.reset_on_retr_of("/BepInEx/plugins/Mod.dll", 1, false);
+
+        let mut conn = ftps_connect(&server);
+        let mut sink = Vec::new();
+        assert!(
+            conn.read_listed(
+                remote_path("/BepInEx/plugins/Mod.dll").as_path(),
+                13,
+                &mut sink
+            )
+            .is_err()
         );
     }
 

@@ -17,9 +17,13 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use chrono::{DateTime, Utc};
@@ -40,7 +44,7 @@ use super::{
         PlanContext, Publication, RemoteLayout, RemoteSnapshot, UploadKind,
     },
     progress::{ProgressReporter, SyncPhase},
-    remote::RemoteOps,
+    remote::{ReadOnly, RemoteOps, RemoteReader},
     settings::RestartPolicy,
     spec::DeploymentSpec,
     state::{
@@ -64,6 +68,15 @@ const OWNERSHIP_RETRY_DELAY: Duration = Duration::from_millis(400);
 const MAX_CONFIG_READ: u64 = 1024 * 1024;
 const RESTART_VERIFY_ATTEMPTS: usize = 12;
 const RESTART_VERIFY_DELAY: Duration = Duration::from_secs(5);
+/// Payload scanning and verification are round-trip bound (each LIST/RETR is
+/// several control and data-channel round trips carrying little data), so
+/// helper connections scale throughput almost linearly. Four keeps a Deploy
+/// at six concurrent control connections (session + heartbeat + four
+/// helpers), each still subject to proactive renewal.
+const MAX_SNAPSHOT_READERS: usize = 4;
+/// A helper login costs roughly as many round trips as verifying one or two
+/// files; only open one per this many desired payload files.
+const FILES_PER_SNAPSHOT_READER: usize = 8;
 
 /// Identifies an operation across the lease record, operation history, and
 /// progress reporting.
@@ -936,17 +949,73 @@ fn take_snapshot(
     if selection.include_mods {
         progress.phase(SyncPhase::ScanningPayload);
         let mut scanned = 0;
-        for dir in &spec.payload_dirs {
-            collect_remote(
-                session.ops.as_mut(),
-                &session.mapper,
-                dir.as_path(),
-                &mut payload_files,
-                &mut payload_dirs,
-                progress,
-                &mut scanned,
-            )?;
+        let mut directories_listed = 0usize;
+
+        // Payload scanning and verification are round-trip bound, so
+        // extra read-only connections run the LIST/RETR work in parallel.
+        // State, lease, and mutation traffic stays on the authoritative
+        // session connection.
+        let requested =
+            (desired.payload.len() / FILES_PER_SNAPSHOT_READER).min(MAX_SNAPSHOT_READERS);
+        let mut readers: Vec<Box<dyn RemoteReader + '_>> =
+            open_snapshot_readers(session.ops.as_ref(), requested);
+        if readers.is_empty() {
+            readers.push(Box::new(ReadOnly(session.ops.as_mut())));
         }
+
+        // List the payload tree level by level: every directory in a
+        // level is listed in parallel, then its children form the next
+        // level. Equivalent to the old recursive walk — the files/dirs
+        // maps are order-independent — while keeping each connection
+        // strictly serial.
+        let scan_started = Instant::now();
+        let mut frontier: Vec<DeployPathBuf> = spec.payload_dirs.clone();
+        let mapper = &session.mapper;
+        while !frontier.is_empty() {
+            directories_listed += frontier.len();
+            let listings = run_parallel(
+                &mut readers,
+                &frontier,
+                |reader, dir| {
+                    let remote_dir = mapper.remote_path(dir);
+                    reader
+                        .list(&remote_dir)
+                        .with_context(|| format!("failed to inspect remote directory {remote_dir}"))
+                },
+                progress,
+                |progress, dir| progress.item(dir.to_string()),
+                |_, _, _| {},
+            )?;
+            let mut next = Vec::new();
+            for (dir, entries) in frontier.iter().zip(listings) {
+                for entry in entries {
+                    let relative = dir.join(&entry.name).with_context(|| {
+                        format!("remote directory contains an unsafe name: {}", entry.name)
+                    })?;
+                    if spec.is_gale_internal(&relative) {
+                        continue;
+                    }
+                    if entry.is_directory {
+                        payload_dirs.insert(relative.clone());
+                        next.push(relative);
+                    } else {
+                        payload_files.insert(relative.clone(), entry.size.unwrap_or(0));
+                        progress.item(relative.to_string());
+                    }
+                    scanned += 1;
+                    progress.advance(scanned, None);
+                }
+            }
+            frontier = next;
+        }
+        info!(
+            phase = "snapshot.scan",
+            readers = readers.len(),
+            directories_listed,
+            entries = scanned,
+            duration_ms = scan_started.elapsed().as_millis(),
+            "payload scan complete"
+        );
 
         // Verify the actual remote bytes of every Gale-owned file the
         // publication still wants. Two different contents can have the
@@ -964,34 +1033,53 @@ fn take_snapshot(
             })
             .collect();
         progress.work(to_hash.len(), None);
-        let mut hashed = 0usize;
-        for (index, (path, staged)) in to_hash.iter().enumerate() {
-            progress.item(path.to_string());
-            let remote = session.mapper.remote_path(path);
-            debug!(phase = "snapshot.payload", path = %remote, hashed, "reading owned payload");
-            match read_snapshot_file(
-                session.ops.as_mut(),
-                &remote,
-                staged.size,
-                "snapshot.payload",
-            )? {
-                Some(bytes) => {
-                    payload_hashes.insert(
-                        (*path).clone(),
-                        ContentHash::from_hash(blake3::hash(&bytes)),
-                    );
-                    hashed += 1;
+        let verify_started = Instant::now();
+        let mut completed = 0usize;
+        let mut files_verified = 0usize;
+        let mut files_missing = 0usize;
+        let mut bytes_verified = 0u64;
+        let mut retries = 0usize;
+        let outcomes = run_parallel(
+            &mut readers,
+            &to_hash,
+            |reader, &(path, staged)| {
+                let remote = mapper.remote_path(path);
+                debug!(phase = "snapshot.payload", path = %remote, "reading owned payload");
+                verify_snapshot_payload(reader, &remote, staged.size)
+            },
+            progress,
+            |progress, (path, _)| progress.item(path.to_string()),
+            |progress, _, outcome| {
+                completed += 1;
+                progress.advance(completed, None);
+                bytes_verified += outcome.bytes;
+                retries += usize::from(outcome.retried);
+                if outcome.hash.is_some() {
+                    files_verified += 1;
+                } else {
+                    files_missing += 1;
                 }
-                // A file removed after listing remains divergent. Transport
-                // failures are returned above and must not become uploads.
-                None => {}
+            },
+        )?;
+        for ((path, _), outcome) in to_hash.iter().zip(outcomes) {
+            if let Some(hash) = outcome.hash {
+                payload_hashes.insert((*path).clone(), hash);
             }
-            progress.advance(index + 1, None);
         }
         info!(
             phase = "snapshot.payload",
-            hashed, "completed owned payload hashes"
+            readers = readers.len(),
+            files_verified,
+            files_missing,
+            bytes_verified,
+            retries,
+            duration_ms = verify_started.elapsed().as_millis(),
+            "completed owned payload hashes"
         );
+
+        // Helpers are done before the config phase — and before any
+        // mutation — so the authoritative connection is free again.
+        drop(readers);
     }
 
     // Hash every config path a decision could touch: published files,
@@ -1062,6 +1150,217 @@ fn read_snapshot_file(
                 format!("{phase}: read failed after reconnect for {path}; first error: {first}")
             })
         }
+    }
+}
+
+/// Opens up to `requested` read-only helper connections for the payload
+/// scan and verify phases. Connections that fail to open are logged and
+/// skipped — the snapshot still runs over however many opened, and an
+/// empty result means the caller falls back to the authoritative
+/// connection entirely.
+fn open_snapshot_readers(ops: &dyn RemoteOps, requested: usize) -> Vec<Box<dyn RemoteReader>> {
+    if requested == 0 {
+        return Vec::new();
+    }
+    let Some(connect) = ops.reader_connector() else {
+        return Vec::new();
+    };
+    let started_at = Instant::now();
+    let (readers, failed) = thread::scope(|scope| {
+        let handles: Vec<_> = (0..requested).map(|_| scope.spawn(|| connect())).collect();
+        let mut readers = Vec::with_capacity(handles.len());
+        let mut failed = 0usize;
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(reader)) => readers.push(reader),
+                Ok(Err(error)) => {
+                    failed += 1;
+                    warn!(phase = "snapshot", error = %error, "snapshot helper connection failed");
+                }
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        }
+        (readers, failed)
+    });
+    info!(
+        phase = "snapshot",
+        requested,
+        opened = readers.len(),
+        failed,
+        duration_ms = started_at.elapsed().as_millis(),
+        "opened snapshot reader connections"
+    );
+    readers
+}
+
+/// Runs `work` on every item, spread over `readers` — one scoped thread
+/// per reader claiming items in order — or inline when only the
+/// authoritative connection is available. `started` and `done` run on the
+/// calling thread for progress reporting. The first failure stops new
+/// work; the error returned is the one with the lowest item index, and
+/// results come back in input order, so outcomes are deterministic
+/// regardless of completion order.
+fn run_parallel<T: Sync, R: Send>(
+    readers: &mut [Box<dyn RemoteReader + '_>],
+    items: &[T],
+    work: impl Fn(&mut dyn RemoteReader, &T) -> Result<R> + Sync,
+    progress: &mut ProgressReporter,
+    mut started: impl FnMut(&mut ProgressReporter, &T),
+    mut done: impl FnMut(&mut ProgressReporter, &T, &R),
+) -> Result<Vec<R>> {
+    if readers.len() <= 1 {
+        let Some(reader) = readers.first_mut() else {
+            bail!("snapshot has no reader connection");
+        };
+        let mut results = Vec::with_capacity(items.len());
+        for item in items {
+            started(progress, item);
+            let result = work(reader.as_mut(), item)?;
+            done(progress, item, &result);
+            results.push(result);
+        }
+        return Ok(results);
+    }
+
+    enum Message<R> {
+        Started(usize),
+        Finished(usize, Result<R>),
+    }
+
+    let next = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let (tx, rx) = mpsc::channel::<Message<R>>();
+    thread::scope(|scope| {
+        for reader in readers.iter_mut() {
+            let tx = tx.clone();
+            let next = &next;
+            let stop = &stop;
+            let work = &work;
+            scope.spawn(move || {
+                let reader = reader.as_mut();
+                loop {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(index) else {
+                        break;
+                    };
+                    if tx.send(Message::Started(index)).is_err() {
+                        break;
+                    }
+                    let result = work(reader, item);
+                    let failed = result.is_err();
+                    if tx.send(Message::Finished(index, result)).is_err() {
+                        break;
+                    }
+                    if failed {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(tx);
+
+        let mut results: Vec<Option<R>> = items.iter().map(|_| None).collect();
+        let mut errors: Vec<(usize, eyre::Report)> = Vec::new();
+        for message in rx {
+            match message {
+                Message::Started(index) => started(progress, &items[index]),
+                Message::Finished(index, Ok(result)) => {
+                    done(progress, &items[index], &result);
+                    results[index] = Some(result);
+                }
+                Message::Finished(index, Err(error)) => {
+                    stop.store(true, Ordering::Relaxed);
+                    errors.push((index, error));
+                }
+            }
+        }
+        if let Some((_, error)) = errors.into_iter().min_by_key(|(index, _)| *index) {
+            return Err(error);
+        }
+        results
+            .into_iter()
+            .enumerate()
+            .map(|(index, result)| {
+                result.ok_or_else(|| eyre::eyre!("parallel work item {index} has no result"))
+            })
+            .collect()
+    })
+}
+
+/// What verifying one owned payload file against its remote bytes found.
+struct PayloadVerification {
+    /// Remote content hash; `None` when the file vanished after listing.
+    hash: Option<ContentHash>,
+    bytes: u64,
+    /// The read needed a reconnect-and-retry.
+    retried: bool,
+}
+
+/// Streams `remote` through a fresh hasher — one reconnect-and-retry on
+/// transport failure, mirroring `read_snapshot_file` for the read-only
+/// helper connections.
+fn verify_snapshot_payload(
+    reader: &mut dyn RemoteReader,
+    remote: &RemotePath,
+    listed_size: u64,
+) -> Result<PayloadVerification> {
+    match hash_snapshot_payload(reader, remote, listed_size) {
+        Ok(outcome) => Ok(outcome),
+        Err(first) => {
+            warn!(phase = "snapshot.payload", path = %remote, error = %first, "remote read failed; reconnecting before retry");
+            reader.reconnect().with_context(|| {
+                format!("snapshot.payload: failed to reconnect after reading {remote}: {first}")
+            })?;
+            hash_snapshot_payload(reader, remote, listed_size)
+                .map(|outcome| PayloadVerification {
+                    retried: true,
+                    ..outcome
+                })
+                .with_context(|| {
+                    format!(
+                        "snapshot.payload: read failed after reconnect for {remote}; first error: {first}"
+                    )
+                })
+        }
+    }
+}
+
+fn hash_snapshot_payload(
+    reader: &mut dyn RemoteReader,
+    remote: &RemotePath,
+    listed_size: u64,
+) -> Result<PayloadVerification> {
+    let mut sink = HashingSink::default();
+    // A file removed after listing remains divergent. Transport failures
+    // are retried by the caller and must not become uploads.
+    let present = reader.read_listed(remote, listed_size, &mut sink)?;
+    Ok(PayloadVerification {
+        hash: present.then(|| ContentHash::from_hash(sink.hasher.finalize())),
+        bytes: sink.bytes,
+        retried: false,
+    })
+}
+
+/// Streams payload bytes into a BLAKE3 hasher while counting them, so a
+/// verification read never materializes the file.
+#[derive(Default)]
+struct HashingSink {
+    hasher: blake3::Hasher,
+    bytes: u64,
+}
+
+impl std::io::Write for HashingSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.hasher.update(buf);
+        self.bytes += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -1538,55 +1837,6 @@ pub fn set_config_policy(
     result
 }
 
-/// Lists every remote file/dir inside the payload dirs, as deploy paths.
-fn collect_remote(
-    ops: &mut dyn RemoteOps,
-    mapper: &RemoteMapper,
-    dir: &DeployPath,
-    files: &mut BTreeMap<DeployPathBuf, u64>,
-    directories: &mut BTreeSet<DeployPathBuf>,
-    progress: &mut ProgressReporter,
-    scanned: &mut usize,
-) -> Result<()> {
-    let remote_dir = mapper.remote_path(dir);
-    progress.item(dir.to_string());
-
-    for entry in ops
-        .list(&remote_dir)
-        .with_context(|| format!("failed to inspect remote directory {remote_dir}"))?
-    {
-        let relative = dir
-            .join(&entry.name)
-            .with_context(|| format!("remote directory contains an unsafe name: {}", entry.name))?;
-
-        if mapper.spec.is_gale_internal(&relative) {
-            continue;
-        }
-
-        if entry.is_directory {
-            directories.insert(relative.clone());
-            *scanned += 1;
-            progress.advance(*scanned, None);
-            collect_remote(
-                ops,
-                mapper,
-                &relative,
-                files,
-                directories,
-                progress,
-                scanned,
-            )?;
-        } else {
-            files.insert(relative.clone(), entry.size.unwrap_or(0));
-            *scanned += 1;
-            progress.item(relative.to_string());
-            progress.advance(*scanned, None);
-        }
-    }
-
-    Ok(())
-}
-
 /// Detects the remote layout. A host that exposes the loader's contents
 /// directly shows stripped mirror dirs (`plugins`, `config`, ...) at the
 /// remote root; that presence is authoritative over a stray `BepInEx`
@@ -1745,6 +1995,30 @@ mod tests {
             deploy_path("BepInEx/plugins/Author-ModA/ModA.dll"),
             staged(b"dll-bytes"),
         );
+        DesiredDeployment { payload }
+    }
+
+    /// The multi-mod payload the FTPS reader-pool tests and the latency
+    /// benchmark share: `mod_dirs` directories under `BepInEx/plugins`,
+    /// each with Mod.dll, manifest.json and docs.txt (README.md would be
+    /// an excluded package-metadata file); the first eight also carry
+    /// en/de translations. 50 dirs make 166 desired payload files across
+    /// 58 payload subdirectories.
+    fn large_mods_payload(mod_dirs: usize) -> DesiredDeployment {
+        let mut payload = BTreeMap::new();
+        for index in 0..mod_dirs {
+            let dir = format!("BepInEx/plugins/Author-Mod{index:02}");
+            for file in ["Mod.dll", "manifest.json", "docs.txt"] {
+                let path = format!("{dir}/{file}");
+                payload.insert(deploy_path(&path), staged(path.as_bytes()));
+            }
+            if index < 8 {
+                for file in ["translations/en.json", "translations/de.json"] {
+                    let path = format!("{dir}/{file}");
+                    payload.insert(deploy_path(&path), staged(path.as_bytes()));
+                }
+            }
+        }
         DesiredDeployment { payload }
     }
 
@@ -2460,6 +2734,231 @@ mod tests {
             !String::from_utf8_lossy(&persisted).contains("pending"),
             "legacy pending bookkeeping must not be persisted again"
         );
+    }
+
+    /// Deploys `desired` onto the memory remote and finishes, leaving an
+    /// unchanged remote — the shared setup for the reader-pool tests.
+    fn deploy_to_memory(memory: &Shared, publication: &Publication, desired: &DesiredDeployment) {
+        let mut session = open(memory.clone()).unwrap();
+        let deployment = deploy(
+            &mut session,
+            no_connect,
+            publication,
+            desired,
+            &selection(true, false),
+            &context(),
+            &meta(),
+            None,
+            false,
+            |_| {},
+        )
+        .unwrap();
+        finish(
+            &mut session,
+            deployment,
+            RestartOutcome::NotRequired,
+            &meta(),
+        )
+        .unwrap();
+    }
+
+    /// The pooled snapshot must be byte-for-byte equivalent to the serial
+    /// one: same plan hash, same empty upload set, and bounded helpers.
+    #[test]
+    fn memory_readers_match_the_serial_snapshot() {
+        let fixture = mod_fixture();
+        let publication = fixture.publication();
+        let desired = large_mods_payload(8);
+        let memory = remote();
+        deploy_to_memory(&memory, &publication, &desired);
+
+        let serial = {
+            let mut session = open(memory.clone()).unwrap();
+            preview(
+                &mut session,
+                &publication,
+                &desired,
+                &selection(true, false),
+                &context(),
+                &meta(),
+            )
+            .unwrap()
+        };
+        assert!(serial.plan.uploads.is_empty());
+
+        memory.lock().unwrap().allow_readers = true;
+        for _ in 0..3 {
+            memory.lock().unwrap().readers_opened = 0;
+            let mut session = open(memory.clone()).unwrap();
+            let pooled = preview(
+                &mut session,
+                &publication,
+                &desired,
+                &selection(true, false),
+                &context(),
+                &meta(),
+            )
+            .unwrap();
+            assert_eq!(pooled.plan.hash, serial.plan.hash);
+            assert_eq!(pooled.plan.uploads, serial.plan.uploads);
+            let opened = memory.lock().unwrap().readers_opened;
+            assert!(
+                (1..=MAX_SNAPSHOT_READERS).contains(&opened),
+                "expected bounded helper readers, opened {opened}"
+            );
+        }
+    }
+
+    /// A payload read that keeps failing must surface as an error — never
+    /// an upload plan — and the preview lease must still be released.
+    #[test]
+    fn memory_reader_failure_surfaces_and_releases_the_lease() {
+        let fixture = mod_fixture();
+        let publication = fixture.publication();
+        let desired = large_mods_payload(8);
+        let memory = remote();
+        deploy_to_memory(&memory, &publication, &desired);
+
+        {
+            let mut remote = memory.lock().unwrap();
+            remote.allow_readers = true;
+            remote
+                .fail_read_always
+                .insert(format!("{BASE}/BepInEx/plugins/Author-Mod00/Mod.dll"));
+        }
+        let mut session = open(memory.clone()).unwrap();
+        let error = preview(
+            &mut session,
+            &publication,
+            &desired,
+            &selection(true, false),
+            &context(),
+            &meta(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("read failed after reconnect"),
+            "expected the retried-read error, got: {error:#}"
+        );
+        assert!(
+            !memory.lock().unwrap().dirs.contains(LEASE_DIR_REMOTE),
+            "the preview lease must be released after a snapshot error"
+        );
+    }
+
+    /// When helper connections cannot be opened the snapshot runs over
+    /// the authoritative connection and produces the serial plan.
+    #[test]
+    fn memory_reader_connect_failure_falls_back_to_serial() {
+        let fixture = mod_fixture();
+        let publication = fixture.publication();
+        let desired = large_mods_payload(8);
+        let memory = remote();
+        deploy_to_memory(&memory, &publication, &desired);
+
+        let serial = {
+            let mut session = open(memory.clone()).unwrap();
+            preview(
+                &mut session,
+                &publication,
+                &desired,
+                &selection(true, false),
+                &context(),
+                &meta(),
+            )
+            .unwrap()
+        };
+
+        {
+            let mut remote = memory.lock().unwrap();
+            remote.allow_readers = true;
+            remote.fail_reader_connect = true;
+        }
+        let mut session = open(memory.clone()).unwrap();
+        let fallback = preview(
+            &mut session,
+            &publication,
+            &desired,
+            &selection(true, false),
+            &context(),
+            &meta(),
+        )
+        .unwrap();
+        assert_eq!(fallback.plan.hash, serial.plan.hash);
+        assert_eq!(memory.lock().unwrap().readers_opened, 0);
+    }
+
+    /// A login costs roughly what verifying a file or two costs, so
+    /// payloads under FILES_PER_SNAPSHOT_READER never open helpers.
+    #[test]
+    fn small_payloads_skip_reader_connections() {
+        let fixture = mod_fixture();
+        let publication = fixture.publication();
+        let desired = desired_payload();
+        let memory = remote();
+        deploy_to_memory(&memory, &publication, &desired);
+
+        memory.lock().unwrap().allow_readers = true;
+        let mut session = open(memory.clone()).unwrap();
+        let previewed = preview(
+            &mut session,
+            &publication,
+            &desired,
+            &selection(true, false),
+            &context(),
+            &meta(),
+        )
+        .unwrap();
+        assert!(previewed.plan.uploads.is_empty());
+        assert_eq!(memory.lock().unwrap().readers_opened, 0);
+    }
+
+    /// The zero-config boundary holds with the pool active: a mods-only
+    /// preview opens reader helpers but performs no config reads — any
+    /// config read is armed to fail the operation.
+    #[test]
+    fn mods_only_preview_with_readers_never_reads_configs() {
+        let mut fixture = mod_fixture();
+        fixture.config.insert(
+            config_path("BepInEx/config/published.cfg"),
+            config_file(b"v2"),
+        );
+        let publication = fixture.publication();
+        let desired = large_mods_payload(8);
+        let memory = remote();
+        deploy_to_memory(&memory, &publication, &desired);
+
+        {
+            let mut remote = memory.lock().unwrap();
+            remote.allow_readers = true;
+            remote.put_file(
+                &format!("{BASE}/BepInEx/config/server.cfg"),
+                b"server-owned",
+            );
+            remote
+                .fail_read_always
+                .insert(format!("{BASE}/BepInEx/config/server.cfg"));
+            remote
+                .fail_read_always
+                .insert(format!("{BASE}/BepInEx/config/published.cfg"));
+        }
+        let mut session = open(memory.clone()).unwrap();
+        let previewed = preview(
+            &mut session,
+            &publication,
+            &desired,
+            &selection(true, false),
+            &context(),
+            &meta(),
+        )
+        .unwrap();
+        assert!(
+            memory.lock().unwrap().readers_opened > 0,
+            "the reader pool must be active for this test to cover it"
+        );
+        assert!(previewed.plan.config_entries.is_empty());
+        assert!(previewed.plan.conflicts.is_empty());
+        assert!(previewed.plan.uploads.is_empty());
     }
 
     #[test]
@@ -3331,6 +3830,38 @@ mod tests {
         }
     }
 
+    /// Deploys `desired` onto the fake host and finishes the operation,
+    /// leaving an unchanged remote for the phase under test.
+    fn deploy_initial(
+        server: &remote::fake_ftp::FakeFtp,
+        publication: &Publication,
+        desired: &DesiredDeployment,
+    ) {
+        let addr = server.addr;
+        let certificate = server.trusted_certificate().unwrap();
+        let mut session = open_ftps(server).unwrap();
+        let deployment = deploy(
+            &mut session,
+            move || ftps_ops(addr, &certificate),
+            publication,
+            desired,
+            &selection(true, false),
+            &context(),
+            &meta(),
+            None,
+            false,
+            |_| {},
+        )
+        .unwrap();
+        finish(
+            &mut session,
+            deployment,
+            RestartOutcome::NotRequired,
+            &meta(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn ftps_preview_recovers_after_reset_without_reupload_or_stranded_lease() {
         use remote::fake_ftp::{FakeFtp, Options};
@@ -3398,9 +3929,11 @@ mod tests {
         assert!(recovered.busy.is_none());
         assert!(!server.has_dir("/BepInEx/config/.gale-deploy.lock"));
 
-        // If the replacement connection also fails, Preview must return
-        // the transport error instead of manufacturing an upload plan.
-        server.reset_on_retrs(81, 2, false);
+        // If the first read of a payload file and its reconnect retry both
+        // fail, Preview must return the transport error instead of
+        // manufacturing an upload plan. RETRs run on parallel readers now,
+        // so the reset targets one path rather than a global ordinal.
+        server.reset_on_retr_of("/BepInEx/plugins/Author-ModA/mod-000.dll", 2, false);
         let error = preview(
             &mut post_deploy,
             &publication,
@@ -3413,10 +3946,12 @@ mod tests {
         assert!(format!("{error:#}").contains("read failed after reconnect"));
         assert!(!server.has_dir("/BepInEx/config/.gale-deploy.lock"));
 
-        // The final payload's data and 226 arrive, then the server closes
-        // the control connection. Release must reconnect, verify the owner,
-        // and remove the claim through that fresh connection.
-        server.reset_on_retr(165, true);
+        // The in-snapshot state refresh is the authoritative connection's
+        // last read before it idles until release: its data and 226 arrive,
+        // then the server closes the connection. Release must reconnect,
+        // verify the owner, and remove the claim through that fresh
+        // connection.
+        server.reset_on_retr_of("/BepInEx/config/.gale-server-state.json", 1, true);
         let logins_before = server
             .commands
             .lock()
@@ -3491,7 +4026,432 @@ mod tests {
         assert!(!server.has_dir("/BepInEx/config/.gale-deploy.lock"));
     }
 
-    /// The live-verified DatHost profile — `SIZE` refused in ASCII mode,
+    /// Wall-clock benchmark for an unchanged mods-only Preview and Deploy
+    /// over a latent FTPS link: each command and each data-channel setup
+    /// costs 10 ms of simulated round-trip time. Run explicitly:
+    /// `cargo test --features worker --lib bench_unchanged -- --ignored --nocapture`
+    #[test]
+    #[ignore = "wall-clock benchmark; run explicitly"]
+    fn bench_unchanged_mods_preview_and_deploy_over_latent_ftps() {
+        use remote::fake_ftp::{FakeFtp, Options};
+        use std::time::Instant;
+
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("gale=info")
+            .try_init();
+
+        let latency = Duration::from_millis(10);
+        let server = FakeFtp::valheim_host(Options {
+            tls: true,
+            size_requires_binary: true,
+            latency: Some(latency),
+            ..Default::default()
+        });
+        let addr = server.addr;
+        let certificate = server.trusted_certificate().unwrap();
+
+        let fixture = mod_fixture();
+        let publication = fixture.publication();
+        let desired = large_mods_payload(50);
+        assert_eq!(desired.payload.len(), 166);
+
+        // Setup deploy runs at full speed; only the measured operations
+        // pay the simulated latency.
+        server.set_latency(None);
+        deploy_initial(&server, &publication, &desired);
+        server.set_latency(Some(latency));
+
+        let report = |label: &str, elapsed: Duration| {
+            let commands = server.commands.lock().unwrap();
+            let count = |prefix: &str| {
+                commands
+                    .iter()
+                    .filter(|line| line.starts_with(prefix))
+                    .count()
+            };
+            println!(
+                "{label}: {elapsed:?} | LIST={} MLST={} RETR={} PASV={} EPSV={} USER={} | peak_connections={}",
+                count("LIST"),
+                count("MLST"),
+                count("RETR"),
+                count("PASV"),
+                count("EPSV"),
+                count("USER"),
+                server.peak_connections(),
+            );
+        };
+
+        // 1) An unchanged mods-only preview on a freshly opened session.
+        let mut preview_session = open_ftps(&server).unwrap();
+        server.clear_commands();
+        let started = Instant::now();
+        let previewed = preview(
+            &mut preview_session,
+            &publication,
+            &desired,
+            &selection(true, false),
+            &context(),
+            &meta(),
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+        report("preview", elapsed);
+        assert!(previewed.plan.uploads.is_empty());
+        drop(preview_session);
+
+        // 2) A deploy of the approved plan on a fresh session.
+        let mut deploy_session = open_ftps(&server).unwrap();
+        server.clear_commands();
+        let started = Instant::now();
+        let deployment = deploy(
+            &mut deploy_session,
+            {
+                let certificate = certificate.clone();
+                move || ftps_ops(addr, &certificate)
+            },
+            &publication,
+            &desired,
+            &selection(true, false),
+            &context(),
+            &meta(),
+            Some(&previewed.plan.hash),
+            false,
+            |_| {},
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+        report("deploy", elapsed);
+        assert_eq!(deployment.summary.uploaded_files, 0);
+        finish(
+            &mut deploy_session,
+            deployment,
+            RestartOutcome::NotRequired,
+            &meta(),
+        )
+        .unwrap();
+    }
+
+    /// Counts received `verb` commands by their path argument, e.g.
+    /// `RETR /BepInEx/plugins/Mod.dll`.
+    fn command_targets(server: &remote::fake_ftp::FakeFtp, verb: &str) -> BTreeMap<String, usize> {
+        let mut targets = BTreeMap::new();
+        for command in server.commands.lock().unwrap().iter() {
+            if let Some(path) = command.strip_prefix(&format!("{verb} ")) {
+                *targets.entry(path.to_owned()).or_default() += 1;
+            }
+        }
+        targets
+    }
+
+    /// An unchanged mods-only preview over FTPS: scanning and hashing run
+    /// on read-only helper connections, so every payload file and
+    /// directory is touched exactly once and no payload path pays an MLST
+    /// probe — the listing already supplied its size.
+    #[test]
+    fn ftps_preview_verifies_each_file_and_directory_exactly_once() {
+        use remote::fake_ftp::{FakeFtp, Options};
+
+        let server = FakeFtp::valheim_host(Options {
+            tls: true,
+            size_requires_binary: true,
+            ..Default::default()
+        });
+        let fixture = mod_fixture();
+        let publication = fixture.publication();
+        let desired = large_mods_payload(50);
+        deploy_initial(&server, &publication, &desired);
+
+        let mut session = open_ftps(&server).unwrap();
+        server.clear_commands();
+        let previewed = preview(
+            &mut session,
+            &publication,
+            &desired,
+            &selection(true, false),
+            &context(),
+            &meta(),
+        )
+        .unwrap();
+        assert!(previewed.plan.uploads.is_empty());
+        assert!(previewed.busy.is_none());
+        assert!(!server.has_dir("/BepInEx/config/.gale-deploy.lock"));
+
+        assert_eq!(
+            server
+                .commands
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|command| command.starts_with("MLST /BepInEx/plugins"))
+                .count(),
+            0,
+            "verification reads must not probe payload metadata"
+        );
+
+        let retrs = command_targets(&server, "RETR");
+        for path in desired.payload.keys() {
+            let remote = format!("/{path}");
+            assert_eq!(
+                retrs.get(&remote),
+                Some(&1),
+                "expected exactly one verification read of {remote}"
+            );
+        }
+        // 3 payload roots (plugins, patchers, monomod) + 50 mod dirs +
+        // 8 translations dirs.
+        let lists = command_targets(&server, "LIST");
+        assert_eq!(lists.len(), 61);
+        for (dir, count) in &lists {
+            assert_eq!(*count, 1, "directory {dir} listed {count} times");
+        }
+
+        // Authoritative connection plus at most MAX_SNAPSHOT_READERS
+        // helpers; preview runs no heartbeat.
+        assert!(
+            server.peak_connections() > 1,
+            "reader helpers must be opened for this fixture"
+        );
+        assert!(server.peak_connections() <= 1 + MAX_SNAPSHOT_READERS);
+    }
+
+    /// Deploy re-reads every payload the approved preview hashed — the
+    /// fresh snapshot under the lease is what the approval is checked
+    /// against — and stays within the deploy-time connection bound.
+    #[test]
+    fn ftps_deploy_rereads_payloads_against_the_approved_plan() {
+        use remote::fake_ftp::{FakeFtp, Options};
+
+        let server = FakeFtp::valheim_host(Options {
+            tls: true,
+            size_requires_binary: true,
+            ..Default::default()
+        });
+        let fixture = mod_fixture();
+        let publication = fixture.publication();
+        let desired = large_mods_payload(50);
+        deploy_initial(&server, &publication, &desired);
+        let addr = server.addr;
+        let certificate = server.trusted_certificate().unwrap();
+
+        let mut preview_session = open_ftps(&server).unwrap();
+        let previewed = preview(
+            &mut preview_session,
+            &publication,
+            &desired,
+            &selection(true, false),
+            &context(),
+            &meta(),
+        )
+        .unwrap();
+        drop(preview_session);
+
+        let mut deploy_session = open_ftps(&server).unwrap();
+        server.clear_commands();
+        let deployment = deploy(
+            &mut deploy_session,
+            {
+                let certificate = certificate.clone();
+                move || ftps_ops(addr, &certificate)
+            },
+            &publication,
+            &desired,
+            &selection(true, false),
+            &context(),
+            &meta(),
+            Some(&previewed.plan.hash),
+            false,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(deployment.summary.uploaded_files, 0);
+
+        let retrs = command_targets(&server, "RETR");
+        for path in desired.payload.keys() {
+            let remote = format!("/{path}");
+            assert_eq!(
+                retrs.get(&remote),
+                Some(&1),
+                "deploy must independently re-read {remote}"
+            );
+        }
+        for (dir, count) in command_targets(&server, "LIST") {
+            assert_eq!(count, 1, "directory {dir} listed {count} times");
+        }
+        // Authoritative + heartbeat slot + readers.
+        assert!(server.peak_connections() <= 2 + MAX_SNAPSHOT_READERS);
+        finish(
+            &mut deploy_session,
+            deployment,
+            RestartOutcome::NotRequired,
+            &meta(),
+        )
+        .unwrap();
+    }
+
+    /// Remote drift between approval and execution — a same-size edit or
+    /// a deletion — must fail the deploy as stale rather than overwrite.
+    #[test]
+    fn ftps_deploy_rejects_payload_drift_after_the_approved_preview() {
+        use remote::fake_ftp::{FakeFtp, Options};
+
+        let server = FakeFtp::valheim_host(Options {
+            tls: true,
+            size_requires_binary: true,
+            ..Default::default()
+        });
+        let fixture = mod_fixture();
+        let publication = fixture.publication();
+        let desired = large_mods_payload(50);
+        deploy_initial(&server, &publication, &desired);
+        let addr = server.addr;
+        let certificate = server.trusted_certificate().unwrap();
+
+        let drifted = "BepInEx/plugins/Author-Mod00/Mod.dll";
+        let drifted_remote = format!("/{drifted}");
+        let staged_size = desired.payload[&deploy_path(drifted)].size;
+
+        fn approve(
+            session: &mut Session,
+            publication: &Publication,
+            desired: &DesiredDeployment,
+        ) -> String {
+            preview(
+                session,
+                publication,
+                desired,
+                &selection(true, false),
+                &context(),
+                &meta(),
+            )
+            .unwrap()
+            .plan
+            .hash
+        }
+        fn attempt(
+            session: &mut Session,
+            publication: &Publication,
+            desired: &DesiredDeployment,
+            addr: std::net::SocketAddr,
+            certificate: &str,
+            hash: &str,
+        ) -> Result<Deployment> {
+            deploy(
+                session,
+                {
+                    let certificate = certificate.to_owned();
+                    move || ftps_ops(addr, &certificate)
+                },
+                publication,
+                desired,
+                &selection(true, false),
+                &context(),
+                &meta(),
+                Some(hash),
+                false,
+                |_| {},
+            )
+        }
+
+        let mut session = open_ftps(&server).unwrap();
+
+        // A same-size remote edit: only hashing the bytes detects it.
+        let approved = approve(&mut session, &publication, &desired);
+        let replacement = vec![b'!'; staged_size as usize];
+        server.seed_file(&drifted_remote, &replacement);
+        let error = match attempt(
+            &mut session,
+            &publication,
+            &desired,
+            addr,
+            &certificate,
+            &approved,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a stale approval must be rejected"),
+        };
+        assert!(
+            format!("{error:#}").contains("server state changed"),
+            "expected the stale-plan error, got: {error:#}"
+        );
+        assert_eq!(
+            server.file(&drifted_remote),
+            Some(replacement),
+            "a stale deploy must not overwrite the remote file"
+        );
+        assert!(!server.has_dir("/BepInEx/config/.gale-deploy.lock"));
+
+        // A deletion between approval and execution is stale too.
+        let approved = approve(&mut session, &publication, &desired);
+        server.remove_file(&drifted_remote);
+        let error = match attempt(
+            &mut session,
+            &publication,
+            &desired,
+            addr,
+            &certificate,
+            &approved,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a stale approval must be rejected"),
+        };
+        assert!(
+            format!("{error:#}").contains("server state changed"),
+            "expected the stale-plan error, got: {error:#}"
+        );
+        assert!(server.file(&drifted_remote).is_none());
+        assert!(!server.has_dir("/BepInEx/config/.gale-deploy.lock"));
+    }
+
+    /// Snapshot helpers are read-only connections: during an unchanged
+    /// preview every mutating command the fake server receives targets the
+    /// deployment lease, never a payload or config path.
+    #[test]
+    fn ftps_preview_reader_connections_never_mutate_payload_paths() {
+        use remote::fake_ftp::{FakeFtp, Options};
+
+        const MUTATING: [&str; 7] = ["STOR", "APPE", "DELE", "MKD", "RMD", "RNFR", "RNTO"];
+
+        let server = FakeFtp::valheim_host(Options {
+            tls: true,
+            size_requires_binary: true,
+            ..Default::default()
+        });
+        let fixture = mod_fixture();
+        let publication = fixture.publication();
+        let desired = large_mods_payload(8);
+        deploy_initial(&server, &publication, &desired);
+
+        let mut session = open_ftps(&server).unwrap();
+        server.clear_commands();
+        let previewed = preview(
+            &mut session,
+            &publication,
+            &desired,
+            &selection(true, false),
+            &context(),
+            &meta(),
+        )
+        .unwrap();
+        assert!(previewed.plan.uploads.is_empty());
+        assert!(
+            server.peak_connections() > 1,
+            "reader helpers must be opened for this test to prove anything"
+        );
+
+        let mut saw_mutation = false;
+        for command in server.commands.lock().unwrap().iter() {
+            let verb = command.split(' ').next().unwrap_or_default();
+            if MUTATING.contains(&verb) {
+                saw_mutation = true;
+                let target = command.split(' ').nth(1).unwrap_or_default();
+                assert!(
+                    target.starts_with("/BepInEx/config/.gale-deploy.lock"),
+                    "{command} mutated a path outside the deployment lease"
+                );
+            }
+        }
+        assert!(saw_mutation, "lease acquire/release must have run");
+    }
     /// dot-prefixed paths fully visible — exercised through the real FTP
     /// transport. A completed deployment must write, verify, and reload
     /// its exact recorded state through a fresh connection, and a second
