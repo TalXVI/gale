@@ -726,11 +726,16 @@ async fn apply_restart_policy_reporting(
     }
 }
 
-fn observed_restart(saw_stopped: &mut bool, running: Option<bool>) -> bool {
-    if running == Some(false) {
+fn observed_restart(saw_stopped: &mut bool, saw_booting: &mut bool, status: &HostStatus) -> bool {
+    if status.running == Some(false) {
         *saw_stopped = true;
     }
-    *saw_stopped && running == Some(true)
+    if status.booting == Some(true) {
+        *saw_booting = true;
+    }
+    status.running == Some(true)
+        && status.booting != Some(true)
+        && (*saw_stopped || (*saw_booting && status.booting == Some(false)))
 }
 
 async fn do_restart(
@@ -746,20 +751,31 @@ async fn do_restart(
         return RestartOutcome::Failed;
     }
 
-    // A running response alone may still describe the old process. Only a
-    // stop followed by a start confirms the requested restart took effect.
-    let mut saw_stopped = before.is_some_and(|status| status.running == Some(false));
+    // A running response alone may still describe the old process. Observe
+    // either a stop/start or a post-request booting/completed transition.
+    let mut saw_stopped = before
+        .as_ref()
+        .is_some_and(|status| status.running == Some(false));
+    let mut saw_booting = false;
     for attempt in 0..RESTART_VERIFY_ATTEMPTS {
         if let Some(progress) = progress.as_deref_mut() {
+            let waiting_for = if before
+                .as_ref()
+                .is_some_and(|status| status.booting.is_some())
+            {
+                "server to finish booting"
+            } else {
+                "server to stop and start"
+            };
             progress.item(format!(
-                "Waiting for server to stop and start (check {} of {})",
+                "Waiting for {waiting_for} (check {} of {})",
                 attempt + 1,
                 RESTART_VERIFY_ATTEMPTS
             ));
         }
         tokio::time::sleep(RESTART_VERIFY_DELAY).await;
         match host.status().await {
-            Ok(status) if observed_restart(&mut saw_stopped, status.running) => {
+            Ok(status) if observed_restart(&mut saw_stopped, &mut saw_booting, &status) => {
                 return RestartOutcome::Restarted;
             }
             Ok(_) => {}
@@ -2999,7 +3015,7 @@ mod tests {
         ] {
             let fixture = mod_fixture();
             let memory = remote();
-            let mut session = open(memory).unwrap();
+            let mut session = open(memory.clone()).unwrap();
             let deployment = deploy(
                 &mut session,
                 no_connect,
@@ -3015,16 +3031,84 @@ mod tests {
             .unwrap();
             let state = finish(&mut session, deployment, outcome, &meta()).unwrap();
             assert_eq!(state.restart_required, required, "{outcome:?}");
+            assert_eq!(
+                open(memory).unwrap().state.restart_required,
+                required,
+                "persisted {outcome:?}"
+            );
         }
     }
 
     #[test]
     fn running_status_without_an_observed_stop_does_not_confirm_restart() {
         let mut saw_stopped = false;
-        assert!(!observed_restart(&mut saw_stopped, Some(true)));
-        assert!(!observed_restart(&mut saw_stopped, None));
-        assert!(!observed_restart(&mut saw_stopped, Some(false)));
-        assert!(observed_restart(&mut saw_stopped, Some(true)));
+        let mut saw_booting = false;
+        let status = |running, booting| HostStatus {
+            running,
+            booting,
+            players: None,
+        };
+        assert!(!observed_restart(
+            &mut saw_stopped,
+            &mut saw_booting,
+            &status(Some(true), None)
+        ));
+        assert!(!observed_restart(
+            &mut saw_stopped,
+            &mut saw_booting,
+            &status(None, None)
+        ));
+        assert!(!observed_restart(
+            &mut saw_stopped,
+            &mut saw_booting,
+            &status(Some(false), None)
+        ));
+        assert!(observed_restart(
+            &mut saw_stopped,
+            &mut saw_booting,
+            &status(Some(true), None)
+        ));
+    }
+
+    #[test]
+    fn booting_must_be_observed_after_the_request_before_completion_counts() {
+        let mut saw_stopped = false;
+        let mut saw_booting = false;
+        let status = |running, booting| HostStatus {
+            running,
+            booting,
+            players: None,
+        };
+        assert!(!observed_restart(
+            &mut saw_stopped,
+            &mut saw_booting,
+            &status(Some(true), Some(false))
+        ));
+        assert!(!observed_restart(
+            &mut saw_stopped,
+            &mut saw_booting,
+            &status(Some(true), None)
+        ));
+        assert!(!observed_restart(
+            &mut saw_stopped,
+            &mut saw_booting,
+            &status(Some(true), Some(true))
+        ));
+        assert!(!observed_restart(
+            &mut saw_stopped,
+            &mut saw_booting,
+            &status(Some(true), None)
+        ));
+        assert!(!observed_restart(
+            &mut saw_stopped,
+            &mut saw_booting,
+            &status(None, Some(false))
+        ));
+        assert!(observed_restart(
+            &mut saw_stopped,
+            &mut saw_booting,
+            &status(Some(true), Some(false))
+        ));
     }
 
     #[test]
@@ -4209,14 +4293,17 @@ mod tests {
         let host = RestartHost(Mutex::new(VecDeque::from([
             HostStatus {
                 running: Some(true),
+                booting: None,
                 players: None,
             },
             HostStatus {
                 running: Some(false),
+                booting: None,
                 players: None,
             },
             HostStatus {
                 running: Some(true),
+                booting: None,
                 players: None,
             },
         ])));
@@ -4249,6 +4336,157 @@ mod tests {
                 .as_deref()
                 .is_some_and(|item| item.contains("check 2 of 12"))
         }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn restart_verification_requires_evidence_and_stops_promptly() {
+        use std::collections::VecDeque;
+
+        use crate::profile::server::host::BoxFuture;
+
+        struct RestartHost {
+            statuses: Mutex<VecDeque<Result<HostStatus>>>,
+            last: HostStatus,
+            probes: Mutex<usize>,
+            fail_restart: bool,
+        }
+
+        impl HostControl for RestartHost {
+            fn capabilities(&self) -> HostCapabilities {
+                HostCapabilities {
+                    can_restart: true,
+                    reports_players: false,
+                }
+            }
+
+            fn restart<'a>(&'a self) -> BoxFuture<'a, Result<()>> {
+                Box::pin(async move {
+                    if self.fail_restart {
+                        bail!("restart rejected")
+                    }
+                    Ok(())
+                })
+            }
+
+            fn status<'a>(&'a self) -> BoxFuture<'a, Result<HostStatus>> {
+                Box::pin(async move {
+                    *self.probes.lock().unwrap() += 1;
+                    self.statuses
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or_else(|| Ok(self.last.clone()))
+                })
+            }
+
+            fn name(&self) -> &'static str {
+                "test host"
+            }
+        }
+
+        let status = |running, booting| HostStatus {
+            running: Some(running),
+            booting,
+            players: None,
+        };
+        let before = status(true, Some(false));
+        for (name, statuses, last, fail_restart, expected, probes) in [
+            (
+                "dathost reboot",
+                vec![
+                    Ok(before.clone()),
+                    Ok(status(true, Some(true))),
+                    Ok(status(true, Some(false))),
+                ],
+                before.clone(),
+                false,
+                RestartOutcome::Restarted,
+                3,
+            ),
+            (
+                "generic stop/start",
+                vec![
+                    Ok(status(true, None)),
+                    Ok(status(false, None)),
+                    Ok(status(true, None)),
+                ],
+                status(true, None),
+                false,
+                RestartOutcome::Restarted,
+                3,
+            ),
+            (
+                "on alone",
+                vec![Ok(before.clone())],
+                before.clone(),
+                false,
+                RestartOutcome::StartupUnverified,
+                13,
+            ),
+            (
+                "unknown booting",
+                vec![Ok(status(true, None)), Ok(status(true, Some(true)))],
+                status(true, None),
+                false,
+                RestartOutcome::StartupUnverified,
+                13,
+            ),
+            (
+                "status failure",
+                vec![Ok(before.clone()), Err(eyre::eyre!("status failed"))],
+                before.clone(),
+                false,
+                RestartOutcome::StartupUnverified,
+                2,
+            ),
+            (
+                "stuck booting",
+                vec![Ok(before.clone())],
+                status(true, Some(true)),
+                false,
+                RestartOutcome::StartupUnverified,
+                13,
+            ),
+            (
+                "restart failure",
+                vec![Ok(before.clone())],
+                before.clone(),
+                true,
+                RestartOutcome::Failed,
+                1,
+            ),
+        ] {
+            let host = RestartHost {
+                statuses: Mutex::new(VecDeque::from(statuses)),
+                last,
+                probes: Mutex::new(0),
+                fail_restart,
+            };
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let sink = events.clone();
+            let mut progress = ProgressReporter::new(
+                "restart-run".to_owned(),
+                SyncOperation::Deploy,
+                &selection(true, true),
+                move |snapshot| sink.lock().unwrap().push(snapshot),
+            );
+            progress.phase(SyncPhase::ApplyingRestart);
+            let result = apply_restart_policy_reporting(
+                &host,
+                RestartPolicy::Immediate,
+                true,
+                Some(&mut progress),
+            )
+            .await;
+            assert_eq!(result, expected, "{name}");
+            assert_eq!(*host.probes.lock().unwrap(), probes, "{name}");
+            if name == "dathost reboot" {
+                assert!(events.lock().unwrap().iter().any(|event| {
+                    event.item.as_deref()
+                        == Some("Waiting for server to finish booting (check 2 of 12)")
+                }));
+            }
+        }
     }
 
     // --- remote accessors through the shared handle ---

@@ -26,6 +26,8 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 #[derive(Debug, Clone, Default)]
 pub struct HostStatus {
     pub running: Option<bool>,
+    /// Startup in progress, when the provider reports it.
+    pub booting: Option<bool>,
     /// Connected player count, when the provider reports one.
     pub players: Option<u32>,
 }
@@ -74,7 +76,7 @@ impl HostControl for NoHostControl {
 
 /// DatHost game-server API adapter.
 ///
-/// - `GET  /api/0.1/game-servers/{id}` returns status including `on`.
+/// - `GET  /api/0.1/game-servers/{id}` refreshes and returns `booting`.
 /// - `GET  /api/0.1/game-servers/{id}/metrics` returns the player count
 ///   where the game supports it.
 /// - `POST /api/0.1/game-servers/{id}/start` is documented to *restart* an
@@ -90,6 +92,7 @@ pub struct DatHostControl {
 #[derive(Debug, Deserialize)]
 struct DatHostServer {
     on: bool,
+    booting: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,6 +171,7 @@ impl HostControl for DatHostControl {
             };
             Ok(HostStatus {
                 running: Some(server.on),
+                booting: server.booting,
                 players,
             })
         })
@@ -258,13 +262,13 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE.into_response()
             }
             "GET /game-servers/server-1/" => {
-                let running = api
+                let booting = api
                     .post_restart_statuses
                     .lock()
                     .unwrap()
                     .pop_front()
-                    .unwrap_or(true);
-                axum::Json(serde_json::json!({"on": running})).into_response()
+                    .unwrap_or(false);
+                axum::Json(serde_json::json!({"on": true, "booting": booting})).into_response()
             }
             "GET /game-servers/server-1/metrics" => {
                 axum::Json(serde_json::json!({"player_count": api.players})).into_response()
@@ -276,7 +280,7 @@ mod tests {
                 api.post_restart_statuses
                     .lock()
                     .unwrap()
-                    .extend([false, true]);
+                    .extend([true, false]);
                 StatusCode::NO_CONTENT.into_response()
             }
             _ => {
@@ -391,5 +395,12 @@ mod tests {
             assert_eq!(*api.calls.lock().unwrap(), calls);
             assert!(api.violations.lock().unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn missing_dat_host_booting_state_stays_unknown() {
+        let server: DatHostServer =
+            serde_json::from_value(serde_json::json!({"on": true})).unwrap();
+        assert_eq!(server.booting, None);
     }
 }
