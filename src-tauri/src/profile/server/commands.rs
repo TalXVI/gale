@@ -35,8 +35,8 @@ use crate::{
             runtime::{self, ServerStatus, SharedChild},
             secrets::{ServerSecret, ServerSecrets},
             settings::{
-                ProfileServerSettings, RemoteServerSettings, RestartPolicy, ServerLocation,
-                SyncDialogPreferences, SyncMode,
+                ProfileServerSettings, RemoteServerSettings, RestartPolicy, SyncDialogPreferences,
+                SyncMode,
             },
             spec::DeploymentSpec,
             stage::{self, CachePayloadSource},
