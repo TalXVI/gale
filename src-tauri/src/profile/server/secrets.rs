@@ -100,6 +100,11 @@ impl ServerSecrets {
         }
     }
 
+    /// Whether a credential is stored, without exposing its value.
+    pub fn has(&self, secret: ServerSecret) -> Result<bool> {
+        self.get(secret).map(|value| value.is_some())
+    }
+
     /// Stores `value` when `remember` is set, clears it otherwise.
     pub fn persist(&self, secret: ServerSecret, value: &str, remember: bool) -> Result<()> {
         if remember && !value.is_empty() {
@@ -124,21 +129,35 @@ impl ServerSecrets {
 }
 
 #[cfg(test)]
+pub(crate) fn in_memory_secrets() -> ServerSecrets {
+    use keyring::mock::MockCredential;
+
+    let entry = || Entry::new_with_credential(Box::new(MockCredential::default()));
+    ServerSecrets {
+        game_password: entry(),
+        sftp_password: entry(),
+        ftp_password: entry(),
+        ssh_key_passphrase: entry(),
+        dat_host_password: entry(),
+        worker_token: entry(),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::profile::server::commands::persist_credential;
     use keyring::mock::MockCredential;
 
-    fn in_memory_secrets() -> ServerSecrets {
-        let entry = || Entry::new_with_credential(Box::new(MockCredential::default()));
-        ServerSecrets {
-            game_password: entry(),
-            sftp_password: entry(),
-            ftp_password: entry(),
-            ssh_key_passphrase: entry(),
-            dat_host_password: entry(),
-            worker_token: entry(),
-        }
+    #[test]
+    fn has_reports_stored_credentials() {
+        let secrets = in_memory_secrets();
+        assert!(!secrets.has(ServerSecret::SftpPassword).unwrap());
+        secrets.set(ServerSecret::SftpPassword, "hunter2").unwrap();
+        assert!(secrets.has(ServerSecret::SftpPassword).unwrap());
+        assert!(!secrets.has(ServerSecret::WorkerToken).unwrap());
+        secrets.remove(ServerSecret::SftpPassword).unwrap();
+        assert!(!secrets.has(ServerSecret::SftpPassword).unwrap());
     }
 
     #[test]

@@ -174,6 +174,7 @@ pub fn run() {
             profile::launch::commands::open_game_dir,
             profile::server::commands::launch_dedicated_server,
             profile::server::commands::get_dedicated_server_settings,
+            profile::server::commands::get_saved_server_credentials,
             profile::server::commands::get_sync_dialog_preferences,
             profile::server::commands::set_sync_dialog_preferences,
             profile::server::commands::set_dedicated_server_settings,

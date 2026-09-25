@@ -192,6 +192,32 @@ pub fn get_dedicated_server_settings(app: AppHandle) -> Option<ProfileServerSett
     app.lock_manager().active_profile().server_settings.clone()
 }
 
+/// Which of the profile's credentials have a stored value, so the UI can
+/// show "saved" markers. Values are never returned.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedServerCredentials {
+    pub game_password: bool,
+    pub sftp_password: bool,
+    pub ftp_password: bool,
+    pub ssh_key_passphrase: bool,
+    pub dat_host_password: bool,
+    pub worker_token: bool,
+}
+
+#[command]
+pub fn get_saved_server_credentials(app: AppHandle) -> Result<SavedServerCredentials> {
+    let secrets = ServerSecrets::for_profile(active_profile_id(&app))?;
+    Ok(SavedServerCredentials {
+        game_password: secrets.has(ServerSecret::GamePassword)?,
+        sftp_password: secrets.has(ServerSecret::SftpPassword)?,
+        ftp_password: secrets.has(ServerSecret::FtpPassword)?,
+        ssh_key_passphrase: secrets.has(ServerSecret::SshKeyPassphrase)?,
+        dat_host_password: secrets.has(ServerSecret::DatHostPassword)?,
+        worker_token: secrets.has(ServerSecret::WorkerToken)?,
+    })
+}
+
 #[command]
 pub fn get_sync_dialog_preferences(app: AppHandle) -> SyncDialogPreferences {
     app.lock_manager()
@@ -241,8 +267,7 @@ pub async fn set_dedicated_server_settings(
         .as_ref()
         .map(|settings| settings.sync_dialog.clone())
         .unwrap_or_default();
-    if settings.location == ServerLocation::Remote
-        && settings.remote.sync_mode == SyncMode::Worker
+    if settings.remote.sync_mode == SyncMode::Worker
         && worker_config_differs(stored.as_ref(), &settings)
     {
         // The running worker is authoritative for automation flags — the
@@ -262,14 +287,12 @@ pub async fn set_dedicated_server_settings(
         settings.remote.restart_policy = confirmed.restart_policy;
     }
 
-    if settings.location == ServerLocation::Local {
-        persist_credential(
-            &secrets,
-            Some(ServerSecret::GamePassword),
-            &request.game_password,
-            request.remember_game_password,
-        )?;
-    }
+    persist_credential(
+        &secrets,
+        Some(ServerSecret::GamePassword),
+        &request.game_password,
+        request.remember_game_password,
+    )?;
 
     save_settings_for(&app, profile_id, settings.clone())?;
 
@@ -696,13 +719,46 @@ pub async fn get_server_sync_status(
         Err(err) => Err(err),
     };
     if let Err(err) = refreshed {
-        status.credential_required = true;
+        status.credential_required = ServerSecrets::for_profile(target.profile_id)
+            .map(|secrets| {
+                credential_missing(
+                    &secrets,
+                    &target.settings,
+                    &request.password,
+                    &request.worker_token,
+                )
+            })
+            .unwrap_or(false);
         status
             .warnings
             .push(format!("could not read server status: {err:#}"));
     }
 
     Ok(status)
+}
+
+/// Whether the executor's required secret is absent from both the request
+/// and the credential store — the only refresh failure that entering a
+/// credential can fix. Other failures surface as plain warnings.
+fn credential_missing(
+    secrets: &ServerSecrets,
+    settings: &RemoteServerSettings,
+    password: &str,
+    worker_token: &str,
+) -> bool {
+    let (secret, provided) = match settings.sync_mode {
+        SyncMode::Local => match ServerSecret::required_by(settings) {
+            Some(secret) => (secret, password),
+            // SSH agent auth has no storable credential.
+            None => return false,
+        },
+        SyncMode::Worker => (ServerSecret::WorkerToken, worker_token),
+    };
+    provided.is_empty()
+        && secrets
+            .get(secret)
+            .map(|value| value.is_none())
+            .unwrap_or(false)
 }
 
 #[command]
@@ -1360,5 +1416,35 @@ mod tests {
         local.remote.sync_mode = SyncMode::Local;
         assert!(worker_config_differs(Some(&local), &stored));
         assert!(worker_config_differs(None, &stored));
+    }
+
+    #[test]
+    fn credential_missing_only_when_the_required_secret_is_absent() {
+        use super::super::secrets::in_memory_secrets;
+
+        let secrets = in_memory_secrets();
+
+        // Local mode with password auth needs the SFTP credential.
+        let mut remote = RemoteServerSettings::default();
+        assert!(credential_missing(&secrets, &remote, "", ""));
+
+        // A provided value or a stored credential both cover it.
+        assert!(!credential_missing(&secrets, &remote, "typed", ""));
+        secrets.set(ServerSecret::SftpPassword, "saved").unwrap();
+        assert!(!credential_missing(&secrets, &remote, "", ""));
+
+        // Agent auth needs no credential at all.
+        remote.authentication = super::super::settings::RemoteAuthentication::Agent;
+        secrets.remove(ServerSecret::SftpPassword).unwrap();
+        assert!(!credential_missing(&secrets, &remote, "", ""));
+
+        // Worker mode keys off the worker token instead.
+        remote.sync_mode = SyncMode::Worker;
+        assert!(credential_missing(&secrets, &remote, "typed", ""));
+        assert!(!credential_missing(&secrets, &remote, "", "token"));
+        secrets
+            .set(ServerSecret::WorkerToken, "saved-token")
+            .unwrap();
+        assert!(!credential_missing(&secrets, &remote, "", ""));
     }
 }

@@ -331,6 +331,17 @@ export type ProfileServerSettings = {
 
 export type SyncDialogPreferences = { restartPolicy: RestartPolicy };
 
+/// Which of the profile's server credentials exist in the credential
+/// store. The values themselves are never exposed to the frontend.
+export type SavedServerCredentials = {
+	gamePassword: boolean;
+	sftpPassword: boolean;
+	ftpPassword: boolean;
+	sshKeyPassphrase: boolean;
+	datHostPassword: boolean;
+	workerToken: boolean;
+};
+
 export type RemoteConnectionTestResult =
 	| { status: 'connected'; fingerprint: string | null; encrypted: boolean }
 	| { status: 'hostKeyUntrusted'; fingerprint: string }

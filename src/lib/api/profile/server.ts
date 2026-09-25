@@ -8,6 +8,7 @@ import type {
 	RemoteConnectionTestResult,
 	RemoteServerSettings,
 	RestartPolicy,
+	SavedServerCredentials,
 	SyncDialogPreferences,
 	ServerSyncPreview,
 	ServerSyncOperationProgress,
@@ -22,6 +23,11 @@ export const getSettings = () =>
 
 export const getSyncDialogPreferences = () =>
 	invoke<SyncDialogPreferences>('get_sync_dialog_preferences');
+
+/// Which server credentials are stored for the active profile. Values
+/// are never returned, only presence flags for "saved" markers.
+export const getSavedCredentials = () =>
+	invoke<SavedServerCredentials>('get_saved_server_credentials');
 
 export const setSyncDialogPreferences = (preferences: SyncDialogPreferences) =>
 	invoke('set_sync_dialog_preferences', { preferences });
