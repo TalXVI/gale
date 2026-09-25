@@ -25,7 +25,7 @@
 <div class="mt-2 flex flex-col gap-3">
 	<div>
 		<div class="flex items-center">
-			<Label for={`${formId}-protocol`}>{m.dedicatedServerDialog_protocol()}</Label>
+			<Label inline for={`${formId}-protocol`}>{m.dedicatedServerDialog_protocol()}</Label>
 			<Info>{protocolInfo}</Info>
 		</div>
 		<Select

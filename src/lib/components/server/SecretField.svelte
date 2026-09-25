@@ -53,7 +53,8 @@
 	{/if}
 	{#if rememberLabel}
 		<div class="mt-1 flex items-center">
-			<Label for={`${id}-remember`}>{rememberLabel}</Label><Info>{m.serverPage_rememberInfo()}</Info
+			<Label inline for={`${id}-remember`}>{rememberLabel}</Label><Info
+				>{m.serverPage_rememberInfo()}</Info
 			><Checkbox id={`${id}-remember`} bind:checked={remember} />
 		</div>
 	{/if}

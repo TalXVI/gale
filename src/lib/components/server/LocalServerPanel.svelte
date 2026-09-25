@@ -88,12 +88,12 @@
 		/>
 	</div>
 	<div class="flex items-center">
-		<Label for={`${formId}-field-6`}>{m.dedicatedServerDialog_public()}</Label><Info
+		<Label inline for={`${formId}-field-6`}>{m.dedicatedServerDialog_public()}</Label><Info
 			>{m.dedicatedServerDialog_publicInfo()}</Info
 		><Checkbox id={`${formId}-field-6`} bind:checked={form.form.publicServer} />
 	</div>
 	<div class="flex items-center">
-		<Label for={`${formId}-field-7`}>{m.dedicatedServerDialog_crossplay()}</Label><Info
+		<Label inline for={`${formId}-field-7`}>{m.dedicatedServerDialog_crossplay()}</Label><Info
 			>{m.dedicatedServerDialog_crossplayInfo()}</Info
 		><Checkbox id={`${formId}-field-7`} bind:checked={form.form.crossplay} />
 	</div>

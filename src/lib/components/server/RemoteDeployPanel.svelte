@@ -260,7 +260,7 @@
 </p>
 <div class="mt-3 flex w-full flex-wrap items-center gap-3">
 	<div class="flex items-center gap-2">
-		<Label class="w-auto min-w-0" for={`${formId}-restart`}>{m.serverSync_restartPolicy()}</Label>
+		<Label inline for={`${formId}-restart`}>{m.serverSync_restartPolicy()}</Label>
 		<Select
 			id={`${formId}-restart`}
 			type="single"

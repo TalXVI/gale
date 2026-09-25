@@ -42,7 +42,7 @@
 
 <div
 	data-testid="server-page-scroll"
-	class="mx-auto flex w-full max-w-3xl grow flex-col gap-1 overflow-y-auto px-6 pt-2 pb-6"
+	class="mx-auto flex w-full max-w-4xl grow flex-col gap-1 overflow-y-auto px-6 pt-2 pb-6"
 >
 	<LargeHeading>{m.serverPage_title()}</LargeHeading>
 	<p class="text-primary-600 dark:text-primary-300">

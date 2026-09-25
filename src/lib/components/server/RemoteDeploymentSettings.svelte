@@ -186,17 +186,21 @@
 	{/if}
 	{#if form.syncChoice !== 'local'}
 		<div class="flex items-center">
-			<Label for={`${formId}-auto-sync`}>{m.dedicatedServerDialog_workerAutoSync()}</Label><Info
-				>{m.dedicatedServerDialog_workerAutoSyncInfo()}</Info
-			><Checkbox id={`${formId}-auto-sync`} bind:checked={form.form.remote.worker.autoSync} />
+			<Label inline for={`${formId}-auto-sync`}>{m.dedicatedServerDialog_workerAutoSync()}</Label
+			><Info>{m.dedicatedServerDialog_workerAutoSyncInfo()}</Info><Checkbox
+				id={`${formId}-auto-sync`}
+				bind:checked={form.form.remote.worker.autoSync}
+			/>
 		</div>
 		<div class="flex items-center">
-			<Label for={`${formId}-auto-mods`}>{m.dedicatedServerDialog_workerAutoMods()}</Label><Info
-				>{m.dedicatedServerDialog_workerAutoModsInfo()}</Info
-			><Checkbox id={`${formId}-auto-mods`} bind:checked={form.form.remote.worker.autoMods} />
+			<Label inline for={`${formId}-auto-mods`}>{m.dedicatedServerDialog_workerAutoMods()}</Label
+			><Info>{m.dedicatedServerDialog_workerAutoModsInfo()}</Info><Checkbox
+				id={`${formId}-auto-mods`}
+				bind:checked={form.form.remote.worker.autoMods}
+			/>
 		</div>
 		<div>
-			<Label for={`${formId}-auto-restart`}>{m.serverPage_autoRestart()}</Label><Info
+			<Label inline for={`${formId}-auto-restart`}>{m.serverPage_autoRestart()}</Label><Info
 				>{m.serverPage_autoRestartInfo()}</Info
 			>
 			<Select

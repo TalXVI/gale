@@ -1,4 +1,4 @@
-import { test, expect, type Page } from '@playwright/test';
+import { test, expect, type Page, type Locator } from '@playwright/test';
 
 const lastSave = (page: Page) =>
 	page.evaluate(
@@ -439,6 +439,59 @@ test('deployment actions fit the page at the default app size', async ({ page })
 		.locator('button, [role="combobox"]')
 		.evaluateAll((els) => els.map((el) => el.getBoundingClientRect().right));
 	expect(Math.max(...widths)).toBeLessThanOrEqual(box.x + box.width + 1);
+});
+
+test.describe('page layout', () => {
+	// In a compact setting the label hugs its text so the tooltip and
+	// control read as one group — a form-field label would reserve a
+	// 35% column and leave dead space between the text and the control.
+	const expectCompactRow = async (label: Locator, control: Locator) => {
+		const labelBox = (await label.boundingBox())!;
+		const controlBox = (await control.boundingBox())!;
+		const textWidth = await label.evaluate((el) => {
+			const range = document.createRange();
+			range.selectNodeContents(el);
+			return range.getBoundingClientRect().width;
+		});
+		expect(Math.abs(controlBox.y - labelBox.y)).toBeLessThan(labelBox.height);
+		expect(labelBox.width).toBeLessThan(textWidth + 16);
+		expect(controlBox.x).toBeLessThan(labelBox.x + textWidth + 60);
+	};
+
+	test('compact settings keep the control next to the label', async ({ page }) => {
+		await page.goto('/tests/dialog/?local=1');
+		const localTab = page.getByRole('tabpanel', { name: 'This computer' });
+		for (const name of ['Remember password', 'Public server', 'Crossplay']) {
+			await expectCompactRow(
+				localTab.locator('label', { hasText: name }),
+				localTab.getByLabel(name)
+			);
+		}
+	});
+
+	test('the restart-policy select forms one control with its label', async ({ page }) => {
+		await page.goto('/tests/dialog/?status=upToDate');
+		const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
+		await expectCompactRow(
+			remoteTab.locator('label', { hasText: 'Restart after this deploy' }),
+			remoteTab.getByLabel('Restart after this deploy')
+		);
+	});
+
+	test('the page uses the modpack-page width', async ({ page }) => {
+		await page.goto('/tests/dialog/?local=1');
+		const scroll = page.getByTestId('server-page-scroll');
+		// max-w-4xl: 56 rem = 896 px, centered — under the 900x700 harness
+		// viewport as well as the default app size.
+		const expectWidth = async (viewportWidth: number) => {
+			const box = (await scroll.boundingBox())!;
+			expect(box.width).toBeCloseTo(896, 0);
+			expect(box.x).toBeCloseTo((viewportWidth - 896) / 2, 0);
+		};
+		await expectWidth(1400);
+		await page.setViewportSize({ width: 900, height: 700 });
+		await expectWidth(900);
+	});
 });
 
 test('provisioning the local worker leaves no unsaved bar', async ({ page }) => {
