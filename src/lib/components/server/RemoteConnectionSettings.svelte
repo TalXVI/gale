@@ -120,7 +120,7 @@
 			id={`${formId}-directory`}
 			class="mt-1 w-full"
 			bind:value={form.form.remote.serverDirectory}
-			placeholder="/home/valheim/server"
+			placeholder="/"
 		/>
 	</div>
 	<div>
