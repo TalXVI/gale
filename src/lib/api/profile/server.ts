@@ -18,8 +18,8 @@ import type {
 	WorkerStatus
 } from '$lib/types';
 
-export const getSettings = () =>
-	invoke<ProfileServerSettings | null>('get_dedicated_server_settings');
+export const getSettings = (options?: { quiet?: boolean }) =>
+	invoke<ProfileServerSettings | null>('get_dedicated_server_settings', undefined, options);
 
 export const getSyncDialogPreferences = () =>
 	invoke<SyncDialogPreferences>('get_sync_dialog_preferences');
@@ -32,27 +32,33 @@ export const getSavedCredentials = () =>
 export const setSyncDialogPreferences = (preferences: SyncDialogPreferences) =>
 	invoke('set_sync_dialog_preferences', { preferences });
 
-/// Persists settings and credentials together. Empty credential fields
-/// leave stored credentials untouched; `rememberCredentials = false`
-/// clears them.
+/// One credential as the form keeps it: the typed value (may be empty)
+/// and whether it should stay stored across saves.
+export type CredentialInput = { value: string; remember: boolean };
+
+/// Persists settings and credentials together. An empty value leaves a
+/// stored credential untouched; each `remember` flag controls only its
+/// own credential — `false` clears that one.
 export const setSettings = (
 	settings: ProfileServerSettings,
-	remotePassword: string,
-	workerToken: string,
-	datHostPassword: string,
-	rememberCredentials: boolean,
-	gamePassword = '',
-	rememberGamePassword = false
+	credentials: {
+		gamePassword: CredentialInput;
+		remotePassword: CredentialInput;
+		workerToken: CredentialInput;
+		datHostPassword: CredentialInput;
+	}
 ) =>
 	invoke('set_dedicated_server_settings', {
 		request: {
 			settings,
-			remotePassword,
-			workerToken,
-			datHostPassword,
-			rememberCredentials,
-			gamePassword,
-			rememberGamePassword
+			remotePassword: credentials.remotePassword.value,
+			rememberRemotePassword: credentials.remotePassword.remember,
+			workerToken: credentials.workerToken.value,
+			rememberWorkerToken: credentials.workerToken.remember,
+			datHostPassword: credentials.datHostPassword.value,
+			rememberDatHostPassword: credentials.datHostPassword.remember,
+			gamePassword: credentials.gamePassword.value,
+			rememberGamePassword: credentials.gamePassword.remember
 		}
 	});
 
@@ -88,10 +94,19 @@ export const forceStop = () => invoke('force_stop_dedicated_server');
 
 // ---------- selective server synchronization ----------
 
-export const getSyncStatus = (refresh: boolean, password = '', workerToken = '') =>
-	invoke<ServerSyncStatus>('get_server_sync_status', {
-		request: { refresh, password, workerToken }
-	});
+export const getSyncStatus = (
+	refresh: boolean,
+	password = '',
+	workerToken = '',
+	options?: { quiet?: boolean }
+) =>
+	invoke<ServerSyncStatus>(
+		'get_server_sync_status',
+		{
+			request: { refresh, password, workerToken }
+		},
+		options
+	);
 
 export const getSyncProgress = (workerToken = '') =>
 	invoke<ServerSyncOperationProgress | null>('get_server_sync_progress', {
@@ -159,7 +174,8 @@ export const configureWorker = (
 // ---------- managed local worker ("host worker on this PC") ----------
 
 /// SCM state + status file + live API status for the managed worker.
-export const getLocalWorkerStatus = () => invoke<LocalWorkerStatus>('get_local_worker_status');
+export const getLocalWorkerStatus = (options?: { quiet?: boolean }) =>
+	invoke<LocalWorkerStatus>('get_local_worker_status', undefined, options);
 
 /// Provisions and installs the managed worker: a second Gale sign-in
 /// gives the worker its own credentials, then one UAC-elevated step

@@ -9,9 +9,9 @@
 		tooltip: string;
 		disabled?: boolean;
 		outline?: boolean;
-		/// Status dot: green while the local server runs, amber when the
-		/// remote has an update pending.
-		badge?: 'running' | 'pending';
+		/// Status dot: green when the local server runs or the remote is
+		/// up to date, amber when the remote has an update pending.
+		badge?: 'healthy' | 'pending';
 	};
 
 	let { to, icon, tooltip, outline = true, disabled = false, badge }: Props = $props();
@@ -53,9 +53,10 @@
 	<Icon icon="{icon}-outline" class={[!hasOutline && 'hidden']} />
 	{#if badge}
 		<span
+			data-badge={badge}
 			class={[
 				'absolute top-1 right-1 size-2 rounded-full',
-				badge === 'running' ? 'bg-green-500' : 'bg-amber-500'
+				badge === 'healthy' ? 'bg-green-500' : 'bg-amber-500'
 			]}
 		></span>
 	{/if}

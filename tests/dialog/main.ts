@@ -65,6 +65,9 @@ const worker = {
 	lastOperation: null,
 	server: null
 };
+if (params.has('deployed')) worker.lastDeployedRevision = '2026-09-21T00:00:00Z';
+if (params.has('wpending')) worker.pendingRevision = '2026-09-23T12:00:00Z';
+let workerRefreshFails = false;
 const profileId = params.get('profile') ?? 'first';
 let activeId = 1;
 const preferences = JSON.parse(
@@ -180,9 +183,10 @@ function serverState() {
 const calls: { cmd: string; args: any }[] = [];
 const unexpected: string[] = [];
 let held = '';
-let release: (() => void) | undefined;
+const heldResolvers = new Set<() => void>();
 const failing = new Set<string>();
 if (params.has('failStatus')) failing.add('get_server_sync_status');
+if (params.has('holdStatus')) held = 'get_server_sync_status';
 let workerProgress: Record<string, unknown> | null = null;
 let progressPolls = 0;
 const progressListeners = new Set<number>();
@@ -245,7 +249,8 @@ Object.assign(window, {
 	},
 	release: () => {
 		held = '';
-		release?.();
+		for (const resolve of heldResolvers) resolve();
+		heldResolvers.clear();
 	},
 	fail: (cmd: string) => {
 		failing.add(cmd);
@@ -263,6 +268,12 @@ Object.assign(window, {
 	setWorkerPending: (pendingRevision: string | null) => {
 		worker.pendingRevision = pendingRevision;
 	},
+	setWorkerDeployed: (revision: string | null) => {
+		worker.lastDeployedRevision = revision;
+	},
+	failWorkerRefresh: (on: boolean) => {
+		workerRefreshFails = on;
+	},
 	progressPolls: () => progressPolls,
 	emitProgress: (patch: Record<string, unknown>) => {
 		for (const handler of progressListeners) {
@@ -275,6 +286,9 @@ Object.assign(window, {
 });
 
 mockIPC(async (cmd, args) => {
+	// The profile a call belongs to is fixed when it arrives — a held
+	// response still describes the profile it was issued for.
+	const callProfile = activeId;
 	if (cmd === 'get_server_sync_progress') {
 		progressPolls++;
 		return workerProgress ? progressPayload(workerProgress) : null;
@@ -282,7 +296,7 @@ mockIPC(async (cmd, args) => {
 	calls.push({ cmd, args: structuredClone(args) });
 	if (cmd === held)
 		await new Promise<void>((resolve) => {
-			release = resolve;
+			heldResolvers.add(resolve);
 		});
 	if (failing.has(cmd))
 		throw { message: `Simulated failure: ${cmd}`, detail: `Simulated failure: ${cmd}` };
@@ -336,6 +350,24 @@ mockIPC(async (cmd, args) => {
 		case 'get_user':
 			return null;
 		case 'get_dedicated_server_settings':
+			if (settings == null) return null;
+			// Profile 2 is a plain manual-sync profile — the navbar must
+			// never poll or badge it as a worker remote. `?worker2=1`
+			// makes it a second worker-mode profile instead.
+			if (activeId === 2) {
+				const s = settings as any;
+				return {
+					...s,
+					remote: {
+						...s.remote,
+						syncMode: params.has('worker2') ? 'worker' : 'local',
+						worker: {
+							...s.remote.worker,
+							address: params.has('worker2') ? 'https://worker2.example.test' : ''
+						}
+					}
+				};
+			}
 			return settings;
 		case 'get_saved_server_credentials':
 			return {
@@ -435,16 +467,27 @@ mockIPC(async (cmd, args) => {
 		case 'get_server_sync_status':
 			// The second profile has never been published or deployed —
 			// a profile switch must show its state, not profile 1's.
-			if (activeId === 2)
-				return {
-					mode: 'local',
-					worker: null,
-					publicationRevision: null,
-					server: null,
-					credentialRequired: false,
-					warnings: []
-				};
-			return {
+			// `?worker2=1` instead makes it a worker remote with pending
+			// work, so its badge shows amber.
+			if (callProfile === 2)
+				return params.has('worker2')
+					? {
+							mode: 'worker',
+							worker: { ...worker, pendingRevision: '2026-09-23T12:00:00Z' },
+							publicationRevision: '2026-09-25T00:00:00Z',
+							server: null,
+							credentialRequired: false,
+							warnings: []
+						}
+					: {
+							mode: 'local',
+							worker: null,
+							publicationRevision: null,
+							server: null,
+							credentialRequired: false,
+							warnings: []
+						};
+			const syncStatus = {
 				mode: workerMode || hostedWorker ? 'worker' : 'local',
 				worker: workerMode || hostedWorker ? worker : null,
 				// A publication normally exists — `nopub` models a profile
@@ -456,8 +499,24 @@ mockIPC(async (cmd, args) => {
 						: '2026-09-22T00:00:00Z',
 				server: serverState(),
 				credentialRequired: false,
-				warnings: []
+				warnings: [] as string[]
 			};
+			// Mirrors the backend: a failed live refresh on the worker
+			// returns an Ok status without the worker payload plus a
+			// warning, rather than throwing.
+			if (
+				workerRefreshFails &&
+				(args as any).request.refresh === true &&
+				syncStatus.mode === 'worker'
+			) {
+				return {
+					...syncStatus,
+					worker: null,
+					server: null,
+					warnings: ['could not read server status: connection refused']
+				};
+			}
+			return syncStatus;
 		case 'get_sync_dialog_preferences':
 			return preferences[profileId] ?? { restartPolicy: 'manual' };
 		case 'set_sync_dialog_preferences':

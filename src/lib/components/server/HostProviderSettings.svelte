@@ -50,6 +50,8 @@
 			label={m.dedicatedServerDialog_datHostPassword()}
 			bind:value={form.datHostPassword}
 			saved={form.savedCredentials?.datHostPassword ?? false}
+			rememberLabel={m.dedicatedServerDialog_rememberPassword()}
+			bind:remember={form.rememberDatHostPassword}
 		/>
 	{/if}
 </div>

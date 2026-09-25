@@ -70,17 +70,14 @@
 			label={m.dedicatedServerDialog_password()}
 			bind:value={form.gamePassword}
 			saved={form.savedCredentials?.gamePassword ?? false}
+			rememberLabel={m.dedicatedServerDialog_rememberPassword()}
+			bind:remember={form.rememberGamePassword}
 		/>
 		{#if !form.rememberGamePassword}
 			<p id={`${formId}-password-help`} class="text-primary-500 mt-1 text-sm">
 				{m.dedicatedServerDialog_sessionPassword()}
 			</p>
 		{/if}
-	</div>
-	<div class="flex items-center">
-		<Label for={`${formId}-field-4`}>{m.dedicatedServerDialog_rememberPassword()}</Label><Info
-			>{m.dedicatedServerDialog_credentialInfo()}</Info
-		><Checkbox id={`${formId}-field-4`} bind:checked={form.rememberGamePassword} />
 	</div>
 	<div>
 		<Label for={`${formId}-field-5`}>{m.dedicatedServerDialog_serverPort()}</Label><InputField

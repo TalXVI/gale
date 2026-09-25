@@ -14,13 +14,15 @@
 	// The background poll only makes sense once a game with dedicated
 	// servers is active; it retargets itself on profile changes.
 	$effect(() => {
-		serverSync.start(games.active?.dedicatedServer ? profiles.activeId : null);
+		serverSync.start(serverSync.currentSyncKey());
 	});
 
-	const serverBadge = $derived.by(() => {
+	const serverBadge = $derived.by<'healthy' | 'pending' | undefined>(() => {
 		if (!games.active?.dedicatedServer) return undefined;
-		if (server.status.state === 'running') return 'running' as const;
-		if (serverSync.pending) return 'pending' as const;
+		// A locally running server always wins over the remote state.
+		if (server.status.state === 'running') return 'healthy';
+		if (serverSync.remoteBadge === 'upToDate') return 'healthy';
+		if (serverSync.remoteBadge === 'pending') return 'pending';
 		return undefined;
 	});
 
@@ -46,6 +48,7 @@
 						to: '/server',
 						icon: 'mdi:server',
 						tooltip: m.navBar_link_server(),
+						outline: false,
 						badge: serverBadge
 					}
 				]

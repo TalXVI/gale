@@ -172,6 +172,8 @@
 			label={m.dedicatedServerDialog_workerToken()}
 			bind:value={form.workerToken}
 			saved={form.savedCredentials?.workerToken ?? false}
+			rememberLabel={m.serverPage_rememberToken()}
+			bind:remember={form.rememberWorkerToken}
 		/>
 		<div>
 			<Button

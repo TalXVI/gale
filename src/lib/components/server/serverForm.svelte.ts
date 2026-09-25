@@ -9,7 +9,6 @@ import type {
 	SavedServerCredentials
 } from '$lib/types';
 import games from '$lib/state/game.svelte';
-import profiles from '$lib/state/profile.svelte';
 import serverSync from '$lib/state/serverSync.svelte';
 import { confirm, message, open as openDialog } from '@tauri-apps/plugin-dialog';
 import { m } from '$lib/paraglide/messages';
@@ -85,6 +84,8 @@ export class ServerFormState {
 	datHostPassword = $state('');
 	rememberGamePassword = $state(true);
 	rememberRemotePassword = $state(true);
+	rememberWorkerToken = $state(true);
+	rememberDatHostPassword = $state(true);
 	savedCredentials = $state<SavedServerCredentials | null>(null);
 	hasSavedSettings = $state(false);
 	loadingSettings = $state(false);
@@ -114,7 +115,9 @@ export class ServerFormState {
 			remotePort: this.remotePort,
 			syncChoice: this.syncChoice,
 			rememberGamePassword: this.rememberGamePassword,
-			rememberRemotePassword: this.rememberRemotePassword
+			rememberRemotePassword: this.rememberRemotePassword,
+			rememberWorkerToken: this.rememberWorkerToken,
+			rememberDatHostPassword: this.rememberDatHostPassword
 		})
 	);
 	secretsDirty = $derived(
@@ -215,18 +218,23 @@ export class ServerFormState {
 		}
 	}
 
-	async refreshLocalWorker() {
+	async refreshLocalWorker({ background = false } = {}) {
 		try {
-			this.localWorker = await api.profile.server.getLocalWorkerStatus();
+			const status = await api.profile.server.getLocalWorkerStatus(
+				background ? { quiet: true } : undefined
+			);
+			this.localWorker = status;
 			// An unfinished setup would otherwise be invisible: the profile
 			// still reads 'local' because linking it is the step that
 			// failed. Show the hosted-worker section so Finish setup is
 			// one click away.
-			if (this.localWorker?.ownership === 'incomplete' && this.syncChoice === 'local') {
+			if (status?.ownership === 'incomplete' && this.syncChoice === 'local') {
 				this.syncChoice = 'hostedWorker';
 			}
 		} catch {
-			this.localWorker = null;
+			// A background refresh keeps the last known service state —
+			// only a foreground call reports the worker as unknown.
+			if (!background) this.localWorker = null;
 		}
 	}
 
@@ -383,15 +391,12 @@ export class ServerFormState {
 		if (!current) return;
 		this.saving = true;
 		try {
-			await api.profile.server.setSettings(
-				current,
-				this.remotePassword,
-				this.workerToken,
-				this.datHostPassword,
-				this.rememberRemotePassword,
-				this.gamePassword,
-				this.rememberGamePassword
-			);
+			await api.profile.server.setSettings(current, {
+				gamePassword: { value: this.gamePassword, remember: this.rememberGamePassword },
+				remotePassword: { value: this.remotePassword, remember: this.rememberRemotePassword },
+				workerToken: { value: this.workerToken, remember: this.rememberWorkerToken },
+				datHostPassword: { value: this.datHostPassword, remember: this.rememberDatHostPassword }
+			});
 			// Automation toggles may have changed — re-read the worker's own
 			// state so the pending banner reflects what it will actually do.
 			await this.refreshLocalWorker();
@@ -407,7 +412,7 @@ export class ServerFormState {
 			this.#savedJson = this.#liveJson;
 			// The navbar poll targets remote+worker setups; a save may have
 			// just created or removed one.
-			serverSync.start(profiles.activeId);
+			void serverSync.reconfigure();
 			pushInfoToast({ message: m.dedicatedServerDialog_saved() });
 		} catch {
 			// The save failed — the backend leaves stored settings
@@ -432,6 +437,8 @@ export class ServerFormState {
 			syncChoice: SyncChoice;
 			rememberGamePassword: boolean;
 			rememberRemotePassword: boolean;
+			rememberWorkerToken: boolean;
+			rememberDatHostPassword: boolean;
 		};
 		this.form = { ...saved.form, location: this.form.location };
 		this.port = saved.port;
@@ -439,6 +446,8 @@ export class ServerFormState {
 		this.syncChoice = saved.syncChoice;
 		this.rememberGamePassword = saved.rememberGamePassword;
 		this.rememberRemotePassword = saved.rememberRemotePassword;
+		this.rememberWorkerToken = saved.rememberWorkerToken;
+		this.rememberDatHostPassword = saved.rememberDatHostPassword;
 	}
 
 	/// Reverts the automation controls to the last state the worker
@@ -469,15 +478,12 @@ export class ServerFormState {
 		current.remote.worker.hosted = false;
 		this.provisioning = true;
 		try {
-			await api.profile.server.setSettings(
-				current,
-				this.remotePassword,
-				this.workerToken,
-				this.datHostPassword,
-				this.rememberRemotePassword,
-				this.gamePassword,
-				this.rememberGamePassword
-			);
+			await api.profile.server.setSettings(current, {
+				gamePassword: { value: this.gamePassword, remember: this.rememberGamePassword },
+				remotePassword: { value: this.remotePassword, remember: this.rememberRemotePassword },
+				workerToken: { value: this.workerToken, remember: this.rememberWorkerToken },
+				datHostPassword: { value: this.datHostPassword, remember: this.rememberDatHostPassword }
+			});
 			this.localWorker = await api.profile.server.provisionLocalWorker(
 				this.remotePassword,
 				this.datHostPassword
@@ -500,6 +506,8 @@ export class ServerFormState {
 			this.clearSecrets();
 			await this.refreshSavedCredentials();
 			this.#savedJson = this.#liveJson;
+			// Provisioning turned this profile into a hosted-worker remote.
+			void serverSync.reconfigure();
 		} finally {
 			this.provisioning = false;
 		}
@@ -542,6 +550,7 @@ export class ServerFormState {
 				saved.form.remote.worker.address = '';
 				this.#savedJson = JSON.stringify(saved);
 			}
+			void serverSync.reconfigure();
 		} finally {
 			this.workerBusy = false;
 		}

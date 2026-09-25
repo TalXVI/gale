@@ -74,18 +74,18 @@
 
 	// Interval ticks never open a transport session — worker refresh=true
 	// also hits the game host through the worker, so both modes only
-	// re-read metadata while the page sits open.
+	// re-read metadata while the page sits open. They also run silently:
+	// a transient failure keeps the last known status instead of
+	// blanking the panel or popping a toast.
 	$effect(() => {
 		const worker = sync.isWorker();
-		const interval = setInterval(
-			() => {
-				if (document.visibilityState === 'visible' && !sync.busy) {
-					void sync.loadStatus(false).catch(() => {});
-				}
-				if (worker && form.syncChoice === 'hostedWorker') void form.refreshLocalWorker();
-			},
-			worker ? 10_000 : 60_000
-		);
+		const interval = setInterval(() => {
+			if (document.visibilityState === 'visible' && !sync.busy) {
+				void sync.loadStatus(false, { silent: true });
+			}
+			if (worker && form.syncChoice === 'hostedWorker')
+				void form.refreshLocalWorker({ background: true });
+		}, 60_000);
 		return () => clearInterval(interval);
 	});
 
@@ -99,7 +99,7 @@
 		}
 		if (updatedAt !== seenPublication) {
 			seenPublication = updatedAt;
-			if (!sync.busy) void sync.loadStatus(true).catch(() => {});
+			if (!sync.busy) void sync.loadStatus(true, { silent: true });
 		}
 	});
 
@@ -107,7 +107,7 @@
 		if (document.visibilityState !== 'visible' || sync.busy) return;
 		// Refocus only re-reads metadata; a live check needs an explicit
 		// Refresh or a new publication.
-		void sync.loadStatus(false).catch(() => {});
+		void sync.loadStatus(false, { silent: true });
 	}
 </script>
 

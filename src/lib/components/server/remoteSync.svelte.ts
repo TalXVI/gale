@@ -214,10 +214,41 @@ export class RemoteSync {
 		return true;
 	}
 
-	async loadStatus(refresh: boolean) {
-		this.loadingStatus = true;
+	#statusSeq = 0;
+
+	/// Silent calls never touch the loading flags: they run in the
+	/// background, keep the last status on failure, and only apply a
+	/// response that is not a step down from what is already known.
+	async loadStatus(refresh: boolean, { silent = false } = {}) {
+		// A silent tick must not fight a manual refresh for the status slot.
+		if (silent && this.loadingStatus) return;
+		if (!silent) this.loadingStatus = true;
+		const seq = ++this.#statusSeq;
+		const syncKey = serverSync.currentSyncKey();
 		try {
-			const next = await api.profile.server.getSyncStatus(refresh, this.password, this.workerToken);
+			const next = await api.profile.server.getSyncStatus(
+				refresh,
+				this.password,
+				this.workerToken,
+				silent ? { quiet: true } : undefined
+			);
+
+			// A newer request or a profile switch superseded this one.
+			if (seq !== this.#statusSeq) return;
+
+			if (silent) {
+				// A degraded response (live pieces lost to a transient
+				// failure, reported as a warning by the backend) must not
+				// overwrite a better known status.
+				const degraded =
+					this.status != null &&
+					next.warnings.length > 0 &&
+					((this.status.worker != null && next.worker == null) ||
+						(this.status.publicationRevision != null && next.publicationRevision == null) ||
+						(refresh && this.status.server != null && next.server == null));
+				if (degraded) return;
+			}
+
 			// A non-refresh response carries only publication metadata in
 			// either mode — keep the last live server state.
 			if (!refresh && next.server == null) {
@@ -227,11 +258,16 @@ export class RemoteSync {
 				next.worker.server = this.status?.worker?.server ?? null;
 			}
 			this.status = next;
-			serverSync.record(next);
 			this.lastRefreshAt = new Date();
+			serverSync.record(syncKey, next);
+		} catch (e) {
+			if (!silent) throw e;
 		} finally {
-			this.loadingStatus = false;
-			if (refresh) this.liveChecked = true;
+			// A superseded call must not settle the flags of its successor.
+			if (!silent && seq === this.#statusSeq) {
+				this.loadingStatus = false;
+				if (refresh) this.liveChecked = true;
+			}
 		}
 	}
 
@@ -239,6 +275,7 @@ export class RemoteSync {
 	/// results — so a profile switch never leaks the old profile's state.
 	/// The panel's own mount() is not re-run, so preferences reload here.
 	reset() {
+		this.#statusSeq++;
 		this.stopProgressTimers();
 		this.status = null;
 		this.preview = null;
@@ -253,7 +290,7 @@ export class RemoteSync {
 		this.restartPolicy = 'manual';
 		this.lastRefreshAt = null;
 		this.liveChecked = false;
-		serverSync.record(null);
+		this.loadingStatus = false;
 		void this.loadPreferences();
 	}
 
@@ -393,7 +430,7 @@ export class RemoteSync {
 			await api.profile.server.acknowledgeExternalRestart(this.password, this.workerToken);
 			this.preview = null;
 			this.approvedInput = '';
-			await this.loadStatus(true);
+			await this.loadStatus(true, { silent: true });
 		} catch (error) {
 			await message(error instanceof Error ? error.message : String(error), {
 				title: m.serverSync_acknowledgeRestartFailed(),
@@ -424,7 +461,7 @@ export class RemoteSync {
 			this.result = nextResult;
 			this.decisions = {};
 			this.preview = null;
-			void this.loadStatus(true).catch(() => {});
+			void this.loadStatus(true, { silent: true });
 		} catch (error) {
 			await this.failOperation(runId, 'deploy');
 			await message(error instanceof Error ? error.message : String(error), {

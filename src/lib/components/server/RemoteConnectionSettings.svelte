@@ -1,7 +1,6 @@
 <script lang="ts">
 	import InputField from '$lib/components/ui/InputField.svelte';
 	import Select from '$lib/components/ui/Select.svelte';
-	import Checkbox from '$lib/components/ui/Checkbox.svelte';
 	import Label from '$lib/components/ui/Label.svelte';
 	import Button from '$lib/components/ui/Button.svelte';
 	import Info from '$lib/components/ui/Info.svelte';
@@ -110,13 +109,12 @@
 				: m.dedicatedServerDialog_keyPassphrase()}
 			bind:value={form.remotePassword}
 			saved={form.remoteCredentialSaved}
+			rememberLabel={form.form.remote.authentication === 'privateKey'
+				? m.serverPage_rememberPassphrase()
+				: m.dedicatedServerDialog_rememberPassword()}
+			bind:remember={form.rememberRemotePassword}
 		/>
 	{/if}
-	<div class="flex items-center">
-		<Label for={`${formId}-remember`}>{m.serverPage_rememberPasswords()}</Label>
-		<Info>{m.serverPage_rememberPasswordsInfo()}</Info>
-		<Checkbox id={`${formId}-remember`} bind:checked={form.rememberRemotePassword} />
-	</div>
 	<div>
 		<Label for={`${formId}-directory`}>{m.dedicatedServerDialog_directory()}</Label><InputField
 			id={`${formId}-directory`}

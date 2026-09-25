@@ -1,5 +1,7 @@
 import * as api from '$lib/api';
-import type { ServerSyncStatus } from '$lib/types';
+import games from '$lib/state/game.svelte';
+import profiles from '$lib/state/profile.svelte';
+import type { ProfileServerSettings, ServerSyncStatus } from '$lib/types';
 
 /// High-level remote deployment state, in the same terms the server
 /// page's status line uses.
@@ -54,62 +56,117 @@ export function remoteDeployState(
 	return 'deployed';
 }
 
-class ServerSyncState {
-	status: ServerSyncStatus | null = $state(null);
-	pending = $derived(remoteDeployState(this.status) === 'pending');
+export class ServerSync {
+	/// Last worker-mode status this game+profile observed — polled by the
+	/// navbar and updated by the remote tab whenever it loads status.
+	status = $state<ServerSyncStatus | null>(null);
 
-	#profileId: number | null = null;
-	#timer: ReturnType<typeof setInterval> | null = null;
+	/// What the navbar badge should show. Only worker observations ever
+	/// reach `status`, so a manual-sync profile correctly shows no
+	/// remote dot.
+	remoteBadge = $derived.by<'upToDate' | 'pending' | null>(() => {
+		const state = remoteDeployState(this.status);
+		if (state === 'upToDate') return 'upToDate';
+		if (state === 'pending') return 'pending';
+		return null;
+	});
 
-	/// Records a status fetched by the server page so the navbar badge
-	/// reflects what the user sees there. `null` clears it.
-	record(status: ServerSyncStatus | null) {
-		this.status = status;
+	#key: string | null = null;
+	#pollTimer: ReturnType<typeof setInterval> | null = null;
+	#pollInFlight: number | null = null;
+	/// Bumped whenever the polling target changes — an in-flight request
+	/// from an older generation is ignored on success and failure alike.
+	#generation = 0;
+
+	/// Identifies the active game+profile the badge belongs to, or null
+	/// when the game has no dedicated server or no profile is selected.
+	currentSyncKey(): string | null {
+		const game = games.active;
+		if (game?.dedicatedServer == null || profiles.activeId == null) return null;
+		return `${game.slug}:${profiles.activeId}`;
 	}
 
-	/// Starts (or retargets) the cheap background status poll. Only
-	/// remote+worker configurations can be polled without opening a
-	/// transport session, so other setups just reset the state.
-	start(profileId: number | null) {
+	/// Called when the active game or profile may have changed. A
+	/// different key drops the old profile's status; the same key keeps
+	/// it and only re-evaluates whether polling should run.
+	start(key: string | null) {
+		if (key !== this.#key) {
+			this.#key = key;
+			this.status = null;
+		}
+		void this.reconfigure();
+	}
+
+	/// Re-reads the settings for the current key and starts or stops
+	/// polling. The observed status is only dropped when the profile is
+	/// no longer a remote worker setup.
+	async reconfigure() {
+		const generation = ++this.#generation;
 		this.stop();
-		if (profileId === null) return;
-		this.#profileId = profileId;
-		void this.#enableIfWorker(profileId);
+		const key = this.#key;
+		if (key == null) {
+			this.status = null;
+			return;
+		}
+		try {
+			const settings = await api.profile.server.getSettings({ quiet: true });
+			if (generation !== this.#generation || key !== this.#key) return;
+			if (settings == null || !this.#enableIfWorker(settings)) {
+				this.status = null;
+				return;
+			}
+			void this.#poll(key);
+			this.#pollTimer = setInterval(() => void this.#poll(key), 60_000);
+		} catch {
+			// Settings could not be read — nothing reliable to poll for.
+		}
 	}
 
 	stop() {
-		this.#profileId = null;
-		if (this.#timer) clearInterval(this.#timer);
-		this.#timer = null;
-		this.status = null;
+		if (this.#pollTimer) clearInterval(this.#pollTimer);
+		this.#pollTimer = null;
 	}
 
-	async #enableIfWorker(profileId: number) {
+	#enableIfWorker(settings: ProfileServerSettings) {
+		return settings.remote.syncMode === 'worker' && settings.remote.host.trim() !== '';
+	}
+
+	async #poll(key: string) {
+		const generation = this.#generation;
+		// Only a poll of the current generation blocks another one — a
+		// stale request must not delay the new target's first poll.
+		if (this.#pollInFlight === generation) return;
+		this.#pollInFlight = generation;
 		try {
-			const settings = await api.profile.server.getSettings();
-			if (
-				this.#profileId !== profileId ||
-				settings?.remote.syncMode !== 'worker' ||
-				settings.remote.host.trim() === ''
-			) {
-				return;
-			}
-			void this.#poll(profileId);
-			this.#timer = setInterval(() => void this.#poll(profileId), 60_000);
+			const status = await api.profile.server.getSyncStatus(false, '', '', {
+				quiet: true
+			});
+			// The target moved while the request was in flight — this
+			// answer belongs to a different profile.
+			if (generation !== this.#generation || key !== this.#key) return;
+			// Anything but a worker observation cannot describe the badge —
+			// keep the last known state.
+			if (!this.#isWorkerObservation(status)) return;
+			this.status = status;
 		} catch {
-			// Polling is best-effort; the badge simply stays unset.
+			// A failed poll keeps the last known status — the navbar dot
+			// must not flap on a transient error.
+		} finally {
+			if (this.#pollInFlight === generation) this.#pollInFlight = null;
 		}
 	}
 
-	async #poll(profileId: number) {
-		try {
-			this.status = await api.profile.server.getSyncStatus(false, '', '');
-		} catch {
-			if (this.#profileId === profileId) this.status = null;
-		}
+	#isWorkerObservation(status: ServerSyncStatus) {
+		return status.mode === 'worker' && status.worker != null;
+	}
+
+	/// The remote tab feeds the statuses it actually applied here so the
+	/// navbar reflects what the page shows.
+	record(key: string | null, status: ServerSyncStatus | null) {
+		if (key !== this.#key || status == null || !this.#isWorkerObservation(status)) return;
+		this.status = status;
 	}
 }
 
-const serverSync = new ServerSyncState();
-
+const serverSync = new ServerSync();
 export default serverSync;
