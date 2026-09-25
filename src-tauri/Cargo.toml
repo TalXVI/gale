@@ -18,6 +18,10 @@ name = "gale-worker"
 path = "src/bin/gale_worker.rs"
 required-features = ["worker"]
 
+[[bin]]
+name = "gale-worker-tray"
+path = "src/bin/gale_worker_tray.rs"
+
 [build-dependencies]
 chrono = "0.4"
 tauri-build = { version = "2", features = [] }
@@ -121,6 +125,7 @@ windows = { version = "0.62", features = [
 ] }
 windows-service = "0.8"
 winreg = "0.52"
+tray-icon = "0.23"
 
 [target.'cfg(target_os="linux")'.dependencies]
 webkit2gtk = "2.0.1"

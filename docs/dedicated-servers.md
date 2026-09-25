@@ -94,6 +94,8 @@ If setup stops after the service was installed but before the profile was linked
 
 Once installed, the service runs as LocalSystem and is independent of the Gale process: it starts with Windows before any user signs in, restarts automatically after a crash, and resumes queued deployments from its journal. The service only reports `Running` to Windows once its API is bound and serving — a start that fails during initialization ends in `Stopped` with a failure exit, so SCM recovery actions behave correctly. Start, Stop, and Restart use the service's configured control permissions. Update (available when Gale ships a newer worker) and Uninstall request UAC elevation.
 
+The notification-area icon is owned by a separate per-user native helper, never by the Session 0 service. Gale copies the helper to a content-versioned directory under `%LocalAppData%\Gale\worker-tray`, registers that copy in the current user's `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, and starts it after provisioning. The resident helper polls only SCM state, shows the normal Gale icon with the `Gale Worker` tooltip while the service is `Running`, and remains hidden but resident while the service is stopped. A session-local mutex prevents duplicate icons. Gale refreshes the versioned copy on app startup after an app update; Worker uninstall removes the startup entry, signals the helper to exit, and removes its user-local files.
+
 State layout:
 
 ```text
@@ -115,6 +117,7 @@ Notes and limitations:
 - SSH **agent** authentication cannot run unattended in a service; use a password or a private key. A private key under `%USERPROFILE%` is copied into `private\` at setup, since LocalSystem cannot read your profile directory.
 - One managed worker per machine, bound to one profile: the `GaleWorker` service name and the state-directory lock both reject duplicates, and the worker is permanently bound to the profile it was set up for. Other profiles see it as owned by someone else — they cannot start, stop, update, or uninstall it, and setup will never silently rebind it. To move it, sign in to the owning profile and uninstall first.
 - Gale updates ship a newer `gale-worker.exe` beside the app, but the service keeps running its installed copy so updates never fight a locked executable. The page shows **Update worker** when the bundled copy is newer; updating keeps credentials and pending work.
+- The tray process runs only from its LocalAppData copy and embeds Gale's existing icon. It therefore holds neither the installed service binary nor Gale's bundled Worker/tray files open. Its **Update** command passes the current bundled `gale-worker.exe` to the same elevated `service reinstall` path as the Server page; the tray helper can never become the service update source.
 - `status.json` records why the worker last stopped. If the service is stopped but the report says `running`, the process crashed — SCM failure actions restart it. A `shutdown` report means the machine went down and the service returns on the next boot.
 
 #### Installing the worker on a separate host

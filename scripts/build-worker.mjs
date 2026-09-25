@@ -31,6 +31,21 @@ mkdirSync(outDir, { recursive: true });
 const staged = join(outDir, exe);
 copyFileSync(join(tauriDir, 'target', profile, exe), staged);
 
+let trayComponent = '';
+if (isWindows) {
+	execSync(['cargo', 'build', ...cargoArgs, '--bin', 'gale-worker-tray'].join(' '), {
+		cwd: tauriDir,
+		stdio: 'inherit',
+	});
+	const trayExe = 'gale-worker-tray.exe';
+	const stagedTray = join(outDir, trayExe);
+	copyFileSync(join(tauriDir, 'target', profile, trayExe), stagedTray);
+	trayComponent = `
+			<Component Id="GaleWorkerTrayBinary" Guid="*" Win64="yes" Directory="INSTALLDIR">
+				<File Id="GaleWorkerTrayExe" Source="${stagedTray}" KeyPath="yes" />
+			</Component>`;
+}
+
 // Referenced by `bundle.windows.wix.fragmentPaths` — the ComponentGroup
 // id is wired into the MSI's External feature via `componentGroupRefs`.
 // In dev the staged binary only feeds `worker_exe()`'s sibling lookup.
@@ -41,7 +56,7 @@ writeFileSync(
 		<ComponentGroup Id="GaleWorkerBinaries">
 			<Component Id="GaleWorkerBinary" Guid="*" Win64="yes" Directory="INSTALLDIR">
 				<File Id="GaleWorkerExe" Source="${staged}" KeyPath="yes" />
-			</Component>
+			</Component>${trayComponent}
 		</ComponentGroup>
 	</Fragment>
 </Wix>

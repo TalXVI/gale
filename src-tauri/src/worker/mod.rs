@@ -20,6 +20,8 @@ pub(crate) mod local;
 /// Windows; dead code elsewhere.
 #[cfg(any(windows, feature = "worker"))]
 pub(crate) mod secrets;
+#[cfg(windows)]
+pub mod tray;
 
 #[cfg(feature = "worker")]
 pub(crate) mod journal;

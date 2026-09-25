@@ -53,6 +53,15 @@ const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
 const ERROR_SERVICE_MARKED_FOR_DELETE: i32 = 1072;
 /// How long to wait for service state transitions.
 const TRANSITION_TIMEOUT: Duration = Duration::from_secs(45);
+/// Serializes elevated install, reinstall, and uninstall. Taken inside
+/// those processes so the lock outlives the unelevated caller that showed
+/// UAC. Session-local: the consenting user's elevated process can open it.
+/// Callers must not hold this name across the launch, or the child waits
+/// on its parent until the timeout.
+const UPDATE_MUTEX: &str = r"Local\GaleWorkerUpdate";
+/// Covers one install or reinstall that stops, replaces, and starts the
+/// service. A waiter past this fails closed instead of overlapping.
+const UPDATE_LOCK_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 
 /// The SDDL DACL applied to the service. It is the Windows default plus
 /// start/stop rights for interactive users, so Gale can control the
@@ -294,12 +303,96 @@ fn provision_fail(log: &Path, err: &eyre::Report) -> eyre::Report {
     eyre::eyre!("{err:#}")
 }
 
+struct UpdateLock(windows::Win32::Foundation::HANDLE);
+
+impl Drop for UpdateLock {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::System::Threading::ReleaseMutex(self.0);
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+fn acquire_update_lock(log: &Path) -> Result<UpdateLock> {
+    match acquire_named_lock(UPDATE_MUTEX, Duration::ZERO) {
+        Ok(Acquired::Ready(lock)) => Ok(lock),
+        Ok(Acquired::TimedOut(handle)) => {
+            provision_log(
+                log,
+                "waiting for another Worker install, update, or uninstall to finish",
+            );
+            match wait_for_lock(handle, UPDATE_LOCK_TIMEOUT) {
+                Ok(Acquired::Ready(lock)) => Ok(lock),
+                Ok(Acquired::TimedOut(handle)) => {
+                    drop_handle(handle);
+                    bail!(
+                        "another Worker install, update, or uninstall is still running — wait for it to finish and try again"
+                    )
+                }
+                Err(err) => Err(err),
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+enum Acquired {
+    Ready(UpdateLock),
+    TimedOut(windows::Win32::Foundation::HANDLE),
+}
+
+fn acquire_named_lock(name: &str, timeout: Duration) -> Result<Acquired> {
+    use windows::Win32::System::Threading::CreateMutexW;
+    use windows::core::{HSTRING, PCWSTR};
+
+    let name = HSTRING::from(name);
+    let handle = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }
+        .context("failed to open the worker update lock")?;
+    // `wait_for_lock` owns the handle: it stores it, returns it, or closes it.
+    wait_for_lock(handle, timeout)
+}
+
+fn wait_for_lock(
+    handle: windows::Win32::Foundation::HANDLE,
+    timeout: Duration,
+) -> Result<Acquired> {
+    use windows::Win32::Foundation::{WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::WaitForSingleObject;
+
+    let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+    let status = unsafe { WaitForSingleObject(handle, millis) };
+    if status == WAIT_OBJECT_0 || status == WAIT_ABANDONED {
+        Ok(Acquired::Ready(UpdateLock(handle)))
+    } else if status == WAIT_TIMEOUT {
+        Ok(Acquired::TimedOut(handle))
+    } else {
+        // CloseHandle overwrites the wait failure, so capture it first.
+        let err = windows::core::Error::from_thread();
+        drop_handle(handle);
+        Err(err).context("failed to acquire the worker update lock")
+    }
+}
+
+fn drop_handle(handle: windows::Win32::Foundation::HANDLE) {
+    unsafe {
+        let _ = windows::Win32::Foundation::CloseHandle(handle);
+    }
+}
+
+/// The desktop reads the provisioning log, not the elevated process's
+/// stderr, so a lock failure has to be written there before it returns.
+fn lock_service_change(log: &Path) -> Result<UpdateLock> {
+    acquire_update_lock(log).map_err(|err| provision_fail(log, &err))
+}
+
 /// `gale-worker service install --from <staging> --log <file>`.
 ///
 /// `staging` holds the `gale-worker.json` and `secrets.env` the desktop
 /// prepared. Everything after this point runs elevated, so it must not
 /// read user-specific state beyond those staged files.
 pub fn install(staging: &Path, log: &Path) -> Result<()> {
+    let _lock = lock_service_change(log)?;
     if let Err(err) = install_inner(staging, log) {
         return Err(provision_fail(log, &err));
     }
@@ -402,6 +495,7 @@ fn start_installed_worker(
 /// service, then removes `%ProgramData%\Gale\worker` — durable state goes
 /// with it, so migration docs tell users to copy it first.
 pub fn uninstall(log: &Path) -> Result<()> {
+    let _lock = lock_service_change(log)?;
     if let Err(err) = uninstall_inner(log) {
         return Err(provision_fail(log, &err));
     }
@@ -567,6 +661,7 @@ fn create_service(
 /// from the *installed* config and swaps in this binary. Gale uses it to
 /// roll out an updated worker without re-running the OAuth provisioning.
 pub fn reinstall(log: &Path) -> Result<()> {
+    let _lock = lock_service_change(log)?;
     if let Err(err) = reinstall_inner(log) {
         return Err(provision_fail(log, &err));
     }
@@ -674,6 +769,8 @@ fn icacls(path: &Path, grants: &[&str]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{ServiceArgs, await_listen_ready, load_and_build};
 
     #[test]
@@ -777,5 +874,44 @@ mod tests {
         .unwrap();
         let init = load_and_build(&args).expect("valid config must load");
         assert_eq!(init.runtime.block_on(async { 42 }), 42);
+    }
+
+    #[test]
+    fn update_lock_is_exclusive_until_the_holder_releases() {
+        let name = r"Local\GaleWorkerUpdateTest";
+        let super::Acquired::Ready(held) =
+            super::acquire_named_lock(name, Duration::from_secs(5)).unwrap()
+        else {
+            panic!("the free lock should be acquired immediately");
+        };
+
+        // A Windows mutex lets the owning thread wait again without
+        // blocking, so the contender has to be a different thread.
+        // The handle is not `Send`, so the contender closes it before returning.
+        let timed_out = std::thread::spawn(move || {
+            match super::acquire_named_lock(name, Duration::from_millis(200)).unwrap() {
+                super::Acquired::TimedOut(handle) => {
+                    super::drop_handle(handle);
+                    true
+                }
+                super::Acquired::Ready(lock) => {
+                    drop(lock);
+                    false
+                }
+            }
+        })
+        .join()
+        .unwrap();
+        assert!(
+            timed_out,
+            "a held lock should time out instead of proceeding"
+        );
+
+        drop(held);
+        let super::Acquired::Ready(_released) =
+            super::acquire_named_lock(name, Duration::from_secs(5)).unwrap()
+        else {
+            panic!("releasing the holder should let the next waiter acquire");
+        };
     }
 }

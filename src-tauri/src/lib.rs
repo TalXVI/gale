@@ -66,6 +66,13 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         warn!("failed to register gale deep link protocol: {:#}", err);
     }
 
+    #[cfg(windows)]
+    tauri::async_runtime::spawn_blocking(|| {
+        if let Err(err) = profile::server::local_worker::refresh_tray_companion() {
+            warn!("failed to refresh the managed Worker tray companion: {err:#}");
+        }
+    });
+
     let args = env::args().collect_vec();
     if let Some(url) = args.get(1)
         && !deep_link::handle(app.handle(), url.to_owned())

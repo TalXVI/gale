@@ -39,7 +39,7 @@ use crate::{
         sync::auth,
     },
     state::ManagerExt,
-    worker::{api::WorkerRunPhase, config::WorkerConfig, local, secrets::Secrets},
+    worker::{api::WorkerRunPhase, config::WorkerConfig, local, secrets::Secrets, tray},
 };
 
 /// What the service control manager reports, projected for the UI.
@@ -501,6 +501,9 @@ async fn provision_windows(
         }
         Ok(_) => {}
     }
+    install_tray_companion().context(
+        "the Worker is running, but its notification-area companion could not be installed",
+    )?;
     // The staged payload was consumed by the install; drop the staging
     // dir now rather than leaving secret copies in temp for the rest of
     // this function. (Drop would catch it anyway; explicit is clearer.)
@@ -573,28 +576,12 @@ pub async fn control(app: &AppHandle, action: LocalWorkerAction) -> Result<Local
     #[cfg(windows)]
     {
         require_owned(app)?;
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            use windows_service::service::ServiceState as ScmState;
-            let service = open_service(match action {
-                LocalWorkerAction::Start => Access::Start,
-                LocalWorkerAction::Stop => Access::Stop,
-                LocalWorkerAction::Restart => Access::StartStop,
-            })?;
-            if !matches!(action, LocalWorkerAction::Start) {
-                local::stop_and_wait(&service)?;
-            }
-            if !matches!(action, LocalWorkerAction::Stop) {
-                service
-                    .start(&[] as &[&std::ffi::OsStr])
-                    .context("failed to start the service")?;
-                local::wait_for_state(&service, ScmState::Running)?;
-                local::await_listen_ready(
-                    &installed_binding()
-                        .ok_or_eyre("the managed worker is not installed")?
-                        .listen,
-                )?;
-            }
-            Ok(())
+        tokio::task::spawn_blocking(move || {
+            local::control_service(match action {
+                LocalWorkerAction::Start => local::ServiceControlAction::Start,
+                LocalWorkerAction::Stop => local::ServiceControlAction::Stop,
+                LocalWorkerAction::Restart => local::ServiceControlAction::Restart,
+            })
         })
         .await
         .context("worker control task failed")??;
@@ -614,19 +601,16 @@ pub async fn update(app: &AppHandle) -> Result<LocalWorkerStatus> {
     #[cfg(windows)]
     {
         require_owned(app)?;
-        let log = std::env::temp_dir().join(format!("gale-worker-update-{}.log", Uuid::new_v4()));
-        let args = format!("service reinstall --log \"{}\"", log.display());
-        let exit = {
+        {
             let exe = worker_exe()?;
-            tokio::task::spawn_blocking(move || run_elevated(&exe, &args))
-                .await
-                .context("elevated update task failed")?
+            let helper = tray_exe()?;
+            tokio::task::spawn_blocking(move || {
+                tray::UpdatePlan::new(exe, local::root_dir().join(local::WORKER_EXE), helper)?
+                    .perform()
+            })
+            .await
+            .context("elevated update task failed")?
         }?;
-        if exit != 0 {
-            let detail = read_log(&log).unwrap_or_default();
-            bail!("worker update failed (exit {exit}): {}", detail.trim());
-        }
-        let _ = std::fs::remove_file(&log);
         status(app).await
     }
 }
@@ -677,6 +661,10 @@ pub async fn uninstall(app: &AppHandle) -> Result<LocalWorkerStatus> {
             persist_credential(&secrets, Some(ServerSecret::WorkerToken), "", false)?;
         }
 
+        tray::uninstall_for_current_user().context(
+            "the Worker was removed, but its tray startup entry could not be cleaned up",
+        )?;
+
         status(app).await
     }
 }
@@ -684,62 +672,14 @@ pub async fn uninstall(app: &AppHandle) -> Result<LocalWorkerStatus> {
 // ---------- Windows service plumbing ----------
 
 #[cfg(windows)]
-enum Access {
-    Start,
-    Stop,
-    StartStop,
-}
-
-#[cfg(windows)]
-fn service_manager() -> Result<windows_service::service_manager::ServiceManager> {
-    windows_service::service_manager::ServiceManager::local_computer(
-        None::<&str>,
-        windows_service::service_manager::ServiceManagerAccess::CONNECT,
-    )
-    .context("failed to open the service control manager")
-}
-
-/// `None` when the service does not exist; errors stay errors.
-#[cfg(windows)]
-fn try_open_service(
-    access: windows_service::service::ServiceAccess,
-) -> Result<Option<windows_service::service::Service>> {
-    match service_manager()?.open_service(local::SERVICE_NAME, access) {
-        Ok(service) => Ok(Some(service)),
-        Err(windows_service::Error::Winapi(err)) if err.raw_os_error() == Some(1060) => Ok(None),
-        Err(err) => Err(err).context("failed to open the worker service"),
-    }
-}
-
-#[cfg(windows)]
-fn open_service(access: Access) -> Result<windows_service::service::Service> {
-    use windows_service::service::ServiceAccess;
-    let access = match access {
-        Access::Start => ServiceAccess::START | ServiceAccess::QUERY_STATUS,
-        Access::Stop => ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
-        Access::StartStop => {
-            ServiceAccess::START | ServiceAccess::STOP | ServiceAccess::QUERY_STATUS
-        }
-    };
-    try_open_service(access)?.ok_or_eyre("the managed worker is not installed")
-}
-
-#[cfg(windows)]
 fn service_state() -> Result<ServiceState> {
-    use windows_service::service::{ServiceAccess, ServiceState as ScmState};
-    let Some(service) = try_open_service(ServiceAccess::QUERY_STATUS)? else {
-        return Ok(ServiceState::NotInstalled);
-    };
-    let state = service
-        .query_status()
-        .context("failed to query the worker service")?
-        .current_state;
-    Ok(match state {
-        ScmState::Stopped => ServiceState::Stopped,
-        ScmState::StartPending => ServiceState::StartPending,
-        ScmState::Running => ServiceState::Running,
-        ScmState::StopPending => ServiceState::StopPending,
-        _ => ServiceState::Other,
+    Ok(match local::service_state()? {
+        local::ManagedServiceState::NotInstalled => ServiceState::NotInstalled,
+        local::ManagedServiceState::Stopped => ServiceState::Stopped,
+        local::ManagedServiceState::StartPending => ServiceState::StartPending,
+        local::ManagedServiceState::Running => ServiceState::Running,
+        local::ManagedServiceState::StopPending => ServiceState::StopPending,
+        local::ManagedServiceState::Other => ServiceState::Other,
     })
 }
 
@@ -764,44 +704,7 @@ fn require_owned(app: &AppHandle) -> Result<()> {
 /// else goes through the service's unelevated control rights.
 #[cfg(windows)]
 fn run_elevated(exe: &std::path::Path, params: &str) -> Result<u32> {
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
-    use windows::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
-    use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
-    use windows::core::{HSTRING, PCWSTR, w};
-
-    let exe_w = HSTRING::from(exe.as_os_str());
-    let params_w = HSTRING::from(params);
-
-    let mut info = SHELLEXECUTEINFOW {
-        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
-        fMask: SEE_MASK_NOCLOSEPROCESS,
-        hwnd: Default::default(),
-        lpVerb: w!("runas"),
-        lpFile: PCWSTR(exe_w.as_ptr()),
-        lpParameters: PCWSTR(params_w.as_ptr()),
-        lpDirectory: PCWSTR::null(),
-        nShow: SW_HIDE.0,
-        ..Default::default()
-    };
-
-    unsafe { ShellExecuteExW(&mut info) }.context(
-        "the elevation prompt was cancelled or failed — installing the worker needs it once",
-    )?;
-
-    ensure!(
-        !info.hProcess.is_invalid(),
-        "the elevated worker installer produced no process handle"
-    );
-
-    let code = unsafe {
-        WaitForSingleObject(info.hProcess, INFINITE);
-        let mut code = 0u32;
-        let _ = GetExitCodeProcess(info.hProcess, &mut code);
-        let _ = CloseHandle(info.hProcess);
-        code
-    };
-    Ok(code)
+    local::run_elevated_worker(exe, params)
 }
 
 // ---------- shared helpers ----------
@@ -987,21 +890,27 @@ fn worker_update_available() -> bool {
     let Ok(bundled) = worker_exe() else {
         return false;
     };
-    let installed = local::root_dir().join(local::WORKER_EXE);
-    match (std::fs::read(&bundled), std::fs::read(&installed)) {
-        (Ok(bundled), Ok(installed)) => bundled != installed,
-        _ => false,
-    }
+    local::worker_update_available(&bundled)
 }
 
 /// `gale-worker.exe` next to the app binary (packaged installs), falling
 /// back to cargo build outputs for development.
 #[cfg(windows)]
 fn worker_exe() -> Result<PathBuf> {
+    bundled_exe(local::WORKER_EXE)
+}
+
+#[cfg(windows)]
+fn tray_exe() -> Result<PathBuf> {
+    bundled_exe(local::TRAY_EXE)
+}
+
+#[cfg(windows)]
+fn bundled_exe(name: &str) -> Result<PathBuf> {
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
-        let sibling = dir.join(local::WORKER_EXE);
+        let sibling = dir.join(name);
         if sibling.exists() {
             return Ok(sibling);
         }
@@ -1009,10 +918,7 @@ fn worker_exe() -> Result<PathBuf> {
 
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     for profile in ["release", "debug"] {
-        let candidate = manifest
-            .join("target")
-            .join(profile)
-            .join(local::WORKER_EXE);
+        let candidate = manifest.join("target").join(profile).join(name);
         if candidate.exists() {
             return Ok(candidate);
         }
@@ -1020,8 +926,24 @@ fn worker_exe() -> Result<PathBuf> {
 
     bail!(
         "{} was not found next to Gale or in target/ — package it with the app or run `cargo build --features worker --bin gale-worker`",
-        local::WORKER_EXE
+        name
     )
+}
+
+#[cfg(windows)]
+fn install_tray_companion() -> Result<()> {
+    tray::install_for_current_user(&tray_exe()?, &worker_exe()?)
+}
+
+/// Refreshes the LocalAppData tray copy after a Gale app update. This is
+/// intentionally best-effort at app startup; provisioning still treats a
+/// failed tray install as an actionable setup error.
+#[cfg(windows)]
+pub(crate) fn refresh_tray_companion() -> Result<()> {
+    if local::service_state()? == local::ManagedServiceState::NotInstalled {
+        return Ok(());
+    }
+    install_tray_companion()
 }
 
 #[cfg(all(test, windows))]
