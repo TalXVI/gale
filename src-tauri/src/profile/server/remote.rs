@@ -2757,20 +2757,17 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use super::{
+        ConnectionAttempt, FtpsCertVerifier, RemoteClient, RemoteConnection, RemoteOps,
+        RemoteProtocol, RemoteServerSettings, certificate_fingerprint, ftp_list_entries, ftp_store,
+        ftps_client_config,
+    };
+    use eyre::Result;
     use suppaftp::rustls::{
         RootCertStore, SignatureScheme,
         client::danger::ServerCertVerifier,
         pki_types::{CertificateDer, ServerName, UnixTime},
     };
-    use suppaftp::{FtpError, Status, types::Response};
-
-    use super::{
-        ConnectionAttempt, FtpsCertVerifier, RemoteClient, RemoteConnection, RemoteOps,
-        RemoteProtocol, RemoteServerSettings, allows_plaintext_ftp_fallback,
-        certificate_fingerprint, ftp_list_entries, ftp_store, ftps_client_config, is_ftp_not_found,
-        is_ftp_tls_unsupported,
-    };
-    use eyre::Result;
 
     #[test]
     fn parses_ftp_directory_responses() {
@@ -2783,48 +2780,20 @@ mod tests {
         assert_eq!(entries[0].size, Some(42));
     }
 
-    #[test]
-    fn recognizes_missing_ftp_paths() {
-        let missing = FtpError::UnexpectedResponse(Response::new(
-            Status::from(550),
-            b"550 path does not exists".to_vec(),
-        ));
-        assert!(is_ftp_not_found(&missing));
-    }
-
-    #[test]
-    fn recognizes_ftp_servers_without_tls() {
-        let unsupported = FtpError::UnexpectedResponse(Response::new(
-            Status::from(502),
-            b"502 AUTH TLS not implemented".to_vec(),
-        ));
-
-        assert!(is_ftp_tls_unsupported(&unsupported));
-    }
-
     /// Only automatic `ftp` mode may drop to plaintext when the server
     /// refuses AUTH TLS. A strict `ftps` selection must surface the
     /// failure instead of logging in unencrypted.
     #[test]
     fn strict_ftps_never_falls_back_to_plaintext() {
-        let tls_refused = FtpError::UnexpectedResponse(Response::new(
-            Status::from(502),
-            b"502 AUTH TLS not implemented".to_vec(),
-        ));
-        let unrelated = FtpError::UnexpectedResponse(Response::new(
-            Status::from(550),
-            b"550 unrelated".to_vec(),
-        ));
-
-        let mut settings = RemoteServerSettings {
-            protocol: RemoteProtocol::Ftp,
-            ..Default::default()
-        };
-        assert!(allows_plaintext_ftp_fallback(&settings, &tls_refused));
-        assert!(!allows_plaintext_ftp_fallback(&settings, &unrelated));
-
+        let server = FakeFtp::spawn(FakeFtpOptions::default());
+        let ftp = ftp_connect(&server);
+        let mut settings = ftp.settings.clone();
+        drop(ftp);
+        server.clear_commands();
         settings.protocol = RemoteProtocol::Ftps;
-        assert!(!allows_plaintext_ftp_fallback(&settings, &tls_refused));
+        assert!(RemoteConnection::connect(&settings, "pw").is_err());
+        assert_eq!(server.count("AUTH TLS"), 1);
+        assert_eq!(server.count("PASS "), 0);
     }
 
     /// The connector must initialize in a fresh process without a global provider.

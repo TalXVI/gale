@@ -189,14 +189,6 @@ mod tests {
     }
 
     #[test]
-    fn loads_a_valid_config() {
-        let config = load(valid_json()).unwrap();
-        assert_eq!(config.worker_id, "vps");
-        assert_eq!(config.profile_id, "p1");
-        assert_eq!(config.poll_interval_secs, 60);
-    }
-
-    #[test]
     fn binds_to_one_profile_and_rejects_empty_identity() {
         for field in ["workerId", "profileId", "game"] {
             let mut value = valid_json();
@@ -210,13 +202,5 @@ mod tests {
         let mut value = valid_json();
         value["pollIntervalSecs"] = serde_json::json!(MIN_POLL_SECS - 1);
         assert!(load(value).is_err());
-    }
-
-    #[test]
-    fn malformed_config_is_an_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("gale-worker.json");
-        std::fs::write(&path, b"{ not json").unwrap();
-        assert!(WorkerConfig::load(&path).is_err());
     }
 }

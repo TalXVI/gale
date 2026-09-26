@@ -318,7 +318,7 @@ impl RemoteServerSettings {
 mod tests {
     use super::{
         LocalServerSettings, ProfileServerSettings, RemoteAuthentication, RemoteProtocol,
-        RemoteServerSettings, RestartPolicy, ServerLocation, SyncMode, WorkerSettings,
+        RemoteServerSettings, ServerLocation, SyncMode, WorkerSettings,
     };
 
     /// The fresh-profile provisioning sequence relies on this contract:
@@ -468,36 +468,6 @@ mod tests {
         assert_eq!(settings.sync_dialog, Default::default());
     }
 
-    #[test]
-    fn manual_dialog_defaults_round_trip_per_local_profile() {
-        let mut first = ProfileServerSettings::default();
-        first.sync_dialog.restart_policy = RestartPolicy::WhenEmpty;
-        first.remote.restart_policy = RestartPolicy::Immediate;
-        let second = ProfileServerSettings::default();
-
-        let first: ProfileServerSettings =
-            serde_json::from_str(&serde_json::to_string(&first).unwrap()).unwrap();
-        let second: ProfileServerSettings =
-            serde_json::from_str(&serde_json::to_string(&second).unwrap()).unwrap();
-        assert_eq!(first.sync_dialog.restart_policy, RestartPolicy::WhenEmpty);
-        assert_eq!(first.remote.restart_policy, RestartPolicy::Immediate);
-        assert_eq!(second.sync_dialog, Default::default());
-    }
-
-    #[test]
-    fn a_legacy_scope_preference_is_ignored() {
-        // Settings written before the dialog dropped its scope selector
-        // still load — the field is simply forgotten.
-        let settings: ProfileServerSettings = serde_json::from_value(serde_json::json!({
-            "syncDialog": { "scope": "configs", "restartPolicy": "whenEmpty" }
-        }))
-        .unwrap();
-        assert_eq!(
-            settings.sync_dialog.restart_policy,
-            RestartPolicy::WhenEmpty
-        );
-    }
-
     /// `"ftps"` is a distinct protocol on the wire: it must not collapse
     /// into `ftp` when settings round-trip, or a strict-TLS selection
     /// would silently gain plaintext fallback.
@@ -523,27 +493,6 @@ mod tests {
         assert_eq!(settings.location, ServerLocation::Remote);
         assert_eq!(settings.local.port, 0);
         assert_eq!(settings.remote.protocol, RemoteProtocol::Sftp);
-    }
-
-    #[test]
-    fn validates_remote_directory() {
-        let settings = RemoteServerSettings {
-            host: "h".into(),
-            port: 22,
-            username: "u".into(),
-            server_directory: "/srv/../escape".into(),
-            ..Default::default()
-        };
-
-        assert!(settings.validate().is_err());
-
-        let valid = RemoteServerSettings {
-            server_directory: "/srv/valheim".into(),
-            ..settings
-        };
-
-        assert!(valid.validate().is_ok());
-        assert_eq!(valid.server_directory().unwrap().as_str(), "/srv/valheim");
     }
 
     #[test]

@@ -212,7 +212,6 @@ fn is_loopback_host(host: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_loopback_host;
     use crate::profile::server::{settings::RemoteServerSettings, worker_client::WorkerClient};
 
     fn settings(address: &str) -> RemoteServerSettings {
@@ -243,8 +242,11 @@ mod tests {
     fn accepts_loopback_http_and_any_https() {
         for address in [
             "http://127.0.0.1:8472",
+            "http://127.0.0.99:8472",
             "http://localhost:8472",
+            "http://LOCALHOST:8472",
             "http://[::1]:8472",
+            "http://[::ffff:127.0.0.1]:8472",
             "https://worker.example.com",
             "https://192.168.1.10:8473",
         ] {
@@ -262,18 +264,5 @@ mod tests {
         ] {
             assert!(WorkerClient::new(&settings(address), token.to_owned()).is_err());
         }
-    }
-
-    #[test]
-    fn loopback_host_detection() {
-        assert!(is_loopback_host("localhost"));
-        assert!(is_loopback_host("LOCALHOST"));
-        assert!(is_loopback_host("127.0.0.1"));
-        assert!(is_loopback_host("127.0.0.99"));
-        assert!(is_loopback_host("::1"));
-        assert!(is_loopback_host("::ffff:127.0.0.1"));
-        assert!(!is_loopback_host("192.168.0.1"));
-        assert!(!is_loopback_host("worker.local"));
-        assert!(!is_loopback_host(""));
     }
 }

@@ -1162,8 +1162,6 @@ mod tests {
     }
 }
 
-/// The pending-banner derivation is platform-free, unlike the service
-/// plumbing above — these run everywhere.
 #[cfg(test)]
 mod pending_tests {
     use chrono::{Duration, Utc};
@@ -1171,133 +1169,43 @@ mod pending_tests {
     use super::{PendingPublication, PendingPublicationMode, pending_publication};
     use crate::{profile::server::settings::RestartPolicy, worker::api::StatusResponse};
 
-    #[derive(Clone, Copy)]
-    struct Flags {
-        auto_sync: bool,
-        auto_mods: bool,
-    }
-
-    fn worker(
-        pending: bool,
-        flags: Flags,
-        next_attempt_at: Option<chrono::DateTime<Utc>>,
-    ) -> StatusResponse {
-        StatusResponse {
+    #[test]
+    fn pending_banner_reflects_mod_automation_and_retries() {
+        assert_eq!(pending_publication(None), None);
+        let now = Utc::now();
+        let mut worker = StatusResponse {
             worker_id: "w".to_owned(),
             profile_id: "p".to_owned(),
-            auto_sync: flags.auto_sync,
-            auto_mods: flags.auto_mods,
+            auto_sync: false,
+            auto_mods: false,
             restart_policy: RestartPolicy::Manual,
-            observed_revision: Some(Utc::now()),
-            pending_revision: pending.then(Utc::now),
-            next_attempt_at,
+            observed_revision: Some(now),
+            pending_revision: None,
+            next_attempt_at: None,
             last_deployed_revision: None,
             busy: None,
             last_operation: None,
             last_error: None,
             poll_error: None,
             server: None,
+        };
+        assert_eq!(pending_publication(Some(&worker)), None);
+
+        for (auto_sync, auto_mods, retry, mode, retrying) in [
+            (false, false, true, PendingPublicationMode::Manual, false),
+            (false, true, false, PendingPublicationMode::Manual, false),
+            (true, false, true, PendingPublicationMode::ModsManual, false),
+            (true, true, false, PendingPublicationMode::Automatic, false),
+            (true, true, true, PendingPublicationMode::Automatic, true),
+        ] {
+            worker.auto_sync = auto_sync;
+            worker.auto_mods = auto_mods;
+            worker.pending_revision = Some(now);
+            worker.next_attempt_at = retry.then_some(now + Duration::minutes(5));
+            assert_eq!(
+                pending_publication(Some(&worker)),
+                Some(PendingPublication { mode, retrying })
+            );
         }
-    }
-
-    const AUTO: Flags = Flags {
-        auto_sync: true,
-        auto_mods: true,
-    };
-
-    #[test]
-    fn no_pending_work_shows_no_banner() {
-        assert_eq!(pending_publication(None), None);
-        assert_eq!(
-            pending_publication(Some(&worker(false, AUTO, None))),
-            None,
-            "an idle worker has nothing pending"
-        );
-    }
-
-    #[test]
-    fn full_automation_reports_a_queued_deploy() {
-        let pending = pending_publication(Some(&worker(true, AUTO, None)));
-        assert_eq!(
-            pending,
-            Some(PendingPublication {
-                mode: PendingPublicationMode::Automatic,
-                retrying: false,
-            })
-        );
-    }
-
-    #[test]
-    fn a_failed_attempt_reports_retrying() {
-        let retry_at = Utc::now() + Duration::minutes(5);
-        let pending = pending_publication(Some(&worker(true, AUTO, Some(retry_at))));
-        assert_eq!(
-            pending,
-            Some(PendingPublication {
-                mode: PendingPublicationMode::Automatic,
-                retrying: true,
-            })
-        );
-    }
-
-    #[test]
-    fn owed_mods_without_auto_mods_stay_manual() {
-        // auto_mods off: the owed mod payload waits for a manual deploy —
-        // nothing runs automatically, and a stale backoff timestamp from
-        // earlier attempts must not mark it as retrying.
-        let flags = Flags {
-            auto_mods: false,
-            ..AUTO
-        };
-        assert_eq!(
-            pending_publication(Some(&worker(true, flags, None))),
-            Some(PendingPublication {
-                mode: PendingPublicationMode::ModsManual,
-                retrying: false,
-            })
-        );
-
-        let retry_at = Utc::now() + Duration::minutes(5);
-        assert_eq!(
-            pending_publication(Some(&worker(true, flags, Some(retry_at)))),
-            Some(PendingPublication {
-                mode: PendingPublicationMode::ModsManual,
-                retrying: false,
-            })
-        );
-    }
-
-    #[test]
-    fn disabled_automation_needs_a_manual_deploy() {
-        // Even with a stale retry timestamp left over from when
-        // automation was on, a disabled worker never retries on its own.
-        let retry_at = Utc::now() + Duration::minutes(5);
-        let flags = Flags {
-            auto_sync: false,
-            auto_mods: false,
-        };
-        let pending = pending_publication(Some(&worker(true, flags, Some(retry_at))));
-        assert_eq!(
-            pending,
-            Some(PendingPublication {
-                mode: PendingPublicationMode::Manual,
-                retrying: false,
-            })
-        );
-        assert_eq!(
-            pending_publication(Some(&worker(
-                true,
-                Flags {
-                    auto_sync: false,
-                    ..AUTO
-                },
-                None
-            ))),
-            Some(PendingPublication {
-                mode: PendingPublicationMode::Manual,
-                retrying: false,
-            }),
-            "auto_mods is meaningless while auto_sync is off"
-        );
     }
 }

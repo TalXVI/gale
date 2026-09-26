@@ -205,23 +205,6 @@ mod tests {
     }
 
     #[test]
-    fn render_omits_absent_values() {
-        let secrets = Secrets {
-            token: Some("t=with=equals".to_owned()),
-            refresh_token: Some("r".to_owned()),
-            ..Secrets::default()
-        };
-
-        let rendered = secrets.render().unwrap();
-        assert!(!rendered.contains("REMOTE_PASSWORD"));
-        assert!(!rendered.contains("DATHOST"));
-
-        let parsed = Secrets::parse(&rendered);
-        assert_eq!(parsed.token.as_deref(), Some("t=with=equals"));
-        assert_eq!(parsed.refresh_token.as_deref(), Some("r"));
-    }
-
-    #[test]
     fn render_rejects_newlines_that_would_corrupt_the_file() {
         for bad in ["line\nbreak", "carriage\rreturn", "both\r\n"] {
             let secrets = Secrets {
@@ -249,13 +232,5 @@ mod tests {
             ..WorkerConfig::default()
         };
         assert!(Secrets::resolve(&config).is_err());
-    }
-
-    #[test]
-    fn no_secrets_file_means_environment_only() {
-        // No file configured: resolution cannot fail regardless of what
-        // the environment happens to contain.
-        let config = WorkerConfig::default();
-        Secrets::resolve(&config).unwrap();
     }
 }

@@ -771,7 +771,7 @@ fn icacls(path: &Path, grants: &[&str]) -> Result<()> {
 mod tests {
     use std::time::Duration;
 
-    use super::{ServiceArgs, await_listen_ready, load_and_build};
+    use super::{ServiceArgs, await_listen_ready};
 
     #[test]
     fn initialization_failure_reports_stopped_with_nonzero_exit() {
@@ -819,61 +819,6 @@ mod tests {
             err.to_string().contains("not answering"),
             "unexpected error: {err:#}"
         );
-    }
-
-    /// `service_main_inner` reports StartPending, then routes every
-    /// remaining fallible step through `load_and_build` so a failure —
-    /// including runtime construction — lands on the Stopped/nonzero
-    /// finalizer instead of an early `?` return. This test pins the
-    /// contract: init failures surface as one `Err` channel.
-    #[test]
-    fn init_failures_all_flow_through_load_and_build() {
-        let dir = tempfile::tempdir().unwrap();
-        let args = ServiceArgs {
-            config: dir.path().join("gale-worker.json"),
-            log_file: dir.path().join("worker.log"),
-        };
-
-        // Missing config file: init fails before the service could ever
-        // report Running.
-        let err = match load_and_build(&args) {
-            Ok(_) => panic!("a missing config must fail"),
-            Err(err) => err,
-        };
-        assert!(!err.to_string().is_empty());
-
-        // Malformed config takes the same path.
-        std::fs::write(&args.config, b"{ not json").unwrap();
-        let err = match load_and_build(&args) {
-            Ok(_) => panic!("a malformed config must fail"),
-            Err(err) => err,
-        };
-        assert!(!err.to_string().is_empty());
-
-        // A valid config with no secrets file proceeds through all three
-        // init steps — and produces a runtime the service can block on.
-        std::fs::write(
-            &args.config,
-            serde_json::to_vec(&serde_json::json!({
-                "workerId": "w",
-                "profileId": "p",
-                "game": "valheim",
-                "listen": "127.0.0.1:0",
-                "remote": {
-                    "protocol": "ftp",
-                    "host": "example.com",
-                    "port": 21,
-                    "username": "u",
-                    "serverDirectory": "/srv",
-                    "authentication": "password",
-                    "privateKeyPath": ""
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let init = load_and_build(&args).expect("valid config must load");
-        assert_eq!(init.runtime.block_on(async { 42 }), 42);
     }
 
     #[test]

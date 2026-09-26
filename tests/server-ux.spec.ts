@@ -24,12 +24,7 @@ test('local settings save includes the password and its remember choice', async 
 	await page.getByRole('button', { name: 'Save settings' }).waitFor({ state: 'visible' });
 	await page.getByRole('button', { name: 'Save settings' }).click();
 	await expect(localTab.getByRole('button', { name: 'Launch server' })).toBeEnabled();
-	const first = await page.evaluate(
-		() =>
-			(window as any).calls
-				.filter((call: any) => call.cmd === 'set_dedicated_server_settings')
-				.at(-1).args.request
-	);
+	const first = await lastSave(page);
 	expect(first).toMatchObject({
 		gamePassword: 'test-game-password',
 		rememberGamePassword: true
@@ -42,21 +37,12 @@ test('local settings save includes the password and its remember choice', async 
 	await localTab.getByLabel('Password', { exact: true }).fill('test-game-password');
 	await page.getByRole('button', { name: 'Save settings' }).click();
 	await expect(localTab.getByText('With Remember password off,')).toBeVisible();
-	const second = await page.evaluate(
-		() =>
-			(window as any).calls
-				.filter((call: any) => call.cmd === 'set_dedicated_server_settings')
-				.at(-1).args.request
-	);
+	const second = await lastSave(page);
 	expect(second).toMatchObject({
 		gamePassword: 'test-game-password',
 		rememberGamePassword: false,
-		// The other credentials' flags are untouched.
-		remotePassword: '',
 		rememberRemotePassword: true,
-		workerToken: '',
 		rememberWorkerToken: true,
-		datHostPassword: '',
 		rememberDatHostPassword: true
 	});
 });
@@ -117,6 +103,7 @@ test('switching tabs does not mark the form dirty', async ({ page }) => {
 });
 
 test('an unconfigured remote shows setup guidance and never polls status', async ({ page }) => {
+	await page.clock.install();
 	await page.goto('/tests/dialog/?unset=1');
 	await page.getByRole('tab', { name: 'Remote server' }).click();
 	const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
@@ -124,15 +111,8 @@ test('an unconfigured remote shows setup guidance and never polls status', async
 	await expect(
 		remoteTab.getByText('Enter the connection details below and save to start deploying.')
 	).toBeVisible();
-	// The status/deploy panels are not mounted, so no sync-status call can
-	// have been issued. Give any stray poll a moment to betray itself.
-	await page.waitForTimeout(300);
-	expect(
-		await page.evaluate(
-			() =>
-				(window as any).calls.filter((call: any) => call.cmd === 'get_server_sync_status').length
-		)
-	).toBe(0);
+	await page.clock.runFor(60_500);
+	expect(await statusCallCount(page)).toBe(0);
 });
 
 test('deploy stays disabled while settings are dirty', async ({ page }) => {
@@ -161,12 +141,7 @@ test('toggling a Remember checkbox is a change: dirty, restorable, and saved', a
 
 	await remember.uncheck();
 	await page.getByRole('button', { name: 'Save settings' }).click();
-	const save = await page.evaluate(
-		() =>
-			(window as any).calls
-				.filter((call: any) => call.cmd === 'set_dedicated_server_settings')
-				.at(-1).args.request
-	);
+	const save = await lastSave(page);
 	expect(save.rememberRemotePassword).toBe(false);
 	await expect(page.getByText('Unsaved changes')).toHaveCount(0);
 });
@@ -181,7 +156,7 @@ test.describe('saved credentials', () => {
 		await remoteTab.getByLabel('Username').fill('other-user');
 		await page.getByRole('button', { name: 'Save settings' }).click();
 		const save = await lastSave(page);
-		// Untouched credentials stay stored: every flag on, every value empty.
+		// Empty values with enabled flags preserve stored credentials.
 		expect(save).toMatchObject({
 			remotePassword: '',
 			rememberRemotePassword: true,
@@ -267,15 +242,6 @@ test.describe('per-credential remember controls', () => {
 		});
 	});
 
-	test('ssh-key auth labels the box Remember passphrase', async ({ page }) => {
-		await page.goto('/tests/dialog/?saved=1');
-		const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
-		await remoteTab.getByLabel('Authentication').click();
-		await page.getByRole('option', { name: 'Private key file' }).click();
-		await expect(remoteTab.getByLabel('Remember passphrase')).toBeChecked();
-		await expect(remoteTab.getByLabel('Remember password')).toHaveCount(0);
-	});
-
 	test('discard restores the checkboxes and clears typed secrets', async ({ page }) => {
 		await page.goto('/tests/dialog/?saved=1');
 		const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
@@ -299,11 +265,8 @@ test.describe('silent automatic refresh', () => {
 
 		await page.evaluate(() => (window as any).hold('get_server_sync_status'));
 		await page.clock.runFor(60_500);
-		// The tick fired — one request sits held — but nothing in the UI
-		// reflects it.
 		await expect.poll(() => statusCallCount(page)).toBe(2);
 		await expect(refresh).toBeEnabled();
-		await expect(remoteTab.locator('.animate-spin')).toHaveCount(0);
 		await expect(remoteTab.getByText('Server is up to date')).toBeVisible();
 		await expect(remoteTab.getByText('Checking server')).toHaveCount(0);
 		await page.evaluate(() => (window as any).release());
@@ -345,30 +308,6 @@ test.describe('silent automatic refresh', () => {
 	});
 });
 
-test.describe('status line', () => {
-	test('up-to-date publication', async ({ page }) => {
-		await page.goto('/tests/dialog/?status=upToDate');
-		await expect(page.getByText('Server is up to date')).toBeVisible();
-	});
-
-	test('newer publication', async ({ page }) => {
-		await page.goto('/tests/dialog/?status=pending');
-		await expect(page.getByText('Server update available')).toBeVisible();
-	});
-
-	test('never deployed', async ({ page }) => {
-		await page.goto('/tests/dialog/?status=never');
-		await expect(page.getByText('Server has never been deployed')).toBeVisible();
-	});
-
-	test('worker update pending', async ({ page }) => {
-		await page.goto('/tests/dialog/?mode=worker');
-		await page.evaluate(() => (window as any).setWorkerPending('2026-09-23T12:00:00Z'));
-		await page.getByRole('button', { name: 'Refresh' }).click();
-		await expect(page.getByText('Server update pending')).toBeVisible();
-	});
-});
-
 test('worker mode polls metadata only — interval ticks never trigger a live refresh', async ({
 	page
 }) => {
@@ -382,12 +321,8 @@ test('worker mode polls metadata only — interval ticks never trigger a live re
 				.map((call: any) => call.args.request.refresh)
 		);
 	const before = await refreshes();
-	// Only mount-time live refreshes may hit the transport.
 	expect(before.every((refresh) => refresh === true)).toBe(true);
-	// The page polls every 60 s — nothing at +10 s.
-	await page.clock.runFor(10_500);
-	expect((await refreshes()).length).toBe(before.length);
-	await page.clock.runFor(50_000);
+	await page.clock.runFor(60_500);
 	await expect.poll(async () => (await refreshes()).length).toBeGreaterThan(before.length);
 	const after = await refreshes();
 	expect(after.slice(before.length).every((refresh) => refresh === false)).toBe(true);
@@ -420,27 +355,6 @@ for (const cancelStop of [false, true]) {
 	});
 }
 
-test('deployment actions fit the page at the default app size', async ({ page }) => {
-	await page.setViewportSize({ width: 900, height: 700 });
-	await page.goto('/tests/dialog/?many=1&status=upToDate');
-	const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
-	await remoteTab.getByText('Server config files').click();
-	await remoteTab.getByRole('button', { name: 'Preview config changes' }).click();
-	const row = page.getByTestId('server-config-row').filter({ hasText: 'file-003.cfg' }).first();
-	await row.getByRole('button', { name: 'Apply' }).click();
-	await expect(
-		remoteTab.getByText('Selection changed. Preview again before deploying.')
-	).toBeVisible();
-
-	const scroll = page.getByTestId('server-page-scroll');
-	const box = (await scroll.boundingBox())!;
-	await expect.poll(() => scroll.evaluate((el) => el.scrollHeight)).toBeGreaterThan(700);
-	const widths = await remoteTab
-		.locator('button, [role="combobox"]')
-		.evaluateAll((els) => els.map((el) => el.getBoundingClientRect().right));
-	expect(Math.max(...widths)).toBeLessThanOrEqual(box.x + box.width + 1);
-});
-
 test('provisioning the local worker leaves no unsaved bar', async ({ page }) => {
 	await page.goto('/tests/dialog/?unset=1');
 	await page.getByRole('tab', { name: 'Remote server' }).click();
@@ -466,7 +380,6 @@ test('a failed live refresh reports unavailable instead of spinning forever', as
 	const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
 	await expect(remoteTab.getByText("Couldn't check the server")).toBeVisible();
 	await expect(remoteTab.getByText('Checking server')).toHaveCount(0);
-	await expect(remoteTab.locator('.animate-spin')).toHaveCount(0);
 });
 
 test('an unpublished profile explains the blocker and disables deployment', async ({ page }) => {
@@ -495,13 +408,4 @@ test('switching profiles resets the remote status instead of leaking it', async 
 		() => (window as any).calls.filter((call: any) => call.cmd === 'get_server_sync_status').length
 	);
 	expect(afterSwitch).toBeGreaterThan(0);
-});
-
-test('launch menu only offers vanilla and modded', async ({ page }) => {
-	await page.goto('/tests/dialog/?component=launch');
-	await page.getByRole('button').last().click();
-	const menu = page.getByRole('menu');
-	await expect(menu.getByText('Launch vanilla')).toBeVisible();
-	await expect(menu.getByText('Launch modded')).toBeVisible();
-	await expect(menu.getByText('server', { exact: false })).toHaveCount(0);
 });

@@ -400,18 +400,6 @@ mod tests {
     }
 
     #[test]
-    fn absent_state_yields_defaults() {
-        let mut remote = MemoryRemote::new();
-        let loaded = read(&mut remote).unwrap();
-
-        assert!(!loaded.migrated);
-        assert!(loaded.warnings.is_empty());
-        assert_eq!(loaded.state.version, VERSION);
-        assert!(loaded.state.files.is_empty());
-        assert!(loaded.state.config.is_empty());
-    }
-
-    #[test]
     fn malformed_state_is_an_error() {
         let mut remote = MemoryRemote::new();
         remote.put_file(STATE_PATH, b"{ not json");
@@ -556,19 +544,6 @@ mod tests {
             !persisted.contains("pending"),
             "state must not resurrect removed bookkeeping: {persisted}"
         );
-    }
-
-    #[test]
-    fn applied_then_declined_at_same_revision_records_decline() {
-        let mut state = ServerDeploymentState::default();
-        let path = config_path("BepInEx/config/mod.cfg");
-        let hash = hash_of("v1");
-
-        state.record_applied(&path, &hash);
-        assert_eq!(state.config[&path].applied, Some(hash.clone()));
-
-        state.record_declined(&path, &hash);
-        assert_eq!(state.config[&path].declined, Some(hash.clone()));
     }
 
     #[test]

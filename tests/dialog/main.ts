@@ -5,7 +5,6 @@ import '../../src/app.css';
 const params = new URLSearchParams(location.search);
 const saved = params.has('saved');
 const workerMode = params.get('mode') === 'worker';
-const hostedWorker = params.get('mode') === 'hosted';
 const statusCase = params.get('status') ?? '';
 let settings: unknown = params.has('unset')
 	? null
@@ -27,14 +26,10 @@ let settings: unknown = params.has('unset')
 				privateKeyPath: '',
 				trustedHostKey: null,
 				trustedCertificate: null,
-				syncMode: workerMode || hostedWorker ? 'worker' : 'local',
+				syncMode: workerMode ? 'worker' : 'local',
 				worker: {
-					address: workerMode
-						? 'https://worker.example.test'
-						: hostedWorker
-							? 'http://127.0.0.1:8472'
-							: '',
-					hosted: hostedWorker,
+					address: workerMode ? 'https://worker.example.test' : '',
+					hosted: false,
 					autoSync: false,
 					autoMods: false
 				},
@@ -45,7 +40,6 @@ let settings: unknown = params.has('unset')
 let serverRunning = params.has('running');
 const cancelStop = params.has('cancelStop');
 const manyConfigs = params.has('many');
-const plannedUploads = Number(params.get('uploads') ?? '0');
 const plannedUnchanged = Number(params.get('unchanged') ?? '0');
 const plannedUnmanaged = Number(params.get('unmanaged') ?? '0');
 let restartRequired = params.has('restart');
@@ -74,10 +68,10 @@ const preferences = JSON.parse(
 	sessionStorage.getItem('mock-profile-preferences') ?? '{}'
 ) as Record<string, { restartPolicy: string }>;
 const configEntries = manyConfigs
-	? Array.from({ length: 133 }, (_, index) => ({
+	? Array.from({ length: 12 }, (_, index) => ({
 			path: `BepInEx/config/file-${String(index).padStart(3, '0')}.cfg`,
-			action: index % 4 === 3 && index < 124 ? 'pending' : 'markApplied',
-			reason: index === 87 ? 'deletedLocally' : 'modifiedLocally',
+			action: index % 4 === 3 ? 'pending' : 'markApplied',
+			reason: 'modifiedLocally',
 			policy: 'ask'
 		}))
 	: [
@@ -93,16 +87,10 @@ const configEntries = manyConfigs
 function planFor(selection: { includeMods: boolean; includeConfigs: boolean }) {
 	return {
 		hash: 'approved-plan',
-		uploads: selection.includeMods
-			? Array.from({ length: plannedUploads }, (_, index) => ({
-					path: `BepInEx/plugins/Author-Mod${index}/Mod${index}.dll`,
-					size: 1024,
-					kind: 'payload'
-				}))
-			: [],
+		uploads: [],
 		removals: [],
 		unmanaged: Array.from({ length: plannedUnmanaged }, (_, index) => `Extra/file-${index}.dat`),
-		uploadBytes: plannedUploads * 1024,
+		uploadBytes: 0,
 		unchangedFiles: selection.includeMods ? plannedUnchanged : 0,
 		modsPhase: selection.includeMods,
 		configsPhase: selection.includeConfigs,
@@ -145,34 +133,6 @@ function serverState() {
 				},
 				lease: null
 			};
-		case 'pending':
-			return {
-				modsRevision: '2026-09-20T00:00:00Z',
-				restartRequired,
-				lastOperation: {
-					id: 'op-1',
-					executor: 'local',
-					kind: 'manual',
-					workerId: null,
-					publicationRevision: '2026-09-20T00:00:00Z',
-					modsRevision: '2026-09-20T00:00:00Z',
-					status: 'succeeded',
-					summary: {
-						uploadedFiles: 3,
-						uploadedBytes: 3072,
-						removedFiles: 0,
-						configWrites: 0,
-						unchangedFiles: 160
-					},
-					restart: 'notRequired',
-					error: null,
-					startedAt: '2026-09-20T00:00:00Z',
-					finishedAt: '2026-09-20T00:01:00Z'
-				},
-				lease: null
-			};
-		case 'never':
-			return { modsRevision: null, restartRequired, lastOperation: null, lease: null };
 		default:
 			return restartRequired
 				? { restartRequired, modsRevision: null, lastOperation: null, lease: null }
@@ -181,7 +141,6 @@ function serverState() {
 }
 
 const calls: { cmd: string; args: any }[] = [];
-const unexpected: string[] = [];
 let held = '';
 const heldResolvers = new Set<() => void>();
 const failing = new Set<string>();
@@ -192,25 +151,10 @@ let progressPolls = 0;
 const progressListeners = new Set<number>();
 let localWorker: Record<string, unknown> = {
 	supported: true,
-	service: hostedWorker ? 'running' : 'notInstalled',
-	binding: hostedWorker
-		? {
-				workerId: 'local-worker',
-				profileId: 'sync-1',
-				listen: '127.0.0.1:8472',
-				address: 'http://127.0.0.1:8472'
-			}
-		: null,
-	ownership: hostedWorker ? 'owned' : 'none',
-	run: hostedWorker
-		? {
-				workerId: 'local-worker',
-				profileId: 'sync-1',
-				pid: 456,
-				phase: 'running',
-				at: '2026-09-25T00:00:00Z'
-			}
-		: null,
+	service: 'notInstalled',
+	binding: null,
+	ownership: 'none',
+	run: null,
 	worker: null,
 	pendingPublication: null,
 	workerError: null,
@@ -243,7 +187,6 @@ function progressPayload(patch: Record<string, unknown>) {
 
 Object.assign(window, {
 	calls,
-	unexpected,
 	hold: (cmd: string) => {
 		held = cmd;
 	},
@@ -389,16 +332,6 @@ mockIPC(async (cmd, args) => {
 		case 'force_stop_dedicated_server':
 			serverRunning = false;
 			return;
-		case 'launch_dedicated_server':
-			serverRunning = true;
-			return {
-				state: 'running',
-				profileId: 1,
-				gameSlug: 'valheim',
-				pid: 123,
-				serverDir: '/test',
-				stopping: false
-			};
 		case 'get_local_worker_status':
 			return localWorker;
 		case 'provision_local_worker':
@@ -421,18 +354,6 @@ mockIPC(async (cmd, args) => {
 				},
 				worker: { ...worker, workerId: 'local-worker' }
 			};
-			return localWorker;
-		case 'control_local_worker':
-			localWorker = {
-				...localWorker,
-				service: (args as any).request.action === 'stop' ? 'stopped' : 'running'
-			};
-			return localWorker;
-		case 'update_local_worker':
-			localWorker = { ...localWorker, updateAvailable: false };
-			return localWorker;
-		case 'uninstall_local_worker':
-			localWorker = { ...localWorker, service: 'notInstalled', ownership: 'none', binding: null };
 			return localWorker;
 		case 'set_dedicated_server_settings':
 			settings = structuredClone((args as any).request.settings);
@@ -485,15 +406,11 @@ mockIPC(async (cmd, args) => {
 							warnings: []
 						};
 			const syncStatus = {
-				mode: workerMode || hostedWorker ? 'worker' : 'local',
-				worker: workerMode || hostedWorker ? worker : null,
+				mode: workerMode ? 'worker' : 'local',
+				worker: workerMode ? worker : null,
 				// A publication normally exists — `nopub` models a profile
 				// that has never been published.
-				publicationRevision: params.has('nopub')
-					? null
-					: statusCase === 'pending'
-						? '2026-09-25T00:00:00Z'
-						: '2026-09-22T00:00:00Z',
+				publicationRevision: params.has('nopub') ? null : '2026-09-22T00:00:00Z',
 				server: serverState(),
 				credentialRequired: false,
 				warnings: [] as string[]
@@ -529,9 +446,6 @@ mockIPC(async (cmd, args) => {
 			// The real command returns nothing; the page reflects the saved
 			// policy itself rather than waiting on a mutated preview.
 			return;
-		case 'configure_worker':
-			Object.assign(worker, (args as any).request);
-			return worker;
 		case 'deploy_server_sync':
 			return {
 				plan: planFor((args as any).request.selection),
@@ -548,13 +462,11 @@ mockIPC(async (cmd, args) => {
 				warnings: []
 			};
 		default:
-			unexpected.push(cmd);
 			throw new Error(`Unexpected IPC: ${cmd}`);
 	}
 });
 
-// Screenshots run in dark mode; pass ?light to preview the light theme.
-if (!params.has('light')) document.documentElement.classList.add('dark');
+document.documentElement.classList.add('dark');
 
 // Install IPC before importing the application's event subscriptions.
 const { default: Harness } = await import('./Harness.svelte');

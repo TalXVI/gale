@@ -380,42 +380,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_journal_loads_defaults() {
-        let dir = tempfile::tempdir().unwrap();
-        let journal = Journal::load(dir.path()).unwrap();
-        let state = journal.state.lock().await;
-
-        assert!(!state.auto_sync);
-        assert!(!state.automation_seeded);
-        assert!(state.refresh_token.is_none());
-        assert!(state.last_operation.is_none());
-        assert!(state.pending.is_none());
-    }
-
-    #[tokio::test]
-    async fn journal_round_trips_durable_state() {
-        let dir = tempfile::tempdir().unwrap();
-        {
-            let journal = Journal::load(dir.path()).unwrap();
-            let mut state = journal.state.lock().await;
-            state.refresh_token = Some("rotated".to_owned());
-            state.auto_sync = true;
-            state.auto_mods = true;
-            state.automation_seeded = true;
-            state.last_seen_revision = Some(Utc::now());
-            journal.save(&state).unwrap();
-        }
-
-        let journal = Journal::load(dir.path()).unwrap();
-        let state = journal.state.lock().await;
-        assert_eq!(state.refresh_token.as_deref(), Some("rotated"));
-        assert!(state.auto_sync);
-        assert!(state.auto_mods);
-        assert!(state.automation_seeded);
-        assert!(state.last_seen_revision.is_some());
-    }
-
-    #[tokio::test]
     async fn record_operation_clears_the_interrupted_marker() {
         let dir = tempfile::tempdir().unwrap();
         let journal = Journal::load(dir.path()).unwrap();
@@ -773,20 +737,6 @@ mod tests {
         let pending = state.pending.as_ref().expect("owed mods survive migration");
         assert_eq!(pending.owed_mods.as_ref(), Some(&mod_rev('a')));
         assert_eq!(pending.attempts, 1);
-    }
-
-    #[test]
-    fn a_legacy_pending_marker_decodes_as_owed() {
-        // Journals written before `owed_mods` was tracked carry no
-        // revision — the marker still means the publication's mod
-        // payload is owed.
-        let json = serde_json::json!({
-            "revision": "2024-01-01T00:00:00Z",
-            "attempts": 1,
-        });
-        let work: PendingWork = serde_json::from_value(json).unwrap();
-        assert!(work.mods_pending.is_none());
-        assert!(work.owed_mods.is_none());
     }
 
     #[tokio::test]

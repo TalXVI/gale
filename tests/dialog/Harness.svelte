@@ -1,7 +1,6 @@
 <script lang="ts">
 	import { Tooltip } from 'bits-ui';
 	import ServerPage from '$lib/components/server/ServerPage.svelte';
-	import LaunchButton from '$lib/components/toolbar/LaunchButton.svelte';
 	import Navbar from '$lib/components/misc/Navbar.svelte';
 	import Toasts from '$lib/components/misc/Toasts.svelte';
 
@@ -13,9 +12,7 @@
 
 <div class="relative flex h-screen w-full flex-col overflow-hidden">
 	<Tooltip.Provider>
-		{#if component === 'launch'}
-			<div class="flex justify-end p-4"><LaunchButton /></div>
-		{:else if component === 'navbar'}
+		{#if component === 'navbar'}
 			<div class="flex h-full">
 				<Navbar />
 				{#if showPage}

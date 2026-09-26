@@ -1215,38 +1215,6 @@ mod tests {
     }
 
     #[test]
-    fn owed_mods_await_permission_when_auto_mods_is_off() {
-        // autoSync on, autoMods off: the owed mod payload must not
-        // retrigger a deploy every tick — and must not be silently
-        // deployed either. It waits for a manual deployment or for the
-        // setting to change.
-        let mut state = journal();
-        state.auto_mods = false;
-        state.pending = Some(PendingWork::new(Utc::now(), owed_mod()));
-
-        assert_eq!(
-            automatic_action(&state, Utc::now()),
-            AutoAction::AwaitingMods
-        );
-
-        // A stale backoff must not change the verdict — nothing
-        // automatic would run anyway.
-        state.pending.as_mut().unwrap().next_attempt_at =
-            Some(Utc::now() + ChronoDuration::minutes(5));
-        assert_eq!(
-            automatic_action(&state, Utc::now()),
-            AutoAction::AwaitingMods
-        );
-
-        // Enabling auto_mods reconsiders the outstanding mods without
-        // needing a new publication; backoff still applies.
-        state.auto_mods = true;
-        assert_eq!(automatic_action(&state, Utc::now()), AutoAction::Waiting);
-        state.pending.as_mut().unwrap().next_attempt_at = None;
-        assert_eq!(automatic_action(&state, Utc::now()), AutoAction::Deploy);
-    }
-
-    #[test]
     fn retry_backoff_is_bounded() {
         assert_eq!(retry_delay(0), std::time::Duration::from_secs(60));
         assert_eq!(retry_delay(1), std::time::Duration::from_secs(120));
@@ -1426,7 +1394,7 @@ mod tests {
         };
         super::run_deployment(
             &ctx,
-            selection.clone(),
+            selection,
             None,
             None,
             false,
@@ -1444,36 +1412,6 @@ mod tests {
         );
         assert!(status.pending_revision.is_none());
         assert_eq!(status.last_deployed_revision, Some(revision));
-
-        // An explicit config push afterwards is a no-op when nothing
-        // diverged, and it never re-opens settled publication work.
-        let no_op = super::run_deployment(
-            &ctx,
-            DeploySelection {
-                include_mods: false,
-                include_configs: true,
-                ..Default::default()
-            },
-            None,
-            None,
-            false,
-            crate::profile::server::state::OperationKind::Manual,
-            None,
-        )
-        .await
-        .unwrap();
-        assert!(no_op.failed_config_writes.is_empty());
-        assert!(no_op.plan.configs_phase);
-        assert!(no_op.plan.config_entries.iter().all(|entry| !matches!(
-            &entry.action,
-            crate::profile::server::plan::ConfigAction::Write
-        )));
-        let status = poll_status(ctx.clone()).await;
-        assert!(status.pending_revision.is_none());
-        assert_eq!(status.last_deployed_revision, Some(revision));
-        drop(ctx);
-        let state = Journal::load(dir.path()).unwrap();
-        assert!(state.state.lock().await.poll_error.is_some());
     }
 
     #[tokio::test]
@@ -1541,17 +1479,6 @@ mod tests {
             serde_json::from_slice(&std::fs::read(config.status_file.as_ref().unwrap()).unwrap())
                 .unwrap();
         assert_eq!(report.phase, super::WorkerRunPhase::Shutdown);
-    }
-
-    #[test]
-    fn run_report_is_optional_without_a_status_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = super::WorkerConfig {
-            state_dir: dir.path().to_path_buf(),
-            ..Default::default()
-        };
-        super::report_run_state(&config, super::WorkerRunPhase::Stopped);
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]

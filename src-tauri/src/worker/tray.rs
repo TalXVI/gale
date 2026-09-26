@@ -64,27 +64,6 @@ impl From<ManagedServiceState> for ServiceObservation {
     }
 }
 
-pub fn icon_desired(state: ServiceObservation) -> bool {
-    state == ServiceObservation::Running
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MenuItem {
-    Update,
-    Separator,
-    Restart,
-    Stop,
-}
-
-pub fn menu_items(update_available: bool) -> Vec<MenuItem> {
-    let mut items = Vec::with_capacity(if update_available { 4 } else { 2 });
-    if update_available {
-        items.extend([MenuItem::Update, MenuItem::Separator]);
-    }
-    items.extend([MenuItem::Restart, MenuItem::Stop]);
-    items
-}
-
 #[derive(Debug, Default)]
 pub struct TrayState {
     observation: Option<ServiceObservation>,
@@ -95,13 +74,8 @@ impl TrayState {
         self.observation = Some(observation);
     }
 
-    /// Action completion carries no service state. Only a fresh, serial SCM
-    /// observation can change visibility, so an old worker thread cannot
-    /// re-add the icon after uninstall.
-    pub fn action_completed(&mut self) {}
-
     pub fn icon_visible(&self) -> bool {
-        self.observation.is_some_and(icon_desired)
+        self.observation == Some(ServiceObservation::Running)
     }
 }
 
@@ -127,10 +101,6 @@ impl UpdatePlan {
         })
     }
 
-    pub fn source(&self) -> &Path {
-        &self.candidate
-    }
-
     fn update_available(&self) -> bool {
         local::binaries_differ(&self.candidate, &self.installed)
     }
@@ -139,25 +109,9 @@ impl UpdatePlan {
     /// That command waits on `Local\GaleWorkerUpdate`
     /// holding the mutex here would deadlock the child, which blocks until this process released it.
     pub(crate) fn perform(&self) -> Result<()> {
-        self.perform_with(&mut RealUpdateLauncher)
-    }
-
-    fn perform_with(&self, launcher: &mut impl UpdateLauncher) -> Result<()> {
-        launcher.reinstall(&self.candidate)
-    }
-}
-
-trait UpdateLauncher {
-    fn reinstall(&mut self, candidate: &Path) -> Result<()>;
-}
-
-struct RealUpdateLauncher;
-
-impl UpdateLauncher for RealUpdateLauncher {
-    fn reinstall(&mut self, candidate: &Path) -> Result<()> {
         let log = std::env::temp_dir().join(format!("gale-worker-update-{}.log", Uuid::new_v4()));
         let args = format!("service reinstall --log \"{}\"", log.display());
-        let exit = local::run_elevated_worker(candidate, &args)?;
+        let exit = local::run_elevated_worker(&self.candidate, &args)?;
         if exit != 0 {
             let detail = std::fs::read_to_string(&log).unwrap_or_default();
             bail!("Worker update failed (exit {exit}): {}", detail.trim());
@@ -341,19 +295,15 @@ fn cleanup_old_versions(root: &Path, current: &Path) {
 /// Removes this user's logon registration and asks the resident helper to
 /// exit, which drops any visible icon before its LocalAppData copy is removed.
 pub fn uninstall_for_current_user() -> Result<()> {
-    uninstall_lifecycle(
-        remove_registration,
-        request_shutdown,
-        wait_for_companion_exit,
-        || {
-            let root = local_root()?;
-            if root.is_dir() {
-                std::fs::remove_dir_all(&root)
-                    .with_context(|| format!("failed to remove {}", root.display()))?;
-            }
-            Ok(())
-        },
-    )
+    remove_registration()?;
+    request_shutdown();
+    wait_for_companion_exit()?;
+    let root = local_root()?;
+    if root.is_dir() {
+        std::fs::remove_dir_all(&root)
+            .with_context(|| format!("failed to remove {}", root.display()))?;
+    }
+    Ok(())
 }
 
 fn wait_for_companion_exit() -> Result<()> {
@@ -364,18 +314,6 @@ fn wait_for_companion_exit() -> Result<()> {
         std::thread::sleep(Duration::from_millis(100));
     }
     bail!("the Worker tray companion did not exit within 5 seconds")
-}
-
-fn uninstall_lifecycle(
-    remove_startup: impl FnOnce() -> Result<()>,
-    signal_shutdown: impl FnOnce(),
-    wait_for_exit: impl FnOnce() -> Result<()>,
-    remove_copy: impl FnOnce() -> Result<()>,
-) -> Result<()> {
-    remove_startup()?;
-    signal_shutdown();
-    wait_for_exit()?;
-    remove_copy()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -515,7 +453,6 @@ fn run(worker_candidate: PathBuf) -> Result<()> {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
         {
-            state.action_completed();
             if let Err(err) = outcome {
                 show_error(&err);
             }
@@ -584,38 +521,7 @@ pub fn run_from_args() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
     use super::*;
-
-    #[test]
-    fn icon_exists_only_for_a_running_service() {
-        assert!(icon_desired(ServiceObservation::Running));
-        for state in [
-            ServiceObservation::NotInstalled,
-            ServiceObservation::Stopped,
-            ServiceObservation::StartPending,
-            ServiceObservation::StopPending,
-            ServiceObservation::Other,
-        ] {
-            assert!(!icon_desired(state), "unexpected icon for {state:?}");
-        }
-    }
-
-    #[test]
-    fn update_is_the_only_conditional_menu_item() {
-        assert_eq!(menu_items(false), vec![MenuItem::Restart, MenuItem::Stop]);
-        assert_eq!(
-            menu_items(true),
-            vec![
-                MenuItem::Update,
-                MenuItem::Separator,
-                MenuItem::Restart,
-                MenuItem::Stop,
-            ]
-        );
-    }
 
     #[test]
     fn duplicate_companion_startup_is_rejected() {
@@ -626,29 +532,12 @@ mod tests {
     }
 
     #[test]
-    fn update_plan_uses_the_bundled_worker_not_the_tray_copy() {
-        let plan = UpdatePlan::new(
-            PathBuf::from(r"C:\Program Files\Gale\gale-worker.exe"),
-            PathBuf::from(r"C:\ProgramData\Gale\worker\gale-worker.exe"),
-            PathBuf::from(r"C:\Users\me\AppData\Local\Gale\worker-tray\tray.exe"),
-        )
-        .unwrap();
-        assert_eq!(
-            plan.source(),
-            Path::new(r"C:\Program Files\Gale\gale-worker.exe")
-        );
-
-        #[derive(Default)]
-        struct FakeLauncher(Option<PathBuf>);
-        impl UpdateLauncher for FakeLauncher {
-            fn reinstall(&mut self, candidate: &Path) -> Result<()> {
-                self.0 = Some(candidate.to_path_buf());
-                Ok(())
-            }
-        }
-        let mut launcher = FakeLauncher::default();
-        plan.perform_with(&mut launcher).unwrap();
-        assert_eq!(launcher.0.as_deref(), Some(plan.source()));
+    fn update_plan_rejects_the_tray_binary_as_a_worker_source_or_install() {
+        let bundled = PathBuf::from(r"C:\Program Files\Gale\gale-worker.exe");
+        let installed = PathBuf::from(r"C:\ProgramData\Gale\worker\gale-worker.exe");
+        let helper = PathBuf::from(r"C:\Users\me\AppData\Local\Gale\worker-tray\tray.exe");
+        assert!(UpdatePlan::new(helper.clone(), installed, helper.clone()).is_err());
+        assert!(UpdatePlan::new(bundled, helper.clone(), helper).is_err());
     }
 
     #[test]
@@ -666,15 +555,6 @@ mod tests {
     }
 
     #[test]
-    fn action_completion_never_overrides_the_latest_scm_observation() {
-        let mut state = TrayState::default();
-        state.observe(ServiceObservation::Running);
-        state.observe(ServiceObservation::NotInstalled);
-        state.action_completed();
-        assert!(!state.icon_visible());
-    }
-
-    #[test]
     fn registration_points_at_the_local_helper_and_current_worker_candidate() {
         let helper =
             Path::new(r"C:\Users\me\AppData\Local\Gale\worker-tray\abc\gale-worker-tray.exe");
@@ -683,75 +563,6 @@ mod tests {
         assert!(command.starts_with(&format!("\"{}\"", helper.display())));
         assert!(command.ends_with(&format!("\"{}\"", candidate.display())));
         assert!(!command.contains(r"ProgramData\Gale\worker\gale-worker.exe"));
-    }
-
-    #[test]
-    fn uninstall_removes_startup_then_requests_shutdown_and_removes_the_copy() {
-        let calls = Rc::new(RefCell::new(Vec::new()));
-        uninstall_lifecycle(
-            {
-                let calls = Rc::clone(&calls);
-                move || {
-                    calls.borrow_mut().push("remove_startup");
-                    Ok(())
-                }
-            },
-            {
-                let calls = Rc::clone(&calls);
-                move || calls.borrow_mut().push("signal_shutdown")
-            },
-            {
-                let calls = Rc::clone(&calls);
-                move || {
-                    calls.borrow_mut().push("wait_for_exit");
-                    Ok(())
-                }
-            },
-            {
-                let calls = Rc::clone(&calls);
-                move || {
-                    calls.borrow_mut().push("remove_copy");
-                    Ok(())
-                }
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            calls.borrow().as_slice(),
-            [
-                "remove_startup",
-                "signal_shutdown",
-                "wait_for_exit",
-                "remove_copy"
-            ]
-        );
-    }
-
-    #[test]
-    fn helper_lifecycle_does_not_mutate_worker_state() {
-        let root = tempfile::tempdir().unwrap();
-        let worker = root.path().join("worker");
-        let private = worker.join("private");
-        std::fs::create_dir_all(&private).unwrap();
-        let sentinels = [
-            (worker.join(local::CONFIG_FILE), b"config".as_slice()),
-            (private.join(local::SECRETS_FILE), b"secrets".as_slice()),
-            (
-                private.join("gale-worker-state.json"),
-                b"journal".as_slice(),
-            ),
-        ];
-        for (path, bytes) in &sentinels {
-            std::fs::write(path, bytes).unwrap();
-        }
-        let source = root.path().join("bundled-tray.exe");
-        std::fs::write(&source, b"tray helper").unwrap();
-
-        install_helper_copy(&source, &root.path().join("user-local-tray")).unwrap();
-
-        for (path, bytes) in sentinels {
-            assert_eq!(std::fs::read(path).unwrap(), bytes);
-        }
     }
 
     #[test]

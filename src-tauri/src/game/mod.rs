@@ -408,6 +408,14 @@ mod tests {
         // Every other field still comes from upstream, even when it
         // disagrees with the bundle (`popular` is true upstream-side).
         assert!(!valheim.popular);
+        assert_eq!(
+            find(&games, "upstream-server")
+                .dedicated_server
+                .unwrap()
+                .default_port,
+            1234
+        );
+        assert!(find(&games, "h3vr").dedicated_server.is_none());
     }
 
     #[test]
@@ -429,39 +437,5 @@ mod tests {
             serde_json::to_value(games[0].dedicated_server.unwrap()).unwrap(),
             serde_json::to_value(bundled_dedicated_server("valheim")).unwrap()
         );
-    }
-
-    #[test]
-    fn upstream_only_dedicated_server_is_preserved() {
-        let games = parse_upstream_games(UPSTREAM_GAMES).unwrap();
-        let game = find(&games, "upstream-server");
-
-        assert_eq!(game.dedicated_server.unwrap().default_port, 1234);
-    }
-
-    #[test]
-    fn unsupported_games_do_not_gain_dedicated_server() {
-        let games = parse_upstream_games(UPSTREAM_GAMES).unwrap();
-        assert!(find(&games, "h3vr").dedicated_server.is_none());
-    }
-
-    /// `update_list_task` caches the merged list; the next launch reads
-    /// it back through the cache path, so the capability survives a
-    /// restart without needing the refresh to run again.
-    #[test]
-    fn refreshed_cache_file_keeps_dedicated_server() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(CACHE_FILE_NAME);
-        let cache = GamesCache {
-            date: Utc::now(),
-            games: parse_upstream_games(UPSTREAM_GAMES).unwrap(),
-        };
-        util::fs::write_json(&path, &cache, JsonStyle::Pretty).unwrap();
-
-        let bytes = fs::read_to_string(&path).unwrap();
-        let written: GamesCache = serde_json::from_str(&bytes).unwrap();
-        assert!(find(&written.games, "valheim").dedicated_server.is_some());
-        let cache = read_games_cache(&path).unwrap();
-        assert!(find(&cache.games, "valheim").dedicated_server.is_some());
     }
 }

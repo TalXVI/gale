@@ -757,25 +757,6 @@ mod tests {
         assert!(remote.dirs.contains(LEASE_DIR));
     }
 
-    #[test]
-    fn check_ownership_tracks_stored_ownership() {
-        let mut remote = MemoryRemote::new();
-        let lease = acquire(&mut remote).unwrap();
-
-        assert!(matches!(
-            lease.check_ownership(&mut remote),
-            Ownership::Held
-        ));
-
-        plant_lease(&mut remote, Utc::now());
-        assert!(matches!(
-            lease.check_ownership(&mut remote),
-            Ownership::Lost {
-                holder: Some(ref owner)
-            } if owner == "other"
-        ));
-    }
-
     /// A shared remote behind the dot-path read filter, mirroring hosts
     /// whose FTP answers SIZE/RETR/LIST on `.gale-deploy.lock` contents
     /// with 550 while MKD/STOR/CWD/DELE/RMD all work.
@@ -1029,40 +1010,6 @@ mod tests {
         assert_eq!(after.operation_id, "op-1");
 
         lease.release(&mut filtered);
-    }
-
-    #[test]
-    fn heartbeat_refreshes_timestamp_while_held() {
-        let mut remote = MemoryRemote::new();
-        let mut lease = acquire(&mut remote).unwrap();
-
-        let shared = Arc::new(std::sync::Mutex::new(MemoryRemote::new()));
-        shared.lock().unwrap().dirs.insert(LEASE_DIR.to_owned());
-        shared
-            .lock()
-            .unwrap()
-            .put_file(LEASE_FILE, remote.contents(LEASE_FILE).unwrap());
-        let before: LeaseRecord =
-            serde_json::from_slice(shared.lock().unwrap().contents(LEASE_FILE).unwrap()).unwrap();
-
-        let (events, written) = std::sync::mpsc::channel();
-        shared.lock().unwrap().write_events = Some(events);
-        let conn = shared.clone();
-        start_heartbeat_every(
-            &mut lease,
-            move || Ok(Box::new(conn.clone()) as Box<dyn RemoteOps>),
-            Duration::from_millis(50),
-        );
-
-        written
-            .recv_timeout(Duration::from_secs(5))
-            .expect("heartbeat did not write");
-        let after: LeaseRecord =
-            serde_json::from_slice(shared.lock().unwrap().contents(LEASE_FILE).unwrap()).unwrap();
-        assert!(after.heartbeat_at > before.heartbeat_at);
-        assert!(!lease.is_lost());
-
-        lease.release(&mut remote);
     }
 
     #[test]

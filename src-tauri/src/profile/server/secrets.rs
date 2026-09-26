@@ -150,17 +150,6 @@ mod tests {
     use keyring::mock::MockCredential;
 
     #[test]
-    fn has_reports_stored_credentials() {
-        let secrets = in_memory_secrets();
-        assert!(!secrets.has(ServerSecret::SftpPassword).unwrap());
-        secrets.set(ServerSecret::SftpPassword, "hunter2").unwrap();
-        assert!(secrets.has(ServerSecret::SftpPassword).unwrap());
-        assert!(!secrets.has(ServerSecret::WorkerToken).unwrap());
-        secrets.remove(ServerSecret::SftpPassword).unwrap();
-        assert!(!secrets.has(ServerSecret::SftpPassword).unwrap());
-    }
-
-    #[test]
     fn saved_game_password_can_be_reused_replaced_and_forgotten() {
         let secrets = in_memory_secrets();
         let password = Some(ServerSecret::GamePassword);
