@@ -6,6 +6,7 @@
 
 	type Props = {
 		text?: string;
+		'aria-label'?: string;
 		side?: 'top' | 'right' | 'bottom' | 'left';
 		sideOffset?: number;
 		delayDuration?: number;
@@ -22,6 +23,7 @@
 
 	let {
 		text = '',
+		'aria-label': ariaLabel,
 		side = 'top',
 		sideOffset = 0,
 		delayDuration = 400,
@@ -42,7 +44,7 @@
 </script>
 
 <Tooltip.Root {delayDuration}>
-	<Tooltip.Trigger class={triggerClass} {disabled}>
+	<Tooltip.Trigger class={triggerClass} {disabled} aria-label={ariaLabel ?? (text || undefined)}>
 		{@render children?.()}
 	</Tooltip.Trigger>
 	<Tooltip.Content forceMount {sideOffset} {side}>

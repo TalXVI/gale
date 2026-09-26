@@ -21,22 +21,26 @@
 		modded: m.toolBar_launch_modded()
 	};
 
-	const launchDropdownItems: ContextItem[] = [
-		{
-			label: labels['vanilla'],
-			onclick: () => {
-				mode.current = 'vanilla';
-				launchGame();
+	const launchDropdownItems = $derived.by(() => {
+		const items: ContextItem[] = [
+			{
+				label: labels.vanilla,
+				onclick: () => {
+					mode.current = 'vanilla';
+					launchGame();
+				}
+			},
+			{
+				label: labels.modded,
+				onclick: () => {
+					mode.current = 'modded';
+					launchGame();
+				}
 			}
-		},
-		{
-			label: labels['modded'],
-			onclick: () => {
-				mode.current = 'modded';
-				launchGame();
-			}
-		}
-	];
+		];
+
+		return items;
+	});
 
 	let launchDialogOpen = $state(false);
 	let launchDropdownOpen = $state(false);
@@ -90,6 +94,13 @@
 	function handleLaunchOptionSelect(args: string) {
 		doLaunch(args);
 	}
+
+	// 'server' was a launch mode before the dedicated server page replaced it.
+	$effect(() => {
+		if ((mode.current as string) === 'server') {
+			mode.current = 'modded';
+		}
+	});
 </script>
 
 <div
@@ -98,7 +109,7 @@
 	<button onclick={() => launchGame()} class="flex items-center pr-2 pl-4">
 		<Icon icon="mdi:play-circle" class="mr-2 text-xl" />
 		<span>
-			{labels[mode.current]}
+			{labels[mode.current as Mode] ?? labels.modded}
 		</span>
 	</button>
 

@@ -3,8 +3,8 @@
 	"version": "1.22.3",
 	"identifier": "com.kesomannen.gale",
 	"build": {
-		"beforeBuildCommand": "pnpm run build",
-		"beforeDevCommand": "pnpm run dev",
+		"beforeBuildCommand": "pnpm run build:worker && pnpm run build",
+		"beforeDevCommand": "pnpm run build:worker -- --dev && pnpm run dev",
 		"frontendDist": "../build",
 		"devUrl": "http://localhost:5173"
 	},
@@ -24,7 +24,12 @@
 			"icons/icon.icns",
 			"icons/icon.ico"
 		],
-		"windows": {},
+		"windows": {
+			"wix": {
+				"fragmentPaths": ["binaries/worker.wxs"],
+				"componentGroupRefs": ["GaleWorkerBinaries"]
+			}
+		},
 		"linux": {
 			"appimage": {
 				"files": {

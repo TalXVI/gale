@@ -18,6 +18,21 @@ mod profile;
 mod state;
 mod thunderstore;
 mod util;
+pub mod worker;
+
+/// Installs aws-lc-rs as the process-level rustls `CryptoProvider`.
+///
+/// The dependency graph compiles two providers — `aws_lc_rs` (this
+/// crate, reqwest, suppaftp) and `ring` (tauri-plugin-updater) — so
+/// rustls' feature-based auto-detection is ambiguous and any
+/// `ClientConfig::builder()` without an installed default panics. Every
+/// process that can open a TLS connection, the desktop app and
+/// gale-worker alike, must run this before its first TLS use.
+pub fn install_crypto_provider() {
+    if let Err(err) = rustls::crypto::aws_lc_rs::default_provider().install_default() {
+        warn!(?err, "failed to install aws_lc_rs default crypto provider");
+    }
+}
 
 fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     info!(
@@ -25,9 +40,7 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         os = std::env::consts::OS,
     );
 
-    if let Err(err) = rustls::crypto::aws_lc_rs::default_provider().install_default() {
-        warn!(?err, "failed to install aws_lc_rs default crypto provider");
-    }
+    install_crypto_provider();
 
     if let Err(err) = state::setup(app.handle()) {
         error!("setup error: {err:?}");
@@ -52,6 +65,13 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     if let Err(err) = app.deep_link().register("gale") {
         warn!("failed to register gale deep link protocol: {:#}", err);
     }
+
+    #[cfg(windows)]
+    tauri::async_runtime::spawn_blocking(|| {
+        if let Err(err) = profile::server::local_worker::refresh_tray_companion() {
+            warn!("failed to refresh the managed Worker tray companion: {err:#}");
+        }
+    });
 
     let args = env::args().collect_vec();
     if let Some(url) = args.get(1)
@@ -159,6 +179,29 @@ pub fn run() {
             profile::launch::commands::launch_game,
             profile::launch::commands::get_launch_args,
             profile::launch::commands::open_game_dir,
+            profile::server::commands::launch_dedicated_server,
+            profile::server::commands::get_dedicated_server_settings,
+            profile::server::commands::get_saved_server_credentials,
+            profile::server::commands::get_sync_dialog_preferences,
+            profile::server::commands::set_sync_dialog_preferences,
+            profile::server::commands::set_dedicated_server_settings,
+            profile::server::commands::test_remote_server_connection,
+            profile::server::commands::test_worker_connection,
+            profile::server::commands::get_server_sync_status,
+            profile::server::commands::get_server_sync_progress,
+            profile::server::commands::preview_server_sync,
+            profile::server::commands::deploy_server_sync,
+            profile::server::commands::set_server_config_policy,
+            profile::server::commands::acknowledge_external_server_restart,
+            profile::server::commands::configure_worker,
+            profile::server::commands::get_dedicated_server_status,
+            profile::server::commands::open_dedicated_server_dir,
+            profile::server::commands::force_stop_dedicated_server,
+            profile::server::commands::get_local_worker_status,
+            profile::server::commands::provision_local_worker,
+            profile::server::commands::control_local_worker,
+            profile::server::commands::update_local_worker,
+            profile::server::commands::uninstall_local_worker,
             profile::launch::commands::get_steam_launch_options,
             profile::install::commands::install_mod,
             profile::install::commands::cancel_all_installs,

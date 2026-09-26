@@ -2,11 +2,29 @@
 	import NavbarLink from './NavbarLink.svelte';
 	import { m } from '$lib/paraglide/messages';
 	import games from '$lib/state/game.svelte';
+	import profiles from '$lib/state/profile.svelte';
+	import server from '$lib/state/server.svelte';
+	import serverSync from '$lib/state/serverSync.svelte';
 	import { loaderSupportsModpacks } from '$lib/util';
 
 	const modpacksDisabled = $derived(
 		!games.active || !loaderSupportsModpacks(games.active.modLoader)
 	);
+
+	// The background poll only makes sense once a game with dedicated
+	// servers is active; it retargets itself on profile changes.
+	$effect(() => {
+		serverSync.start(serverSync.currentSyncKey());
+	});
+
+	const serverBadge = $derived.by<'healthy' | 'pending' | undefined>(() => {
+		if (!games.active?.dedicatedServer) return undefined;
+		// A locally running server always wins over the remote state.
+		if (server.status.state === 'running') return 'healthy';
+		if (serverSync.remoteBadge === 'upToDate') return 'healthy';
+		if (serverSync.remoteBadge === 'pending') return 'pending';
+		return undefined;
+	});
 
 	const links = $derived([
 		{
@@ -24,6 +42,17 @@
 			icon: 'mdi:file-cog',
 			tooltip: m.navBar_link_config()
 		},
+		...(games.active?.dedicatedServer
+			? [
+					{
+						to: '/server',
+						icon: 'mdi:server',
+						tooltip: m.navBar_link_server(),
+						outline: false,
+						badge: serverBadge
+					}
+				]
+			: []),
 		{
 			to: '/modpack',
 			icon: 'mdi:package-variant',

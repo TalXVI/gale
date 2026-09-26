@@ -54,7 +54,8 @@ impl ModLoader<'_> {
         }
     }
 
-    /// Checks for the mod loader's own package on Thunderstore.
+    /// Whether `full_name` is the mod loader's own package on
+    /// Thunderstore.
     fn is_loader_package(&self, full_name: &str) -> bool {
         if let Some(package_name) = self.package_name {
             full_name == package_name
@@ -241,6 +242,41 @@ impl ModLoader<'static> {
 
                 Box::new(SubdirInstaller::new(SUBDIRS).with_default(0))
             }
+        }
+    }
+
+    /// Profile subdirectories a dedicated server should mirror: the mod
+    /// install targets plus config directories. The loader's own payload
+    /// directories are left out on purpose, since mirroring them could
+    /// delete a host-managed loader. Loaders without dedicated-server
+    /// deployment support return `None`.
+    pub fn server_mirror_dirs(&self) -> Option<Vec<&'static str>> {
+        match &self.kind {
+            ModLoaderKind::BepInEx { extra_subdirs } => Some(
+                [
+                    "BepInEx/plugins",
+                    "BepInEx/patchers",
+                    "BepInEx/monomod",
+                    "BepInEx/config",
+                ]
+                .into_iter()
+                .chain(extra_subdirs.iter().map(|subdir| subdir.target))
+                .collect(),
+            ),
+            ModLoaderKind::BepisLoader { extra_subdirs } => Some(
+                [
+                    "BepInEx/plugins",
+                    "BepInEx/patchers",
+                    "BepInEx/monomod",
+                    "BepInEx/config",
+                    "Renderer/BepInEx/plugins",
+                    "Renderer/BepInEx/config",
+                ]
+                .into_iter()
+                .chain(extra_subdirs.iter().map(|subdir| subdir.target))
+                .collect(),
+            ),
+            _ => None,
         }
     }
 

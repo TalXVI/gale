@@ -20,26 +20,38 @@ type InvokeError = {
 	detail: string;
 };
 
-export async function invoke<T = void>(cmd: string, args?: any): Promise<T> {
+type InvokeOptions = {
+	/// Background calls skip the error toast — the failure is still
+	/// logged and still throws to the caller.
+	quiet?: boolean;
+};
+
+export async function invoke<T = void>(
+	cmd: string,
+	args?: any,
+	options: InvokeOptions = {}
+): Promise<T> {
 	try {
 		return await tauriInvoke<T>(cmd, args);
 	} catch (anyError: any) {
 		let error = anyError as InvokeError;
 		tauriInvoke('log_err', { msg: `${cmd} failed: ${error.detail}` });
 
-		let name = `Failed to ${toSentenceCase(cmd).toLowerCase()}`;
-		let message = error.message || error.toString();
-		let displayMessage = message[0].toUpperCase() + message.slice(1);
+		if (!options.quiet) {
+			let name = `Failed to ${toSentenceCase(cmd).toLowerCase()}`;
+			let message = error.message || error.toString();
+			let displayMessage = message[0].toUpperCase() + message.slice(1);
 
-		if (!['.', '?', '!'].includes(displayMessage[displayMessage.length - 1])) {
-			displayMessage += '.';
+			if (!['.', '?', '!'].includes(displayMessage[displayMessage.length - 1])) {
+				displayMessage += '.';
+			}
+
+			pushToast({
+				type: 'error',
+				name,
+				message: displayMessage
+			});
 		}
-
-		pushToast({
-			type: 'error',
-			name,
-			message: displayMessage
-		});
 
 		throw error.detail;
 	}

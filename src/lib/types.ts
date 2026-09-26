@@ -274,6 +274,373 @@ export type ExportCode = {
 	backend: Backend;
 };
 
+export type DedicatedServerInfo = {
+	platforms: Platform[];
+	defaultPort: number;
+};
+
+export type ServerLocation = 'local' | 'remote';
+export type RemoteAuthentication = 'password' | 'privateKey' | 'agent';
+export type RemoteProtocol = 'sftp' | 'ftp' | 'ftps';
+export type SyncMode = 'local' | 'worker';
+export type RestartPolicy = 'manual' | 'immediate' | 'whenEmpty';
+export type HostProvider = 'none' | 'datHost';
+
+export type WorkerSettings = {
+	address: string;
+	/// True when `address` points at the Gale-managed Windows service on
+	/// this machine rather than an independently hosted worker.
+	hosted: boolean;
+	autoDeployMods: boolean;
+};
+
+export type HostSettings = {
+	provider: HostProvider;
+	datHostServerId: string;
+	datHostUsername: string;
+};
+
+export type RemoteServerSettings = {
+	protocol: RemoteProtocol;
+	host: string;
+	port: number;
+	username: string;
+	serverDirectory: string;
+	authentication: RemoteAuthentication;
+	privateKeyPath: string;
+	trustedHostKey: string | null;
+	trustedCertificate: string | null;
+	syncMode: SyncMode;
+	worker: WorkerSettings;
+	hostControl: HostSettings;
+	restartPolicy: RestartPolicy;
+};
+
+export type ProfileServerSettings = {
+	location: ServerLocation;
+	serverName: string;
+	world: string;
+	port: number;
+	publicServer: boolean;
+	crossplay: boolean;
+	extraArgs: string;
+	remote: RemoteServerSettings;
+	syncDialog?: SyncDialogPreferences;
+};
+
+export type SyncDialogPreferences = { restartPolicy: RestartPolicy };
+
+/// Which of the profile's server credentials exist in the credential
+/// store. The values themselves are never exposed to the frontend.
+export type SavedServerCredentials = {
+	gamePassword: boolean;
+	sftpPassword: boolean;
+	ftpPassword: boolean;
+	sshKeyPassphrase: boolean;
+	datHostPassword: boolean;
+	workerToken: boolean;
+};
+
+export type RemoteConnectionTestResult =
+	| { status: 'connected'; fingerprint: string | null; encrypted: boolean }
+	| { status: 'hostKeyUntrusted'; fingerprint: string }
+	| { status: 'certificateUntrusted'; fingerprint: string };
+
+// ---------- selective server synchronization ----------
+
+export type DeploySelection = {
+	includeMods: boolean;
+	includeConfigs: boolean;
+	applyConfigs: string[];
+	restoreConfigs: string[];
+	declineConfigs: string[];
+};
+
+export type UploadKind = 'payload' | 'config';
+export type RemoteLayout = 'standard' | 'mirrorRoot';
+
+export type PlanUpload = {
+	path: string;
+	size: number;
+	kind: UploadKind;
+};
+
+export type ConfigAction =
+	| { action: 'markApplied' }
+	| { action: 'write' }
+	| { action: 'decline' }
+	| { action: 'keep' }
+	| { action: 'pending'; reason: PendingSyncConfigReason }
+	| { action: 'unapplied' };
+
+export type PlanConfigEntry = {
+	path: string;
+	policy: SyncConfigUpdatePolicy;
+	selected: boolean;
+} & ConfigAction;
+
+export type PlanConflict = {
+	path: string;
+	reason: PendingSyncConfigReason;
+};
+
+export type DeploymentPlan = {
+	hash: string;
+	publicationRevision: string;
+	modsRevision: string;
+	deployedModsRevision: string | null;
+	stateSeq: number;
+	layout: RemoteLayout;
+	hostManaged: boolean;
+	modsPhase: boolean;
+	configsPhase: boolean;
+	uploads: PlanUpload[];
+	uploadBytes: number;
+	removals: string[];
+	directoryRemovals: string[];
+	unchangedFiles: number;
+	configEntries: PlanConfigEntry[];
+	conflicts: PlanConflict[];
+	/// Remote payload files Gale has never owned. Shown for review,
+	/// never deleted by the deployment.
+	unmanaged: string[];
+	requiresRestart: boolean;
+};
+
+export type ExecutorKind = 'local' | 'worker';
+export type OperationKind = 'manual' | 'automatic';
+export type OperationStatus = 'succeeded' | 'partial' | 'failed';
+export type RestartOutcome =
+	| 'notRequired'
+	| 'awaitingManual'
+	| 'awaitingEmpty'
+	| 'restarted'
+	| 'startupUnverified'
+	| 'failed';
+
+export type OperationSummary = {
+	uploadedFiles: number;
+	uploadedBytes: number;
+	removedFiles: number;
+	configWrites: number;
+	unchangedFiles: number;
+};
+
+export type OperationRecord = {
+	id: string;
+	executor: ExecutorKind;
+	kind: OperationKind;
+	workerId: string | null;
+	publicationRevision: string | null;
+	modsRevision: string | null;
+	status: OperationStatus;
+	summary: OperationSummary;
+	restart: RestartOutcome;
+	externalRestartAcknowledged?: boolean;
+	error: string | null;
+	startedAt: string;
+	finishedAt: string;
+};
+
+export type LeaseRecord = {
+	owner: string;
+	executor: ExecutorKind;
+	operationId: string;
+	acquiredAt: string;
+	heartbeatAt: string;
+	ttlSecs: number;
+};
+
+/// A preview that found another live executor holding the deployment
+/// lease. `stale` marks a lease whose heartbeat expired, the only case
+/// where a forced takeover is offered.
+export type LeaseBusy = {
+	record: LeaseRecord;
+	stale: boolean;
+};
+
+/// The subset of the remote deployment state the UI displays.
+export type ServerDeploymentState = {
+	version: number;
+	operationSeq: number;
+	modsRevision: string | null;
+	restartRequired: boolean;
+	lastOperation: OperationRecord | null;
+};
+
+export type ServerSyncPreview = {
+	plan: DeploymentPlan;
+	busy: LeaseBusy | null;
+	warnings: string[];
+};
+
+export type ServerSyncResult = {
+	plan: DeploymentPlan;
+	summary: OperationSummary;
+	warnings: string[];
+	failedConfigWrites: string[];
+	restart: RestartOutcome;
+	state: ServerDeploymentState;
+};
+
+export type BusyOperation = {
+	id: string;
+	kind: OperationKind;
+	startedAt: string;
+};
+
+export type ServerStateSummary = {
+	modsRevision: string | null;
+	restartRequired: boolean;
+	lastOperation: OperationRecord | null;
+	lease: LeaseRecord | null;
+};
+
+export type WorkerStatus = {
+	workerId: string;
+	profileId: string;
+	autoDeployMods: boolean;
+	restartPolicy: RestartPolicy;
+	/// The newest publication revision the worker has observed.
+	/// Observation alone is not deployment.
+	observedRevision: string | null;
+	/// A publication revision whose mod payload is still owed, if any.
+	/// Workers never owe config work: the server is authoritative for its
+	/// config files after setup.
+	pendingRevision: string | null;
+	/// When the pending work becomes eligible for its next attempt.
+	nextAttemptAt: string | null;
+	/// The newest publication revision whose mod payload is confirmed
+	/// deployed on the server.
+	lastDeployedRevision: string | null;
+	busy: BusyOperation | null;
+	lastOperation: OperationRecord | null;
+	/// The last deployment failure from this worker.
+	lastError: string | null;
+	/// The current publication-poll failure.
+	pollError: string | null;
+	server: ServerStateSummary | null;
+};
+
+export type ServerSyncStatus = {
+	mode: SyncMode;
+	server: ServerStateSummary | null;
+	publicationRevision: string | null;
+	worker: WorkerStatus | null;
+	credentialRequired: boolean;
+	warnings: string[];
+};
+
+// ---------- managed local worker ("host worker on this PC") ----------
+
+export type LocalWorkerServiceState =
+	| 'notInstalled'
+	| 'stopped'
+	| 'startPending'
+	| 'running'
+	| 'stopPending'
+	| 'other';
+
+export type LocalWorkerBinding = {
+	workerId: string;
+	/// The sync-profile id the installed worker serves.
+	profileId: string;
+	listen: string;
+	address: string;
+};
+
+/// Why the worker process last stopped, from its status file. A `running`
+/// report on a stopped service means the process died unexpectedly.
+export type LocalWorkerRunPhase = 'running' | 'stopped' | 'shutdown';
+
+export type LocalWorkerRunReport = {
+	workerId: string;
+	profileId: string;
+	pid: number;
+	phase: LocalWorkerRunPhase;
+	at: string;
+};
+
+export type LocalWorkerAction = 'start' | 'stop' | 'restart';
+
+/// Who the installed worker belongs to relative to this profile. One
+/// `GaleWorker` service exists per machine and is bound to a single sync
+/// profile at install — `foreign` workers must never be controlled from
+/// here.
+export type LocalWorkerOwnership =
+	/// No worker is installed.
+	| 'none'
+	/// Installed for this profile and fully bound (settings + token).
+	| 'owned'
+	/// Installed for this profile but the desktop binding never completed
+	/// — provisioning can finish it.
+	| 'incomplete'
+	/// Installed for a different profile; controls must not be offered.
+	| 'foreign';
+
+export type LocalWorkerStatus = {
+	/// False off Windows — provisioning is unavailable there.
+	supported: boolean;
+	service: LocalWorkerServiceState;
+	binding: LocalWorkerBinding | null;
+	/// Whether the installed worker belongs to this profile.
+	ownership: LocalWorkerOwnership;
+	run: LocalWorkerRunReport | null;
+	worker: WorkerStatus | null;
+	/// Why the live worker status is unavailable.
+	workerError: string | null;
+	/// The last run report says the machine shut down — the service
+	/// comes back with the next boot.
+	stoppedForShutdown: boolean;
+	/// A newer worker binary shipped with the app than the service runs.
+	updateAvailable: boolean;
+	warnings: string[];
+};
+
+export type ServerSyncPhase =
+	| 'fetchingPublication'
+	| 'stagingPayload'
+	| 'connecting'
+	| 'readingState'
+	| 'checkingLease'
+	| 'refreshingState'
+	| 'scanningPayload'
+	| 'verifyingPayload'
+	| 'checkingConfigs'
+	| 'buildingPlan'
+	| 'finalizingPreview'
+	| 'removingFiles'
+	| 'uploadingPayload'
+	| 'writingConfigs'
+	| 'persistingState'
+	| 'applyingRestart'
+	| 'releasingLease';
+
+export type ServerSyncOperationProgress = {
+	runId: string;
+	operation: 'preview' | 'deploy';
+	status: 'running' | 'succeeded' | 'failed';
+	phase: ServerSyncPhase;
+	completedPhases: number;
+	totalPhases: number;
+	completed: number;
+	total: number | null;
+	completedBytes: number | null;
+	totalBytes: number | null;
+	item: string | null;
+};
+
+export type DedicatedServerStatus =
+	| { state: 'stopped' }
+	| {
+			state: 'running';
+			stopping: boolean;
+			profileId: number;
+			gameSlug: string;
+			pid: number;
+			serverDir: string;
+	  };
+
 export type Game = {
 	name: string;
 	slug: string;
@@ -282,6 +649,7 @@ export type Game = {
 	modLoader: ModLoader;
 	popular: boolean;
 	backends: Backend[];
+	dedicatedServer: DedicatedServerInfo | null;
 };
 
 export enum ModLoader {
