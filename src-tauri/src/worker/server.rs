@@ -1807,6 +1807,62 @@ mod tests {
             .count()
     }
 
+    /// The running service checks for publications on its normal cadence
+    /// even when automatic deployment is disabled.
+    #[tokio::test]
+    async fn running_worker_keeps_polling_with_automation_disabled() {
+        use std::time::Duration;
+
+        use crate::profile::server::worker_client::WorkerClient;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sync_api = serve(MockApi::default()).await;
+        let mut config = worker_config(dir.path(), format!("127.0.0.1:{}", free_port()));
+        config.profile_id = SYNC_PROFILE.to_owned();
+        config.sync_url = Some(sync_api.url.clone());
+        config.poll_interval_secs = 30;
+        let secrets = Secrets {
+            refresh_token: Some("refresh-seed".to_owned()),
+            ..worker_secrets()
+        };
+        let mut settings = RemoteServerSettings::default();
+        settings.worker.address = format!("http://{}", config.listen);
+        let client = WorkerClient::new(&settings, "token".to_owned()).unwrap();
+
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(super::run(
+            config,
+            secrets,
+            shutdown.clone(),
+            Some(ready_tx),
+        ));
+        ready_rx.await.expect("the worker never became ready");
+        assert!(!client.status(false).await.unwrap().auto_deploy_mods);
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while sync_api.metadata_requests() < 1 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("automation disabled the initial publication check");
+
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::time::resume();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while sync_api.metadata_requests() < 2 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("automation disabled publication polling stopped");
+
+        shutdown.cancel();
+        task.await.unwrap().unwrap();
+    }
+
     /// With automation disabled, polling observes the publication and
     /// keeps its mod payload owed until automation is enabled. Configs
     /// are never evaluated by the background path.
@@ -2168,7 +2224,7 @@ mod tests {
         let shutdown = tokio_util::sync::CancellationToken::new();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(super::run(
-            config,
+            config.clone(),
             worker_secrets(),
             shutdown.clone(),
             Some(ready_tx),
@@ -2180,6 +2236,36 @@ mod tests {
             !status.auto_deploy_mods,
             "the journal must win over the config after the first seed"
         );
+
+        // The enabled value is durable too; restart policy stays separate.
+        client
+            .configure(true, RestartPolicy::WhenEmpty)
+            .await
+            .unwrap();
+        let status = client.status(false).await.unwrap();
+        assert!(status.auto_deploy_mods);
+        assert_eq!(status.restart_policy, RestartPolicy::WhenEmpty);
+
+        shutdown.cancel();
+        task.await.unwrap().unwrap();
+
+        // The config now disagrees with both saved values. The journal
+        // remains authoritative for automation and restart policy.
+        config.automation.auto_deploy_mods = false;
+        config.restart_policy = RestartPolicy::Immediate;
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(super::run(
+            config,
+            worker_secrets(),
+            shutdown.clone(),
+            Some(ready_tx),
+        ));
+        ready_rx.await.expect("the worker never became ready");
+
+        let status = client.status(false).await.unwrap();
+        assert!(status.auto_deploy_mods);
+        assert_eq!(status.restart_policy, RestartPolicy::WhenEmpty);
 
         shutdown.cancel();
         task.await.unwrap().unwrap();
