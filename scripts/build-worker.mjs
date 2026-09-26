@@ -31,19 +31,15 @@ mkdirSync(outDir, { recursive: true });
 const staged = join(outDir, exe);
 copyFileSync(join(tauriDir, 'target', profile, exe), staged);
 
-let trayComponent = '';
+// The tray has no required-features, so `tauri build` already installs
+// target/<profile>/gale-worker-tray.exe next to gale.exe. A second WiX
+// component for that same filename fails ICE30. The worker binary stays
+// in this fragment because its `worker` feature keeps Tauri from bundling it.
 if (isWindows) {
 	execSync(['cargo', 'build', ...cargoArgs, '--bin', 'gale-worker-tray'].join(' '), {
 		cwd: tauriDir,
 		stdio: 'inherit',
 	});
-	const trayExe = 'gale-worker-tray.exe';
-	const stagedTray = join(outDir, trayExe);
-	copyFileSync(join(tauriDir, 'target', profile, trayExe), stagedTray);
-	trayComponent = `
-			<Component Id="GaleWorkerTrayBinary" Guid="*" Win64="yes" Directory="INSTALLDIR">
-				<File Id="GaleWorkerTrayExe" Source="${stagedTray}" KeyPath="yes" />
-			</Component>`;
 }
 
 // Referenced by `bundle.windows.wix.fragmentPaths` — the ComponentGroup
@@ -56,7 +52,7 @@ writeFileSync(
 		<ComponentGroup Id="GaleWorkerBinaries">
 			<Component Id="GaleWorkerBinary" Guid="*" Win64="yes" Directory="INSTALLDIR">
 				<File Id="GaleWorkerExe" Source="${staged}" KeyPath="yes" />
-			</Component>${trayComponent}
+			</Component>
 		</ComponentGroup>
 	</Fragment>
 </Wix>
