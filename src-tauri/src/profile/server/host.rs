@@ -197,7 +197,11 @@ pub fn from_settings(settings: &HostSettings, password: Option<&str>) -> Box<dyn
 mod tests {
     use super::*;
     use crate::profile::server::{
-        engine::apply_restart_policy_reporting, settings::RestartPolicy, state::RestartOutcome,
+        engine::apply_restart_policy_reporting,
+        plan::DeploySelection,
+        progress::{ProgressReporter, SyncOperation},
+        settings::RestartPolicy,
+        state::RestartOutcome,
     };
     use axum::{
         Router,
@@ -367,7 +371,10 @@ mod tests {
                 username: "user".into(),
                 password: "pass".into(),
             };
-            let outcome = apply_restart_policy_reporting(&host, policy, required, None).await;
+            let mut progress =
+                ProgressReporter::silent(SyncOperation::Deploy, &DeploySelection::default());
+            let outcome =
+                apply_restart_policy_reporting(&host, policy, required, &mut progress).await;
             task.abort();
             assert_eq!(outcome, expected, "policy {policy:?}, players {players:?}");
             assert_eq!(*api.calls.lock().unwrap(), calls);

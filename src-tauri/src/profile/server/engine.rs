@@ -18,7 +18,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
-        Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
@@ -39,9 +38,9 @@ use super::{
     paths::{DeployPath, DeployPathBuf, RemotePath, RemotePathBuf},
     plan::{
         self, ConfigAction, DeploySelection, DeploymentPlan, DesiredDeployment, FileSource,
-        PlanContext, Publication, RemoteLayout, RemoteSnapshot, UploadKind,
+        PlanContext, RemoteLayout, RemoteSnapshot, UploadKind,
     },
-    progress::{ProgressReporter, SyncPhase},
+    progress::{ProgressReporter, SyncOperation, SyncPhase},
     remote::{ReadOnly, RemoteOps, RemoteReader},
     settings::RestartPolicy,
     spec::DeploymentSpec,
@@ -52,7 +51,7 @@ use super::{
 };
 use crate::profile::{
     export::{ConfigPath, ContentHash},
-    sync::ConfigUpdatePolicy,
+    sync::{ConfigUpdatePolicy, FetchedPublication},
 };
 
 const TRANSFER_ATTEMPTS: usize = 3;
@@ -76,7 +75,7 @@ const MAX_SNAPSHOT_READERS: usize = 4;
 /// files; only open one per this many desired payload files.
 const FILES_PER_SNAPSHOT_READER: usize = 8;
 
-/// Identifies an operation across the lease record, operation history, and
+/// Identifies an operation across the lease record, last operation, and
 /// progress reporting.
 #[derive(Debug, Clone)]
 pub struct OperationMeta {
@@ -125,24 +124,6 @@ impl OperationMeta {
             started_at: Utc::now(),
         }
     }
-}
-
-/// Per-file progress reported while executing a plan.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EngineProgress {
-    pub completed: usize,
-    pub total: usize,
-    pub path: DeployPathBuf,
-    pub operation: ProgressOp,
-}
-
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ProgressOp {
-    Remove,
-    Upload,
-    WriteConfig,
 }
 
 /// Maps deploy paths to absolute remote paths for the detected layout.
@@ -288,7 +269,7 @@ pub struct Preview {
 /// advisory only) and the holder is reported through `busy`.
 pub fn preview_with_progress(
     session: &mut Session,
-    publication: &Publication,
+    publication: &FetchedPublication,
     desired: &DesiredDeployment,
     selection: &DeploySelection,
     context: &PlanContext,
@@ -296,7 +277,7 @@ pub fn preview_with_progress(
     progress: &mut ProgressReporter,
 ) -> Result<Preview> {
     progress.phase(SyncPhase::CheckingLease);
-    let held = match lease::acquire(
+    let (held, busy) = match lease::acquire(
         session.ops.as_mut(),
         &session.mapper.remote_path(&session.mapper.spec.lease_dir),
         &meta.owner,
@@ -304,26 +285,11 @@ pub fn preview_with_progress(
         &meta.id,
         false,
     ) {
-        Ok(lease) => Some(lease),
+        Ok(lease) => (Some(lease), None),
         Err(err) => {
             let busy = err.downcast::<lease::LeaseBusy>()?;
             info!(phase = "preview.busy", owner = %busy.record.owner, stale = busy.stale, "preview found an existing deployment lease; taking a read-only snapshot");
-            let snapshot = take_snapshot(session, publication, desired, selection, progress)?;
-            progress.phase(SyncPhase::BuildingPlan);
-            let plan = plan::build_plan(
-                publication,
-                desired,
-                &snapshot,
-                selection,
-                context,
-                &session.mapper.spec,
-            )?;
-            progress.phase(SyncPhase::FinalizingPreview);
-            return Ok(Preview {
-                plan,
-                busy: Some(busy),
-                warnings: session.warnings.clone(),
-            });
+            (None, Some(busy))
         }
     };
 
@@ -346,7 +312,7 @@ pub fn preview_with_progress(
     progress.phase(SyncPhase::FinalizingPreview);
     Ok(Preview {
         plan,
-        busy: None,
+        busy,
         warnings: session.warnings.clone(),
     })
 }
@@ -374,51 +340,124 @@ pub struct DeploymentResult {
     pub state: ServerDeploymentState,
 }
 
+/// Runs the blocking remote preview behind the async process boundary.
+/// Both desktop and Worker supply their own authenticated connection.
+#[allow(clippy::too_many_arguments)]
+pub async fn preview(
+    connect: impl Fn() -> Result<Box<dyn RemoteOps>> + Send + 'static,
+    spec: DeploymentSpec,
+    base: RemotePathBuf,
+    publication: FetchedPublication,
+    desired: DesiredDeployment,
+    selection: DeploySelection,
+    context: PlanContext,
+    meta: OperationMeta,
+    progress: &mut ProgressReporter,
+) -> Result<Preview> {
+    let mut blocking_progress = std::mem::replace(
+        progress,
+        ProgressReporter::silent(SyncOperation::Preview, &selection),
+    );
+    let (result, returned) = tokio::task::spawn_blocking(move || {
+        blocking_progress.phase(SyncPhase::Connecting);
+        let result = (|| {
+            let ops = connect()?;
+            blocking_progress.phase(SyncPhase::ReadingState);
+            let mut session = open_session(ops, &spec, base)?;
+            preview_with_progress(
+                &mut session,
+                &publication,
+                &desired,
+                &selection,
+                &context,
+                &meta,
+                &mut blocking_progress,
+            )
+        })();
+        (result, blocking_progress)
+    })
+    .await
+    .context("preview task failed")?;
+    *progress = returned;
+    result
+}
+
+/// Runs the blocking file phase, then the async restart, while retaining
+/// the same remote lease throughout both phases.
+#[allow(clippy::too_many_arguments)]
+pub async fn deploy(
+    connect: impl Fn() -> Result<Box<dyn RemoteOps>> + Clone + Send + 'static,
+    spec: DeploymentSpec,
+    base: RemotePathBuf,
+    publication: FetchedPublication,
+    desired: DesiredDeployment,
+    selection: DeploySelection,
+    context: PlanContext,
+    meta: OperationMeta,
+    expected_plan_hash: Option<String>,
+    force: bool,
+    host: &dyn HostControl,
+    policy: RestartPolicy,
+    progress: &mut ProgressReporter,
+) -> Result<DeploymentResult> {
+    let mut blocking_progress = std::mem::replace(
+        progress,
+        ProgressReporter::silent(SyncOperation::Deploy, &selection),
+    );
+    let final_meta = meta.clone();
+    let (result, returned) = tokio::task::spawn_blocking(move || {
+        blocking_progress.phase(SyncPhase::Connecting);
+        let result = (|| {
+            let ops = connect()?;
+            blocking_progress.phase(SyncPhase::ReadingState);
+            let mut session = open_session(ops, &spec, base)?;
+            let deployment = deploy_with_progress(
+                &mut session,
+                connect.clone(),
+                &publication,
+                &desired,
+                &selection,
+                &context,
+                &meta,
+                expected_plan_hash.as_deref(),
+                force,
+                &mut blocking_progress,
+            )?;
+            Ok::<_, eyre::Report>((session, deployment))
+        })();
+        (result, blocking_progress)
+    })
+    .await
+    .context("deployment task failed")?;
+    *progress = returned;
+    let (session, deployment) = result?;
+    complete_with_progress(session, deployment, host, policy, final_meta, progress).await
+}
+
 /// Completes the restart and records the result before releasing the lease.
 pub async fn complete_with_progress(
-    session: Session,
+    mut session: Session,
     deployment: Deployment,
     host: &dyn HostControl,
     policy: RestartPolicy,
     meta: OperationMeta,
     progress: &mut ProgressReporter,
 ) -> Result<DeploymentResult> {
-    complete_impl(session, deployment, host, policy, meta, Some(progress)).await
-}
-
-async fn complete_impl(
-    mut session: Session,
-    deployment: Deployment,
-    host: &dyn HostControl,
-    policy: RestartPolicy,
-    meta: OperationMeta,
-    mut progress: Option<&mut ProgressReporter>,
-) -> Result<DeploymentResult> {
-    if let Some(progress) = progress.as_deref_mut() {
-        progress.phase(SyncPhase::ApplyingRestart);
-    }
-    let restart = apply_restart_policy_reporting(
-        host,
-        policy,
-        session.state.restart_required,
-        progress.as_deref_mut(),
-    )
-    .await;
+    progress.phase(SyncPhase::ApplyingRestart);
+    let restart =
+        apply_restart_policy_reporting(host, policy, session.state.restart_required, progress)
+            .await;
     let plan = deployment.plan.clone();
     let summary = deployment.summary.clone();
     let warnings = deployment.warnings.clone();
     let failed_config_writes = deployment.failed_config_writes.clone();
-    if let Some(progress) = progress.as_deref_mut() {
-        progress.phase(SyncPhase::ReleasingLease);
-    }
+    progress.phase(SyncPhase::ReleasingLease);
     let state =
         tokio::task::spawn_blocking(move || finish(&mut session, deployment, restart, &meta))
             .await
             .context("deployment finalization task failed")??;
 
-    if let Some(progress) = progress {
-        progress.succeeded();
-    }
+    progress.succeeded();
 
     Ok(DeploymentResult {
         plan,
@@ -447,7 +486,7 @@ async fn complete_impl(
 pub fn deploy_with_progress(
     session: &mut Session,
     connect: impl FnMut() -> Result<Box<dyn RemoteOps>> + Send + 'static,
-    publication: &Publication,
+    publication: &FetchedPublication,
     desired: &DesiredDeployment,
     selection: &DeploySelection,
     context: &PlanContext,
@@ -455,7 +494,6 @@ pub fn deploy_with_progress(
     expected_plan_hash: Option<&str>,
     force: bool,
     progress: &mut ProgressReporter,
-    mut report: impl FnMut(EngineProgress),
 ) -> Result<Deployment> {
     progress.phase(SyncPhase::CheckingLease);
     let mut lease = lease::acquire(
@@ -500,15 +538,7 @@ pub fn deploy_with_progress(
         }
     };
 
-    let result = execute(
-        session,
-        &plan,
-        desired,
-        publication,
-        &lease,
-        progress,
-        &mut report,
-    );
+    let result = execute(session, &plan, desired, publication, &lease, progress);
 
     match result {
         Ok((summary, mut warnings, failed_config_writes)) => {
@@ -619,33 +649,25 @@ pub(super) async fn apply_restart_policy_reporting(
     host: &dyn HostControl,
     policy: RestartPolicy,
     requires_restart: bool,
-    mut progress: Option<&mut ProgressReporter>,
+    progress: &mut ProgressReporter,
 ) -> RestartOutcome {
     if !requires_restart {
-        if let Some(progress) = progress.as_deref_mut() {
-            progress.item("No restart needed");
-        }
+        progress.item("No restart needed");
         return RestartOutcome::NotRequired;
     }
 
     if !host.can_restart() {
-        if let Some(progress) = progress.as_deref_mut() {
-            progress.item("Waiting for a manual restart");
-        }
+        progress.item("Waiting for a manual restart");
         return RestartOutcome::AwaitingManual;
     }
 
     match policy {
         RestartPolicy::Manual => {
-            if let Some(progress) = progress.as_deref_mut() {
-                progress.item("Waiting for a manual restart");
-            }
+            progress.item("Waiting for a manual restart");
             RestartOutcome::AwaitingManual
         }
         RestartPolicy::Immediate => {
-            if let Some(progress) = progress.as_deref_mut() {
-                progress.item("Checking server status");
-            }
+            progress.item("Checking server status");
             do_restart(host, host.status().await.ok(), progress).await
         }
         RestartPolicy::WhenEmpty => match host.status().await {
@@ -653,9 +675,7 @@ pub(super) async fn apply_restart_policy_reporting(
                 do_restart(host, Some(status), progress).await
             }
             _ => {
-                if let Some(progress) = progress {
-                    progress.item("Waiting until the server is empty");
-                }
+                progress.item("Waiting until the server is empty");
                 RestartOutcome::AwaitingEmpty
             }
         },
@@ -677,12 +697,10 @@ fn observed_restart(saw_stopped: &mut bool, saw_booting: &mut bool, status: &Hos
 async fn do_restart(
     host: &dyn HostControl,
     before: Option<HostStatus>,
-    mut progress: Option<&mut ProgressReporter>,
+    progress: &mut ProgressReporter,
 ) -> RestartOutcome {
     info!(host = host.name(), "restarting dedicated server");
-    if let Some(progress) = progress.as_deref_mut() {
-        progress.item("Requesting server restart");
-    }
+    progress.item("Requesting server restart");
     if host.restart().await.is_err() {
         return RestartOutcome::Failed;
     }
@@ -694,21 +712,19 @@ async fn do_restart(
         .is_some_and(|status| status.running == Some(false));
     let mut saw_booting = false;
     for attempt in 0..RESTART_VERIFY_ATTEMPTS {
-        if let Some(progress) = progress.as_deref_mut() {
-            let waiting_for = if before
-                .as_ref()
-                .is_some_and(|status| status.booting.is_some())
-            {
-                "server to finish booting"
-            } else {
-                "server to stop and start"
-            };
-            progress.item(format!(
-                "Waiting for {waiting_for} (check {} of {})",
-                attempt + 1,
-                RESTART_VERIFY_ATTEMPTS
-            ));
-        }
+        let waiting_for = if before
+            .as_ref()
+            .is_some_and(|status| status.booting.is_some())
+        {
+            "server to finish booting"
+        } else {
+            "server to stop and start"
+        };
+        progress.item(format!(
+            "Waiting for {waiting_for} (check {} of {})",
+            attempt + 1,
+            RESTART_VERIFY_ATTEMPTS
+        ));
         tokio::time::sleep(RESTART_VERIFY_DELAY).await;
         match host.status().await {
             Ok(status) if observed_restart(&mut saw_stopped, &mut saw_booting, &status) => {
@@ -754,7 +770,6 @@ pub fn finish(
         },
         summary: deployment.summary.clone(),
         restart,
-        external_restart_acknowledged: false,
         error: (!deployment.failed_config_writes.is_empty()).then(|| {
             format!(
                 "{} selected config file(s) could not be written",
@@ -804,7 +819,6 @@ pub fn acknowledge_external_restart(
             status: OperationStatus::Succeeded,
             summary: OperationSummary::default(),
             restart: RestartOutcome::Restarted,
-            external_restart_acknowledged: true,
             error: None,
             started_at: meta.started_at,
             finished_at: Utc::now(),
@@ -836,7 +850,6 @@ fn fail_operation(
         status: OperationStatus::Failed,
         summary: OperationSummary::default(),
         restart: RestartOutcome::NotRequired,
-        external_restart_acknowledged: false,
         error: Some(error.to_string()),
         started_at: meta.started_at,
         finished_at: Utc::now(),
@@ -850,7 +863,7 @@ fn fail_operation(
 /// may touch.
 fn take_snapshot(
     session: &mut Session,
-    publication: &Publication,
+    publication: &FetchedPublication,
     desired: &DesiredDeployment,
     selection: &DeploySelection,
     progress: &mut ProgressReporter,
@@ -860,7 +873,7 @@ fn take_snapshot(
     info!(
         phase = "snapshot",
         owned_files = session.state.files.len(),
-        desired_files = desired.payload.len(),
+        desired_files = desired.len(),
         "starting remote snapshot"
     );
 
@@ -878,8 +891,7 @@ fn take_snapshot(
         // extra read-only connections run the LIST/RETR work in parallel.
         // State, lease, and mutation traffic stays on the authoritative
         // session connection.
-        let requested =
-            (desired.payload.len() / FILES_PER_SNAPSHOT_READER).min(MAX_SNAPSHOT_READERS);
+        let requested = (desired.len() / FILES_PER_SNAPSHOT_READER).min(MAX_SNAPSHOT_READERS);
         let mut readers: Vec<Box<dyn RemoteReader + '_>> =
             open_snapshot_readers(session.ops.as_ref(), requested);
         if readers.is_empty() {
@@ -948,7 +960,6 @@ fn take_snapshot(
         // desired is being removed anyway.
         progress.phase(SyncPhase::VerifyingPayload);
         let to_hash: Vec<_> = desired
-            .payload
             .iter()
             .filter(|(path, staged)| {
                 session.state.files.contains_key(*path)
@@ -1293,13 +1304,10 @@ fn execute(
     session: &mut Session,
     plan: &DeploymentPlan,
     desired: &DesiredDeployment,
-    publication: &Publication,
+    publication: &FetchedPublication,
     lease: &Lease,
     progress: &mut ProgressReporter,
-    report: &mut impl FnMut(EngineProgress),
 ) -> Result<(OperationSummary, Vec<String>, Vec<ConfigPath>)> {
-    let total = plan.removals.len() + plan.directory_removals.len() + plan.uploads.len();
-    let mut completed = 0;
     let mut summary = OperationSummary {
         unchanged_files: plan.unchanged_files,
         ..Default::default()
@@ -1327,15 +1335,8 @@ fn execute(
             session.state.restart_required = true;
         }
         session.state.files.remove(path);
-        completed += 1;
         removed += 1;
         progress.advance(removed, None);
-        report(EngineProgress {
-            completed,
-            total,
-            path: path.clone(),
-            operation: ProgressOp::Remove,
-        });
     }
 
     for dir in &plan.directory_removals {
@@ -1344,15 +1345,8 @@ fn execute(
         if let Err(error) = session.ops.delete_dir(&remote) {
             warnings.push(format!("could not remove {dir}/: {error}"));
         }
-        completed += 1;
         removed += 1;
         progress.advance(removed, None);
-        report(EngineProgress {
-            completed,
-            total,
-            path: dir.clone(),
-            operation: ProgressOp::Remove,
-        });
     }
 
     // ---- Uploads: payload first, then published config writes.
@@ -1387,7 +1381,7 @@ fn execute(
         progress.item(upload.path.to_string());
         let result = match upload.kind {
             UploadKind::Payload => {
-                let staged = desired.payload.get(&upload.path).ok_or_else(|| {
+                let staged = desired.get(&upload.path).ok_or_else(|| {
                     eyre::eyre!("planned upload missing staged content: {}", upload.path)
                 });
 
@@ -1407,7 +1401,7 @@ fn execute(
                     upload_file(
                         session,
                         &upload.path,
-                        &FileSource::Bytes(Arc::new(file.bytes.clone())),
+                        &FileSource::Bytes(file.bytes.clone()),
                         &mut ensured,
                     )?;
                     session.state.record_applied(&config_path, &file.hash);
@@ -1441,7 +1435,6 @@ fn execute(
             }
         }
 
-        completed += 1;
         if upload.kind == UploadKind::Config {
             written_configs += 1;
             progress.advance(written_configs, None);
@@ -1450,15 +1443,6 @@ fn execute(
             uploaded_bytes += upload.size;
             progress.advance(uploaded, Some(uploaded_bytes));
         }
-        report(EngineProgress {
-            completed,
-            total,
-            path: upload.path.clone(),
-            operation: match upload.kind {
-                UploadKind::Config => ProgressOp::WriteConfig,
-                _ => ProgressOp::Upload,
-            },
-        });
     }
 
     // ---- Config decision records (non-write outcomes).
@@ -1476,7 +1460,7 @@ fn execute(
                 ConfigAction::MarkApplied => session.state.record_applied(&entry.path, hash),
                 ConfigAction::Decline => session.state.record_declined(&entry.path, hash),
                 ConfigAction::Pending { .. } => session.state.record_conflict(&entry.path, hash),
-                ConfigAction::Keep | ConfigAction::Write | ConfigAction::Unapplied => {}
+                ConfigAction::Write | ConfigAction::Unapplied => {}
             }
         }
     }
@@ -1485,7 +1469,6 @@ fn execute(
     // whole payload phase succeeded, since a failure returns early above.
     if plan.mods_phase {
         session.state.mods_revision = Some(plan.mods_revision.clone());
-        session.state.deployed_mods = plan.deployed_mods.clone();
     }
 
     Ok((summary, warnings, failed_config_writes))
@@ -1822,12 +1805,12 @@ mod tests {
     use crate::{
         game::mod_loader::{ModLoader, ModLoaderKind},
         profile::{
-            export::{ConfigPath, ModRevision, R2Mod},
+            export::{ConfigPath, ModRevision, ProfileManifest, R2Mod},
             server::{
                 host,
                 lease::LeaseRecord,
                 paths::RemotePathBuf,
-                plan::{Publication, StagedFile},
+                plan::StagedFile,
                 progress::SyncOperation,
                 remote::{self, ConnectionAttempt, RemoteConnection, memory::MemoryRemote},
                 settings::{RemoteAuthentication, RemoteProtocol, RemoteServerSettings},
@@ -1864,7 +1847,7 @@ mod tests {
 
     fn staged(bytes: &[u8]) -> StagedFile {
         StagedFile {
-            source: FileSource::Bytes(Arc::new(bytes.to_vec())),
+            source: FileSource::Bytes(bytes.to_vec()),
             hash: blake3::hash(bytes).to_hex().to_string(),
             size: bytes.len() as u64,
         }
@@ -1877,21 +1860,27 @@ mod tests {
         }
     }
 
-    /// Owns the borrowed halves of a `Publication`.
     struct Fixture {
         mods: Vec<R2Mod>,
         config: BTreeMap<ConfigPath, ValidatedConfigFile>,
     }
 
     impl Fixture {
-        fn publication(&self) -> Publication<'_> {
-            Publication {
+        fn publication(&self) -> FetchedPublication {
+            FetchedPublication {
                 revision: DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
                     .unwrap()
                     .to_utc(),
                 mods_revision: ModRevision::from_hash(blake3::hash(b"rev-1")),
-                mods: &self.mods,
-                config: &self.config,
+                manifest: ProfileManifest {
+                    name: String::new(),
+                    mods: self.mods.clone(),
+                    game: None,
+                    ignored_version_updates: Vec::new(),
+                    ignored_package_updates: Vec::new(),
+                    sync: None,
+                },
+                config: self.config.clone(),
             }
         }
     }
@@ -1914,7 +1903,7 @@ mod tests {
             deploy_path("BepInEx/plugins/Author-ModA/ModA.dll"),
             staged(b"dll-bytes"),
         );
-        DesiredDeployment { payload }
+        payload
     }
 
     /// The multi-mod payload the FTPS reader-pool tests and the latency
@@ -1938,7 +1927,7 @@ mod tests {
                 }
             }
         }
-        DesiredDeployment { payload }
+        payload
     }
 
     fn selection(mods: bool, configs: bool) -> DeploySelection {
@@ -1988,7 +1977,7 @@ mod tests {
 
     fn preview(
         session: &mut Session,
-        publication: &Publication,
+        publication: &FetchedPublication,
         desired: &DesiredDeployment,
         selection: &DeploySelection,
         context: &PlanContext,
@@ -2010,14 +1999,13 @@ mod tests {
     fn deploy(
         session: &mut Session,
         connect: impl FnMut() -> Result<Box<dyn RemoteOps>> + Send + 'static,
-        publication: &Publication,
+        publication: &FetchedPublication,
         desired: &DesiredDeployment,
         selection: &DeploySelection,
         context: &PlanContext,
         meta: &OperationMeta,
         expected_plan_hash: Option<&str>,
         force: bool,
-        mut report: impl FnMut(EngineProgress),
     ) -> Result<Deployment> {
         let mut progress = ProgressReporter::silent(SyncOperation::Deploy, selection);
         deploy_with_progress(
@@ -2031,7 +2019,6 @@ mod tests {
             expected_plan_hash,
             force,
             &mut progress,
-            &mut report,
         )
     }
 
@@ -2116,8 +2103,6 @@ mod tests {
         let desired = desired_payload();
         let memory = remote();
         let mut session = open(memory.clone()).unwrap();
-        let mut progress = Vec::new();
-
         let deployment = deploy(
             &mut session,
             no_connect,
@@ -2128,7 +2113,6 @@ mod tests {
             &meta(),
             None,
             false,
-            |p| progress.push(p),
         )
         .unwrap();
 
@@ -2137,7 +2121,6 @@ mod tests {
             "restart must survive a crash before finalization"
         );
         assert_eq!(deployment.summary.uploaded_files, 1);
-        assert!(!progress.is_empty());
 
         let state = finish(
             &mut session,
@@ -2191,7 +2174,6 @@ mod tests {
             &meta(),
             Some("bogus-hash"),
             false,
-            |_| {},
         );
 
         assert!(result.is_err());
@@ -2231,7 +2213,6 @@ mod tests {
             &meta(),
             None,
             false,
-            |_| {},
         );
         match result {
             Err(err) => assert!(err.downcast_ref::<lease::LeaseBusy>().is_some()),
@@ -2263,7 +2244,6 @@ mod tests {
             &meta(),
             None,
             false,
-            |_| {},
         );
         assert!(result.is_err());
 
@@ -2283,9 +2263,7 @@ mod tests {
         let fixture = mod_fixture();
         let publication = fixture.publication();
         // Desired payload does not include the stale owned file.
-        let desired = DesiredDeployment {
-            payload: BTreeMap::new(),
-        };
+        let desired = DesiredDeployment::new();
 
         let memory = remote();
         let stale = "BepInEx/plugins/Old/Old.dll";
@@ -2321,7 +2299,6 @@ mod tests {
             &meta(),
             None,
             false,
-            |_| {},
         )
         .err()
         .expect("failed removal must fail the deployment");
@@ -2365,7 +2342,6 @@ mod tests {
             &meta(),
             None,
             false,
-            |_| {},
         )
         .unwrap();
         let state = finish(
@@ -2423,8 +2399,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            pending.plan.conflicts[0].reason,
-            PendingConfigReason::DeletedLocally
+            pending.plan.config_entries[0].action,
+            ConfigAction::Pending {
+                reason: PendingConfigReason::DeletedLocally
+            }
         );
         assert!(pending.plan.uploads.is_empty());
 
@@ -2452,7 +2430,6 @@ mod tests {
             &meta(),
             None,
             false,
-            |_| {},
         )
         .unwrap();
         finish(
@@ -2521,7 +2498,6 @@ mod tests {
             &meta(),
             None,
             false,
-            |_| {},
         )
         .unwrap();
         finish(
@@ -2574,7 +2550,6 @@ mod tests {
             &meta(),
             None,
             false,
-            |_| {},
         )
         .unwrap();
         let state = finish(
@@ -2632,7 +2607,6 @@ mod tests {
         )
         .unwrap();
         assert!(preview.plan.config_entries.is_empty());
-        assert!(preview.plan.conflicts.is_empty());
         assert!(
             preview
                 .plan
@@ -2651,7 +2625,6 @@ mod tests {
             &meta(),
             None,
             false,
-            |_| {},
         )
         .unwrap();
         let state = finish(
@@ -2676,7 +2649,11 @@ mod tests {
 
     /// Deploys `desired` onto the memory remote and finishes, leaving an
     /// unchanged remote — the shared setup for the reader-pool tests.
-    fn deploy_to_memory(memory: &Shared, publication: &Publication, desired: &DesiredDeployment) {
+    fn deploy_to_memory(
+        memory: &Shared,
+        publication: &FetchedPublication,
+        desired: &DesiredDeployment,
+    ) {
         let mut session = open(memory.clone()).unwrap();
         let deployment = deploy(
             &mut session,
@@ -2688,7 +2665,6 @@ mod tests {
             &meta(),
             None,
             false,
-            |_| {},
         )
         .unwrap();
         finish(
@@ -2830,7 +2806,6 @@ mod tests {
             "the reader pool must be active for this test to cover it"
         );
         assert!(previewed.plan.config_entries.is_empty());
-        assert!(previewed.plan.conflicts.is_empty());
         assert!(previewed.plan.uploads.is_empty());
     }
 
@@ -2916,7 +2891,6 @@ mod tests {
             &meta(),
             None,
             false,
-            |_| {},
         )
         .unwrap();
         // The never-owned server-only plugin is reported as unmanaged.
@@ -2971,7 +2945,6 @@ mod tests {
             &meta(),
             None,
             false,
-            |_| {},
         )
         .unwrap();
         finish(
@@ -3000,7 +2973,6 @@ mod tests {
             &meta(),
             None,
             false,
-            |_| {},
         )
         .unwrap();
 
@@ -3066,7 +3038,6 @@ mod tests {
             &meta(),
             Some(&approved),
             false,
-            |_| {},
         );
         match result {
             Err(err) => assert!(err.to_string().contains("preview")),
@@ -3110,7 +3081,6 @@ mod tests {
             &meta(),
             Some(&preview.plan.hash),
             false,
-            |_| {},
         );
         match result {
             Err(err) => assert!(err.to_string().contains("preview")),
@@ -3201,7 +3171,6 @@ mod tests {
             &meta(),
             None,
             false,
-            |_| {},
         )
         .unwrap();
         assert_eq!(
@@ -3257,7 +3226,6 @@ mod tests {
         assert_eq!(acknowledged.operation_seq, 1);
         let record = acknowledged.last_operation.unwrap();
         assert_eq!(record.restart, RestartOutcome::Restarted);
-        assert!(record.external_restart_acknowledged);
         assert!(!remote_has_dir(&memory, LEASE_DIR_REMOTE));
         assert!(!open(memory.clone()).unwrap().state.restart_required);
         assert!(acknowledge_external_restart(&mut session, &meta()).is_err());
@@ -3274,7 +3242,6 @@ mod tests {
             &meta(),
             None,
             false,
-            |_| {},
         )
         .unwrap();
         let state = finish(
@@ -3309,7 +3276,6 @@ mod tests {
                 &meta(),
                 None,
                 false,
-                |_| {},
             )
             .unwrap();
             let state = finish(&mut session, deployment, outcome, &meta()).unwrap();
@@ -3345,7 +3311,6 @@ mod tests {
             &meta(),
             None,
             false,
-            |_| {},
         )
         .err()
         .expect("a dead transport must fail the deployment");
@@ -3434,7 +3399,7 @@ mod tests {
     /// leaving an unchanged remote for the phase under test.
     fn deploy_initial(
         server: &remote::fake_ftp::FakeFtp,
-        publication: &Publication,
+        publication: &FetchedPublication,
         desired: &DesiredDeployment,
     ) {
         let addr = server.addr;
@@ -3450,7 +3415,6 @@ mod tests {
             &meta(),
             None,
             false,
-            |_| {},
         )
         .unwrap();
         finish(
@@ -3471,14 +3435,10 @@ mod tests {
             size_requires_binary: true,
             ..Default::default()
         });
-        let mut desired = DesiredDeployment {
-            payload: BTreeMap::new(),
-        };
+        let mut desired = DesiredDeployment::new();
         for index in 0..164 {
             let path = deploy_path(&format!("BepInEx/plugins/Author-ModA/mod-{index:03}.dll"));
-            desired
-                .payload
-                .insert(path, staged(format!("mod-{index:03}").as_bytes()));
+            desired.insert(path, staged(format!("mod-{index:03}").as_bytes()));
         }
         let fixture = mod_fixture();
         let publication = fixture.publication();
@@ -3498,7 +3458,6 @@ mod tests {
             &meta(),
             None,
             false,
-            |_| {},
         )
         .unwrap();
         assert_eq!(deployment.summary.uploaded_files, 164);
@@ -3612,7 +3571,6 @@ mod tests {
             &meta(),
             Some(&next.plan.hash),
             false,
-            |_| {},
         )
         .unwrap();
         assert_eq!(unchanged.summary.uploaded_files, 0);
@@ -3684,7 +3642,7 @@ mod tests {
         );
 
         let retrs = command_targets(&server, "RETR");
-        for path in desired.payload.keys() {
+        for path in desired.keys() {
             let remote = format!("/{path}");
             assert_eq!(
                 retrs.get(&remote),
@@ -3729,11 +3687,11 @@ mod tests {
 
         let drifted = "BepInEx/plugins/Author-Mod00/Mod.dll";
         let drifted_remote = format!("/{drifted}");
-        let staged_size = desired.payload[&deploy_path(drifted)].size;
+        let staged_size = desired[&deploy_path(drifted)].size;
 
         fn approve(
             session: &mut Session,
-            publication: &Publication,
+            publication: &FetchedPublication,
             desired: &DesiredDeployment,
         ) -> String {
             preview(
@@ -3750,7 +3708,7 @@ mod tests {
         }
         fn attempt(
             session: &mut Session,
-            publication: &Publication,
+            publication: &FetchedPublication,
             desired: &DesiredDeployment,
             addr: std::net::SocketAddr,
             certificate: &str,
@@ -3769,7 +3727,6 @@ mod tests {
                 &meta(),
                 Some(hash),
                 false,
-                |_| {},
             )
         }
 
@@ -3907,7 +3864,6 @@ mod tests {
             &meta(),
             None,
             false,
-            |_| {},
         )
         .unwrap();
         assert_eq!(deployment.summary.uploaded_files, 1);
@@ -3946,15 +3902,12 @@ mod tests {
             &mut second,
             move || ftp_ops(addr),
             &empty.publication(),
-            &DesiredDeployment {
-                payload: BTreeMap::new(),
-            },
+            &DesiredDeployment::new(),
             &selection(true, false),
             &context(),
             &meta(),
             None,
             false,
-            |_| {},
         )
         .unwrap();
         assert_eq!(deployment.summary.removed_files, 1);
@@ -4013,7 +3966,6 @@ mod tests {
             &meta(),
             None,
             false,
-            |_| {},
         )
         .err()
         .expect("unverifiable state persistence must fail the deploy");
@@ -4269,9 +4221,7 @@ mod tests {
         for index in 0..4 {
             let path = deploy_path(&format!("BepInEx/plugins/Author-ModA/file-{index:02}.dll"));
             let bytes = format!("payload-{index:02}");
-            desired
-                .payload
-                .insert(path.clone(), staged(bytes.as_bytes()));
+            desired.insert(path.clone(), staged(bytes.as_bytes()));
             state.files.insert(
                 path.clone(),
                 OwnedFile {
@@ -4364,7 +4314,7 @@ mod tests {
         let path = deploy_path("BepInEx/plugins/Author-ModA/broken.dll");
         let bytes = b"owned payload";
         let mut desired = DesiredDeployment::default();
-        desired.payload.insert(path.clone(), staged(bytes));
+        desired.insert(path.clone(), staged(bytes));
         let mut state = ServerDeploymentState {
             version: state::VERSION,
             ..Default::default()
@@ -4438,9 +4388,7 @@ mod tests {
         let mut desired = DesiredDeployment::default();
         for index in 0..4 {
             let path = deploy_path(&format!("BepInEx/plugins/New/file-{index}.dll"));
-            desired
-                .payload
-                .insert(path, staged(&vec![index as u8; (index + 1) * 1024]));
+            desired.insert(path, staged(&vec![index as u8; (index + 1) * 1024]));
         }
         let config = config_path("BepInEx/config/published.cfg");
         let mut fixture = mod_fixture();
@@ -4480,7 +4428,6 @@ mod tests {
             Some(&approved.plan.hash),
             false,
             &mut progress,
-            |_| {},
         )
         .unwrap();
         let host = host::from_settings(&Default::default(), None);
@@ -4660,7 +4607,7 @@ mod tests {
                 &host,
                 RestartPolicy::Immediate,
                 true,
-                Some(&mut progress),
+                &mut progress,
             )
             .await;
             assert_eq!(result, expected, "{name}");

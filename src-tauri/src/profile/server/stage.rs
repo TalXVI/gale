@@ -20,12 +20,13 @@ use zip::ZipArchive;
 
 use super::{
     paths::DeployPathBuf,
-    plan::{DesiredDeployment, FileSource, Publication, StagedFile},
+    plan::{DesiredDeployment, FileSource, StagedFile},
+    progress::{ProgressReporter, SyncPhase},
     spec::DeploymentSpec,
 };
 use crate::{
     game::mod_loader::ModLoader,
-    profile::export::R2Mod,
+    profile::{export::R2Mod, sync::FetchedPublication},
     thunderstore::{Backend, VersionIdent},
     util,
 };
@@ -121,13 +122,50 @@ fn is_staged(dir: &Path) -> bool {
             .is_ok_and(|mut entries| entries.next().is_some())
 }
 
+/// Stages the same published payload and reports work for either executor.
+pub async fn stage_fetched(
+    publication: &FetchedPublication,
+    cache_dir: PathBuf,
+    mod_loader: &'static ModLoader<'static>,
+    spec: &DeploymentSpec,
+    include_mods: bool,
+    progress: &mut ProgressReporter,
+) -> Result<DesiredDeployment> {
+    if include_mods {
+        progress.phase(SyncPhase::StagingPayload);
+    }
+    let source = CachePayloadSource {
+        root: cache_dir,
+        client: reqwest::Client::new(),
+        mod_loader,
+    };
+    let mut staging_total = None;
+    stage_publication(
+        publication,
+        &source,
+        spec,
+        include_mods,
+        |completed, total, name| {
+            if staging_total.is_none() {
+                progress.work(total, None);
+                staging_total = Some(total);
+            }
+            if !name.is_empty() {
+                progress.item(name);
+            }
+            progress.advance(completed, None);
+        },
+    )
+    .await
+}
+
 /// Reads the staged package trees and builds the desired deployment file
 /// maps. Only enabled mods contribute files; the planner removes previously
 /// deployed files that are no longer in this map.
 ///
 /// `progress` receives `(completed, total, mod_name)` for reporting.
 pub async fn stage_publication(
-    publication: &Publication<'_>,
+    publication: &crate::profile::sync::FetchedPublication,
     source: &dyn PayloadSource,
     spec: &DeploymentSpec,
     include_mods: bool,
@@ -138,7 +176,12 @@ pub async fn stage_publication(
         return Ok(desired);
     }
 
-    let enabled: Vec<&R2Mod> = publication.mods.iter().filter(|m| m.enabled).collect();
+    let enabled: Vec<&R2Mod> = publication
+        .manifest
+        .mods
+        .iter()
+        .filter(|m| m.enabled)
+        .collect();
     let total = enabled.len();
 
     for (index, r2mod) in enabled.iter().enumerate() {
@@ -151,7 +194,7 @@ pub async fn stage_publication(
     }
     progress(total, total, "");
 
-    info!(payload = desired.payload.len(), "staged published mod set");
+    info!(payload = desired.len(), "staged published mod set");
 
     Ok(desired)
 }
@@ -190,7 +233,7 @@ fn collect_tree(root: &Path, spec: &DeploymentSpec, desired: &mut DesiredDeploym
         }
 
         let file = staged_file(entry.path(), &relative)?;
-        desired.payload.insert(relative, file);
+        desired.insert(relative, file);
     }
 
     Ok(())
@@ -235,12 +278,28 @@ mod tests {
     use crate::{
         game::mod_loader::{ModLoader, ModLoaderKind},
         profile::{
-            export::{ConfigPath, ModRevision, R2Mod},
-            server::{plan::Publication, spec::DeploymentSpec},
-            sync::archive::ValidatedConfigFile,
+            export::{ModRevision, ProfileManifest, R2Mod},
+            server::spec::DeploymentSpec,
+            sync::FetchedPublication,
         },
         thunderstore::{Backend, PackageIdent, VersionIdent},
     };
+
+    fn publication(mods: Vec<R2Mod>) -> FetchedPublication {
+        FetchedPublication {
+            revision: Utc::now(),
+            mods_revision: ModRevision::from_hash(blake3::hash(b"rev")),
+            manifest: ProfileManifest {
+                name: String::new(),
+                mods,
+                game: None,
+                ignored_version_updates: Vec::new(),
+                ignored_package_updates: Vec::new(),
+                sync: None,
+            },
+            config: BTreeMap::new(),
+        }
+    }
 
     /// A payload source that must never be touched. Any call to it fails
     /// the test, which proves configs-only operations never stage mod
@@ -290,25 +349,19 @@ mod tests {
         // Local/Worker parity regression: a configs-only operation must
         // not require downloading or extracting any mod package, even
         // when the publication contains enabled mods.
-        let mods = [R2Mod {
+        let mods = vec![R2Mod {
             ident: PackageIdent::from(("Author", "SomeMod")),
             version: semver::Version::new(1, 0, 0).into(),
             enabled: true,
             source: Backend::Thunderstore,
         }];
-        let config: BTreeMap<ConfigPath, ValidatedConfigFile> = BTreeMap::new();
-        let publication = Publication {
-            revision: Utc::now(),
-            mods_revision: ModRevision::from_hash(blake3::hash(b"rev")),
-            mods: &mods,
-            config: &config,
-        };
+        let publication = publication(mods);
 
         let desired = stage_publication(&publication, &FailSource, &spec(), false, |_, _, _| {})
             .await
             .unwrap();
 
-        assert!(desired.payload.is_empty());
+        assert!(desired.is_empty());
     }
 
     /// Serves a prepared package tree from disk.
@@ -339,29 +392,22 @@ mod tests {
         std::fs::create_dir_all(&plugin_dir).unwrap();
         std::fs::write(plugin_dir.join("Mod.dll"), b"dll").unwrap();
 
-        let mods = [R2Mod {
+        let mods = vec![R2Mod {
             ident: PackageIdent::from(("Author", "Mod")),
             version: semver::Version::new(1, 0, 0).into(),
             enabled: true,
             source: Backend::Thunderstore,
         }];
-        let config: BTreeMap<ConfigPath, ValidatedConfigFile> = BTreeMap::new();
-        let publication = Publication {
-            revision: Utc::now(),
-            mods_revision: ModRevision::from_hash(blake3::hash(b"rev")),
-            mods: &mods,
-            config: &config,
-        };
+        let publication = publication(mods);
         let source = StaticSource(package.path().to_path_buf());
 
         let desired = stage_publication(&publication, &source, &spec(), true, |_, _, _| {})
             .await
             .unwrap();
 
-        assert_eq!(desired.payload.len(), 1);
+        assert_eq!(desired.len(), 1);
         assert!(
             desired
-                .payload
                 .keys()
                 .all(|path| path.as_str() == "BepInEx/plugins/Mod/Mod.dll"),
             "the bundled config must not enter the deployment set"

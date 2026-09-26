@@ -29,8 +29,8 @@ use crate::{
             args,
             engine::{self, OperationMeta},
             host, local, local_worker,
-            plan::{self, DeploySelection, Publication},
-            progress::{ProgressReporter, SyncOperation, SyncPhase, SyncProgress},
+            plan::{self, DeploySelection},
+            progress::{ProgressReporter, SyncOperation, SyncProgress},
             remote::{self, ConnectionAttempt, ConnectionTestResult, RemoteConnection, RemoteOps},
             runtime::{self, ServerStatus, SharedChild},
             secrets::{ServerSecret, ServerSecrets},
@@ -39,7 +39,7 @@ use crate::{
                 SyncMode,
             },
             spec::DeploymentSpec,
-            stage::{self, CachePayloadSource},
+            stage,
             worker_client::WorkerClient,
         },
         sync::{self, ConfigUpdatePolicy, FetchedPublication},
@@ -313,7 +313,7 @@ fn persist_remote_credentials(
 ) -> eyre::Result<()> {
     persist_credential(
         secrets,
-        remote_secret(remote),
+        ServerSecret::required_by(remote),
         &request.remote_password,
         request.remember_remote_password,
     )?;
@@ -329,11 +329,6 @@ fn persist_remote_credentials(
         &request.dat_host_password,
         request.remember_dat_host_password,
     )
-}
-
-/// The transport credential the remote settings require, if any.
-pub(crate) fn remote_secret(settings: &RemoteServerSettings) -> Option<ServerSecret> {
-    ServerSecret::required_by(settings)
 }
 
 pub(crate) fn persist_credential(
@@ -615,7 +610,7 @@ pub struct LocalWorkerProvisionRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalWorkerControlRequest {
-    pub action: local_worker::LocalWorkerAction,
+    pub action: crate::worker::ServiceControlAction,
 }
 
 /// SCM state + status file + live API status for the managed worker.
@@ -1022,7 +1017,7 @@ pub(crate) fn remote_credential(
     settings: &RemoteServerSettings,
     provided: &str,
 ) -> eyre::Result<String> {
-    match remote_secret(settings) {
+    match ServerSecret::required_by(settings) {
         Some(secret) => secrets.resolve(secret, provided),
         None => Ok(String::new()),
     }
@@ -1086,32 +1081,13 @@ async fn fetch_and_stage(
     let publication = sync::fetch_publication(&sync_id, app)
         .await
         .context("failed to fetch the canonical publication")?;
-    if include_mods {
-        progress.phase(SyncPhase::StagingPayload);
-    }
-
-    let source = CachePayloadSource {
-        root: target.cache_dir.clone(),
-        client: reqwest::Client::new(),
-        mod_loader: target.mod_loader,
-    };
-
-    let mut staging_total = None;
-    let desired = stage::stage_publication(
-        &Publication::from_fetched(&publication),
-        &source,
+    let desired = stage::stage_fetched(
+        &publication,
+        target.cache_dir.clone(),
+        target.mod_loader,
         spec,
         include_mods,
-        |completed, total, name| {
-            if staging_total.is_none() {
-                progress.work(total, None);
-                staging_total = Some(total);
-            }
-            if !name.is_empty() {
-                progress.item(name);
-            }
-            progress.advance(completed, None);
-        },
+        progress,
     )
     .await
     .context("failed to stage the published mod set")?;
@@ -1143,72 +1119,33 @@ async fn local_preview(
         ProgressReporter::new(run_id, SyncOperation::Preview, selection, move |snapshot| {
             let _ = event_app.emit("server_sync_operation_progress", snapshot);
         });
-    let result = local_preview_inner(
-        app,
-        target,
-        selection,
-        restart_policy,
-        credential,
-        &mut progress,
-    )
+    let result = async {
+        let spec = DeploymentSpec::for_loader(target.mod_loader)?;
+        let (publication, desired) =
+            fetch_and_stage(app, target, &spec, selection.include_mods, &mut progress).await?;
+        let (settings, password) = (target.settings.clone(), credential.to_owned());
+        engine::preview(
+            move || connect_remote(&settings, &password),
+            spec,
+            target.settings.server_directory()?,
+            publication,
+            desired,
+            selection.clone(),
+            plan_context(target, restart_policy),
+            OperationMeta::local(
+                &target.profile_id.to_string(),
+                crate::profile::server::state::OperationKind::Manual,
+            ),
+            &mut progress,
+        )
+        .await
+    }
     .await;
     if result.is_err() {
         progress.failed();
     } else {
         progress.succeeded();
     }
-    result
-}
-
-async fn local_preview_inner(
-    app: &AppHandle,
-    target: &SyncTarget,
-    selection: &DeploySelection,
-    restart_policy: Option<RestartPolicy>,
-    credential: &str,
-    progress: &mut ProgressReporter,
-) -> eyre::Result<PreviewResponse> {
-    let spec = DeploymentSpec::for_loader(target.mod_loader)?;
-    let (publication, desired) =
-        fetch_and_stage(app, target, &spec, selection.include_mods, progress).await?;
-
-    let (settings, password, selection, mod_loader, context, meta) = (
-        target.settings.clone(),
-        credential.to_owned(),
-        selection.clone(),
-        target.mod_loader,
-        plan_context(target, restart_policy),
-        OperationMeta::local(
-            &target.profile_id.to_string(),
-            crate::profile::server::state::OperationKind::Manual,
-        ),
-    );
-    let mut blocking_progress = std::mem::replace(
-        progress,
-        ProgressReporter::silent(SyncOperation::Preview, &selection),
-    );
-    let (result, returned) = tokio::task::spawn_blocking(move || {
-        let result = (|| {
-            blocking_progress.phase(SyncPhase::Connecting);
-            let spec = DeploymentSpec::for_loader(mod_loader)?;
-            let ops = connect_remote(&settings, &password)?;
-            blocking_progress.phase(SyncPhase::ReadingState);
-            let mut session = engine::open_session(ops, &spec, settings.server_directory()?)?;
-            engine::preview_with_progress(
-                &mut session,
-                &Publication::from_fetched(&publication),
-                &desired,
-                &selection,
-                &context,
-                &meta,
-                &mut blocking_progress,
-            )
-        })();
-        (result, blocking_progress)
-    })
-    .await
-    .map_err(|err| eyre::eyre!("preview worker failed: {err}"))?;
-    *progress = returned;
     result
 }
 
@@ -1227,86 +1164,47 @@ async fn local_deploy(
             let _ = event_app.emit("server_sync_operation_progress", snapshot);
         },
     );
-    let result = local_deploy_inner(app, target, request, credential, &mut progress).await;
+    let result = async {
+        let spec = DeploymentSpec::for_loader(target.mod_loader)?;
+        let (publication, desired) = fetch_and_stage(
+            app,
+            target,
+            &spec,
+            request.selection.include_mods,
+            &mut progress,
+        )
+        .await?;
+        let secrets = ServerSecrets::for_profile(target.profile_id)?;
+        let dat_host_password = secrets.get(ServerSecret::DatHostPassword)?;
+        let host = host::from_settings(&target.settings.host_control, dat_host_password.as_deref());
+        let (settings, password) = (target.settings.clone(), credential.to_owned());
+        engine::deploy(
+            move || connect_remote(&settings, &password),
+            spec,
+            target.settings.server_directory()?,
+            publication,
+            desired,
+            request.selection,
+            plan_context(target, request.restart_policy),
+            OperationMeta::local(
+                &target.profile_id.to_string(),
+                crate::profile::server::state::OperationKind::Manual,
+            ),
+            Some(request.plan_hash),
+            request.force,
+            host.as_ref(),
+            request
+                .restart_policy
+                .unwrap_or(target.settings.restart_policy),
+            &mut progress,
+        )
+        .await
+    }
+    .await;
     if result.is_err() {
         progress.failed();
     }
     result
-}
-
-async fn local_deploy_inner(
-    app: &AppHandle,
-    target: &SyncTarget,
-    request: ServerSyncDeployRequest,
-    credential: &str,
-    progress: &mut ProgressReporter,
-) -> eyre::Result<DeployResponse> {
-    let spec = DeploymentSpec::for_loader(target.mod_loader)?;
-    let (publication, desired) =
-        fetch_and_stage(app, target, &spec, request.selection.include_mods, progress).await?;
-
-    let meta = OperationMeta::local(
-        &target.profile_id.to_string(),
-        crate::profile::server::state::OperationKind::Manual,
-    );
-
-    let (settings, password, selection, plan_hash, mod_loader, context, force) = (
-        target.settings.clone(),
-        credential.to_owned(),
-        request.selection.clone(),
-        request.plan_hash.clone(),
-        target.mod_loader,
-        plan_context(target, request.restart_policy),
-        request.force,
-    );
-    let connect = {
-        let (settings, password) = (settings.clone(), password.clone());
-        move || connect_remote(&settings, &password)
-    };
-
-    let meta2 = meta.clone();
-    let mut blocking_progress = std::mem::replace(
-        progress,
-        ProgressReporter::silent(SyncOperation::Deploy, &selection),
-    );
-    let (result, returned) = tokio::task::spawn_blocking(move || {
-        let result = (|| {
-            blocking_progress.phase(SyncPhase::Connecting);
-            let spec = DeploymentSpec::for_loader(mod_loader)?;
-            let ops = connect_remote(&settings, &password)?;
-            blocking_progress.phase(SyncPhase::ReadingState);
-            let mut session = engine::open_session(ops, &spec, settings.server_directory()?)?;
-            let deployment = engine::deploy_with_progress(
-                &mut session,
-                connect,
-                &Publication::from_fetched(&publication),
-                &desired,
-                &selection,
-                &context,
-                &meta2,
-                Some(plan_hash.as_str()),
-                force,
-                &mut blocking_progress,
-                |_| {},
-            )?;
-            Ok::<_, eyre::Report>((session, deployment))
-        })();
-        (result, blocking_progress)
-    })
-    .await
-    .map_err(|err| eyre::eyre!("deployment worker failed: {err}"))?;
-    *progress = returned;
-    let (session, deployment) = result?;
-
-    // Restart policy through the configured host provider; unknown player
-    // presence is never treated as empty.
-    let secrets = ServerSecrets::for_profile(target.profile_id)?;
-    let dat_host_password = secrets.get(ServerSecret::DatHostPassword)?;
-    let host = host::from_settings(&target.settings.host_control, dat_host_password.as_deref());
-    let policy = request
-        .restart_policy
-        .unwrap_or(target.settings.restart_policy);
-    engine::complete_with_progress(session, deployment, host.as_ref(), policy, meta, progress).await
 }
 
 // ---------- misc ----------

@@ -14,7 +14,10 @@ use eyre::{Result, bail};
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 
-use crate::worker::api::{StatusResponse, WorkerRunReport};
+use crate::worker::{
+    ManagedServiceState, ServiceControlAction,
+    api::{StatusResponse, WorkerRunReport},
+};
 
 #[cfg(windows)]
 use eyre::{Context, OptionExt, ensure};
@@ -39,36 +42,8 @@ use crate::{
         sync::auth,
     },
     state::ManagerExt,
-    worker::{api::WorkerRunPhase, config::WorkerConfig, local, secrets::Secrets, tray},
+    worker::{config::WorkerConfig, local, secrets::Secrets, tray},
 };
-
-/// What the service control manager reports, projected for the UI.
-/// `NotInstalled` is a state so the dialog can offer Install again after
-/// an out-of-band removal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ServiceState {
-    NotInstalled,
-    Stopped,
-    StartPending,
-    Running,
-    StopPending,
-    /// Any other SCM state (pause states the worker never enters).
-    Other,
-}
-
-/// Who the installed worker is bound to, read from its config file.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkerBinding {
-    pub worker_id: String,
-    /// The sync-profile id the worker serves — compare against the
-    /// profile's own sync id to detect a binding to another profile.
-    pub profile_id: String,
-    pub listen: String,
-    /// The worker's API base URL, derived from `listen`.
-    pub address: String,
-}
 
 /// The installed worker's ownership relative to the profile being viewed.
 /// There is exactly one `GaleWorker` per machine, bound to one sync
@@ -96,14 +71,14 @@ pub enum WorkerOwnership {
 /// profile currently has no sync id — never treat "unknown" as "mine".
 #[cfg(windows)]
 fn ownership_of(
-    binding: Option<&WorkerBinding>,
+    installed_profile: Option<&str>,
     sync_id: Option<&str>,
     bound: bool,
 ) -> WorkerOwnership {
-    let Some(binding) = binding else {
+    let Some(installed_profile) = installed_profile else {
         return WorkerOwnership::None;
     };
-    if sync_id != Some(binding.profile_id.as_str()) {
+    if sync_id != Some(installed_profile) {
         return WorkerOwnership::Foreign;
     }
     if bound {
@@ -119,9 +94,9 @@ fn ownership_of(
 pub struct LocalWorkerStatus {
     /// `false` off Windows — provisioning is unavailable there.
     pub supported: bool,
-    pub service: ServiceState,
-    /// The installed worker's binding, when a config exists.
-    pub binding: Option<WorkerBinding>,
+    pub service: ManagedServiceState,
+    /// The installed worker's loopback API address, when its config is readable.
+    pub address: Option<String>,
     /// Whether the installed worker belongs to this profile — controls
     /// must only be offered for `Owned` (or `Incomplete`, to finish
     /// setup), never for `Foreign`.
@@ -134,9 +109,6 @@ pub struct LocalWorkerStatus {
     pub worker: Option<StatusResponse>,
     /// Why `worker` is absent (unreachable, bad token, ...).
     pub worker_error: Option<String>,
-    /// True when the run report says `shutdown` — the machine went down;
-    /// the service comes back with the next boot.
-    pub stopped_for_shutdown: bool,
     /// True when the bundled `gale-worker.exe` differs from the copy the
     /// installed service runs — an app update left a newer worker behind.
     /// `update` swaps it in without re-running the OAuth provisioning.
@@ -152,25 +124,16 @@ impl LocalWorkerStatus {
     fn unsupported() -> Self {
         Self {
             supported: false,
-            service: ServiceState::NotInstalled,
-            binding: None,
+            service: ManagedServiceState::NotInstalled,
+            address: None,
             ownership: WorkerOwnership::None,
             run: None,
             worker: None,
             worker_error: None,
-            stopped_for_shutdown: false,
             update_available: false,
             warnings: Vec::new(),
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum LocalWorkerAction {
-    Start,
-    Stop,
-    Restart,
 }
 
 // ---------- status ----------
@@ -185,17 +148,20 @@ pub async fn status(app: &AppHandle) -> Result<LocalWorkerStatus> {
     }
     #[cfg(windows)]
     {
-        let service_state = service_state()?;
-        let binding = installed_binding();
+        let service_state = local::service_state()?;
+        let installed = installed_config();
+        let address = installed
+            .as_ref()
+            .map(|config| format!("http://{}", config.listen));
         let run = read_run_report();
 
         let profile_id = app.lock_manager().active_profile().id;
         let ownership = ownership_of(
-            binding.as_ref(),
+            installed.as_ref().map(|config| config.profile_id.as_str()),
             sync_id_for(app, profile_id).as_deref(),
-            binding
+            address
                 .as_ref()
-                .is_some_and(|binding| profile_bound_to(app, profile_id, binding)),
+                .is_some_and(|address| profile_bound_to(app, profile_id, address)),
         );
 
         let mut worker = None;
@@ -211,7 +177,7 @@ pub async fn status(app: &AppHandle) -> Result<LocalWorkerStatus> {
                 worker_error =
                     Some("setup did not finish — run 'Set up worker' to complete it".to_owned());
             }
-            WorkerOwnership::Owned if service_state == ServiceState::Running => {
+            WorkerOwnership::Owned if service_state == ManagedServiceState::Running => {
                 let secrets = ServerSecrets::for_profile(profile_id)?;
                 let token = secrets
                     .resolve(ServerSecret::WorkerToken, "")
@@ -220,10 +186,9 @@ pub async fn status(app: &AppHandle) -> Result<LocalWorkerStatus> {
                     worker_error = Some("this profile has no stored worker token".to_owned());
                 } else {
                     let mut settings = RemoteServerSettings::default();
-                    settings.worker.address = binding
+                    settings.worker.address = address
                         .as_ref()
-                        .expect("owned implies binding")
-                        .address
+                        .expect("owned implies an installed address")
                         .clone();
                     match worker_client(&secrets, &settings, &token) {
                         Ok(client) => match client.status(false).await {
@@ -240,12 +205,8 @@ pub async fn status(app: &AppHandle) -> Result<LocalWorkerStatus> {
         Ok(LocalWorkerStatus {
             supported: true,
             service: service_state,
-            binding,
+            address,
             ownership,
-            stopped_for_shutdown: matches!(
-                run.as_ref().map(|report| report.phase),
-                Some(WorkerRunPhase::Shutdown)
-            ),
             run,
             worker,
             worker_error,
@@ -260,7 +221,7 @@ pub async fn status(app: &AppHandle) -> Result<LocalWorkerStatus> {
 /// can leave this incomplete if the install succeeded but saving settings
 /// or the bearer token failed.
 #[cfg(windows)]
-fn profile_bound_to(app: &AppHandle, profile_id: i64, binding: &WorkerBinding) -> bool {
+fn profile_bound_to(app: &AppHandle, profile_id: i64, address: &str) -> bool {
     let bound = {
         let manager = app.lock_manager();
         manager
@@ -270,7 +231,7 @@ fn profile_bound_to(app: &AppHandle, profile_id: i64, binding: &WorkerBinding) -
             .is_some_and(|settings| {
                 settings.remote.sync_mode == SyncMode::Worker
                     && settings.remote.worker.hosted
-                    && settings.remote.worker.address == binding.address
+                    && settings.remote.worker.address == address
             })
     };
     let token = ServerSecrets::for_profile(profile_id)
@@ -325,7 +286,7 @@ async fn provision_windows(
     // replace another profile's, and check again after OAuth — the prompt
     // takes minutes and the dialog could have installed one meanwhile.
     ensure!(
-        installed_binding().is_none_or(|b| b.profile_id == sync_id),
+        installed_config().is_none_or(|config| config.profile_id == sync_id),
         "the installed worker belongs to a different profile — manage it from that profile"
     );
     Staging::sweep_stale();
@@ -376,7 +337,7 @@ async fn provision_windows(
     // rotates it, so whichever side refreshed second would be dead.
     let creds = auth::oauth_credentials(app).await?;
     ensure!(
-        installed_binding().is_none_or(|b| b.profile_id == sync_id),
+        installed_config().is_none_or(|config| config.profile_id == sync_id),
         "a worker for a different profile was installed while setup was running — manage it from that profile"
     );
 
@@ -387,9 +348,6 @@ async fn provision_windows(
         game: target.game.clone(),
         sync_url: None,
         remote: worker_remote,
-        host_control: target.settings.host_control.clone(),
-        auto_deploy_mods: target.settings.worker.auto_deploy_mods,
-        restart_policy: target.settings.restart_policy,
         poll_interval_secs: 300,
         state_dir: private.clone(),
         secrets_file: Some(private.join(local::SECRETS_FILE)),
@@ -433,7 +391,7 @@ async fn provision_windows(
                 log_text.trim()
             );
         }
-        Ok(_) if service_state()? != ServiceState::Running => {
+        Ok(_) if local::service_state()? != ManagedServiceState::Running => {
             bail!("the worker service did not come up: {}", log_text.trim());
         }
         Ok(_) => {}
@@ -501,7 +459,7 @@ async fn provision_windows(
 
 /// Starts, stops, or restarts the installed service through the SCM.
 /// These calls are unelevated — install grants interactive users control.
-pub async fn control(app: &AppHandle, action: LocalWorkerAction) -> Result<LocalWorkerStatus> {
+pub async fn control(app: &AppHandle, action: ServiceControlAction) -> Result<LocalWorkerStatus> {
     #[cfg(not(windows))]
     {
         let _ = (app, action);
@@ -510,15 +468,9 @@ pub async fn control(app: &AppHandle, action: LocalWorkerAction) -> Result<Local
     #[cfg(windows)]
     {
         require_owned(app)?;
-        tokio::task::spawn_blocking(move || {
-            local::control_service(match action {
-                LocalWorkerAction::Start => local::ServiceControlAction::Start,
-                LocalWorkerAction::Stop => local::ServiceControlAction::Stop,
-                LocalWorkerAction::Restart => local::ServiceControlAction::Restart,
-            })
-        })
-        .await
-        .context("worker control task failed")??;
+        tokio::task::spawn_blocking(move || local::control_service(action))
+            .await
+            .context("worker control task failed")??;
         status(app).await
     }
 }
@@ -605,29 +557,17 @@ pub async fn uninstall(app: &AppHandle) -> Result<LocalWorkerStatus> {
 
 // ---------- Windows service plumbing ----------
 
-#[cfg(windows)]
-fn service_state() -> Result<ServiceState> {
-    Ok(match local::service_state()? {
-        local::ManagedServiceState::NotInstalled => ServiceState::NotInstalled,
-        local::ManagedServiceState::Stopped => ServiceState::Stopped,
-        local::ManagedServiceState::StartPending => ServiceState::StartPending,
-        local::ManagedServiceState::Running => ServiceState::Running,
-        local::ManagedServiceState::StopPending => ServiceState::StopPending,
-        local::ManagedServiceState::Other => ServiceState::Other,
-    })
-}
-
 /// Backend ownership gate for every operation that touches the globally
 /// installed `GaleWorker` service: the active profile's sync id must
 /// match the installed binding. A worker bound to another profile is
 /// that profile's to manage — never controllable from here.
 #[cfg(windows)]
 fn require_owned(app: &AppHandle) -> Result<()> {
-    let binding = installed_binding().ok_or_eyre("the managed worker is not installed")?;
+    let config = installed_config().ok_or_eyre("the managed worker is not installed")?;
     let profile_id = app.lock_manager().active_profile().id;
     let sync_id = sync_id_for(app, profile_id);
     ensure!(
-        sync_id.as_deref() == Some(binding.profile_id.as_str()),
+        sync_id.as_deref() == Some(config.profile_id.as_str()),
         "the installed worker belongs to a different profile — switch to that profile to manage it"
     );
     Ok(())
@@ -773,24 +713,18 @@ fn restrict_dir(path: &std::path::Path) -> Result<()> {
 /// The installed worker's binding, read leniently — status must degrade
 /// gracefully when the config was written by a different version.
 #[cfg(windows)]
-fn installed_binding() -> Option<WorkerBinding> {
+fn installed_config() -> Option<WorkerConfig> {
     let path = local::root_dir().join(local::CONFIG_FILE);
     let bytes = std::fs::read(&path).ok()?;
-    let config: WorkerConfig = serde_json::from_slice(&bytes).ok()?;
-    Some(WorkerBinding {
-        worker_id: config.worker_id,
-        profile_id: config.profile_id,
-        listen: config.listen.clone(),
-        address: format!("http://{}", config.listen),
-    })
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// The port the existing install listens on, so reprovisioning keeps the
 /// profile's worker address stable.
 #[cfg(windows)]
 fn installed_port() -> Option<u16> {
-    installed_binding().and_then(|binding| {
-        binding
+    installed_config().and_then(|config| {
+        config
             .listen
             .rsplit_once(':')
             .and_then(|(_, port)| port.parse().ok())
@@ -874,7 +808,7 @@ fn install_tray_companion() -> Result<()> {
 /// failed tray install as an actionable setup error.
 #[cfg(windows)]
 pub(crate) fn refresh_tray_companion() -> Result<()> {
-    if local::service_state()? == local::ManagedServiceState::NotInstalled {
+    if local::service_state()? == ManagedServiceState::NotInstalled {
         return Ok(());
     }
     install_tray_companion()
@@ -884,22 +818,11 @@ pub(crate) fn refresh_tray_companion() -> Result<()> {
 mod tests {
     use super::*;
 
-    fn binding(profile_id: &str) -> WorkerBinding {
-        WorkerBinding {
-            worker_id: "w".to_owned(),
-            profile_id: profile_id.to_owned(),
-            listen: "127.0.0.1:8472".to_owned(),
-            address: "http://127.0.0.1:8472".to_owned(),
-        }
-    }
-
     /// The single installed `GaleWorker` must only answer to the profile
     /// it was provisioned for. "Bound" covers the desktop half: settings
     /// pointing at the address and a stored bearer token.
     #[test]
     fn ownership_tracks_the_installed_binding() {
-        let mine = binding("sync-A");
-
         // No service installed → nothing to own.
         assert_eq!(
             ownership_of(None, Some("sync-A"), false),
@@ -908,25 +831,25 @@ mod tests {
 
         // Bound to this profile's sync id, fully linked.
         assert_eq!(
-            ownership_of(Some(&mine), Some("sync-A"), true),
+            ownership_of(Some("sync-A"), Some("sync-A"), true),
             WorkerOwnership::Owned
         );
 
         // Installed for this profile but the desktop binding never
         // completed — finish-setup territory, not foreign.
         assert_eq!(
-            ownership_of(Some(&mine), Some("sync-A"), false),
+            ownership_of(Some("sync-A"), Some("sync-A"), false),
             WorkerOwnership::Incomplete
         );
 
         // A different sync id owns the service — every operation must be
         // refused for this profile, whether or not it has synced before.
         assert_eq!(
-            ownership_of(Some(&mine), Some("sync-B"), true),
+            ownership_of(Some("sync-A"), Some("sync-B"), true),
             WorkerOwnership::Foreign
         );
         assert_eq!(
-            ownership_of(Some(&mine), None, false),
+            ownership_of(Some("sync-A"), None, false),
             WorkerOwnership::Foreign,
             "an unknown local sync id must never count as ownership"
         );

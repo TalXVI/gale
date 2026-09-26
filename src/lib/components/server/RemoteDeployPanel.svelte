@@ -68,12 +68,15 @@
 				</details>
 			</InfoBox>
 		{/if}
-		{#if sync.preview.plan.requiresRestart}
+		{#if sync.preview.plan.uploads.length > 0 || sync.preview.plan.removals.length > 0}
 			<InfoBox type="info" class="mt-3">{m.serverSync_willRestart()}</InfoBox>
 		{/if}
 
 		{#if sync.preview.plan.configEntries.length > 0}
-			<details class="mt-3" open={sync.preview.plan.conflicts.length > 0}>
+			<details
+				class="mt-3"
+				open={sync.preview.plan.configEntries.some((entry) => entry.action === 'pending')}
+			>
 				<summary class="text-primary-700 dark:text-primary-300 cursor-pointer font-medium">
 					{m.serverSync_configFiles({ count: sync.preview.plan.configEntries.length })}
 				</summary>

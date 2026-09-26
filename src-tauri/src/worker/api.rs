@@ -7,10 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::profile::{
     export::{ConfigPath, ModRevision},
     server::{
-        lease::LeaseRecord,
-        plan::DeploySelection,
-        settings::RestartPolicy,
-        state::{OperationKind, OperationRecord},
+        lease::LeaseRecord, plan::DeploySelection, settings::RestartPolicy, state::OperationRecord,
     },
     sync::ConfigUpdatePolicy,
 };
@@ -78,8 +75,8 @@ pub struct StatusResponse {
     /// owns its config files, and an explicit config push never
     /// advances this marker.
     pub last_deployed_revision: Option<DateTime<Utc>>,
-    /// The operation currently in flight, if any.
-    pub busy: Option<BusyOperation>,
+    /// Whether an operation is currently in flight.
+    pub busy: bool,
     pub last_operation: Option<OperationRecord>,
     /// The last deployment failure the worker recorded.
     pub last_error: Option<String>,
@@ -87,14 +84,6 @@ pub struct StatusResponse {
     pub poll_error: Option<String>,
     /// Live remote state, present only for `?refresh=true` requests.
     pub server: Option<ServerStateSummary>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BusyOperation {
-    pub id: String,
-    pub kind: OperationKind,
-    pub started_at: DateTime<Utc>,
 }
 
 /// A projection of the remote deployment state for status displays.

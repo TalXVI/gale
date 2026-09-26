@@ -14,6 +14,8 @@ use std::{
 use windows_service::service::{ServiceAccess, ServiceState};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
+use super::{ManagedServiceState, ServiceControlAction};
+
 const TRANSITION_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// SCM service name for the managed worker. One service exists per
@@ -74,23 +76,6 @@ pub fn binaries_differ(candidate: &Path, installed: &Path) -> bool {
         (Ok(candidate), Ok(installed)) => candidate != installed,
         _ => false,
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ManagedServiceState {
-    NotInstalled,
-    Stopped,
-    StartPending,
-    Running,
-    StopPending,
-    Other,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ServiceControlAction {
-    Start,
-    Stop,
-    Restart,
 }
 
 fn service_manager() -> Result<ServiceManager> {

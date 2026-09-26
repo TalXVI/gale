@@ -20,15 +20,15 @@
 //!     "username": "user",
 //!     "serverDirectory": "/",
 //!     "authentication": "password",
-//!     "trustedHostKey": "SHA256:..."
+//!     "trustedHostKey": "SHA256:...",
+//!     "hostControl": {
+//!       "provider": "datHost",
+//!       "datHostServerId": "...",
+//!       "datHostUsername": "email@example.com"
+//!     },
+//!     "worker": { "autoDeployMods": true },
+//!     "restartPolicy": "whenEmpty"
 //!   },
-//!   "hostControl": {
-//!     "provider": "datHost",
-//!     "datHostServerId": "...",
-//!     "datHostUsername": "email@example.com"
-//!   },
-//!   "autoDeployMods": true,
-//!   "restartPolicy": "whenEmpty",
 //!   "pollIntervalSecs": 300,
 //!   "stateDir": "."
 //! }
@@ -45,7 +45,7 @@ use eyre::Result;
 use eyre::ensure;
 use serde::{Deserialize, Serialize};
 
-use crate::profile::server::settings::{HostSettings, RemoteServerSettings, RestartPolicy};
+use crate::profile::server::settings::RemoteServerSettings;
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:8472";
 const DEFAULT_POLL_SECS: u64 = 300;
@@ -70,12 +70,6 @@ pub struct WorkerConfig {
     pub sync_url: Option<String>,
     /// Remote server transport settings (host/port/auth/pins).
     pub remote: RemoteServerSettings,
-    /// Hosting provider for restart/presence operations.
-    pub host_control: HostSettings,
-    /// Whether the worker may deploy new mod revisions on its own.
-    pub auto_deploy_mods: bool,
-    /// What may happen to the server process after deployment.
-    pub restart_policy: RestartPolicy,
     /// How often the worker checks for new publications.
     pub poll_interval_secs: u64,
     /// Where the journal and staged packages live.
@@ -99,9 +93,6 @@ impl Default for WorkerConfig {
             game: String::new(),
             sync_url: None,
             remote: RemoteServerSettings::default(),
-            host_control: HostSettings::default(),
-            auto_deploy_mods: false,
-            restart_policy: RestartPolicy::default(),
             poll_interval_secs: DEFAULT_POLL_SECS,
             state_dir: PathBuf::from("."),
             secrets_file: None,

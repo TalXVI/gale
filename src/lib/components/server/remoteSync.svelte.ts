@@ -479,8 +479,6 @@ export class RemoteSync {
 				return m.serverSync_actionWrite();
 			case 'markApplied':
 				return m.serverSync_actionApplied();
-			case 'keep':
-				return m.serverSync_actionKeep();
 			case 'decline':
 				return m.serverSync_actionDeclined();
 			case 'pending':

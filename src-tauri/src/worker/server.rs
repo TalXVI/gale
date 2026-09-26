@@ -28,9 +28,9 @@ use super::{
         PreviewRequest, StatusResponse, WorkerRunPhase, WorkerRunReport,
     },
     config::WorkerConfig,
-    journal::{Journal, WorkerJournal, busy_marker},
+    journal::{Journal, WorkerJournal},
     secrets::Secrets,
-    sync_client::{PublicationProbe, SyncClient},
+    sync_client::SyncClient,
 };
 use crate::{
     game,
@@ -38,12 +38,12 @@ use crate::{
         server::{
             engine::{self, OperationMeta, Session},
             host,
-            plan::{self, DeploySelection, Publication},
-            progress::{ProgressReporter, ProgressStatus, SyncOperation, SyncPhase, SyncProgress},
+            plan::{self, DeploySelection},
+            progress::{ProgressReporter, ProgressStatus, SyncOperation, SyncProgress},
             remote::{ConnectionAttempt, RemoteConnection, RemoteOps},
             settings::RestartPolicy,
             spec::DeploymentSpec,
-            stage::{self, CachePayloadSource},
+            stage,
             state::OperationKind,
         },
         sync::FetchedPublication,
@@ -56,6 +56,7 @@ pub struct WorkerContext {
     secrets: Secrets,
     journal: Journal,
     sync: SyncClient,
+    mod_loader: &'static game::mod_loader::ModLoader<'static>,
     spec: DeploymentSpec,
     /// Serializes operations inside this process. Cross-executor safety is
     /// the remote lease's job; this keeps a manual request and an automatic
@@ -85,6 +86,7 @@ impl WorkerContext {
             cache_dir: config.state_dir.join("cache"),
             token: secrets.token()?,
             sync: SyncClient::new(config.clone(), secrets.seed_refresh_token()),
+            mod_loader: &game.mod_loader,
             config,
             secrets,
             journal,
@@ -159,70 +161,29 @@ impl WorkerContext {
 
     fn host(&self) -> Box<dyn host::HostControl> {
         host::from_settings(
-            &self.config.host_control,
+            &self.config.remote.host_control,
             self.secrets.dat_host_password().as_deref(),
         )
     }
 
-    /// Fetches the latest canonical publication and stages its mod payload
-    /// into `DesiredDeployment`. `include_mods` gates staging exactly like
-    /// Local mode: a configs-only operation never touches mod sources.
-    async fn publication(
-        &self,
-        include_mods: bool,
-    ) -> Result<(FetchedPublication, plan::DesiredDeployment)> {
-        let mut progress =
-            ProgressReporter::silent(SyncOperation::Preview, &DeploySelection::default());
-        self.publication_with_progress(include_mods, &mut progress)
-            .await
-    }
-
+    /// Fetches the latest publication and stages its mod payload when selected.
     async fn publication_with_progress(
         &self,
         include_mods: bool,
         progress: &mut ProgressReporter,
     ) -> Result<(FetchedPublication, plan::DesiredDeployment)> {
-        let publication = match self.sync.poll(&self.journal, None).await? {
-            PublicationProbe::New(publication) => publication,
-            PublicationProbe::Unchanged(metadata) => {
-                // `since = None` should never produce Unchanged. If it
-                // ever does, bail rather than pretend a publication
-                // exists.
-                let _ = metadata;
-                bail!("sync service reported no new publication")
-            }
-            PublicationProbe::None => {
-                bail!("profile has no published revision yet")
-            }
-        };
-        if include_mods {
-            progress.phase(SyncPhase::StagingPayload);
-        }
-
-        let source = CachePayloadSource {
-            root: self.cache_dir.clone(),
-            client: reqwest::Client::new(),
-            mod_loader: &game::bundled_from_slug(&self.config.game)
-                .ok_or_else(|| eyre::eyre!("unknown game slug"))?
-                .mod_loader,
-        };
-
-        let mut staging_total = None;
-        let desired = stage::stage_publication(
-            &Publication::from_fetched(&publication),
-            &source,
+        let publication = self
+            .sync
+            .poll(&self.journal, None)
+            .await?
+            .ok_or_else(|| eyre::eyre!("profile has no published revision yet"))?;
+        let desired = stage::stage_fetched(
+            &publication,
+            self.cache_dir.clone(),
+            self.mod_loader,
             &self.spec,
             include_mods,
-            |completed, total, name| {
-                if staging_total.is_none() {
-                    progress.work(total, None);
-                    staging_total = Some(total);
-                }
-                if !name.is_empty() {
-                    progress.item(name);
-                }
-                progress.advance(completed, None);
-            },
+            progress,
         )
         .await?;
 
@@ -326,11 +287,11 @@ async fn status(
         profile_id: ctx.config.profile_id.clone(),
         auto_deploy_mods: journal.auto_deploy_mods,
         restart_policy: journal.restart_policy,
-        observed_revision: journal.last_seen_revision,
+        observed_revision: journal.observed_revision(),
         pending_revision: pending.map(|work| work.revision),
         next_attempt_at: pending.and_then(|work| work.next_attempt_at),
         last_deployed_revision: journal.last_deployed_revision,
-        busy: journal.interrupted_operation.clone(),
+        busy: ctx.operation_lock.try_lock().is_err(),
         last_operation: journal.last_operation.clone(),
         last_error: journal.last_error.clone(),
         poll_error: journal.poll_error.clone(),
@@ -397,36 +358,19 @@ async fn preview_inner(
         None => ctx.journal.state.lock().await.restart_policy,
     };
 
-    let ctx2 = ctx.clone();
-    let meta = ctx.meta(OperationKind::Manual);
-    let context = ctx.plan_context(policy);
-    let mut blocking_progress = std::mem::replace(
+    let worker = Arc::clone(ctx);
+    engine::preview(
+        move || worker.connect(),
+        ctx.spec.clone(),
+        ctx.config.remote.server_directory()?,
+        publication,
+        desired,
+        selection,
+        ctx.plan_context(policy),
+        ctx.meta(OperationKind::Manual),
         progress,
-        ProgressReporter::silent(SyncOperation::Preview, &selection),
-    );
-    let (result, returned) = tokio::task::spawn_blocking(move || {
-        let result = (|| {
-            blocking_progress.phase(SyncPhase::Connecting);
-            let ops = ctx2.connect()?;
-            blocking_progress.phase(SyncPhase::ReadingState);
-            let mut session =
-                engine::open_session(ops, &ctx2.spec, ctx2.config.remote.server_directory()?)?;
-            engine::preview_with_progress(
-                &mut session,
-                &Publication::from_fetched(&publication),
-                &desired,
-                &selection,
-                &context,
-                &meta,
-                &mut blocking_progress,
-            )
-        })();
-        (result, blocking_progress)
-    })
+    )
     .await
-    .context("preview task panicked")?;
-    *progress = returned;
-    result
 }
 
 async fn deploy(
@@ -479,16 +423,49 @@ async fn run_deployment(
         .filter(|id| !id.is_empty())
         .unwrap_or_else(|| meta.id.clone());
     let mut progress = ctx.reporter(run_id, SyncOperation::Deploy, &selection);
-    let result = run_deployment_inner(
-        ctx,
-        selection,
-        plan_hash,
-        restart_policy,
-        force,
-        kind,
-        &meta,
-        &mut progress,
-    )
+    let result = async {
+        // The journal's current policy wins over the config file after setup.
+        let policy = match restart_policy {
+            Some(policy) => policy,
+            None => ctx.journal.state.lock().await.restart_policy,
+        };
+        let (publication, desired) = ctx
+            .publication_with_progress(selection.include_mods, &mut progress)
+            .await?;
+        let worker = Arc::clone(ctx);
+        let response = engine::deploy(
+            move || worker.connect(),
+            ctx.spec.clone(),
+            ctx.config.remote.server_directory()?,
+            publication,
+            desired,
+            selection,
+            ctx.plan_context(policy),
+            meta,
+            plan_hash,
+            force,
+            ctx.host().as_ref(),
+            policy,
+            &mut progress,
+        )
+        .await?;
+
+        let mut state = ctx.journal.state.lock().await;
+        // Config-only pushes do not discharge owed mod work.
+        state.acknowledge_deployment(
+            response.plan.publication_revision,
+            response.plan.mods_phase,
+            response.state.mods_revision.clone(),
+        );
+        state.last_operation = response.state.last_operation.clone();
+        if response.failed_config_writes.is_empty() && state.pending.is_none() {
+            state.last_error = None;
+        }
+        if let Err(err) = ctx.journal.save(&state) {
+            warn!(%err, "failed to update journal after deployment");
+        }
+        Ok(response)
+    }
     .await;
     if result.is_err() {
         progress.failed();
@@ -497,164 +474,6 @@ async fn run_deployment(
         ctx.clear_progress();
     }
     result
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_deployment_inner(
-    ctx: &Arc<WorkerContext>,
-    selection: DeploySelection,
-    plan_hash: Option<String>,
-    restart_policy: Option<RestartPolicy>,
-    force: bool,
-    kind: OperationKind,
-    meta: &OperationMeta,
-    progress: &mut ProgressReporter,
-) -> Result<DeployResponse> {
-    // The restart policy is resolved before planning so the approval hash
-    // binds the behavior the operation will actually apply.
-    let policy = match restart_policy {
-        Some(policy) => policy,
-        // The journal's current policy wins over the config file so a
-        // runtime change via /v1/config persists across restarts.
-        None => ctx.journal.state.lock().await.restart_policy,
-    };
-
-    let (publication, desired) = ctx
-        .publication_with_progress(selection.include_mods, progress)
-        .await?;
-
-    {
-        // Marks the in-flight operation so a crash mid-deployment is
-        // visible through /v1/status after restart.
-        let mut state = ctx.journal.state.lock().await;
-        state.interrupted_operation = Some(busy_marker(meta.id.clone(), kind));
-        if let Err(err) = ctx.journal.save(&state) {
-            warn!(%err, "failed to persist in-flight marker");
-        }
-    }
-
-    let context = ctx.plan_context(policy);
-    let result = execute_deployment(
-        ctx,
-        publication,
-        desired,
-        selection,
-        plan_hash,
-        policy,
-        force,
-        &context,
-        meta,
-        progress,
-    )
-    .await;
-
-    {
-        let mut state = ctx.journal.state.lock().await;
-        match &result {
-            Ok(response) => {
-                // Only a deployment that ran the mods phase discharges
-                // owed work — an explicit config push never acknowledges
-                // a mod payload it did not deploy. A remote state that
-                // already reports the owed revision settles it too.
-                state.acknowledge_deployment(
-                    response.plan.publication_revision,
-                    response.plan.mods_phase,
-                    response.state.mods_revision.clone(),
-                );
-                // A manual deployment can settle failed automatic work too.
-                // Keep its error while owed work or failed writes remain.
-                if response.failed_config_writes.is_empty() && state.pending.is_none() {
-                    state.last_error = None;
-                }
-            }
-            Err(_) => {
-                // `record_operation` clears the marker on success. On
-                // failure it must be cleared here, so status doesn't
-                // report a stale in-flight operation and the next startup
-                // doesn't warn about an interruption that was handled.
-                state.interrupted_operation = None;
-            }
-        }
-        if let Err(err) = ctx.journal.save(&state) {
-            warn!(%err, "failed to update journal after deployment");
-        }
-    }
-
-    result
-}
-
-/// The blocking half of [`run_deployment`]. Deploys under the lease,
-/// decides the restart, then persists and records. Kept separate so the
-/// caller can clear the in-flight marker on every exit path.
-#[allow(clippy::too_many_arguments)]
-async fn execute_deployment(
-    ctx: &Arc<WorkerContext>,
-    publication: FetchedPublication,
-    desired: plan::DesiredDeployment,
-    selection: DeploySelection,
-    plan_hash: Option<String>,
-    restart_policy: RestartPolicy,
-    force: bool,
-    context: &plan::PlanContext,
-    meta: &OperationMeta,
-    progress: &mut ProgressReporter,
-) -> Result<DeployResponse> {
-    let ctx2 = ctx.clone();
-    let meta2 = meta.clone();
-    let context2 = context.clone();
-    let connect = {
-        let ctx3 = ctx.clone();
-        move || ctx3.connect()
-    };
-
-    let mut blocking_progress = std::mem::replace(
-        progress,
-        ProgressReporter::silent(SyncOperation::Deploy, &selection),
-    );
-    let (result, returned) = tokio::task::spawn_blocking(move || {
-        let result = (|| {
-            blocking_progress.phase(SyncPhase::Connecting);
-            let ops = ctx2.connect()?;
-            blocking_progress.phase(SyncPhase::ReadingState);
-            let mut session =
-                engine::open_session(ops, &ctx2.spec, ctx2.config.remote.server_directory()?)?;
-            let deployment = engine::deploy_with_progress(
-                &mut session,
-                connect,
-                &Publication::from_fetched(&publication),
-                &desired,
-                &selection,
-                &context2,
-                &meta2,
-                plan_hash.as_deref(),
-                force,
-                &mut blocking_progress,
-                |_| {},
-            )?;
-            Ok::<_, eyre::Report>((session, deployment))
-        })();
-        (result, blocking_progress)
-    })
-    .await
-    .context("deployment task panicked")?;
-    *progress = returned;
-    let (session, deployment) = result?;
-
-    let response = engine::complete_with_progress(
-        session,
-        deployment,
-        ctx.host().as_ref(),
-        restart_policy,
-        meta.clone(),
-        progress,
-    )
-    .await?;
-    if let Some(record) = response.state.last_operation.clone()
-        && let Err(err) = ctx.journal.record_operation(record).await
-    {
-        warn!(%err, "failed to record operation in journal");
-    }
-    Ok(response)
 }
 
 async fn set_policy(
@@ -672,11 +491,12 @@ async fn set_policy(
 
     // The worker resolves the policy pin from the canonical publication,
     // so the client cannot supply an arbitrary one.
-    let pinned_at = match ctx.publication(false).await {
-        Ok((publication, _)) => publication
+    let pinned_at = match ctx.sync.poll(&ctx.journal, None).await {
+        Ok(Some(publication)) => publication
             .config
             .get(&request.path)
             .map(|file| file.hash.clone()),
+        Ok(None) => return error_response(&eyre::eyre!("profile has no published revision yet")),
         Err(err) => {
             drop(guard);
             return error_response(&err);
@@ -773,8 +593,7 @@ async fn configure(
 
 /// Periodically checks for new publications and drives pending work when
 /// the journal allows automatic mod deployment. It keeps distinct
-/// marks: `last_seen_revision` (newest observed), `pending` (a
-/// publication whose mod payload is still owed, retried with backoff),
+/// marks: `pending` (a publication whose mod payload is still owed, retried with backoff),
 /// `last_deployed_revision` (newest publication whose mod payload is
 /// confirmed applied), and `deployed_mods_revision` (the remote state's
 /// last reported mod revision, mirrored for classifying new
@@ -816,7 +635,7 @@ fn retry_delay(attempts: u32) -> Duration {
 /// One poll cycle. Observes the newest publication, then drives pending
 /// work.
 async fn poll_once(ctx: &Arc<WorkerContext>) {
-    let last_seen = ctx.journal.state.lock().await.last_seen_revision;
+    let last_seen = ctx.journal.state.lock().await.observed_revision();
     let probe = match ctx.sync.poll(&ctx.journal, last_seen).await {
         Ok(probe) => probe,
         Err(err) => {
@@ -834,7 +653,7 @@ async fn poll_once(ctx: &Arc<WorkerContext>) {
     let mut state = ctx.journal.state.lock().await;
     let recovered = state.poll_error.take().is_some();
     match probe {
-        PublicationProbe::New(publication) => {
+        Some(publication) => {
             let revision = publication.revision;
             info!(%revision, "observed new publication");
             state.observe_publication(revision, &publication.mods_revision);
@@ -842,7 +661,7 @@ async fn poll_once(ctx: &Arc<WorkerContext>) {
                 warn!(%err, "failed to persist observed revision");
             }
         }
-        PublicationProbe::Unchanged(_) | PublicationProbe::None => {
+        None => {
             if recovered && let Err(err) = ctx.journal.save(&state) {
                 warn!(%err, "failed to persist recovered publication poll");
             }
@@ -915,7 +734,6 @@ async fn poll_once(ctx: &Arc<WorkerContext>) {
                             + chrono::Duration::from_std(retry_delay(work.attempts))
                                 .expect("bounded retry delay fits chrono"),
                     );
-                    work.last_error = Some(message.clone());
                 }
                 state.last_error = Some(format!("automatic deployment failed: {message}"));
             }
@@ -998,12 +816,9 @@ pub async fn run(
             // The config file seeds automation on first run; after
             // that the journal is the source of truth so /v1/config
             // changes persist across restarts.
-            state.auto_deploy_mods = config.auto_deploy_mods;
-            state.restart_policy = config.restart_policy;
+            state.auto_deploy_mods = config.remote.worker.auto_deploy_mods;
+            state.restart_policy = config.remote.restart_policy;
             state.automation_seeded = true;
-        }
-        if let Some(op) = state.interrupted_operation.take() {
-            warn!(operation = %op.id, "last run was interrupted mid-operation; the remote lease governs recovery");
         }
         journal.save(&state)?;
     }
@@ -1194,7 +1009,7 @@ mod tests {
         drop(ctx);
         let journal = crate::worker::journal::Journal::load(dir.path()).unwrap();
         let state = journal.state.lock().await;
-        assert_eq!(state.last_seen_revision, Some(revision));
+        assert_eq!(state.observed_revision(), Some(revision));
         assert_eq!(state.pending.as_ref().unwrap().revision, revision);
         assert_eq!(state.last_deployed_revision, None);
         assert_eq!(state.last_error, None);
@@ -1253,7 +1068,7 @@ mod tests {
         let ctx = poll_test_context(dir.path(), server.url.clone());
         {
             let mut state = ctx.journal.state.lock().await;
-            state.last_seen_revision = Some(revision);
+            state.pending = Some(PendingWork::new(revision, owed_mod()));
             state.refresh_token = Some("refresh-seed".to_owned());
             state.last_error = Some("automatic deployment failed: upload failed".to_owned());
             ctx.journal.save(&state).unwrap();
@@ -2085,7 +1900,6 @@ mod tests {
         let api_port = free_port();
 
         let mut config = worker_config(dir.path(), format!("127.0.0.1:{api_port}"));
-        config.auto_deploy_mods = true;
         config.remote = RemoteServerSettings {
             protocol: RemoteProtocol::Ftp,
             host: "127.0.0.1".to_owned(),
@@ -2094,6 +1908,7 @@ mod tests {
             server_directory: "/".to_owned(),
             ..RemoteServerSettings::default()
         };
+        config.remote.worker.auto_deploy_mods = true;
         config.sync_url = Some("http://127.0.0.1:1/".to_owned());
 
         let mut settings = RemoteServerSettings::default();
@@ -2142,7 +1957,7 @@ mod tests {
 
         // A restart with a config claiming automation is on keeps the
         // journal's values — it is authoritative once seeded.
-        config.auto_deploy_mods = true;
+        config.remote.worker.auto_deploy_mods = true;
         let shutdown = tokio_util::sync::CancellationToken::new();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(super::run(
@@ -2173,8 +1988,8 @@ mod tests {
 
         // The config now disagrees with both saved values. The journal
         // remains authoritative for automation and restart policy.
-        config.auto_deploy_mods = false;
-        config.restart_policy = RestartPolicy::Immediate;
+        config.remote.worker.auto_deploy_mods = false;
+        config.remote.restart_policy = RestartPolicy::Immediate;
         let shutdown = tokio_util::sync::CancellationToken::new();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(super::run(

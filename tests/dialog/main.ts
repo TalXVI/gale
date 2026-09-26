@@ -53,7 +53,7 @@ const worker = {
 	pendingRevision: null as string | null,
 	nextAttemptAt: null as string | null,
 	lastDeployedRevision: null as string | null,
-	busy: null,
+	busy: false,
 	lastOperation: null,
 	server: null
 };
@@ -92,12 +92,6 @@ function planFor(selection: { includeMods: boolean; includeConfigs: boolean }) {
 		unchangedFiles: selection.includeMods ? plannedUnchanged : 0,
 		modsPhase: selection.includeMods,
 		configsPhase: selection.includeConfigs,
-		requiresRestart: false,
-		conflicts: selection.includeConfigs
-			? configEntries
-					.filter((entry) => entry.action === 'pending')
-					.map((entry) => ({ path: entry.path, reason: entry.reason }))
-			: [],
 		configEntries: selection.includeConfigs ? configEntries : []
 	};
 }
@@ -151,12 +145,11 @@ const progressListeners = new Set<number>();
 let localWorker: Record<string, unknown> = {
 	supported: true,
 	service: 'notInstalled',
-	binding: null,
+	address: null,
 	ownership: 'none',
 	run: null,
 	worker: null,
 	workerError: null,
-	stoppedForShutdown: false,
 	updateAvailable: false,
 	warnings: []
 };
@@ -349,12 +342,7 @@ mockIPC(async (cmd, args) => {
 				...localWorker,
 				service: 'running',
 				ownership: 'owned',
-				binding: {
-					workerId: 'local-worker',
-					profileId: 'sync-1',
-					listen: '127.0.0.1:8472',
-					address: 'http://127.0.0.1:8472'
-				},
+				address: 'http://127.0.0.1:8472',
 				run: {
 					workerId: 'local-worker',
 					profileId: 'sync-1',

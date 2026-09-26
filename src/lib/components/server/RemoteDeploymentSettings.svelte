@@ -78,7 +78,7 @@
 						'inline-flex w-fit items-center gap-1.5 rounded-full px-2.5 py-0.5 text-sm font-medium capitalize',
 						servicePillClass
 					]}
-					title={form.localWorker.binding?.address}
+					title={form.localWorker.address ?? undefined}
 				>
 					{form.localWorkerStateLabel(form.localWorker.service)}
 				</span>
@@ -94,7 +94,7 @@
 						>
 					</div>
 				{/if}
-				{#if form.localWorker.stoppedForShutdown}
+				{#if form.localWorker.run?.phase === 'shutdown'}
 					<InfoBox type="info">{m.dedicatedServerDialog_localWorkerShutdown()}</InfoBox>
 				{:else if form.localWorker.service !== 'running' && form.localWorker.run?.phase === 'running'}
 					<InfoBox type="warning">{m.dedicatedServerDialog_localWorkerCrash()}</InfoBox>

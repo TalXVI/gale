@@ -10,7 +10,7 @@ use super::{
     spec::DeploymentSpec,
 };
 use crate::profile::{
-    export::{ConfigPath, ContentHash, ModRevision, R2Mod},
+    export::{ConfigPath, ContentHash, ModRevision},
     sync::{AppliedFile, ConfigUpdatePolicy},
 };
 
@@ -21,7 +21,6 @@ pub const VERSION: u32 = 2;
 /// Upper bound for the remote state file. Reads are refused past it so a
 /// corrupt or hostile file cannot cause an unbounded download.
 pub(crate) const MAX_STATE_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_HISTORY: usize = 10;
 
 /// A Gale-owned remote payload file recorded by a completed deployment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,8 +71,7 @@ pub enum RestartOutcome {
     /// Players were present or presence was unknown, so a WhenEmpty restart
     /// was deferred.
     AwaitingEmpty,
-    /// A Gale-issued restart was observed, or the user acknowledged one
-    /// outside Gale. See `external_restart_acknowledged` on the operation.
+    /// A Gale-issued restart was observed, or the user acknowledged one outside Gale.
     Restarted,
     /// A restart was issued but its result could not be verified.
     StartupUnverified,
@@ -106,16 +104,9 @@ pub struct OperationRecord {
     pub status: OperationStatus,
     pub summary: OperationSummary,
     pub restart: RestartOutcome,
-    /// True only when the user confirmed a restart outside Gale.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub external_restart_acknowledged: bool,
     pub error: Option<String>,
     pub started_at: DateTime<Utc>,
     pub finished_at: DateTime<Utc>,
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 /// The authoritative record of what a dedicated server's managed content
@@ -138,10 +129,6 @@ pub struct ServerDeploymentState {
     /// advances once the whole payload phase succeeded.
     #[serde(default)]
     pub mods_revision: Option<ModRevision>,
-    /// The published mod set `mods_revision` describes, for display and
-    /// recovery information.
-    #[serde(default)]
-    pub deployed_mods: Vec<R2Mod>,
     /// Payload files Gale deployed and therefore owns, keyed by deploy path.
     /// Together with mirrored extras these are the only paths a deployment
     /// may remove.
@@ -158,8 +145,6 @@ pub struct ServerDeploymentState {
     pub restart_required: bool,
     #[serde(default)]
     pub last_operation: Option<OperationRecord>,
-    #[serde(default)]
-    pub history: Vec<OperationRecord>,
 }
 
 /// State plus warnings produced while reading it.
@@ -250,9 +235,7 @@ impl ServerDeploymentState {
 
     pub fn record_operation(&mut self, record: OperationRecord) {
         self.operation_seq += 1;
-        self.history.insert(0, record);
-        self.history.truncate(MAX_HISTORY);
-        self.last_operation = self.history.first().cloned();
+        self.last_operation = Some(record);
     }
 }
 
@@ -444,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn operation_history_is_bounded_and_sequenced() {
+    fn operation_record_replaces_previous_and_advances_sequence() {
         let mut state = ServerDeploymentState::default();
         let record = |id: &str| OperationRecord {
             id: id.to_owned(),
@@ -456,18 +439,16 @@ mod tests {
             status: OperationStatus::Succeeded,
             summary: OperationSummary::default(),
             restart: RestartOutcome::NotRequired,
-            external_restart_acknowledged: false,
             error: None,
             started_at: Utc::now(),
             finished_at: Utc::now(),
         };
 
-        for i in 0..(MAX_HISTORY + 3) {
+        for i in 0..13 {
             state.record_operation(record(&format!("op-{i}")));
         }
 
-        assert_eq!(state.history.len(), MAX_HISTORY);
         assert_eq!(state.last_operation.as_ref().unwrap().id, "op-12");
-        assert_eq!(state.operation_seq, MAX_HISTORY as u64 + 3);
+        assert_eq!(state.operation_seq, 13);
     }
 }

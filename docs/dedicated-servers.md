@@ -132,10 +132,12 @@ Notes and limitations:
      "listen": "127.0.0.1:8472",
      "profileId": "the sync profile id",
      "game": "valheim",
-     "remote": { "protocol": "sftp", "host": "...", "username": "..." },
-     "hostControl": { "provider": "datHost", "datHostServerId": "...", "datHostUsername": "..." },
-     "autoDeployMods": true,
-     "restartPolicy": "whenEmpty",
+     "remote": {
+       "protocol": "sftp", "host": "...", "username": "...",
+       "hostControl": { "provider": "datHost", "datHostServerId": "...", "datHostUsername": "..." },
+       "worker": { "autoDeployMods": true },
+       "restartPolicy": "whenEmpty"
+     },
      "pollIntervalSecs": 300,
      "stateDir": "/var/lib/gale-worker"
    }
@@ -212,7 +214,7 @@ A deployment only reports success once its state file reads back byte-identical.
 
 ## What is preserved
 
-The deployment state file (`BepInEx/config/.gale-server-state.json`, or `config/.gale-server-state.json` in restricted-root layouts) records owned files, content hashes, applied config revisions, per-file policies, operation history, and restart state. It is the authority for what Gale may remove. A file absent from the publication but never recorded as deployed stays put.
+The deployment state file (`BepInEx/config/.gale-server-state.json`, or `config/.gale-server-state.json` in restricted-root layouts) records owned files, content hashes, applied config revisions, per-file policies, the last operation, and restart state. It is the authority for what Gale may remove. A file absent from the publication but never recorded as deployed stays put.
 
 The existing protections apply in both modes: managed vs host-managed BepInEx installations, restricted-root layouts, validated state-path adoption, retried removals, and server-config preservation during mods-only updates.
 
@@ -223,7 +225,7 @@ The backend lives in `src-tauri/src/profile/server`:
 - `plan.rs`: the pure planner. It is the only place sync semantics are decided, shared by previews and deploys in both modes.
 - `engine.rs`: session, snapshot, lease-gated execution, restart, and state persistence shared by Local and Worker.
 - `lease.rs`: the remote deployment lease (claim/heartbeat/ownership-verified release/stale takeover).
-- `state.rs`: `.gale-server-state.json`, holding ownership records, config policies, operation history, and the restart flag.
+- `state.rs`: `.gale-server-state.json`, holding ownership records, config policies, the last operation, and the restart flag.
 - `spec.rs`: managed scope, loader-specific ownership, excluded paths, removal authority.
 - `remote.rs`: SFTP/FTP/FTPS operations; FTPS certificate pinning and verification.
 - `stage.rs`: publication → staged payloads; configs-only operations never touch mod sources.

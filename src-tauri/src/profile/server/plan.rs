@@ -18,8 +18,10 @@ use super::{
     state::ServerDeploymentState,
 };
 use crate::profile::{
-    export::{ConfigPath, ContentHash, ModRevision, R2Mod},
-    sync::{ConfigUpdatePolicy, PendingConfigReason, archive::ValidatedConfigFile},
+    export::{ConfigPath, ContentHash, ModRevision},
+    sync::{
+        ConfigUpdatePolicy, FetchedPublication, PendingConfigReason, archive::ValidatedConfigFile,
+    },
 };
 
 /// Which scope a deployment covers.
@@ -88,34 +90,8 @@ impl DeploySelection {
     }
 }
 
-/// A canonical publication the server deploys. It is the same artifact
-/// friends' clients install. Local unpublished profile changes are never
-/// part of it.
-pub struct Publication<'a> {
-    /// Remote `updatedAt`, identifying this exact revision.
-    pub revision: DateTime<Utc>,
-    pub mods_revision: ModRevision,
-    pub mods: &'a [R2Mod],
-    /// Published config bytes keyed by canonical config path.
-    pub config: &'a BTreeMap<ConfigPath, ValidatedConfigFile>,
-}
-
-impl<'a> Publication<'a> {
-    /// Converts a fetched canonical publication into the view the planner
-    /// works with. Both executors use this same conversion, so "the
-    /// publication" means the same artifact on both sides.
-    pub fn from_fetched(publication: &'a crate::profile::sync::FetchedPublication) -> Self {
-        Self {
-            revision: publication.revision,
-            mods_revision: publication.mods_revision.clone(),
-            mods: &publication.manifest.mods,
-            config: &publication.config,
-        }
-    }
-}
-
 /// A file the publication wants on the server.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct StagedFile {
     /// Where the bytes come from during upload.
     pub source: FileSource,
@@ -124,22 +100,16 @@ pub struct StagedFile {
     pub size: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum FileSource {
     /// A staged file on local disk (extracted package tree).
     Path(std::path::PathBuf),
     /// In-memory bytes (published configs).
-    Bytes(std::sync::Arc<Vec<u8>>),
+    Bytes(Vec<u8>),
 }
 
-/// The published content offered to the planner, in deploy-path space.
-/// Config-dir files inside packages are never staged: the server owns its
-/// config files, and only an explicit config push writes them.
-#[derive(Debug, Default)]
-pub struct DesiredDeployment {
-    /// Mod payload files (outside config dirs).
-    pub payload: BTreeMap<DeployPathBuf, StagedFile>,
-}
+/// Staged mod payload files in deploy-path space. Package configs are excluded.
+pub type DesiredDeployment = BTreeMap<DeployPathBuf, StagedFile>;
 
 /// Identity and behavior options the plan hash binds. An approval is
 /// specific to exactly one profile, server target, and restart policy.
@@ -224,9 +194,6 @@ pub enum ConfigAction {
     Write,
     /// The published revision stays declined this revision.
     Decline,
-    /// The remote file stays untouched (already applied, server-customized
-    /// after apply, or AlwaysKeep policy).
-    Keep,
     /// Awaits a decision. Applying would clobber a remote change or
     /// recreate a remote deletion.
     Pending { reason: PendingConfigReason },
@@ -241,16 +208,6 @@ pub struct PlanConfigEntry {
     #[serde(flatten)]
     pub action: ConfigAction,
     pub policy: ConfigUpdatePolicy,
-    /// Whether the user explicitly selected this file for application.
-    pub selected: bool,
-}
-
-/// A config situation the deployment could not resolve on its own.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct PlanConflict {
-    pub path: ConfigPath,
-    pub reason: PendingConfigReason,
 }
 
 /// The complete, approved description of one deployment. It runs exactly
@@ -266,12 +223,6 @@ pub struct DeploymentPlan {
     /// The publication this plan applies.
     pub publication_revision: DateTime<Utc>,
     pub mods_revision: ModRevision,
-    /// The mod revision the server had before this plan.
-    pub deployed_mods_revision: Option<ModRevision>,
-    /// The `operationSeq` of the remote state this plan was computed from.
-    pub state_seq: u64,
-    pub layout: RemoteLayout,
-    pub host_managed: bool,
     /// Whether the plan touches the mod payload.
     pub mods_phase: bool,
     /// Whether the plan evaluates published configs.
@@ -283,31 +234,25 @@ pub struct DeploymentPlan {
     pub unchanged_files: usize,
     /// Every published config file and its decided fate.
     pub config_entries: Vec<PlanConfigEntry>,
-    /// Published config files the plan cannot write without a decision.
-    pub conflicts: Vec<PlanConflict>,
-    /// Payload changes require a server restart to take effect.
-    pub requires_restart: bool,
     /// Remote payload files that are neither published nor recorded as
     /// Gale-owned, like manually installed mods or leftovers from other
     /// tools. Shown in the preview for visibility; never removed
     /// automatically.
     pub unmanaged: Vec<DeployPathBuf>,
-    /// The published mod set, recorded as `deployed_mods` on success.
-    pub deployed_mods: Vec<R2Mod>,
 }
 
 /// Computes the deployment plan. This is the only place sync semantics are
 /// decided. Local and Worker modes call the same function, so identical
 /// inputs always produce identical plans.
 pub fn build_plan(
-    publication: &Publication<'_>,
+    publication: &FetchedPublication,
     desired: &DesiredDeployment,
     snapshot: &RemoteSnapshot,
     selection: &DeploySelection,
     context: &PlanContext,
     spec: &DeploymentSpec,
 ) -> Result<DeploymentPlan> {
-    selection.validate(publication.config, spec)?;
+    selection.validate(&publication.config, spec)?;
 
     let state = &snapshot.state;
     let mut uploads: Vec<PlanUpload> = Vec::new();
@@ -315,11 +260,10 @@ pub fn build_plan(
     let mut directory_removals: Vec<DeployPathBuf> = Vec::new();
     let mut unmanaged: Vec<DeployPathBuf> = Vec::new();
     let mut unchanged_files = 0usize;
-    let mut conflicts: Vec<PlanConflict> = Vec::new();
 
     // ---- Mods phase: converge the payload dirs on the exact published set.
     if selection.include_mods {
-        for (path, staged) in &desired.payload {
+        for (path, staged) in desired {
             if !spec.deploys(path, snapshot.host_managed) {
                 continue;
             }
@@ -348,7 +292,7 @@ pub fn build_plan(
         // reported as unmanaged instead, so the user sees what else lives
         // in the payload directories.
         let desired_paths: BTreeSet<&DeployPath> =
-            desired.payload.keys().map(DeployPathBuf::as_path).collect();
+            desired.keys().map(DeployPathBuf::as_path).collect();
         for path in state.files.keys() {
             if desired_paths.contains(path.as_path())
                 || !spec.owns_for_removal(path, snapshot.host_managed)
@@ -396,7 +340,7 @@ pub fn build_plan(
     let configs_phase = selection.include_configs;
     let mut config_entries = Vec::new();
     if configs_phase {
-        for (path, file) in publication.config {
+        for (path, file) in &publication.config {
             if !spec.is_managed_config(path) {
                 continue;
             }
@@ -419,35 +363,20 @@ pub fn build_plan(
                     size: file.bytes.len() as u64,
                     kind: UploadKind::Config,
                 });
-            } else if let ConfigAction::Pending { reason } = action {
-                conflicts.push(PlanConflict {
-                    path: path.clone(),
-                    reason,
-                });
             }
 
             config_entries.push(PlanConfigEntry {
                 path: path.clone(),
                 action,
                 policy: record.map(|record| record.policy).unwrap_or_default(),
-                selected,
             });
         }
     }
-
-    // Any write or removal changes server content: the running server only
-    // picks it up after a restart. Pending/declined/unselected configs plan
-    // no upload and never force one.
-    let requires_restart = !uploads.is_empty() || !removals.is_empty();
 
     let mut plan = DeploymentPlan {
         hash: String::new(),
         publication_revision: publication.revision,
         mods_revision: publication.mods_revision.clone(),
-        deployed_mods_revision: state.mods_revision.clone(),
-        state_seq: state.operation_seq,
-        layout: snapshot.layout,
-        host_managed: snapshot.host_managed,
         mods_phase: selection.include_mods,
         configs_phase,
         upload_bytes: uploads.iter().map(|upload| upload.size).sum(),
@@ -456,10 +385,7 @@ pub fn build_plan(
         directory_removals,
         unchanged_files,
         config_entries,
-        conflicts,
-        requires_restart,
         unmanaged,
-        deployed_mods: publication.mods.to_vec(),
     };
     plan.hash = plan_hash(&plan, snapshot, selection, context);
 
@@ -609,9 +535,9 @@ fn plan_hash(
         context,
         publication_revision: plan.publication_revision,
         mods_revision: &plan.mods_revision,
-        state_seq: plan.state_seq,
-        layout: plan.layout,
-        host_managed: plan.host_managed,
+        state_seq: snapshot.state.operation_seq,
+        layout: snapshot.layout,
+        host_managed: snapshot.host_managed,
         selection,
         uploads: &plan.uploads,
         removals: &plan.removals,
@@ -632,12 +558,13 @@ pub fn stale_plan_error() -> eyre::Report {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
     use crate::{
         game::mod_loader::{ModLoader, ModLoaderKind},
-        profile::{export::R2Mod, sync::AppliedFile},
+        profile::{
+            export::{ProfileManifest, R2Mod},
+            sync::AppliedFile,
+        },
         thunderstore::{Backend, PackageIdent},
     };
 
@@ -666,7 +593,7 @@ mod tests {
 
     fn staged(bytes: &[u8]) -> StagedFile {
         StagedFile {
-            source: FileSource::Bytes(Arc::new(bytes.to_vec())),
+            source: FileSource::Bytes(bytes.to_vec()),
             hash: blake3::hash(bytes).to_hex().to_string(),
             size: bytes.len() as u64,
         }
@@ -692,22 +619,27 @@ mod tests {
         }
     }
 
-    /// Owns the borrowed halves of a `Publication` so tests can build one
-    /// per case without lifetime gymnastics.
     struct Fixture {
         mods: Vec<R2Mod>,
         config: BTreeMap<ConfigPath, ValidatedConfigFile>,
     }
 
     impl Fixture {
-        fn publication(&self) -> Publication<'_> {
-            Publication {
+        fn publication(&self) -> FetchedPublication {
+            FetchedPublication {
                 revision: DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
                     .unwrap()
                     .to_utc(),
                 mods_revision: mod_revision("rev-1"),
-                mods: &self.mods,
-                config: &self.config,
+                manifest: ProfileManifest {
+                    name: String::new(),
+                    mods: self.mods.clone(),
+                    game: None,
+                    ignored_version_updates: Vec::new(),
+                    ignored_package_updates: Vec::new(),
+                    sync: None,
+                },
+                config: self.config.clone(),
             }
         }
     }
@@ -751,11 +683,9 @@ mod tests {
     }
 
     fn payload(bytes: &[u8]) -> DesiredDeployment {
-        DesiredDeployment {
-            payload: [(deploy("BepInEx/plugins/ModA/ModA.dll"), staged(bytes))]
-                .into_iter()
-                .collect(),
-        }
+        [(deploy("BepInEx/plugins/ModA/ModA.dll"), staged(bytes))]
+            .into_iter()
+            .collect()
     }
 
     #[test]
@@ -808,7 +738,7 @@ mod tests {
         assert!(plan.uploads.is_empty());
         assert!(plan.removals.is_empty());
         assert!(!plan.mods_phase);
-        assert!(!plan.requires_restart);
+        assert!(plan.uploads.is_empty() && plan.removals.is_empty());
     }
 
     #[test]
@@ -930,12 +860,12 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(plan.config_entries[0].path, path);
         assert_eq!(
-            plan.conflicts,
-            vec![PlanConflict {
-                path: path.clone(),
-                reason: PendingConfigReason::ModifiedLocally,
-            }]
+            plan.config_entries[0].action,
+            ConfigAction::Pending {
+                reason: PendingConfigReason::ModifiedLocally
+            }
         );
 
         // Applying the selection turns the same snapshot into a write.
@@ -950,7 +880,7 @@ mod tests {
             &spec(),
         )
         .unwrap();
-        assert!(plan.conflicts.is_empty());
+        assert_eq!(plan.config_entries[0].action, ConfigAction::Write);
         assert!(plan.uploads.iter().any(|u| u.kind == UploadKind::Config));
 
         // Declining keeps the remote file untouched.
@@ -965,7 +895,7 @@ mod tests {
             &spec(),
         )
         .unwrap();
-        assert!(plan.uploads.is_empty() && plan.conflicts.is_empty());
+        assert!(plan.uploads.is_empty());
         assert_eq!(plan.config_entries[0].action, ConfigAction::Decline);
     }
 
@@ -999,11 +929,7 @@ mod tests {
             &spec(),
         )
         .unwrap();
-        assert_eq!(plan.conflicts.len(), 1);
-        assert_eq!(
-            plan.conflicts[0].reason,
-            PendingConfigReason::DeletedLocally
-        );
+        assert_eq!(plan.config_entries.len(), 1);
         assert_eq!(
             plan.config_entries[0].action,
             ConfigAction::Pending {
@@ -1025,8 +951,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            plan.conflicts[0].reason,
-            PendingConfigReason::DeletedLocally
+            plan.config_entries[0].action,
+            ConfigAction::Pending {
+                reason: PendingConfigReason::DeletedLocally
+            }
         );
 
         // Apply + restore authorization finally writes.
@@ -1041,7 +969,7 @@ mod tests {
             &spec(),
         )
         .unwrap();
-        assert!(plan.conflicts.is_empty());
+        assert_eq!(plan.config_entries[0].action, ConfigAction::Write);
         assert!(plan.uploads.iter().any(|u| u.kind == UploadKind::Config));
     }
 
@@ -1279,7 +1207,7 @@ mod tests {
             &spec(),
         )
         .unwrap();
-        assert!(plan.requires_restart);
+        assert!(!plan.uploads.is_empty());
 
         // But a declined/unselected config writes nothing, so no restart.
         let mut decline = selection(false, true);
@@ -1293,7 +1221,7 @@ mod tests {
             &spec(),
         )
         .unwrap();
-        assert!(!plan.requires_restart);
+        assert!(plan.uploads.is_empty() && plan.removals.is_empty());
 
         // Payload upload: restart required.
         let plan = build_plan(
@@ -1305,6 +1233,6 @@ mod tests {
             &spec(),
         )
         .unwrap();
-        assert!(plan.requires_restart);
+        assert!(!plan.uploads.is_empty());
     }
 }

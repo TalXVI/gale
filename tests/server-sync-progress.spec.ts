@@ -28,7 +28,7 @@ test('Local Preview and Deploy show snapshot, mutation, byte, and restart progre
 	await page.goto('/tests/dialog/?mode=local');
 	await hold(page, 'preview_server_sync');
 	await page.getByRole('button', { name: 'Preview', exact: true }).click();
-	const progress = page.getByTestId('server-sync-operation-progress');
+	const progress = page.getByRole('region', { name: 'Server sync progress' });
 	await expect(progress).toContainText('Previewing server');
 	await emit(page, {
 		phase: 'scanningPayload',
@@ -99,7 +99,7 @@ test('Worker polls its run, ignores stale snapshots, and clears progress on succ
 	);
 	await hold(page, 'preview_server_sync');
 	await page.getByRole('button', { name: 'Preview', exact: true }).click();
-	const progress = page.getByTestId('server-sync-operation-progress');
+	const progress = page.getByRole('region', { name: 'Server sync progress' });
 	await expect(progress).toContainText('83 / 166 files');
 	const oldRun = await runId(page, 'preview_server_sync');
 	await release(page);
@@ -163,7 +163,7 @@ test('failed progress keeps its phase and leaving the tab discards old events', 
 	const oldRun = await runId(page, 'preview_server_sync');
 	await emit(page, { completed: 42, total: 166, item });
 	await release(page);
-	const progress = page.getByTestId('server-sync-operation-progress');
+	const progress = page.getByRole('region', { name: 'Server sync progress' });
 	await expect(progress).toContainText('Preview failed while verifying deployed mods');
 	await expect(progress).toContainText(`Last item: ${item}`);
 	await page.evaluate(() => (window as any).unfail('preview_server_sync'));

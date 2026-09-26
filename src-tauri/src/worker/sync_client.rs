@@ -35,18 +35,6 @@ struct TokenResponse {
     refresh_token: String,
 }
 
-/// What the worker fetched for one poll cycle: metadata only when the
-/// archive is unchanged (cheap revision check), or the full validated
-/// publication.
-pub enum PublicationProbe {
-    /// No publication has ever been pushed for this profile.
-    None,
-    /// The remote revision did not advance past `since`.
-    Unchanged(SyncProfileMetadata),
-    /// A new publication revision, downloaded and validated.
-    New(FetchedPublication),
-}
-
 pub struct SyncClient {
     config: WorkerConfig,
     /// The seed refresh token from the worker's secrets, used until the
@@ -203,24 +191,24 @@ impl SyncClient {
         &self,
         journal: &Journal,
         since: Option<DateTime<Utc>>,
-    ) -> Result<PublicationProbe> {
+    ) -> Result<Option<FetchedPublication>> {
         let token = self.access_token(journal).await?;
 
         let Some(metadata) = self.manifest(&token).await? else {
-            return Ok(PublicationProbe::None);
+            return Ok(None);
         };
 
         if let Some(seen) = since
             && metadata.updated_at <= seen
         {
-            return Ok(PublicationProbe::Unchanged(metadata));
+            return Ok(None);
         }
 
         let bytes = self.archive_bytes(&token, &metadata).await?;
         let publication = sync::publication_from_archive(&metadata, &bytes)
             .context("canonical publication failed validation")?;
 
-        Ok(PublicationProbe::New(publication))
+        Ok(Some(publication))
     }
 }
 
@@ -484,7 +472,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(probe, PublicationProbe::None));
+        assert!(probe.is_none());
         assert_eq!(api.token_hits.load(Ordering::Relaxed), 1);
         assert_eq!(api.archive_hits.load(Ordering::Relaxed), 0);
         // The rotated refresh token was persisted even though nothing was
@@ -511,9 +499,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        let PublicationProbe::New(publication) = probe else {
-            panic!("expected a new publication");
-        };
+        let publication = probe.expect("expected a new publication");
         assert_eq!(publication.revision, updated);
         assert_eq!(publication.manifest.mods.len(), 1);
         assert_eq!(publication.config.len(), 1);
@@ -541,7 +527,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(probe, PublicationProbe::Unchanged(_)));
+        assert!(probe.is_none());
         assert_eq!(api.archive_hits.load(Ordering::Relaxed), 0);
     }
 
@@ -637,10 +623,7 @@ pub(crate) mod tests {
         );
 
         api.token_status.store(0, Ordering::Relaxed);
-        assert!(matches!(
-            client.poll(&journal, None).await.unwrap(),
-            PublicationProbe::None
-        ));
+        assert!(client.poll(&journal, None).await.unwrap().is_none());
         assert_eq!(
             *api.refresh_tokens.lock().await,
             ["refresh-seed"],

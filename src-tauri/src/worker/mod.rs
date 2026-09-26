@@ -8,6 +8,28 @@
 //! them. `server`, built only with the `worker` cargo feature, is the
 //! runnable binary's HTTP API and automatic-sync poll loop.
 
+use serde::{Deserialize, Serialize};
+
+/// The SCM view shared by the desktop and the per-user tray.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ManagedServiceState {
+    NotInstalled,
+    Stopped,
+    StartPending,
+    Running,
+    StopPending,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ServiceControlAction {
+    Start,
+    Stop,
+    Restart,
+}
+
 pub(crate) mod api;
 /// Config-file contract — the worker runtime loads it, and the Windows
 /// desktop writes it when provisioning the managed service.

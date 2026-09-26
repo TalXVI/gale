@@ -15,22 +15,14 @@ use tokio::sync::Mutex;
 
 use crate::profile::{
     export::ModRevision,
-    server::{
-        settings::RestartPolicy,
-        state::{OperationKind, OperationRecord},
-    },
+    server::{settings::RestartPolicy, state::OperationRecord},
 };
-use crate::worker::api::BusyOperation;
 
 pub const JOURNAL_FILE: &str = "gale-worker-state.json";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct WorkerJournal {
-    /// The newest publication `updated_at` the worker has observed.
-    /// Observation only advances this marker; it never acknowledges
-    /// deployment, so a failed or skipped revision stays recoverable.
-    pub last_seen_revision: Option<DateTime<Utc>>,
     /// A publication whose mod payload is not yet confirmed deployed on
     /// the server. Retained across restarts and retried with backoff
     /// until it lands. Config state is never owed: the server is
@@ -62,9 +54,6 @@ pub struct WorkerJournal {
     pub last_error: Option<String>,
     /// The current publication-poll failure, cleared by the next successful poll.
     pub poll_error: Option<String>,
-    /// An operation that was in flight when the worker stopped. The remote
-    /// lease is the real lock; this marker is diagnostic only.
-    pub interrupted_operation: Option<BusyOperation>,
 }
 
 /// A publication whose mod payload still needs to reach the server.
@@ -84,9 +73,6 @@ pub struct PendingWork {
     /// Earliest time the next attempt may start (bounded backoff).
     #[serde(default)]
     pub next_attempt_at: Option<DateTime<Utc>>,
-    /// The last deployment failure, for status reporting.
-    #[serde(default)]
-    pub last_error: Option<String>,
 }
 
 impl PendingWork {
@@ -98,19 +84,26 @@ impl PendingWork {
             owed_mods,
             attempts: 0,
             next_attempt_at: None,
-            last_error: None,
         }
     }
 }
 
 impl WorkerJournal {
+    pub fn observed_revision(&self) -> Option<DateTime<Utc>> {
+        self.pending
+            .as_ref()
+            .map(|work| work.revision)
+            .into_iter()
+            .chain(self.last_deployed_revision)
+            .max()
+    }
+
     /// Records the latest publication. The worker only owes the mod
     /// payload: when the publication's mod revision already matches the
     /// remote's last-reported one the publication settles immediately,
     /// regardless of any config differences — the server is
     /// authoritative for its config files.
     pub fn observe_publication(&mut self, revision: DateTime<Utc>, mods_revision: &ModRevision) {
-        self.last_seen_revision = Some(revision);
         self.pending = (self.deployed_mods_revision.as_ref() != Some(mods_revision))
             .then(|| PendingWork::new(revision, mods_revision.clone()));
         if self.pending.is_none() {
@@ -251,7 +244,6 @@ impl Journal {
     pub async fn record_operation(&self, record: OperationRecord) -> Result<()> {
         let mut state = self.state.lock().await;
         state.last_operation = Some(record);
-        state.interrupted_operation = None;
         self.save(&state)
     }
 
@@ -263,21 +255,11 @@ impl Journal {
     }
 }
 
-/// The in-flight marker recorded before an operation starts. `kind` says
-/// whether the poll loop or an API request started it.
-pub fn busy_marker(id: String, kind: OperationKind) -> BusyOperation {
-    BusyOperation {
-        id,
-        kind,
-        started_at: Utc::now(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::profile::server::state::{
-        ExecutorKind, OperationStatus, OperationSummary, RestartOutcome,
+        ExecutorKind, OperationKind, OperationStatus, OperationSummary, RestartOutcome,
     };
 
     fn operation(id: &str) -> OperationRecord {
@@ -291,7 +273,6 @@ mod tests {
             status: OperationStatus::Succeeded,
             summary: OperationSummary::default(),
             restart: RestartOutcome::NotRequired,
-            external_restart_acknowledged: false,
             error: None,
             started_at: Utc::now(),
             finished_at: Utc::now(),
@@ -299,28 +280,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_operation_clears_the_interrupted_marker() {
+    async fn record_operation_persists_the_latest_record() {
         let dir = tempfile::tempdir().unwrap();
         let journal = Journal::load(dir.path()).unwrap();
-        {
-            let mut state = journal.state.lock().await;
-            state.interrupted_operation =
-                Some(busy_marker("op-1".to_owned(), OperationKind::Automatic));
-            journal.save(&state).unwrap();
-        }
-
         journal.record_operation(operation("op-1")).await.unwrap();
 
         let state = journal.state.lock().await;
-        assert!(state.interrupted_operation.is_none());
         assert_eq!(state.last_operation.as_ref().unwrap().id, "op-1");
         drop(state);
-
-        // The cleared marker survives reload, so a restarted worker
-        // doesn't report a phantom in-flight operation.
         let journal = Journal::load(dir.path()).unwrap();
         let state = journal.state.lock().await;
-        assert!(state.interrupted_operation.is_none());
+        assert_eq!(state.last_operation.as_ref().unwrap().id, "op-1");
     }
 
     #[tokio::test]
@@ -384,7 +354,7 @@ mod tests {
 
         assert!(state.pending.is_none());
         assert_eq!(state.last_deployed_revision, Some(revision));
-        assert_eq!(state.last_seen_revision, Some(revision));
+        assert_eq!(state.observed_revision(), Some(revision));
     }
 
     #[test]
@@ -506,13 +476,11 @@ mod tests {
         {
             let journal = Journal::load(dir.path()).unwrap();
             let mut state = journal.state.lock().await;
-            state.last_seen_revision = Some(revision);
             state.pending = Some(PendingWork {
                 revision,
                 owed_mods: mod_rev('a'),
                 attempts: 2,
                 next_attempt_at: Some(revision + chrono::Duration::minutes(5)),
-                last_error: Some("upload failed".to_owned()),
             });
             journal.save(&state).unwrap();
         }
@@ -523,8 +491,7 @@ mod tests {
         assert_eq!(pending.revision, revision);
         assert_eq!(pending.owed_mods, mod_rev('a'));
         assert_eq!(pending.attempts, 2);
-        assert_eq!(pending.last_error.as_deref(), Some("upload failed"));
-        assert_eq!(state.last_seen_revision, Some(revision));
+        assert_eq!(state.observed_revision(), Some(revision));
         assert_eq!(state.last_deployed_revision, None);
     }
 }

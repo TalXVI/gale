@@ -4,7 +4,6 @@ import type {
 	ProfileServerSettings,
 	RemoteServerSettings,
 	RemoteProtocol,
-	RestartPolicy,
 	SavedServerCredentials,
 	WorkerStatus
 } from '$lib/types';
@@ -70,13 +69,6 @@ export class ServerFormState {
 	/// with `hosted: true`.
 	syncChoice = $state<SyncChoice>('local');
 	localWorker = $state<LocalWorkerStatus | null>(null);
-	/// The automation state the worker last confirmed (for the managed
-	/// worker, what it reports live). A failed save snaps the controls
-	/// back to this instead of leaving intent that never took effect.
-	savedAutomation = $state<{
-		autoDeployMods: boolean;
-		restartPolicy: RestartPolicy;
-	}>({ autoDeployMods: false, restartPolicy: 'manual' });
 	gamePassword = $state('');
 	remotePassword = $state('');
 	workerToken = $state('');
@@ -199,10 +191,6 @@ export class ServerFormState {
 			this.form.remote.worker.autoDeployMods =
 				liveWorker?.autoDeployMods ?? this.form.remote.worker.autoDeployMods;
 			this.form.remote.restartPolicy = liveWorker?.restartPolicy ?? this.form.remote.restartPolicy;
-			this.savedAutomation = {
-				autoDeployMods: this.form.remote.worker.autoDeployMods,
-				restartPolicy: this.form.remote.restartPolicy
-			};
 			this.savedCredentials = credentials;
 			this.clearSecrets();
 			this.#savedJson = this.#liveJson;
@@ -408,10 +396,6 @@ export class ServerFormState {
 			// Automation may have changed — re-read the worker's own
 			// state so the pending banner reflects what it will actually do.
 			await this.refreshLocalWorker();
-			this.savedAutomation = {
-				autoDeployMods: this.form.remote.worker.autoDeployMods,
-				restartPolicy: this.form.remote.restartPolicy
-			};
 			this.form = current;
 			this.hasSavedSettings = true;
 			this.clearSecrets();
@@ -462,10 +446,11 @@ export class ServerFormState {
 	/// values it acknowledged.
 	reconcileAutomation() {
 		const liveWorker = this.syncChoice === 'hostedWorker' ? this.localWorker?.worker : null;
+		const saved = JSON.parse(this.#savedJson) as { form: ProfileServerSettings };
 		this.form.remote.worker.autoDeployMods =
-			liveWorker?.autoDeployMods ?? this.savedAutomation.autoDeployMods;
+			liveWorker?.autoDeployMods ?? saved.form.remote.worker.autoDeployMods;
 		this.form.remote.restartPolicy =
-			liveWorker?.restartPolicy ?? this.savedAutomation.restartPolicy;
+			liveWorker?.restartPolicy ?? saved.form.remote.restartPolicy;
 	}
 
 	/// Saves the current transport settings first — provisioning derives
@@ -495,16 +480,12 @@ export class ServerFormState {
 				this.remotePassword,
 				this.datHostPassword
 			);
-			if (this.localWorker.binding)
-				this.form.remote.worker.address = this.localWorker.binding.address;
+			if (this.localWorker.address)
+				this.form.remote.worker.address = this.localWorker.address;
 			this.syncChoice = 'hostedWorker';
 			// A reprovisioned worker keeps its journal — adopt whatever
 			// automation setting it actually runs.
 			this.reconcileAutomation();
-			this.savedAutomation = {
-				autoDeployMods: this.form.remote.worker.autoDeployMods,
-				restartPolicy: this.form.remote.restartPolicy
-			};
 			// Provisioning persisted the remote settings itself (hosted
 			// worker mode plus the loopback address), so the saved baseline
 			// moves to what the page now shows.

@@ -357,8 +357,6 @@ export type DeploySelection = {
 };
 
 export type UploadKind = 'payload' | 'config';
-export type RemoteLayout = 'standard' | 'mirrorRoot';
-
 export type PlanUpload = {
 	path: string;
 	size: number;
@@ -369,29 +367,18 @@ export type ConfigAction =
 	| { action: 'markApplied' }
 	| { action: 'write' }
 	| { action: 'decline' }
-	| { action: 'keep' }
 	| { action: 'pending'; reason: PendingSyncConfigReason }
 	| { action: 'unapplied' };
 
 export type PlanConfigEntry = {
 	path: string;
 	policy: SyncConfigUpdatePolicy;
-	selected: boolean;
 } & ConfigAction;
-
-export type PlanConflict = {
-	path: string;
-	reason: PendingSyncConfigReason;
-};
 
 export type DeploymentPlan = {
 	hash: string;
 	publicationRevision: string;
 	modsRevision: string;
-	deployedModsRevision: string | null;
-	stateSeq: number;
-	layout: RemoteLayout;
-	hostManaged: boolean;
 	modsPhase: boolean;
 	configsPhase: boolean;
 	uploads: PlanUpload[];
@@ -400,11 +387,9 @@ export type DeploymentPlan = {
 	directoryRemovals: string[];
 	unchangedFiles: number;
 	configEntries: PlanConfigEntry[];
-	conflicts: PlanConflict[];
 	/// Remote payload files Gale has never owned. Shown for review,
 	/// never deleted by the deployment.
 	unmanaged: string[];
-	requiresRestart: boolean;
 };
 
 export type ExecutorKind = 'local' | 'worker';
@@ -436,7 +421,6 @@ export type OperationRecord = {
 	status: OperationStatus;
 	summary: OperationSummary;
 	restart: RestartOutcome;
-	externalRestartAcknowledged?: boolean;
 	error: string | null;
 	startedAt: string;
 	finishedAt: string;
@@ -483,12 +467,6 @@ export type ServerSyncResult = {
 	state: ServerDeploymentState;
 };
 
-export type BusyOperation = {
-	id: string;
-	kind: OperationKind;
-	startedAt: string;
-};
-
 export type ServerStateSummary = {
 	modsRevision: string | null;
 	restartRequired: boolean;
@@ -513,7 +491,7 @@ export type WorkerStatus = {
 	/// The newest publication revision whose mod payload is confirmed
 	/// deployed on the server.
 	lastDeployedRevision: string | null;
-	busy: BusyOperation | null;
+	busy: boolean;
 	lastOperation: OperationRecord | null;
 	/// The last deployment failure from this worker.
 	lastError: string | null;
@@ -540,14 +518,6 @@ export type LocalWorkerServiceState =
 	| 'running'
 	| 'stopPending'
 	| 'other';
-
-export type LocalWorkerBinding = {
-	workerId: string;
-	/// The sync-profile id the installed worker serves.
-	profileId: string;
-	listen: string;
-	address: string;
-};
 
 /// Why the worker process last stopped, from its status file. A `running`
 /// report on a stopped service means the process died unexpectedly.
@@ -582,7 +552,7 @@ export type LocalWorkerStatus = {
 	/// False off Windows — provisioning is unavailable there.
 	supported: boolean;
 	service: LocalWorkerServiceState;
-	binding: LocalWorkerBinding | null;
+	address: string | null;
 	/// Whether the installed worker belongs to this profile.
 	ownership: LocalWorkerOwnership;
 	run: LocalWorkerRunReport | null;
@@ -591,7 +561,6 @@ export type LocalWorkerStatus = {
 	workerError: string | null;
 	/// The last run report says the machine shut down — the service
 	/// comes back with the next boot.
-	stoppedForShutdown: boolean;
 	/// A newer worker binary shipped with the app than the service runs.
 	updateAvailable: boolean;
 	warnings: string[];

@@ -31,7 +31,7 @@ use windows::core::{HSTRING, PCWSTR};
 use winreg::RegKey;
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
 
-use super::local::{self, ManagedServiceState, ServiceControlAction};
+use super::{ManagedServiceState, ServiceControlAction, local};
 
 const TOOLTIP: &str = "Gale Worker";
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -40,44 +40,6 @@ const INSTANCE_MUTEX: &str = r"Local\GaleWorkerTray";
 const SHUTDOWN_EVENT: &str = r"Local\GaleWorkerTrayShutdown";
 const SERVICE_POLL: Duration = Duration::from_millis(500);
 const UPDATE_POLL: Duration = Duration::from_secs(5 * 60);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ServiceObservation {
-    NotInstalled,
-    Stopped,
-    StartPending,
-    Running,
-    StopPending,
-    Other,
-}
-
-impl From<ManagedServiceState> for ServiceObservation {
-    fn from(value: ManagedServiceState) -> Self {
-        match value {
-            ManagedServiceState::NotInstalled => Self::NotInstalled,
-            ManagedServiceState::Stopped => Self::Stopped,
-            ManagedServiceState::StartPending => Self::StartPending,
-            ManagedServiceState::Running => Self::Running,
-            ManagedServiceState::StopPending => Self::StopPending,
-            ManagedServiceState::Other => Self::Other,
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct TrayState {
-    observation: Option<ServiceObservation>,
-}
-
-impl TrayState {
-    pub fn observe(&mut self, observation: ServiceObservation) {
-        self.observation = Some(observation);
-    }
-
-    pub fn icon_visible(&self) -> bool {
-        self.observation == Some(ServiceObservation::Running)
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct UpdatePlan {
@@ -435,7 +397,6 @@ fn run(worker_candidate: PathBuf) -> Result<()> {
     let icon = gale_icon()?;
     let mut tray: Option<TrayIcon> = None;
     let mut menu: Option<MenuBindings> = None;
-    let mut state = TrayState::default();
     let busy = Arc::new(AtomicBool::new(false));
     let action_result: Arc<Mutex<Option<std::result::Result<(), String>>>> =
         Arc::new(Mutex::new(None));
@@ -461,11 +422,9 @@ fn run(worker_candidate: PathBuf) -> Result<()> {
         }
 
         if last_service_poll.elapsed() >= SERVICE_POLL {
-            let observation = local::service_state()
-                .map(ServiceObservation::from)
-                .unwrap_or(ServiceObservation::Other);
-            state.observe(observation);
-            if state.icon_visible() && tray.is_none() {
+            let running =
+                local::service_state().is_ok_and(|state| state == ManagedServiceState::Running);
+            if running && tray.is_none() {
                 let bindings = MenuBindings::new(update_available)?;
                 tray = Some(
                     TrayIconBuilder::new()
@@ -476,7 +435,7 @@ fn run(worker_candidate: PathBuf) -> Result<()> {
                         .build()?,
                 );
                 menu = Some(bindings);
-            } else if !state.icon_visible() {
+            } else if !running {
                 tray = None;
                 menu = None;
             }
