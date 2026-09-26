@@ -186,17 +186,11 @@
 	{/if}
 	{#if form.syncChoice !== 'local'}
 		<div class="flex items-center">
-			<Label inline for={`${formId}-auto-sync`}>{m.dedicatedServerDialog_workerAutoSync()}</Label
-			><Info>{m.dedicatedServerDialog_workerAutoSyncInfo()}</Info><Checkbox
-				id={`${formId}-auto-sync`}
-				bind:checked={form.form.remote.worker.autoSync}
-			/>
-		</div>
-		<div class="flex items-center">
-			<Label inline for={`${formId}-auto-mods`}>{m.dedicatedServerDialog_workerAutoMods()}</Label
-			><Info>{m.dedicatedServerDialog_workerAutoModsInfo()}</Info><Checkbox
-				id={`${formId}-auto-mods`}
-				bind:checked={form.form.remote.worker.autoMods}
+			<Label inline for={`${formId}-auto-deploy-mods`}
+				>{m.dedicatedServerDialog_workerAutoDeployMods()}</Label
+			><Info>{m.dedicatedServerDialog_workerAutoDeployModsInfo()}</Info><Checkbox
+				id={`${formId}-auto-deploy-mods`}
+				bind:checked={form.form.remote.worker.autoDeployMods}
 			/>
 		</div>
 		<div>

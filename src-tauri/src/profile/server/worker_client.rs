@@ -172,20 +172,18 @@ impl WorkerClient {
         .await
     }
 
-    /// Updates the worker's automation toggles. Manual Deploy Now requests
-    /// are unaffected by `auto_sync`.
+    /// Updates automatic mod deployment and restart policy. Manual Deploy
+    /// Now requests are unaffected.
     pub async fn configure(
         &self,
-        auto_sync: bool,
-        auto_mods: bool,
+        auto_deploy_mods: bool,
         restart_policy: RestartPolicy,
     ) -> Result<()> {
         self.send(
             self.http
                 .post(format!("{}{}/config", self.base, api::API_BASE))
                 .json(&ConfigureRequest {
-                    auto_sync,
-                    auto_mods,
+                    auto_deploy_mods,
                     restart_policy,
                 }),
         )

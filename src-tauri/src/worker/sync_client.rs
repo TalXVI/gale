@@ -336,6 +336,12 @@ pub(crate) mod tests {
         api: MockApi,
     }
 
+    impl MockServer {
+        pub(crate) fn metadata_requests(&self) -> usize {
+            self.api.meta_hits.load(Ordering::Relaxed)
+        }
+    }
+
     impl Drop for MockServer {
         fn drop(&mut self) {
             self.task.abort();

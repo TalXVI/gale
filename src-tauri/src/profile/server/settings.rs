@@ -73,6 +73,39 @@ pub enum HostProvider {
     DatHost,
 }
 
+/// The worker observes publications regardless of this setting. Legacy
+/// automation required both flags to deploy mods, so migration preserves
+/// that effective behavior instead of enabling a previously disabled worker.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerAutomation {
+    pub auto_deploy_mods: bool,
+}
+
+impl<'de> Deserialize<'de> for WorkerAutomation {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Stored {
+            auto_deploy_mods: Option<bool>,
+            #[serde(default)]
+            auto_sync: bool,
+            #[serde(default)]
+            auto_mods: bool,
+        }
+
+        let stored = Stored::deserialize(deserializer)?;
+        Ok(Self {
+            auto_deploy_mods: stored
+                .auto_deploy_mods
+                .unwrap_or(stored.auto_sync && stored.auto_mods),
+        })
+    }
+}
+
 /// Connection details for the worker that executes deployments remotely.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -84,14 +117,9 @@ pub struct WorkerSettings {
     /// than an independently hosted worker. Provisioning sets it;
     /// uninstall clears it.
     pub hosted: bool,
-    /// Whether the worker may synchronize new publications on its own.
-    /// Manual Deploy Now requests work regardless of this toggle.
-    pub auto_sync: bool,
-    /// When `auto_sync` is on, whether published mod revisions may deploy
-    /// automatically or always wait for a manual request. Config files
-    /// are never deployed automatically — the server owns them after
-    /// setup, so this flag only gates the mod payload.
-    pub auto_mods: bool,
+    /// Whether owed mod payloads may deploy without a manual request.
+    #[serde(flatten)]
+    pub automation: WorkerAutomation,
 }
 
 /// Hosting-provider configuration used for restart/presence operations.
@@ -350,8 +378,7 @@ mod tests {
 
         let mut saved_first = transport.clone();
         assert!(saved_first.validate().is_ok());
-        saved_first.worker.auto_sync = true;
-        saved_first.worker.auto_mods = true;
+        saved_first.worker.automation.auto_deploy_mods = true;
         assert!(saved_first.validate().is_ok());
 
         // An already-configured external worker is untouched.
@@ -493,6 +520,34 @@ mod tests {
         assert_eq!(settings.location, ServerLocation::Remote);
         assert_eq!(settings.local.port, 0);
         assert_eq!(settings.remote.protocol, RemoteProtocol::Sftp);
+    }
+
+    #[test]
+    fn legacy_profile_automation_migrates_without_enabling_one_flag_states() {
+        for (auto_sync, auto_mods) in [(true, true), (true, false), (false, true), (false, false)] {
+            let old = serde_json::json!({
+                "address": "https://worker.example.test",
+                "autoSync": auto_sync,
+                "autoMods": auto_mods,
+            });
+            let settings: WorkerSettings = serde_json::from_value(old).unwrap();
+            assert_eq!(settings.automation.auto_deploy_mods, auto_sync && auto_mods);
+            let saved = serde_json::to_value(settings).unwrap();
+            assert_eq!(saved["autoDeployMods"], auto_sync && auto_mods);
+            assert!(saved.get("autoSync").is_none());
+            assert!(saved.get("autoMods").is_none());
+        }
+    }
+
+    #[test]
+    fn canonical_profile_automation_wins_over_stale_legacy_fields() {
+        let settings: WorkerSettings = serde_json::from_value(serde_json::json!({
+            "autoDeployMods": false,
+            "autoSync": true,
+            "autoMods": true,
+        }))
+        .unwrap();
+        assert!(!settings.automation.auto_deploy_mods);
     }
 
     #[test]

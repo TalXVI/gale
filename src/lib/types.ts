@@ -291,8 +291,7 @@ export type WorkerSettings = {
 	/// True when `address` points at the Gale-managed Windows service on
 	/// this machine rather than an independently hosted worker.
 	hosted: boolean;
-	autoSync: boolean;
-	autoMods: boolean;
+	autoDeployMods: boolean;
 };
 
 export type HostSettings = {
@@ -500,8 +499,7 @@ export type ServerStateSummary = {
 export type WorkerStatus = {
 	workerId: string;
 	profileId: string;
-	autoSync: boolean;
-	autoMods: boolean;
+	autoDeployMods: boolean;
 	restartPolicy: RestartPolicy;
 	/// The newest publication revision the worker has observed.
 	/// Observation alone is not deployment.
@@ -581,9 +579,9 @@ export type LocalWorkerOwnership =
 	| 'foreign';
 
 /// What the worker will do with its pending publication, derived from
-/// its own reported automation flags — not the unsaved local checkboxes.
+/// its own reported automation setting — not the unsaved local checkbox.
 /// Pending work is always the mod payload; configs are never owed.
-export type PendingPublicationMode = 'automatic' | 'modsManual' | 'manual';
+export type PendingPublicationMode = 'automatic' | 'manual';
 
 export type PendingPublication = {
 	mode: PendingPublicationMode;

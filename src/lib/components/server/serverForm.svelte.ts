@@ -44,7 +44,7 @@ export function defaultSettings(): ProfileServerSettings {
 			trustedHostKey: null,
 			trustedCertificate: null,
 			syncMode: 'local',
-			worker: { address: '', hosted: false, autoSync: false, autoMods: false },
+			worker: { address: '', hosted: false, autoDeployMods: false },
 			hostControl: { provider: 'none', datHostServerId: '', datHostUsername: '' },
 			restartPolicy: 'manual'
 		}
@@ -74,10 +74,9 @@ export class ServerFormState {
 	/// worker, what it reports live). A failed save snaps the controls
 	/// back to this instead of leaving intent that never took effect.
 	savedAutomation = $state<{
-		autoSync: boolean;
-		autoMods: boolean;
+		autoDeployMods: boolean;
 		restartPolicy: RestartPolicy;
-	}>({ autoSync: false, autoMods: false, restartPolicy: 'manual' });
+	}>({ autoDeployMods: false, restartPolicy: 'manual' });
 	gamePassword = $state('');
 	remotePassword = $state('');
 	workerToken = $state('');
@@ -187,12 +186,11 @@ export class ServerFormState {
 			// for the managed worker its live report wins over the stored
 			// copy, which only seeds new installs.
 			const liveWorker = this.syncChoice === 'hostedWorker' ? this.localWorker?.worker : null;
-			this.form.remote.worker.autoSync = liveWorker?.autoSync ?? this.form.remote.worker.autoSync;
-			this.form.remote.worker.autoMods = liveWorker?.autoMods ?? this.form.remote.worker.autoMods;
+			this.form.remote.worker.autoDeployMods =
+				liveWorker?.autoDeployMods ?? this.form.remote.worker.autoDeployMods;
 			this.form.remote.restartPolicy = liveWorker?.restartPolicy ?? this.form.remote.restartPolicy;
 			this.savedAutomation = {
-				autoSync: this.form.remote.worker.autoSync,
-				autoMods: this.form.remote.worker.autoMods,
+				autoDeployMods: this.form.remote.worker.autoDeployMods,
 				restartPolicy: this.form.remote.restartPolicy
 			};
 			await this.refreshSavedCredentials();
@@ -375,7 +373,7 @@ export class ServerFormState {
 			await message(
 				m.dedicatedServerDialog_workerConnected({
 					workerId: status.workerId,
-					autoSync: status.autoSync
+					autoDeployMods: status.autoDeployMods
 						? m.dedicatedServerDialog_workerAutoOn()
 						: m.dedicatedServerDialog_workerAutoOff()
 				}),
@@ -397,12 +395,11 @@ export class ServerFormState {
 				workerToken: { value: this.workerToken, remember: this.rememberWorkerToken },
 				datHostPassword: { value: this.datHostPassword, remember: this.rememberDatHostPassword }
 			});
-			// Automation toggles may have changed — re-read the worker's own
+			// Automation may have changed — re-read the worker's own
 			// state so the pending banner reflects what it will actually do.
 			await this.refreshLocalWorker();
 			this.savedAutomation = {
-				autoSync: this.form.remote.worker.autoSync,
-				autoMods: this.form.remote.worker.autoMods,
+				autoDeployMods: this.form.remote.worker.autoDeployMods,
 				restartPolicy: this.form.remote.restartPolicy
 			};
 			this.form = current;
@@ -455,8 +452,8 @@ export class ServerFormState {
 	/// values it acknowledged.
 	reconcileAutomation() {
 		const liveWorker = this.syncChoice === 'hostedWorker' ? this.localWorker?.worker : null;
-		this.form.remote.worker.autoSync = liveWorker?.autoSync ?? this.savedAutomation.autoSync;
-		this.form.remote.worker.autoMods = liveWorker?.autoMods ?? this.savedAutomation.autoMods;
+		this.form.remote.worker.autoDeployMods =
+			liveWorker?.autoDeployMods ?? this.savedAutomation.autoDeployMods;
 		this.form.remote.restartPolicy =
 			liveWorker?.restartPolicy ?? this.savedAutomation.restartPolicy;
 	}
@@ -492,11 +489,10 @@ export class ServerFormState {
 				this.form.remote.worker.address = this.localWorker.binding.address;
 			this.syncChoice = 'hostedWorker';
 			// A reprovisioned worker keeps its journal — adopt whatever
-			// automation flags it actually runs.
+			// automation setting it actually runs.
 			this.reconcileAutomation();
 			this.savedAutomation = {
-				autoSync: this.form.remote.worker.autoSync,
-				autoMods: this.form.remote.worker.autoMods,
+				autoDeployMods: this.form.remote.worker.autoDeployMods,
 				restartPolicy: this.form.remote.restartPolicy
 			};
 			// Provisioning persisted the remote settings itself (hosted
@@ -565,8 +561,6 @@ export class ServerFormState {
 				return pending.retrying
 					? m.dedicatedServerDialog_localWorkerPendingRetry()
 					: m.dedicatedServerDialog_localWorkerPending();
-			case 'modsManual':
-				return m.dedicatedServerDialog_localWorkerPendingModsManual();
 			case 'manual':
 				return m.dedicatedServerDialog_localWorkerPendingManual();
 		}

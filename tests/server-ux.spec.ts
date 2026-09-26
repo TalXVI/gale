@@ -13,6 +13,39 @@ const statusCallCount = (page: Page) =>
 		() => (window as any).calls.filter((call: any) => call.cmd === 'get_server_sync_status').length
 	);
 
+test('Worker settings expose one mod automation toggle with accurate help', async ({ page }) => {
+	await page.goto('/tests/dialog/?mode=worker');
+	const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
+	const automation = remoteTab.getByRole('checkbox', {
+		name: 'Automatically deploy mod updates'
+	});
+	await expect(automation).toHaveCount(1);
+	await expect(automation).not.toBeChecked();
+	await expect(remoteTab.getByText('Auto-sync publications')).toHaveCount(0);
+	await expect(remoteTab.getByText('Auto-deploy mod updates')).toHaveCount(0);
+
+	await remoteTab
+		.getByText('Automatically deploy mod updates', { exact: true })
+		.locator('..')
+		.getByRole('button', { name: 'More information' })
+		.hover();
+	await expect(
+		page.getByText(
+			'Automatically deploy newly published mod revisions to the server while Gale is closed.',
+			{ exact: true }
+		)
+	).toBeVisible();
+	await expect(remoteTab.getByText(/automatic sync only applies config files/i)).toHaveCount(0);
+	await expect(remoteTab.getByText(/while this device is offline/i)).toHaveCount(0);
+
+	await automation.check();
+	await page.getByRole('button', { name: 'Save settings' }).click();
+	const worker = (await lastSave(page)).settings.remote.worker;
+	expect(worker.autoDeployMods).toBe(true);
+	expect(worker).not.toHaveProperty('autoSync');
+	expect(worker).not.toHaveProperty('autoMods');
+});
+
 test('local settings save includes the password and its remember choice', async ({ page }) => {
 	await page.goto('/tests/dialog/?local=1');
 

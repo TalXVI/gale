@@ -79,7 +79,7 @@ Gale on your PC connects directly to the server and deploys. Nothing else needs 
 
 `gale-worker` is a standalone binary that polls the sync service, deploys approved changes on its own, and can restart the server through the hosting provider's API. It can run on this PC as a managed Windows service, or on a separate always-on machine (a VPS, home server, or NAS) that can reach the game server over FTP/SFTP and the provider's control API.
 
-When to use it: automatic sync, or a host that is only reachable from a fixed location. Some game-panel providers do not allow running arbitrary persistent processes; file-management and restart APIs alone do not let a host run the worker.
+When to use it: automatic mod deployment, or a host that is only reachable from a fixed location. Some game-panel providers do not allow running arbitrary persistent processes; file-management and restart APIs alone do not let a host run the worker.
 
 #### Hosting the worker on this PC (Windows)
 
@@ -133,8 +133,7 @@ Notes and limitations:
    	"game": "valheim",
    	"remote": { "protocol": "sftp", "host": "...", "username": "..." },
    	"hostControl": { "provider": "datHost", "datHostServerId": "...", "datHostUsername": "..." },
-   	"autoSync": true,
-   	"autoMods": true,
+     "autoDeployMods": true,
    	"restartPolicy": "whenEmpty",
    	"pollIntervalSecs": 300,
    	"stateDir": "/var/lib/gale-worker"
@@ -176,9 +175,11 @@ In the remote settings, choose **Worker on another machine** as the sync mode an
 - Gale accepts `http://` **only** for a worker on the same machine (loopback). The bearer token travels in the clear over plaintext HTTP, so remote workers need `https://`. Terminate TLS with a reverse proxy (Caddy, nginx, Traefik) or reach the worker through a secure tunnel (WireGuard, Tailscale, SSH port-forward). Never expose the plaintext API to a LAN and assume it is safe.
 - **Test connection** verifies reachability, the token, and that the worker's bound profile matches this profile.
 
-Manual **Deploy** through the worker works regardless of the `autoSync` toggle. You can change the automation toggles (`autoSync`, `autoMods`) and the restart policy in the **Deployment** section of the Server page — Gale pushes the values to the running worker, reads them back, and they persist across worker restarts.
+Manual **Deploy** through the worker works regardless of `autoDeployMods`. You can change automatic mod deployment and the independent restart policy in the **Deployment** section of the Server page. Gale pushes the values to the running worker, reads them back, and they persist across worker restarts.
 
-The worker tracks only the publication's mod payload. A publication is pending when its mod revision differs from the revision recorded on the server, and settled once that mod revision is confirmed deployed — published config changes never create pending work, so a publication that changes only configs is observed and acknowledged without any deployment. With `autoSync` on but `autoMods` off, the worker observes each publication and keeps the owed mod payload pending until a manual deploy runs it or `autoMods` is enabled. Config files are never evaluated or written automatically; **Push configs** on the Server page is the only path that writes them, and it runs through the worker the same way a mod deploy does.
+The worker tracks only the publication's mod payload. A publication is pending when its mod revision differs from the revision recorded on the server, and settled once that mod revision is confirmed deployed. Published config changes never create pending work, so a publication that changes only configs is observed and acknowledged without any deployment. The worker polls for publications with automatic deployment on or off. When `autoDeployMods` is off, it keeps owed mod work pending until a manual deploy runs it or automatic deployment is enabled. Config files are never evaluated or written automatically; **Push configs** on the Server page is the only path that writes them, and it runs through the worker the same way a mod deploy does.
+
+Existing worker configs, journals, and profile settings migrate to `autoDeployMods: true` only when both old `autoSync` and `autoMods` were true. All other old combinations remain disabled. Newly written state contains only `autoDeployMods`.
 
 Workers upgraded from builds that tracked config synchronization drop the old `configsPending`, `evaluatedConfigRevision`, and `lastConfigSyncAt` journal fields on load and never write them again. A pending publication that only owed config evaluation is discarded rather than deployed.
 

@@ -166,8 +166,7 @@ pub struct SetConfigPolicyRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigureWorkerRequest {
-    pub auto_sync: bool,
-    pub auto_mods: bool,
+    pub auto_deploy_mods: bool,
     pub restart_policy: RestartPolicy,
     #[serde(default)]
     pub worker_token: String,
@@ -275,7 +274,7 @@ pub async fn set_dedicated_server_settings(
     if settings.remote.sync_mode == SyncMode::Worker
         && worker_config_differs(stored.as_ref(), &settings)
     {
-        // The running worker is authoritative for automation flags — the
+        // The running worker is authoritative for automation — the
         // stored copy only seeds new workers. Push the requested
         // configuration first and persist the values the worker
         // confirmed: a worker that cannot be reached must not look
@@ -287,8 +286,7 @@ pub async fn set_dedicated_server_settings(
             &request.worker_token,
         )
         .await?;
-        settings.remote.worker.auto_sync = confirmed.auto_sync;
-        settings.remote.worker.auto_mods = confirmed.auto_mods;
+        settings.remote.worker.automation.auto_deploy_mods = confirmed.auto_deploy_mods;
         settings.remote.restart_policy = confirmed.restart_policy;
     }
 
@@ -368,8 +366,8 @@ fn worker_config_differs(
     };
     stored.remote.sync_mode != SyncMode::Worker
         || stored.remote.worker.address.trim() != new.remote.worker.address.trim()
-        || stored.remote.worker.auto_sync != new.remote.worker.auto_sync
-        || stored.remote.worker.auto_mods != new.remote.worker.auto_mods
+        || stored.remote.worker.automation.auto_deploy_mods
+            != new.remote.worker.automation.auto_deploy_mods
         || stored.remote.restart_policy != new.remote.restart_policy
 }
 
@@ -407,8 +405,7 @@ async fn configure_running_worker(
     }
     client
         .configure(
-            remote.worker.auto_sync,
-            remote.worker.auto_mods,
+            remote.worker.automation.auto_deploy_mods,
             remote.restart_policy,
         )
         .await
@@ -936,14 +933,13 @@ pub async fn configure_worker(
     let target = sync_target(&app)?;
     if target.settings.sync_mode != SyncMode::Worker {
         return Err(
-            eyre::eyre!("automatic synchronization is only available in Worker mode").into(),
+            eyre::eyre!("automatic mod deployment is only available in Worker mode").into(),
         );
     }
 
     let secrets = ServerSecrets::for_profile(target.profile_id)?;
     let mut remote = target.settings.clone();
-    remote.worker.auto_sync = request.auto_sync;
-    remote.worker.auto_mods = request.auto_mods;
+    remote.worker.automation.auto_deploy_mods = request.auto_deploy_mods;
     remote.restart_policy = request.restart_policy;
     let confirmed = configure_running_worker(
         &secrets,
@@ -958,8 +954,7 @@ pub async fn configure_worker(
     let mut manager = app.lock_manager();
     let (_, profile) = manager.profile_by_id_mut(target.profile_id)?;
     let mut settings = profile.server_settings.clone().unwrap_or_default();
-    settings.remote.worker.auto_sync = confirmed.auto_sync;
-    settings.remote.worker.auto_mods = confirmed.auto_mods;
+    settings.remote.worker.automation.auto_deploy_mods = confirmed.auto_deploy_mods;
     settings.remote.restart_policy = confirmed.restart_policy;
     profile.server_settings = Some(settings);
     profile.save(&app, true)?;
@@ -1399,13 +1394,9 @@ mod tests {
         // plain save never depends on the worker being reachable.
         assert!(!worker_config_differs(Some(&stored), &stored.clone()));
 
-        // Toggling either automation flag differs.
+        // Toggling automation differs.
         let mut new = stored.clone();
-        new.remote.worker.auto_sync = true;
-        assert!(worker_config_differs(Some(&stored), &new));
-
-        let mut new = stored.clone();
-        new.remote.worker.auto_mods = true;
+        new.remote.worker.automation.auto_deploy_mods = true;
         assert!(worker_config_differs(Some(&stored), &new));
 
         // The restart policy is worker-run configuration too.

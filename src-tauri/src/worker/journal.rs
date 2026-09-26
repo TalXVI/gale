@@ -16,7 +16,7 @@ use tokio::sync::Mutex;
 use crate::profile::{
     export::ModRevision,
     server::{
-        settings::RestartPolicy,
+        settings::{RestartPolicy, WorkerAutomation},
         state::{OperationKind, OperationRecord},
     },
 };
@@ -51,10 +51,10 @@ pub struct WorkerJournal {
     /// The current sync refresh token (rotated on each token grant).
     /// Seeded from `GALE_WORKER_REFRESH_TOKEN` on first run.
     pub refresh_token: Option<String>,
-    pub auto_sync: bool,
-    pub auto_mods: bool,
+    #[serde(flatten)]
+    pub automation: WorkerAutomation,
     pub restart_policy: RestartPolicy,
-    /// Whether the automation flags above were seeded from the config file.
+    /// Whether automation and restart policy were seeded from the config file.
     /// The config seeds once; afterwards `/v1/config` and this journal are
     /// the source of truth so runtime changes survive restarts.
     pub automation_seeded: bool,
@@ -77,8 +77,7 @@ impl Default for WorkerJournal {
             last_deployed_revision: None,
             deployed_mods_revision: None,
             refresh_token: None,
-            auto_sync: false,
-            auto_mods: false,
+            automation: WorkerAutomation::default(),
             restart_policy: RestartPolicy::default(),
             automation_seeded: false,
             last_operation: None,
@@ -402,6 +401,32 @@ mod tests {
         let journal = Journal::load(dir.path()).unwrap();
         let state = journal.state.lock().await;
         assert!(state.interrupted_operation.is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_journal_automation_migrates_and_saves_canonically() {
+        for (auto_sync, auto_mods) in [(true, true), (true, false), (false, true), (false, false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let old = serde_json::json!({
+                "autoSync": auto_sync,
+                "autoMods": auto_mods,
+                "restartPolicy": "whenEmpty",
+                "automationSeeded": true,
+            });
+            let path = dir.path().join(JOURNAL_FILE);
+            std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+            let journal = Journal::load(dir.path()).unwrap();
+            let state = journal.state.lock().await;
+            assert_eq!(state.automation.auto_deploy_mods, auto_sync && auto_mods);
+            assert!(state.automation_seeded);
+            assert_eq!(state.restart_policy, RestartPolicy::WhenEmpty);
+            journal.save(&state).unwrap();
+            let saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            assert_eq!(saved["autoDeployMods"], auto_sync && auto_mods);
+            assert!(saved.get("autoSync").is_none());
+            assert!(saved.get("autoMods").is_none());
+        }
     }
 
     #[tokio::test]

@@ -120,12 +120,9 @@ fn ownership_of(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PendingPublicationMode {
-    /// `autoSync` plus `autoMods` — the owed mod payload deploys on its own.
+    /// The owed mod payload deploys on its own.
     Automatic,
-    /// `autoSync` without `autoMods` — nothing runs automatically until
-    /// a manual deployment or the setting changes.
-    ModsManual,
-    /// `autoSync` off — the pending revision is retained but nothing
+    /// Automation off — the pending revision is retained but nothing
     /// deploys until a manual request or the setting is re-enabled.
     Manual,
 }
@@ -147,18 +144,16 @@ pub struct PendingPublication {
 /// promise a deployment the worker cannot perform.
 ///
 /// A pending revision is always owed mod payload — the worker never
-/// owes config work — so the banner only needs the automation flags to
+/// owes config work — so the banner only needs the automation setting to
 /// say whether it will deploy on its own.
 fn pending_publication(worker: Option<&StatusResponse>) -> Option<PendingPublication> {
     let worker = worker?;
     worker.pending_revision?;
 
-    let mode = if !worker.auto_sync {
-        PendingPublicationMode::Manual
-    } else if worker.auto_mods {
+    let mode = if worker.auto_deploy_mods {
         PendingPublicationMode::Automatic
     } else {
-        PendingPublicationMode::ModsManual
+        PendingPublicationMode::Manual
     };
     Some(PendingPublication {
         mode,
@@ -450,8 +445,7 @@ async fn provision_windows(
         sync_url: None,
         remote: worker_remote,
         host_control: target.settings.host_control.clone(),
-        auto_sync: target.settings.worker.auto_sync,
-        auto_mods: target.settings.worker.auto_mods,
+        automation: target.settings.worker.automation,
         restart_policy: target.settings.restart_policy,
         poll_interval_secs: 300,
         state_dir: private.clone(),
@@ -515,8 +509,7 @@ async fn provision_windows(
     remote.worker = WorkerSettings {
         address: format!("http://{listen}"),
         hosted: true,
-        auto_sync: remote.worker.auto_sync,
-        auto_mods: remote.worker.auto_mods,
+        automation: remote.worker.automation,
     };
     // Persisting the desktop half of the binding can still fail, leaving
     // a running worker whose profile can't reach it — status reports it
@@ -531,9 +524,9 @@ async fn provision_windows(
 
     let mut worker_status = status(app).await?;
     // A reprovisioned worker keeps its journal — the config written above
-    // only seeds a first run — so the journal's automation flags are
-    // authoritative even when they differ from what was just installed.
-    // Mirror the worker's actual flags into the profile's settings so the
+    // only seeds a first run — so the journal's automation setting is
+    // authoritative even when it differs from what was just installed.
+    // Mirror the worker's actual setting into the profile's settings so the
     // dialogs and future provisioning see the same truth.
     if let Some(live) = worker_status.worker.as_ref() {
         let mut remote = {
@@ -542,12 +535,10 @@ async fn provision_windows(
             profile.server_settings.clone().unwrap_or_default().remote
         };
         if remote.sync_mode == SyncMode::Worker
-            && (remote.worker.auto_sync != live.auto_sync
-                || remote.worker.auto_mods != live.auto_mods
+            && (remote.worker.automation.auto_deploy_mods != live.auto_deploy_mods
                 || remote.restart_policy != live.restart_policy)
         {
-            remote.worker.auto_sync = live.auto_sync;
-            remote.worker.auto_mods = live.auto_mods;
+            remote.worker.automation.auto_deploy_mods = live.auto_deploy_mods;
             remote.restart_policy = live.restart_policy;
             save_remote_settings_for(app, target.profile_id, remote)
                 .context("failed to mirror the worker's automation settings")?;
@@ -1176,8 +1167,7 @@ mod pending_tests {
         let mut worker = StatusResponse {
             worker_id: "w".to_owned(),
             profile_id: "p".to_owned(),
-            auto_sync: false,
-            auto_mods: false,
+            auto_deploy_mods: false,
             restart_policy: RestartPolicy::Manual,
             observed_revision: Some(now),
             pending_revision: None,
@@ -1191,15 +1181,13 @@ mod pending_tests {
         };
         assert_eq!(pending_publication(Some(&worker)), None);
 
-        for (auto_sync, auto_mods, retry, mode, retrying) in [
-            (false, false, true, PendingPublicationMode::Manual, false),
-            (false, true, false, PendingPublicationMode::Manual, false),
-            (true, false, true, PendingPublicationMode::ModsManual, false),
-            (true, true, false, PendingPublicationMode::Automatic, false),
-            (true, true, true, PendingPublicationMode::Automatic, true),
+        for (auto_deploy_mods, retry, mode, retrying) in [
+            (false, true, PendingPublicationMode::Manual, false),
+            (false, false, PendingPublicationMode::Manual, false),
+            (true, false, PendingPublicationMode::Automatic, false),
+            (true, true, PendingPublicationMode::Automatic, true),
         ] {
-            worker.auto_sync = auto_sync;
-            worker.auto_mods = auto_mods;
+            worker.auto_deploy_mods = auto_deploy_mods;
             worker.pending_revision = Some(now);
             worker.next_attempt_at = retry.then_some(now + Duration::minutes(5));
             assert_eq!(

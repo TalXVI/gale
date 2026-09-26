@@ -162,13 +162,12 @@ export const acknowledgeExternalRestart = (password = '', workerToken = '') =>
 /// Pushes the automation configuration to the bound worker and returns
 /// the status it confirmed — the values the worker actually runs.
 export const configureWorker = (
-	autoSync: boolean,
-	autoMods: boolean,
+	autoDeployMods: boolean,
 	restartPolicy: RestartPolicy,
 	workerToken = ''
 ) =>
 	invoke<WorkerStatus>('configure_worker', {
-		request: { autoSync, autoMods, restartPolicy, workerToken }
+		request: { autoDeployMods, restartPolicy, workerToken }
 	});
 
 // ---------- managed local worker ("host worker on this PC") ----------

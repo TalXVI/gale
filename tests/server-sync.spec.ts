@@ -30,7 +30,7 @@ test('a pending publication is owed mods; routine status never reports config wo
 	await expect(page.getByText('Update pending')).toBeVisible();
 	await expect(
 		page.getByText(
-			'A publication is pending. Deploy it manually, or enable automatic synchronization.'
+			'A publication is pending. Deploy its mod updates manually, or enable automatic mod deployment.'
 		)
 	).toBeVisible();
 	// Config divergence is server-owned state, never routine pending

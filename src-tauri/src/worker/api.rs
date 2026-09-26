@@ -63,8 +63,7 @@ pub struct StatusResponse {
     /// The sync profile id this worker is bound to. The caller verifies it
     /// matches the profile it intended to manage.
     pub profile_id: String,
-    pub auto_sync: bool,
-    pub auto_mods: bool,
+    pub auto_deploy_mods: bool,
     pub restart_policy: RestartPolicy,
     /// The newest publication revision the worker has observed.
     /// Observation alone is not deployment.
@@ -125,13 +124,12 @@ pub struct PolicyRequest {
     pub policy: ConfigUpdatePolicy,
 }
 
-/// `POST /v1/config` updates the worker's automation toggles. Manual
-/// Deploy Now requests are unaffected by `auto_sync`.
+/// `POST /v1/config` updates automatic mod deployment and restart policy.
+/// Manual Deploy Now requests are unaffected.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigureRequest {
-    pub auto_sync: bool,
-    pub auto_mods: bool,
+    pub auto_deploy_mods: bool,
     pub restart_policy: RestartPolicy,
 }
 

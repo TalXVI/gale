@@ -30,8 +30,7 @@ let settings: unknown = params.has('unset')
 				worker: {
 					address: workerMode ? 'https://worker.example.test' : '',
 					hosted: false,
-					autoSync: false,
-					autoMods: false
+					autoDeployMods: false
 				},
 				hostControl: { provider: 'none', datHostServerId: '', datHostUsername: '' },
 				restartPolicy: 'manual'
@@ -46,8 +45,7 @@ let restartRequired = params.has('restart');
 const worker = {
 	workerId: 'test-worker',
 	profileId: 'sync-1',
-	autoSync: false,
-	autoMods: false,
+	autoDeployMods: false,
 	restartPolicy: 'manual',
 	observedRevision: null as string | null,
 	lastError: null as string | null,
@@ -361,7 +359,7 @@ mockIPC(async (cmd, args) => {
 		case 'test_remote_server_connection':
 			return { status: 'connected', encrypted: true };
 		case 'test_worker_connection':
-			return { workerId: 'test-worker', autoSync: false };
+			return { workerId: 'test-worker', autoDeployMods: false };
 		case 'plugin:event|listen':
 			if ((args as any).event === 'server_sync_operation_progress') {
 				progressListeners.add((args as any).handler);
