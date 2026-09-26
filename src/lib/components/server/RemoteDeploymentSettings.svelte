@@ -103,8 +103,8 @@
 				{:else if form.localWorker.worker === null && form.localWorker.workerError}
 					<InfoBox type="warning">{form.localWorker.workerError}</InfoBox>
 				{/if}
-				{#if form.localWorker.pendingPublication}
-					<InfoBox type="info">{form.pendingLabel(form.localWorker.pendingPublication)}</InfoBox>
+				{#if form.localWorker.worker?.pendingRevision}
+					<InfoBox type="info">{form.pendingLabel(form.localWorker.worker)}</InfoBox>
 				{/if}
 				{#if form.localWorker.updateAvailable}
 					<InfoBox type="info">{m.dedicatedServerDialog_localWorkerUpdateInfo()}</InfoBox>

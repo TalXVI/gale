@@ -56,7 +56,6 @@
 <section
 	class="border-primary-300 dark:border-primary-600 bg-primary-50 dark:bg-primary-900 mt-4 min-w-0 rounded-lg border p-3"
 	aria-label={m.serverSync_progressLabel()}
-	data-testid="server-sync-operation-progress"
 >
 	<div class="flex min-w-0 items-start justify-between gap-3">
 		<div class="min-w-0" role="status" aria-live="polite" aria-atomic="true">

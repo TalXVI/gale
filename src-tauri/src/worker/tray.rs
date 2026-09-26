@@ -199,11 +199,11 @@ fn install_helper_copy(source: &Path, root: &Path) -> Result<(PathBuf, PathBuf)>
     if std::fs::read(&installed).ok().as_deref() != Some(bytes.as_slice()) {
         let temporary = installed.with_extension("tmp");
         std::fs::write(&temporary, &bytes).context("failed to install the Worker tray helper")?;
-        if installed.exists() {
-            if let Err(err) = std::fs::remove_file(&installed) {
-                let _ = std::fs::remove_file(&temporary);
-                return Err(err).context("failed to replace a partial Worker tray helper");
-            }
+        if installed.exists()
+            && let Err(err) = std::fs::remove_file(&installed)
+        {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(err).context("failed to replace a partial Worker tray helper");
         }
         if let Err(err) = std::fs::rename(&temporary, &installed) {
             let _ = std::fs::remove_file(&temporary);
@@ -353,9 +353,9 @@ impl MenuBindings {
     fn action(&self, id: &MenuId) -> Option<Action> {
         if self.update.as_ref() == Some(id) {
             Some(Action::Update)
-        } else if &self.restart == id {
+        } else if self.restart == id {
             Some(Action::Restart)
-        } else if &self.stop == id {
+        } else if self.stop == id {
             Some(Action::Stop)
         } else {
             None

@@ -60,7 +60,7 @@ pub enum ConnectionTestResult {
 }
 
 pub enum ConnectionAttempt {
-    Connected(RemoteConnection),
+    Connected(Box<RemoteConnection>),
     HostKeyUntrusted { fingerprint: String },
     CertificateUntrusted { fingerprint: String },
 }
@@ -383,9 +383,9 @@ impl RemoteConnection {
     pub fn connect(settings: &RemoteServerSettings, password: &str) -> Result<ConnectionAttempt> {
         if settings.protocol != RemoteProtocol::Sftp {
             return match Self::connect_ftp(settings, password) {
-                Ok((client, encrypted)) => Ok(ConnectionAttempt::Connected(Self::new(
+                Ok((client, encrypted)) => Ok(ConnectionAttempt::Connected(Box::new(Self::new(
                     client, settings, password, None, encrypted,
-                ))),
+                )))),
                 Err(FtpConnectError::Untrusted { fingerprint }) => {
                     Ok(ConnectionAttempt::CertificateUntrusted { fingerprint })
                 }
@@ -412,7 +412,7 @@ impl RemoteConnection {
             .sftp()
             .context("connected over SSH, but the server did not provide an SFTP subsystem")?;
 
-        Ok(ConnectionAttempt::Connected(Self::new(
+        Ok(ConnectionAttempt::Connected(Box::new(Self::new(
             RemoteClient::Sftp {
                 sftp,
                 _session: session,
@@ -421,7 +421,7 @@ impl RemoteConnection {
             password,
             Some(fingerprint),
             true,
-        )))
+        ))))
     }
 
     fn new(
@@ -793,7 +793,7 @@ impl RemoteOps for RemoteConnection {
         Some(Arc::new(move || {
             match Self::connect(&settings, &password)? {
                 ConnectionAttempt::Connected(conn) => {
-                    Ok(Box::new(ReadOnly(Box::new(conn))) as Box<dyn RemoteReader>)
+                    Ok(Box::new(ReadOnly(conn)) as Box<dyn RemoteReader>)
                 }
                 ConnectionAttempt::HostKeyUntrusted { .. }
                 | ConnectionAttempt::CertificateUntrusted { .. } => {
@@ -3140,7 +3140,7 @@ mod tests {
             ..Default::default()
         };
         match RemoteConnection::connect(&settings, "pw").unwrap() {
-            ConnectionAttempt::Connected(conn) => conn,
+            ConnectionAttempt::Connected(conn) => *conn,
             _ => panic!("plaintext fallback should connect to the fake"),
         }
     }
@@ -3159,7 +3159,7 @@ mod tests {
         match RemoteConnection::connect(&settings, "pw").unwrap() {
             ConnectionAttempt::Connected(conn) => {
                 assert!(conn.encrypted, "FTPS connection must be encrypted");
-                conn
+                *conn
             }
             _ => panic!("pinned certificate should connect to the fake over TLS"),
         }

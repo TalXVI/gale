@@ -139,7 +139,6 @@ tokio = { version = "1", features = ["test-util"] }
 [features]
 custom-protocol = ["tauri/custom-protocol"]
 worker = ["dep:axum", "dep:fd-lock"]
-axum = ["dep:axum"]
 
 [profile.release]
 opt-level = "z"

@@ -141,6 +141,7 @@ function serverState() {
 const calls: { cmd: string; args: any }[] = [];
 let held = '';
 const heldResolvers = new Set<() => void>();
+const heldInitialSettings = new Set<() => void>();
 const failing = new Set<string>();
 if (params.has('failStatus')) failing.add('get_server_sync_status');
 if (params.has('holdStatus')) held = 'get_server_sync_status';
@@ -154,7 +155,6 @@ let localWorker: Record<string, unknown> = {
 	ownership: 'none',
 	run: null,
 	worker: null,
-	pendingPublication: null,
 	workerError: null,
 	stoppedForShutdown: false,
 	updateAvailable: false,
@@ -192,6 +192,10 @@ Object.assign(window, {
 		held = '';
 		for (const resolve of heldResolvers) resolve();
 		heldResolvers.clear();
+	},
+	releaseInitialSettings: () => {
+		for (const resolve of heldInitialSettings) resolve();
+		heldInitialSettings.clear();
 	},
 	fail: (cmd: string) => {
 		failing.add(cmd);
@@ -235,6 +239,14 @@ mockIPC(async (cmd, args) => {
 	if (cmd === held)
 		await new Promise<void>((resolve) => {
 			heldResolvers.add(resolve);
+		});
+	if (
+		cmd === 'get_dedicated_server_settings' &&
+		callProfile === 1 &&
+		params.has('holdInitialSettings')
+	)
+		await new Promise<void>((resolve) => {
+			heldInitialSettings.add(resolve);
 		});
 	if (failing.has(cmd))
 		throw { message: `Simulated failure: ${cmd}`, detail: `Simulated failure: ${cmd}` };
@@ -292,7 +304,7 @@ mockIPC(async (cmd, args) => {
 			// Profile 2 is a plain manual-sync profile — the navbar must
 			// never poll or badge it as a worker remote. `?worker2=1`
 			// makes it a second worker-mode profile instead.
-			if (activeId === 2) {
+			if (callProfile === 2) {
 				const s = settings as any;
 				return {
 					...s,

@@ -118,9 +118,9 @@ export const getSyncProgress = (workerToken = '') =>
 export const previewSync = (
 	selection: DeploySelection,
 	restartPolicy: RestartPolicy | null,
-	password = '',
-	workerToken = '',
-	runId = ''
+	password: string,
+	workerToken: string,
+	runId: string
 ) =>
 	invoke<ServerSyncPreview>('preview_server_sync', {
 		request: { selection, restartPolicy, password, workerToken, runId }
@@ -134,9 +134,9 @@ export const deploySync = (
 	planHash: string,
 	restartPolicy: RestartPolicy | null,
 	force: boolean,
-	password = '',
-	workerToken = '',
-	runId = ''
+	password: string,
+	workerToken: string,
+	runId: string
 ) =>
 	invoke<ServerSyncResult>('deploy_server_sync', {
 		request: { selection, planHash, restartPolicy, force, password, workerToken, runId }

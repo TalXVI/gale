@@ -68,8 +68,6 @@ fn valheim_args(
     settings: &LocalServerSettings,
     password: &str,
 ) -> Result<()> {
-    validate_valheim(settings, password)?;
-
     command
         .arg("-nographics")
         .arg("-batchmode")

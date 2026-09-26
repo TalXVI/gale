@@ -15,7 +15,6 @@ use crate::profile::{
 };
 
 pub const FILE_NAME: &str = ".gale-server-state.json";
-pub const LEGACY_FILE_NAME: &str = ".gale-server-manifest.json";
 pub const LEASE_DIR_NAME: &str = ".gale-deploy.lock";
 pub const LEASE_FILE_NAME: &str = "lease.json";
 pub const VERSION: u32 = 2;
@@ -107,9 +106,7 @@ pub struct OperationRecord {
     pub status: OperationStatus,
     pub summary: OperationSummary,
     pub restart: RestartOutcome,
-    /// True only when the user confirmed a restart outside Gale. Optional
-    /// for older state files, and ignored by older executors that still
-    /// understand the existing `restarted` outcome.
+    /// True only when the user confirmed a restart outside Gale.
     #[serde(default, skip_serializing_if = "is_false")]
     pub external_restart_acknowledged: bool,
     pub error: Option<String>,
@@ -165,24 +162,10 @@ pub struct ServerDeploymentState {
     pub history: Vec<OperationRecord>,
 }
 
-/// The deployment manifest written by the previous implementation. Read once
-/// to adopt its ownership records, then superseded by [`FILE_NAME`].
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct LegacyManifest {
-    version: u32,
-    #[serde(default)]
-    files: BTreeMap<DeployPathBuf, OwnedFile>,
-}
-
-/// State plus warnings produced while reading it (dropped out-of-scope
-/// entries, adopted legacy manifests).
+/// State plus warnings produced while reading it.
 pub struct LoadedState {
     pub state: ServerDeploymentState,
     pub warnings: Vec<String>,
-    /// Whether the on-disk state predates the current format and should be
-    /// rewritten on the next persist.
-    pub migrated: bool,
 }
 
 /// A transport failure while fetching an authoritative state file. The
@@ -275,15 +258,12 @@ impl ServerDeploymentState {
 
 /// Reads and validates the remote deployment state.
 ///
-/// A missing state file falls back to the legacy deployment manifest and
-/// adopts its ownership records. A state file that fails to parse is an
-/// error, because deploying without knowing Gale's ownership could delete
-/// foreign files.
+/// A malformed state file is an error. Deploying without knowing Gale's
+/// ownership could delete foreign files.
 pub fn read_state(
     ops: &mut dyn RemoteOps,
     spec: &DeploymentSpec,
     state_remote_path: &RemotePath,
-    legacy_remote_path: &RemotePath,
 ) -> Result<LoadedState> {
     let mut warnings = Vec::new();
 
@@ -297,53 +277,16 @@ pub fn read_state(
         let state: ServerDeploymentState =
             serde_json::from_slice(&bytes).context("remote Gale deployment state is invalid")?;
         let state = state.validate(spec, &mut warnings)?;
-        return Ok(LoadedState {
-            state,
-            warnings,
-            migrated: false,
-        });
+        return Ok(LoadedState { state, warnings });
     }
 
-    match ops
-        .read(legacy_remote_path, MAX_STATE_BYTES)
-        .map_err(|source| StateReadError {
-            path: legacy_remote_path.to_string(),
-            source,
-        })? {
-        Some(bytes) => {
-            let legacy: LegacyManifest = serde_json::from_slice(&bytes)
-                .context("remote Gale deployment manifest is invalid")?;
-            ensure!(
-                legacy.version == 1,
-                "unsupported remote Gale manifest version {}",
-                legacy.version
-            );
-
-            warnings
-                .push("adopted previous deployment manifest into the new state format".to_owned());
-
-            let state = ServerDeploymentState {
-                version: VERSION,
-                files: legacy.files,
-                ..Default::default()
-            }
-            .validate(spec, &mut warnings)?;
-
-            Ok(LoadedState {
-                state,
-                warnings,
-                migrated: true,
-            })
-        }
-        None => Ok(LoadedState {
-            state: ServerDeploymentState {
-                version: VERSION,
-                ..Default::default()
-            },
-            warnings,
-            migrated: false,
-        }),
-    }
+    Ok(LoadedState {
+        state: ServerDeploymentState {
+            version: VERSION,
+            ..Default::default()
+        },
+        warnings,
+    })
 }
 
 /// Serializes the state for persistence. Kept separate from writing so the
@@ -361,7 +304,6 @@ mod tests {
     };
 
     const STATE_PATH: &str = "/srv/.gale-server-state.json";
-    const LEGACY_PATH: &str = "/srv/.gale-server-manifest.json";
 
     fn spec() -> DeploymentSpec {
         DeploymentSpec::for_loader(&ModLoader {
@@ -379,12 +321,7 @@ mod tests {
     }
 
     fn read(remote: &mut MemoryRemote) -> Result<LoadedState> {
-        read_state(
-            remote,
-            &spec(),
-            &remote_path(STATE_PATH),
-            &remote_path(LEGACY_PATH),
-        )
+        read_state(remote, &spec(), &remote_path(STATE_PATH))
     }
 
     fn deploy(value: &str) -> DeployPathBuf {
@@ -427,48 +364,6 @@ mod tests {
     fn wrong_version_state_is_an_error() {
         let mut remote = MemoryRemote::new();
         remote.put_file(STATE_PATH, br#"{"version": 3}"#);
-        assert!(read(&mut remote).is_err());
-    }
-
-    #[test]
-    fn legacy_manifest_is_adopted_once() {
-        let mut remote = MemoryRemote::new();
-        remote.put_file(
-            LEGACY_PATH,
-            br#"{
-                "version": 1,
-                "files": {
-                    "BepInEx/plugins/ModA.dll": { "hash": "abc", "size": 12 }
-                }
-            }"#,
-        );
-
-        let loaded = read(&mut remote).unwrap();
-        assert!(loaded.migrated);
-        assert_eq!(
-            loaded.state.files.get(&deploy("BepInEx/plugins/ModA.dll")),
-            Some(&OwnedFile {
-                hash: "abc".to_owned(),
-                size: 12,
-            })
-        );
-        assert!(loaded.warnings.iter().any(|w| w.contains("manifest")));
-
-        // The new state file takes precedence once it exists.
-        let state = ServerDeploymentState {
-            version: VERSION,
-            ..Default::default()
-        };
-        remote.put_file(STATE_PATH, &serialize(&state).unwrap());
-        let loaded = read(&mut remote).unwrap();
-        assert!(!loaded.migrated);
-        assert!(loaded.state.files.is_empty());
-    }
-
-    #[test]
-    fn unsupported_legacy_version_is_an_error() {
-        let mut remote = MemoryRemote::new();
-        remote.put_file(LEGACY_PATH, br#"{"version": 9, "files": {}}"#);
         assert!(read(&mut remote).is_err());
     }
 
@@ -519,31 +414,6 @@ mod tests {
         assert!(loaded.state.config.contains_key(&supported));
         assert_eq!(loaded.warnings.len(), 2);
         assert!(loaded.warnings[1].contains("ignored 3 out-of-scope"));
-    }
-
-    #[test]
-    fn legacy_pending_decisions_are_inert_and_dropped_on_persist() {
-        // State files written by the continuous-config design carry a
-        // `pending` map of undecided configs. That bookkeeping no longer
-        // exists: it is ignored on load and absent from the next write,
-        // so historical automatic-config debt can never surface as work.
-        let mut remote = MemoryRemote::new();
-        remote.put_file(
-            STATE_PATH,
-            format!(
-                r#"{{"version": {VERSION}, "operationSeq": 4, "pending": {{"BepInEx/config/mod.cfg": "modifiedLocally", "BepInEx/config/other.cfg": "deletedLocally"}}}}"#
-            )
-            .as_bytes(),
-        );
-
-        let loaded = read(&mut remote).unwrap();
-        assert_eq!(loaded.state.operation_seq, 4);
-
-        let persisted = String::from_utf8(serialize(&loaded.state).unwrap()).unwrap();
-        assert!(
-            !persisted.contains("pending"),
-            "state must not resurrect removed bookkeeping: {persisted}"
-        );
     }
 
     #[test]

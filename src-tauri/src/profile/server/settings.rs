@@ -73,39 +73,6 @@ pub enum HostProvider {
     DatHost,
 }
 
-/// The worker observes publications regardless of this setting. Legacy
-/// automation required both flags to deploy mods, so migration preserves
-/// that effective behavior instead of enabling a previously disabled worker.
-#[derive(Debug, Clone, Copy, Default, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkerAutomation {
-    pub auto_deploy_mods: bool,
-}
-
-impl<'de> Deserialize<'de> for WorkerAutomation {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Stored {
-            auto_deploy_mods: Option<bool>,
-            #[serde(default)]
-            auto_sync: bool,
-            #[serde(default)]
-            auto_mods: bool,
-        }
-
-        let stored = Stored::deserialize(deserializer)?;
-        Ok(Self {
-            auto_deploy_mods: stored
-                .auto_deploy_mods
-                .unwrap_or(stored.auto_sync && stored.auto_mods),
-        })
-    }
-}
-
 /// Connection details for the worker that executes deployments remotely.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -118,8 +85,7 @@ pub struct WorkerSettings {
     /// uninstall clears it.
     pub hosted: bool,
     /// Whether owed mod payloads may deploy without a manual request.
-    #[serde(flatten)]
-    pub automation: WorkerAutomation,
+    pub auto_deploy_mods: bool,
 }
 
 /// Hosting-provider configuration used for restart/presence operations.
@@ -140,8 +106,7 @@ pub struct HostSettings {
 /// remote settings drive deploying the profile over FTP/SFTP. Both are
 /// remembered when switching `location` back and forth.
 ///
-/// The local fields are flattened into this struct when serialized, which
-/// keeps the representation identical to the original flat settings format.
+/// The local fields are flattened into this struct when serialized.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProfileServerSettings {
@@ -332,14 +297,6 @@ impl RemoteServerSettings {
             self.server_directory.trim()
         )
     }
-
-    pub fn trust_host_key(&mut self, fingerprint: String) {
-        self.trusted_host_key = Some(fingerprint);
-    }
-
-    pub fn trust_certificate(&mut self, fingerprint: String) {
-        self.trusted_certificate = Some(fingerprint);
-    }
 }
 
 #[cfg(test)]
@@ -378,7 +335,7 @@ mod tests {
 
         let mut saved_first = transport.clone();
         assert!(saved_first.validate().is_ok());
-        saved_first.worker.automation.auto_deploy_mods = true;
+        saved_first.worker.auto_deploy_mods = true;
         assert!(saved_first.validate().is_ok());
 
         // An already-configured external worker is untouched.
@@ -465,11 +422,8 @@ mod tests {
     }
 
     #[test]
-    fn deserializes_legacy_flat_shape() {
-        // Settings written by the original implementation keep working: the
-        // flattened `local` fields land in the right place and `location` is
-        // respected.
-        let legacy = serde_json::json!({
+    fn deserializes_flat_settings() {
+        let value = serde_json::json!({
             "location": "remote",
             "serverName": "My Server",
             "world": "Dedicated",
@@ -486,7 +440,7 @@ mod tests {
             }
         });
 
-        let settings: ProfileServerSettings = serde_json::from_value(legacy).unwrap();
+        let settings: ProfileServerSettings = serde_json::from_value(value).unwrap();
 
         assert_eq!(settings.location, ServerLocation::Remote);
         assert_eq!(settings.local.server_name, "My Server");
@@ -520,34 +474,6 @@ mod tests {
         assert_eq!(settings.location, ServerLocation::Remote);
         assert_eq!(settings.local.port, 0);
         assert_eq!(settings.remote.protocol, RemoteProtocol::Sftp);
-    }
-
-    #[test]
-    fn legacy_profile_automation_migrates_without_enabling_one_flag_states() {
-        for (auto_sync, auto_mods) in [(true, true), (true, false), (false, true), (false, false)] {
-            let old = serde_json::json!({
-                "address": "https://worker.example.test",
-                "autoSync": auto_sync,
-                "autoMods": auto_mods,
-            });
-            let settings: WorkerSettings = serde_json::from_value(old).unwrap();
-            assert_eq!(settings.automation.auto_deploy_mods, auto_sync && auto_mods);
-            let saved = serde_json::to_value(settings).unwrap();
-            assert_eq!(saved["autoDeployMods"], auto_sync && auto_mods);
-            assert!(saved.get("autoSync").is_none());
-            assert!(saved.get("autoMods").is_none());
-        }
-    }
-
-    #[test]
-    fn canonical_profile_automation_wins_over_stale_legacy_fields() {
-        let settings: WorkerSettings = serde_json::from_value(serde_json::json!({
-            "autoDeployMods": false,
-            "autoSync": true,
-            "autoMods": true,
-        }))
-        .unwrap();
-        assert!(!settings.automation.auto_deploy_mods);
     }
 
     #[test]

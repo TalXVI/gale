@@ -517,8 +517,8 @@ export type WorkerStatus = {
 	lastOperation: OperationRecord | null;
 	/// The last deployment failure from this worker.
 	lastError: string | null;
-	/// The current publication-poll failure. Absent on older workers.
-	pollError?: string | null;
+	/// The current publication-poll failure.
+	pollError: string | null;
 	server: ServerStateSummary | null;
 };
 
@@ -578,17 +578,6 @@ export type LocalWorkerOwnership =
 	/// Installed for a different profile; controls must not be offered.
 	| 'foreign';
 
-/// What the worker will do with its pending publication, derived from
-/// its own reported automation setting — not the unsaved local checkbox.
-/// Pending work is always the mod payload; configs are never owed.
-export type PendingPublicationMode = 'automatic' | 'manual';
-
-export type PendingPublication = {
-	mode: PendingPublicationMode;
-	/// A previous automatic attempt failed; a retry is scheduled.
-	retrying: boolean;
-};
-
 export type LocalWorkerStatus = {
 	/// False off Windows — provisioning is unavailable there.
 	supported: boolean;
@@ -598,9 +587,7 @@ export type LocalWorkerStatus = {
 	ownership: LocalWorkerOwnership;
 	run: LocalWorkerRunReport | null;
 	worker: WorkerStatus | null;
-	/// The pending banner's content; null hides it — nothing pending, or
-	/// the worker is stopped/unreachable so pending state is unknown.
-	pendingPublication: PendingPublication | null;
+	/// Why the live worker status is unavailable.
 	workerError: string | null;
 	/// The last run report says the machine shut down — the service
 	/// comes back with the next boot.

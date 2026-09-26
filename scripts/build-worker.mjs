@@ -19,10 +19,13 @@ const dev = process.argv.includes('--dev');
 const cargoArgs = dev ? [] : ['--release'];
 const profile = dev ? 'debug' : 'release';
 
-execSync(['cargo', 'build', ...cargoArgs, '--features', 'worker', '--bin', 'gale-worker'].join(' '), {
-	cwd: tauriDir,
-	stdio: 'inherit',
-});
+execSync(
+	['cargo', 'build', ...cargoArgs, '--features', 'worker', '--bin', 'gale-worker'].join(' '),
+	{
+		cwd: tauriDir,
+		stdio: 'inherit'
+	}
+);
 
 const isWindows = process.platform === 'win32';
 const exe = isWindows ? 'gale-worker.exe' : 'gale-worker';
@@ -38,7 +41,7 @@ copyFileSync(join(tauriDir, 'target', profile, exe), staged);
 if (isWindows) {
 	execSync(['cargo', 'build', ...cargoArgs, '--bin', 'gale-worker-tray'].join(' '), {
 		cwd: tauriDir,
-		stdio: 'inherit',
+		stdio: 'inherit'
 	});
 }
 
@@ -51,12 +54,12 @@ writeFileSync(
 	<Fragment>
 		<ComponentGroup Id="GaleWorkerBinaries">
 			<Component Id="GaleWorkerBinary" Guid="*" Win64="yes" Directory="INSTALLDIR">
-				<File Id="GaleWorkerExe" Source="${staged}" KeyPath="yes" />
+				<File Id="GaleWorkerExe" Source="${staged.replaceAll('&', '&amp;')}" KeyPath="yes" />
 			</Component>
 		</ComponentGroup>
 	</Fragment>
 </Wix>
-`,
+`
 );
 
 console.log(`staged ${staged}`);

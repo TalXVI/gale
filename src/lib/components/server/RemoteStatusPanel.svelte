@@ -37,21 +37,14 @@
 					: 'text-primary-700 dark:text-primary-300'
 	);
 
-	/// Pending wording reflects what the worker will actually do — for the
-	/// managed worker its own reported pending mode, otherwise the
-	/// automation setting in the live worker status.
 	const pendingText = $derived.by(() => {
-		const worker = sync.status?.worker;
+		const hosted =
+			form.syncChoice === 'hostedWorker' && form.localWorker?.worker?.pendingRevision
+				? form.localWorker.worker
+				: null;
+		const worker = hosted ?? sync.status?.worker;
 		if (statusKind !== 'pending' || !worker) return null;
-		const hosted = form.localWorker?.pendingPublication;
-		if (form.syncChoice === 'hostedWorker' && hosted) {
-			return form.pendingLabel(hosted);
-		}
-		const mode = worker.autoDeployMods ? 'automatic' : 'manual';
-		return form.pendingLabel({
-			mode,
-			retrying: mode === 'automatic' && worker.nextAttemptAt != null
-		});
+		return form.pendingLabel(worker);
 	});
 
 	const executorLabel = $derived.by(() => {

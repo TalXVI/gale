@@ -45,9 +45,7 @@ use eyre::Result;
 use eyre::ensure;
 use serde::{Deserialize, Serialize};
 
-use crate::profile::server::settings::{
-    HostSettings, RemoteServerSettings, RestartPolicy, WorkerAutomation,
-};
+use crate::profile::server::settings::{HostSettings, RemoteServerSettings, RestartPolicy};
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:8472";
 const DEFAULT_POLL_SECS: u64 = 300;
@@ -75,8 +73,7 @@ pub struct WorkerConfig {
     /// Hosting provider for restart/presence operations.
     pub host_control: HostSettings,
     /// Whether the worker may deploy new mod revisions on its own.
-    #[serde(flatten)]
-    pub automation: WorkerAutomation,
+    pub auto_deploy_mods: bool,
     /// What may happen to the server process after deployment.
     pub restart_policy: RestartPolicy,
     /// How often the worker checks for new publications.
@@ -103,7 +100,7 @@ impl Default for WorkerConfig {
             sync_url: None,
             remote: RemoteServerSettings::default(),
             host_control: HostSettings::default(),
-            automation: WorkerAutomation::default(),
+            auto_deploy_mods: false,
             restart_policy: RestartPolicy::default(),
             poll_interval_secs: DEFAULT_POLL_SECS,
             state_dir: PathBuf::from("."),
@@ -200,20 +197,5 @@ mod tests {
         let mut value = valid_json();
         value["pollIntervalSecs"] = serde_json::json!(MIN_POLL_SECS - 1);
         assert!(load(value).is_err());
-    }
-
-    #[test]
-    fn legacy_config_automation_migrates_to_one_canonical_setting() {
-        for (auto_sync, auto_mods) in [(true, true), (true, false), (false, true), (false, false)] {
-            let mut old = valid_json();
-            old["autoSync"] = serde_json::json!(auto_sync);
-            old["autoMods"] = serde_json::json!(auto_mods);
-            let config = load(old).unwrap();
-            assert_eq!(config.automation.auto_deploy_mods, auto_sync && auto_mods);
-            let saved = serde_json::to_value(config).unwrap();
-            assert_eq!(saved["autoDeployMods"], auto_sync && auto_mods);
-            assert!(saved.get("autoSync").is_none());
-            assert!(saved.get("autoMods").is_none());
-        }
     }
 }

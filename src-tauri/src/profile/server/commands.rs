@@ -103,7 +103,6 @@ pub struct RemoteServerRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerSyncRequest {
-    #[serde(default)]
     pub run_id: String,
     pub selection: DeploySelection,
     /// The restart policy the deploy will use. Preview binds it into the
@@ -120,7 +119,6 @@ pub struct ServerSyncRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerSyncDeployRequest {
-    #[serde(default)]
     pub run_id: String,
     pub selection: DeploySelection,
     /// The hash of the approved preview; deployment is rejected when the
@@ -286,7 +284,7 @@ pub async fn set_dedicated_server_settings(
             &request.worker_token,
         )
         .await?;
-        settings.remote.worker.automation.auto_deploy_mods = confirmed.auto_deploy_mods;
+        settings.remote.worker.auto_deploy_mods = confirmed.auto_deploy_mods;
         settings.remote.restart_policy = confirmed.restart_policy;
     }
 
@@ -366,8 +364,7 @@ fn worker_config_differs(
     };
     stored.remote.sync_mode != SyncMode::Worker
         || stored.remote.worker.address.trim() != new.remote.worker.address.trim()
-        || stored.remote.worker.automation.auto_deploy_mods
-            != new.remote.worker.automation.auto_deploy_mods
+        || stored.remote.worker.auto_deploy_mods != new.remote.worker.auto_deploy_mods
         || stored.remote.restart_policy != new.remote.restart_policy
 }
 
@@ -404,10 +401,7 @@ async fn configure_running_worker(
         );
     }
     client
-        .configure(
-            remote.worker.automation.auto_deploy_mods,
-            remote.restart_policy,
-        )
+        .configure(remote.worker.auto_deploy_mods, remote.restart_policy)
         .await
         .context("the worker did not accept the automation update")?;
     client
@@ -447,16 +441,15 @@ pub async fn launch_dedicated_server(
         (game, profile.server_settings.clone())
     };
 
-    let settings = match request.settings {
-        Some(settings) => {
-            args::validate_game_args(game, &settings.local, &password)?;
-            save_settings_for(&app, profile_id, settings.clone())?;
-            settings
-        }
-        None => stored_settings.ok_or_eyre("the dedicated server has not been configured yet")?,
-    };
-
+    let save_settings = request.settings.is_some();
+    let settings = request
+        .settings
+        .or(stored_settings)
+        .ok_or_eyre("the dedicated server has not been configured yet")?;
     args::validate_game_args(game, &settings.local, &password)?;
+    if save_settings {
+        save_settings_for(&app, profile_id, settings.clone())?;
+    }
     secrets.persist(
         ServerSecret::GamePassword,
         &password,
@@ -713,12 +706,6 @@ pub async fn get_server_sync_status(
             open_remote_session(&target.settings, &credential, target.mod_loader)
                 .await
                 .map(|session| {
-                    if session.migrated {
-                        status.warnings.push(
-                            "adopted the previous deployment manifest into the new state format"
-                                .to_owned(),
-                        );
-                    }
                     status.server = Some(ServerStateSummary {
                         mods_revision: session.state.mods_revision.clone(),
                         restart_required: session.state.restart_required,
@@ -791,7 +778,7 @@ pub async fn preview_server_sync(
             &request.selection,
             request.restart_policy,
             &credential,
-            operation_run_id(&request.run_id),
+            request.run_id,
         )
         .await?),
     }
@@ -833,14 +820,6 @@ pub async fn get_server_sync_progress(
         return Ok(None);
     };
     Ok(client.progress().await?)
-}
-
-fn operation_run_id(requested: &str) -> String {
-    if requested.is_empty() {
-        uuid::Uuid::new_v4().simple().to_string()
-    } else {
-        requested.to_owned()
-    }
 }
 
 #[command]
@@ -939,7 +918,7 @@ pub async fn configure_worker(
 
     let secrets = ServerSecrets::for_profile(target.profile_id)?;
     let mut remote = target.settings.clone();
-    remote.worker.automation.auto_deploy_mods = request.auto_deploy_mods;
+    remote.worker.auto_deploy_mods = request.auto_deploy_mods;
     remote.restart_policy = request.restart_policy;
     let confirmed = configure_running_worker(
         &secrets,
@@ -954,7 +933,7 @@ pub async fn configure_worker(
     let mut manager = app.lock_manager();
     let (_, profile) = manager.profile_by_id_mut(target.profile_id)?;
     let mut settings = profile.server_settings.clone().unwrap_or_default();
-    settings.remote.worker.automation.auto_deploy_mods = confirmed.auto_deploy_mods;
+    settings.remote.worker.auto_deploy_mods = confirmed.auto_deploy_mods;
     settings.remote.restart_policy = confirmed.restart_policy;
     profile.server_settings = Some(settings);
     profile.save(&app, true)?;
@@ -1056,7 +1035,7 @@ fn connect_remote(
     password: &str,
 ) -> eyre::Result<Box<dyn RemoteOps>> {
     match RemoteConnection::connect(settings, password)? {
-        ConnectionAttempt::Connected(connection) => Ok(Box::new(connection)),
+        ConnectionAttempt::Connected(connection) => Ok(connection),
         ConnectionAttempt::HostKeyUntrusted { fingerprint } => bail!(
             "SFTP host key is not trusted ({fingerprint}); trust it from the server settings first"
         ),
@@ -1241,7 +1220,7 @@ async fn local_deploy(
 ) -> eyre::Result<DeployResponse> {
     let event_app = app.clone();
     let mut progress = ProgressReporter::new(
-        operation_run_id(&request.run_id),
+        request.run_id.clone(),
         SyncOperation::Deploy,
         &request.selection,
         move |snapshot| {
@@ -1396,7 +1375,7 @@ mod tests {
 
         // Toggling automation differs.
         let mut new = stored.clone();
-        new.remote.worker.automation.auto_deploy_mods = true;
+        new.remote.worker.auto_deploy_mods = true;
         assert!(worker_config_differs(Some(&stored), &new));
 
         // The restart policy is worker-run configuration too.

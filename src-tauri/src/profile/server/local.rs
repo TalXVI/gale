@@ -29,10 +29,6 @@ pub fn launch(
     password: &str,
     prefs: &Prefs,
 ) -> Result<LocalServerProcess> {
-    if game.game.dedicated_server.is_none() {
-        eyre::bail!("this game does not define a dedicated server");
-    }
-
     let (server_dir, server_platform) = locate_server_dir(game, prefs)?;
     let executable = launch::find_executable(&server_dir)
         .context("failed to locate dedicated server executable")?;

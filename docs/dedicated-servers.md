@@ -125,18 +125,19 @@ Notes and limitations:
 1. Build the binary: `cargo build --release --features worker --bin gale-worker` in `src-tauri`, or copy a prebuilt binary to the host.
 2. Create `gale-worker.json` (see `src-tauri/src/worker/config.rs` for the full reference):
 
+   <!-- prettier-ignore -->
    ```json
    {
-   	"workerId": "my-vps",
-   	"listen": "127.0.0.1:8472",
-   	"profileId": "the sync profile id",
-   	"game": "valheim",
-   	"remote": { "protocol": "sftp", "host": "...", "username": "..." },
-   	"hostControl": { "provider": "datHost", "datHostServerId": "...", "datHostUsername": "..." },
+     "workerId": "my-vps",
+     "listen": "127.0.0.1:8472",
+     "profileId": "the sync profile id",
+     "game": "valheim",
+     "remote": { "protocol": "sftp", "host": "...", "username": "..." },
+     "hostControl": { "provider": "datHost", "datHostServerId": "...", "datHostUsername": "..." },
      "autoDeployMods": true,
-   	"restartPolicy": "whenEmpty",
-   	"pollIntervalSecs": 300,
-   	"stateDir": "/var/lib/gale-worker"
+     "restartPolicy": "whenEmpty",
+     "pollIntervalSecs": 300,
+     "stateDir": "/var/lib/gale-worker"
    }
    ```
 
@@ -178,10 +179,6 @@ In the remote settings, choose **Worker on another machine** as the sync mode an
 Manual **Deploy** through the worker works regardless of `autoDeployMods`. You can change automatic mod deployment and the independent restart policy in the **Deployment** section of the Server page. Gale pushes the values to the running worker, reads them back, and they persist across worker restarts.
 
 The worker tracks only the publication's mod payload. A publication is pending when its mod revision differs from the revision recorded on the server, and settled once that mod revision is confirmed deployed. Published config changes never create pending work, so a publication that changes only configs is observed and acknowledged without any deployment. The worker polls for publications with automatic deployment on or off. When `autoDeployMods` is off, it keeps owed mod work pending until a manual deploy runs it or automatic deployment is enabled. Config files are never evaluated or written automatically; **Push configs** on the Server page is the only path that writes them, and it runs through the worker the same way a mod deploy does.
-
-Existing worker configs, journals, and profile settings migrate to `autoDeployMods: true` only when both old `autoSync` and `autoMods` were true. All other old combinations remain disabled. Newly written state contains only `autoDeployMods`.
-
-Workers upgraded from builds that tracked config synchronization drop the old `configsPending`, `evaluatedConfigRevision`, and `lastConfigSyncAt` journal fields on load and never write them again. A pending publication that only owed config evaluation is discarded rather than deployed.
 
 #### Moving a managed worker to a VPS
 

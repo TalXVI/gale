@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use eyre::{Context, Result, ensure};
+use eyre::{Context, Result};
 use futures_util::future::BoxFuture;
 use tracing::info;
 use walkdir::WalkDir;
@@ -59,7 +59,8 @@ impl PayloadSource for CachePayloadSource {
         backend: Backend,
     ) -> BoxFuture<'a, Result<PathBuf>> {
         Box::pin(async move {
-            let dest = self.root.join(ident.full_name()).join(ident.version());
+            let parent = self.root.join(ident.full_name());
+            let dest = parent.join(ident.version());
 
             if is_staged(&dest) {
                 return Ok(dest);
@@ -77,15 +78,12 @@ impl PayloadSource for CachePayloadSource {
                 .await
                 .with_context(|| format!("failed to read {ident} download"))?;
 
-            let parent = dest
-                .parent()
-                .ok_or_else(|| eyre::eyre!("invalid staging path"))?;
-            std::fs::create_dir_all(parent).context("failed to create staging directory")?;
+            std::fs::create_dir_all(&parent).context("failed to create staging directory")?;
 
             // Extract to a sibling temp dir, then rename into place so an
             // interrupted extraction can't leave a half-populated tree
             // behind.
-            let tmp = tempfile::tempdir_in(parent)?;
+            let tmp = tempfile::tempdir_in(&parent)?;
             self.extract(bytes, ident, tmp.path())?;
             commit_staged(tmp, &dest)?;
             Ok(dest)
@@ -124,8 +122,8 @@ fn is_staged(dir: &Path) -> bool {
 }
 
 /// Reads the staged package trees and builds the desired deployment file
-/// maps. Only enabled mods contribute files. A disabled mod's files leave
-/// the server entirely, matching how a subscriber's profile handles it.
+/// maps. Only enabled mods contribute files; the planner removes previously
+/// deployed files that are no longer in this map.
 ///
 /// `progress` receives `(completed, total, mod_name)` for reporting.
 pub async fn stage_publication(
@@ -158,7 +156,7 @@ pub async fn stage_publication(
     Ok(desired)
 }
 
-/// Classifies one staged package tree into payload files and config seeds.
+/// Collects the payload files in one staged package tree.
 fn collect_tree(root: &Path, spec: &DeploymentSpec, desired: &mut DesiredDeployment) -> Result<()> {
     for entry in WalkDir::new(root).follow_links(false) {
         let entry = entry.context("failed to enumerate staged package")?;
@@ -223,12 +221,7 @@ fn deploy_path(path: &Path) -> Result<DeployPathBuf> {
         .ok_or_else(|| eyre::eyre!("staged file has a non-Unicode path: {}", path.display()))?
         .join("/");
 
-    let path = DeployPathBuf::new(value)?;
-    ensure!(
-        !path.as_str().is_empty(),
-        "staged file produced an empty deploy path"
-    );
-    Ok(path)
+    DeployPathBuf::new(value)
 }
 
 #[cfg(test)]

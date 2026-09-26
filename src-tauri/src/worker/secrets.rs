@@ -51,9 +51,8 @@ impl Secrets {
         Ok(secrets)
     }
 
-    /// Parses a `KEY=value` secrets file. Blank lines and `#` comments are
-    /// ignored; unknown keys are skipped so the file stays forward-
-    /// compatible with newer workers.
+    /// Parses a `KEY=value` secrets file, ignoring blank lines, comments,
+    /// and unrelated keys.
     #[cfg(feature = "worker")]
     pub fn load_file(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)

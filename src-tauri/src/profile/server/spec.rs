@@ -14,11 +14,7 @@ const PROFILE_INTERNAL_NAMES: &[&str] = &["profile.json", "mods.yml", "snapshots
 
 /// Remote names managed by Gale inside config directories. They are not
 /// configs and are never treated as managed config files.
-const GALE_INTERNAL_NAMES: &[&str] = &[
-    state::FILE_NAME,
-    state::LEGACY_FILE_NAME,
-    state::LEASE_DIR_NAME,
-];
+const GALE_INTERNAL_NAMES: &[&str] = &[state::FILE_NAME, state::LEASE_DIR_NAME];
 
 /// How a profile should be laid out on a dedicated server, derived from the
 /// game's mod loader. This is the single place where mod-loader-specific
@@ -61,10 +57,6 @@ pub struct DeploymentSpec {
 
     /// Where the lease directory is created to coordinate executors.
     pub lease_dir: DeployPathBuf,
-
-    /// The previous deployment manifest's location, read once to adopt its
-    /// ownership records into the new state format.
-    pub legacy_manifest_path: DeployPathBuf,
 
     /// Deploy paths that are never uploaded: generated caches, logs and
     /// package metadata that is only meaningful locally.
@@ -150,7 +142,6 @@ impl DeploymentSpec {
             loader_markers,
             state_path: config_dir.join(state::FILE_NAME)?,
             lease_dir: config_dir.join(state::LEASE_DIR_NAME)?,
-            legacy_manifest_path: config_dir.join(state::LEGACY_FILE_NAME)?,
             exclude_globs,
         })
     }

@@ -1,12 +1,12 @@
 import * as api from '$lib/api';
 import type {
 	LocalWorkerStatus,
-	PendingPublication,
 	ProfileServerSettings,
 	RemoteServerSettings,
 	RemoteProtocol,
 	RestartPolicy,
-	SavedServerCredentials
+	SavedServerCredentials,
+	WorkerStatus
 } from '$lib/types';
 import games from '$lib/state/game.svelte';
 import serverSync from '$lib/state/serverSync.svelte';
@@ -104,6 +104,7 @@ export class ServerFormState {
 	);
 
 	#savedJson = $state('');
+	#loadSeq = 0;
 	/// The tab binding (`location`) is just the last-viewed tab now, so it
 	/// is normalized out of the comparison; the remember checkboxes stay
 	/// in because toggling them controls whether secrets persist.
@@ -163,9 +164,15 @@ export class ServerFormState {
 	});
 
 	async load() {
+		const seq = ++this.#loadSeq;
 		this.loadingSettings = true;
 		try {
-			const value = await api.profile.server.getSettings();
+			const [value, localWorker, credentials] = await Promise.all([
+				api.profile.server.getSettings(),
+				api.profile.server.getLocalWorkerStatus().catch(() => null),
+				api.profile.server.getSavedCredentials().catch(() => null)
+			]);
+			if (seq !== this.#loadSeq) return;
 			this.hasSavedSettings = value !== null;
 			this.form = value ?? defaultSettings();
 			this.port = String(
@@ -181,7 +188,10 @@ export class ServerFormState {
 						? 'hostedWorker'
 						: 'worker'
 					: 'local';
-			await this.refreshLocalWorker();
+			this.localWorker = localWorker;
+			if (localWorker?.ownership === 'incomplete' && this.syncChoice === 'local') {
+				this.syncChoice = 'hostedWorker';
+			}
 			// The worker's journal is the authoritative automation state —
 			// for the managed worker its live report wins over the stored
 			// copy, which only seeds new installs.
@@ -193,11 +203,11 @@ export class ServerFormState {
 				autoDeployMods: this.form.remote.worker.autoDeployMods,
 				restartPolicy: this.form.remote.restartPolicy
 			};
-			await this.refreshSavedCredentials();
+			this.savedCredentials = credentials;
 			this.clearSecrets();
 			this.#savedJson = this.#liveJson;
 		} finally {
-			this.loadingSettings = false;
+			if (seq === this.#loadSeq) this.loadingSettings = false;
 		}
 	}
 
@@ -552,18 +562,12 @@ export class ServerFormState {
 		}
 	}
 
-	/// The pending banner mirrors the worker's own automation state —
-	/// never the unsaved checkboxes — so it only promises an automatic
-	/// deployment the worker can actually perform.
-	pendingLabel(pending: PendingPublication): string {
-		switch (pending.mode) {
-			case 'automatic':
-				return pending.retrying
-					? m.dedicatedServerDialog_localWorkerPendingRetry()
-					: m.dedicatedServerDialog_localWorkerPending();
-			case 'manual':
-				return m.dedicatedServerDialog_localWorkerPendingManual();
-		}
+	/// Use the worker's confirmed setting, not the unsaved checkbox.
+	pendingLabel(worker: WorkerStatus): string {
+		if (!worker.autoDeployMods) return m.dedicatedServerDialog_localWorkerPendingManual();
+		return worker.nextAttemptAt
+			? m.dedicatedServerDialog_localWorkerPendingRetry()
+			: m.dedicatedServerDialog_localWorkerPending();
 	}
 
 	localWorkerStateLabel(state: string | undefined): string {

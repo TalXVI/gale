@@ -442,3 +442,25 @@ test('switching profiles resets the remote status instead of leaking it', async 
 	);
 	expect(afterSwitch).toBeGreaterThan(0);
 });
+
+test('a delayed settings response cannot replace the newly selected profile', async ({ page }) => {
+	await page.goto('/tests/dialog/?mode=worker&worker2=1&holdInitialSettings=1');
+	await expect
+		.poll(() =>
+			page.evaluate(
+				() =>
+					(window as any).calls.filter((call: any) => call.cmd === 'get_dedicated_server_settings')
+						.length
+			)
+		)
+		.toBeGreaterThan(0);
+
+	await page.evaluate(() => (window as any).switchProfile(2));
+	const address = page.getByPlaceholder('https://worker.example.com');
+	await expect(address).toHaveValue('https://worker2.example.test');
+	await page.evaluate(async () => {
+		(window as any).releaseInitialSettings();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+	});
+	await expect(address).toHaveValue('https://worker2.example.test');
+});

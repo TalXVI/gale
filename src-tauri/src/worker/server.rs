@@ -98,12 +98,12 @@ impl WorkerContext {
     fn connect(&self) -> Result<Box<dyn RemoteOps>> {
         let password = self.secrets.remote_password();
         match RemoteConnection::connect(&self.config.remote, &password)? {
-            ConnectionAttempt::Connected(connection) => Ok(Box::new(connection)),
+            ConnectionAttempt::Connected(connection) => Ok(connection),
             ConnectionAttempt::HostKeyUntrusted { fingerprint } => bail!(
                 "SFTP host key is not trusted ({fingerprint}); pin it as trustedHostKey in the worker config"
             ),
             ConnectionAttempt::CertificateUntrusted { fingerprint } => bail!(
-                "FTPS certificate is not trusted ({fingerprint}); pin it as trustedHostKey in the worker config"
+                "FTPS certificate is not trusted ({fingerprint}); pin it as trustedCertificate in the worker config"
             ),
         }
     }
@@ -138,10 +138,10 @@ impl WorkerContext {
     }
 
     fn fail_progress(&self) {
-        if let Ok(mut slot) = self.progress.lock() {
-            if let Some(snapshot) = slot.as_mut() {
-                snapshot.status = ProgressStatus::Failed;
-            }
+        if let Ok(mut slot) = self.progress.lock()
+            && let Some(snapshot) = slot.as_mut()
+        {
+            snapshot.status = ProgressStatus::Failed;
         }
     }
 
@@ -324,7 +324,7 @@ async fn status(
     Json(StatusResponse {
         worker_id: ctx.config.worker_id.clone(),
         profile_id: ctx.config.profile_id.clone(),
-        auto_deploy_mods: journal.automation.auto_deploy_mods,
+        auto_deploy_mods: journal.auto_deploy_mods,
         restart_policy: journal.restart_policy,
         observed_revision: journal.last_seen_revision,
         pending_revision: pending.map(|work| work.revision),
@@ -363,12 +363,7 @@ async fn preview(
     };
 
     let selection = request.selection;
-    let run_id = if request.run_id.is_empty() {
-        uuid::Uuid::new_v4().simple().to_string()
-    } else {
-        request.run_id
-    };
-    let mut progress = ctx.reporter(run_id, SyncOperation::Preview, &selection);
+    let mut progress = ctx.reporter(request.run_id, SyncOperation::Preview, &selection);
     let response = preview_inner(&ctx, selection, request.restart_policy, &mut progress).await;
     match response {
         Ok(preview) => {
@@ -654,10 +649,10 @@ async fn execute_deployment(
         progress,
     )
     .await?;
-    if let Some(record) = response.state.last_operation.clone() {
-        if let Err(err) = ctx.journal.record_operation(record).await {
-            warn!(%err, "failed to record operation in journal");
-        }
+    if let Some(record) = response.state.last_operation.clone()
+        && let Err(err) = ctx.journal.record_operation(record).await
+    {
+        warn!(%err, "failed to record operation in journal");
     }
     Ok(response)
 }
@@ -733,10 +728,10 @@ async fn acknowledge_external_restart(
 
     match result {
         Ok(Ok(state)) => {
-            if let Some(record) = state.last_operation {
-                if let Err(error) = ctx.journal.record_operation(record).await {
-                    warn!(%error, "failed to journal external restart acknowledgment");
-                }
+            if let Some(record) = state.last_operation
+                && let Err(error) = ctx.journal.record_operation(record).await
+            {
+                warn!(%error, "failed to journal external restart acknowledgment");
             }
             StatusCode::NO_CONTENT.into_response()
         }
@@ -756,11 +751,11 @@ async fn configure(
 
     let mut state = ctx.journal.state.lock().await;
     let mut updated = state.clone();
-    updated.automation.auto_deploy_mods = request.auto_deploy_mods;
+    updated.auto_deploy_mods = request.auto_deploy_mods;
     updated.restart_policy = request.restart_policy;
     // Enabling automation re-evaluates work observed while disabled.
     if request.auto_deploy_mods
-        && !state.automation.auto_deploy_mods
+        && !state.auto_deploy_mods
         && let Some(work) = updated.pending.as_mut()
     {
         work.next_attempt_at = None;
@@ -805,44 +800,17 @@ async fn poll_loop(ctx: Arc<WorkerContext>, shutdown: CancellationToken) {
     }
 }
 
-/// The poll loop's decision for outstanding automatic work.
-#[derive(Debug, PartialEq, Eq)]
-enum AutoAction {
-    /// Nothing is waiting.
-    Idle,
-    /// Work is pending but automation is off. Kept for later.
-    Disabled,
-    /// Backoff from the last failure is still running.
-    Waiting,
-    /// Deploy the pending revision now.
-    Deploy,
-}
-
-/// What to do with the journal's pending work this tick. Pure, so the
-/// durable-progress rules are testable without a running worker.
-///
-/// Pending work is always the mod payload. It deploys when automation is
-/// enabled and no backoff is running.
-fn automatic_action(state: &WorkerJournal, now: DateTime<Utc>) -> AutoAction {
-    let Some(pending) = &state.pending else {
-        return AutoAction::Idle;
-    };
-    if !state.automation.auto_deploy_mods {
-        return AutoAction::Disabled;
-    }
-    if pending.next_attempt_at.is_some_and(|next| now < next) {
-        return AutoAction::Waiting;
-    }
-    AutoAction::Deploy
+fn automatic_deploy_due(state: &WorkerJournal, now: DateTime<Utc>) -> bool {
+    state.auto_deploy_mods
+        && state
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.next_attempt_at.is_none_or(|next| now >= next))
 }
 
 /// Bounded exponential backoff between automatic retries.
 fn retry_delay(attempts: u32) -> Duration {
-    const BASE: Duration = Duration::from_secs(60);
-    const CAP: Duration = Duration::from_secs(30 * 60);
-    BASE.checked_mul(1 << attempts.min(6))
-        .unwrap_or(CAP)
-        .min(CAP)
+    Duration::from_secs((60_u64 << attempts.min(6)).min(30 * 60))
 }
 
 /// One poll cycle. Observes the newest publication, then drives pending
@@ -882,81 +850,78 @@ async fn poll_once(ctx: &Arc<WorkerContext>) {
     }
     drop(state);
 
-    let action = {
+    let due = {
         let state = ctx.journal.state.lock().await;
-        automatic_action(&state, Utc::now())
+        automatic_deploy_due(&state, Utc::now())
     };
 
-    match action {
-        AutoAction::Idle | AutoAction::Disabled | AutoAction::Waiting => {}
-        AutoAction::Deploy => {
-            let Ok(guard) = ctx.operation_lock.try_lock() else {
-                // A manual operation is running, so the pending work
-                // stays in the journal and retries next tick.
-                info!("automatic deploy deferred: another operation is running");
+    if due {
+        let Ok(guard) = ctx.operation_lock.try_lock() else {
+            // A manual operation is running, so the pending work
+            // stays in the journal and retries next tick.
+            info!("automatic deploy deferred: another operation is running");
+            return;
+        };
+
+        // Re-check under the operation lock — the action check above
+        // may be stale. Owed work is always the mod payload, so the
+        // automatic selection is mods-only: configs are never part of
+        // unattended synchronization.
+        {
+            let state = ctx.journal.state.lock().await;
+            if !automatic_deploy_due(&state, Utc::now()) {
+                info!("automatic deployment no longer due");
                 return;
-            };
-
-            // Re-check under the operation lock — the action check above
-            // may be stale. Owed work is always the mod payload, so the
-            // automatic selection is mods-only: configs are never part of
-            // unattended synchronization.
-            {
-                let state = ctx.journal.state.lock().await;
-                if automatic_action(&state, Utc::now()) != AutoAction::Deploy {
-                    info!("automatic deployment no longer due");
-                    return;
-                }
             }
-            let selection = DeploySelection {
-                include_mods: true,
-                include_configs: false,
-                apply_configs: Vec::new(),
-                restore_configs: Vec::new(),
-                decline_configs: Vec::new(),
-            };
+        }
+        let selection = DeploySelection {
+            include_mods: true,
+            include_configs: false,
+            apply_configs: Vec::new(),
+            restore_configs: Vec::new(),
+            decline_configs: Vec::new(),
+        };
 
-            let result = run_deployment(
-                ctx,
-                selection,
-                None,
-                None,
-                false,
-                OperationKind::Automatic,
-                None,
-            )
-            .await;
-            drop(guard);
+        let result = run_deployment(
+            ctx,
+            selection,
+            None,
+            None,
+            false,
+            OperationKind::Automatic,
+            None,
+        )
+        .await;
+        drop(guard);
 
-            let mut state = ctx.journal.state.lock().await;
-            match result {
-                Ok(response) => {
-                    // `run_deployment` already discharged the owed mod
-                    // work and advanced `last_deployed_revision`.
-                    info!(
-                        revision = %response.plan.publication_revision,
-                        "automatic deployment completed"
+        let mut state = ctx.journal.state.lock().await;
+        match result {
+            Ok(response) => {
+                // `run_deployment` already discharged the owed mod
+                // work and advanced `last_deployed_revision`.
+                info!(
+                    revision = %response.plan.publication_revision,
+                    "automatic deployment completed"
+                );
+                state.last_error = None;
+            }
+            Err(err) => {
+                error!(error = %err, "automatic deployment failed");
+                let message = format!("{err:#}");
+                if let Some(work) = state.pending.as_mut() {
+                    work.attempts = work.attempts.saturating_add(1);
+                    work.next_attempt_at = Some(
+                        Utc::now()
+                            + chrono::Duration::from_std(retry_delay(work.attempts))
+                                .expect("bounded retry delay fits chrono"),
                     );
-                    state.last_error = None;
+                    work.last_error = Some(message.clone());
                 }
-                Err(err) => {
-                    error!(error = %err, "automatic deployment failed");
-                    let message = format!("{err:#}");
-                    if let Some(work) = state.pending.as_mut() {
-                        work.attempts = work.attempts.saturating_add(1);
-                        work.next_attempt_at = Some(
-                            Utc::now()
-                                + chrono::Duration::from_std(retry_delay(work.attempts))
-                                    .unwrap_or_default(),
-                        );
-                        work.last_error = Some(message.clone());
-                    }
-                    state.last_error = Some(format!("automatic deployment failed: {message}"));
-                }
+                state.last_error = Some(format!("automatic deployment failed: {message}"));
             }
-            if let Err(err) = ctx.journal.save(&state) {
-                warn!(%err, "failed to persist journal after deployment");
-            }
+        }
+        if let Err(err) = ctx.journal.save(&state) {
+            warn!(%err, "failed to persist journal after deployment");
         }
     }
 }
@@ -1033,7 +998,7 @@ pub async fn run(
             // The config file seeds automation on first run; after
             // that the journal is the source of truth so /v1/config
             // changes persist across restarts.
-            state.automation = config.automation;
+            state.auto_deploy_mods = config.auto_deploy_mods;
             state.restart_policy = config.restart_policy;
             state.automation_seeded = true;
         }
@@ -1085,7 +1050,7 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
 
-    use super::{AutoAction, WorkerContext, automatic_action, operation_progress, retry_delay};
+    use super::{WorkerContext, automatic_deploy_due, operation_progress, retry_delay};
     use crate::profile::server::{
         plan::DeploySelection,
         progress::{ProgressStatus, SyncOperation, SyncPhase, SyncProgress},
@@ -1095,9 +1060,7 @@ mod tests {
 
     fn journal() -> WorkerJournal {
         WorkerJournal {
-            automation: crate::profile::server::settings::WorkerAutomation {
-                auto_deploy_mods: true,
-            },
+            auto_deploy_mods: true,
             ..WorkerJournal::default()
         }
     }
@@ -1179,27 +1142,22 @@ mod tests {
     fn pending_work_deploys_only_when_enabled_and_due() {
         let mut state = journal();
 
-        // Nothing pending, so the loop is idle, not deploying.
-        assert_eq!(automatic_action(&state, Utc::now()), AutoAction::Idle);
+        assert!(!automatic_deploy_due(&state, Utc::now()));
 
         state.pending = Some(PendingWork::new(Utc::now(), owed_mod()));
-        assert_eq!(automatic_action(&state, Utc::now()), AutoAction::Deploy);
+        assert!(automatic_deploy_due(&state, Utc::now()));
 
-        // Automation disabled: the pending work is retained for later,
-        // never dropped.
-        state.automation.auto_deploy_mods = false;
-        assert_eq!(automatic_action(&state, Utc::now()), AutoAction::Disabled);
+        state.auto_deploy_mods = false;
+        assert!(!automatic_deploy_due(&state, Utc::now()));
 
-        state.automation.auto_deploy_mods = true;
-        // A failed attempt scheduled a retry in the future, so wait.
+        state.auto_deploy_mods = true;
         state.pending.as_mut().unwrap().next_attempt_at =
             Some(Utc::now() + ChronoDuration::minutes(5));
-        assert_eq!(automatic_action(&state, Utc::now()), AutoAction::Waiting);
+        assert!(!automatic_deploy_due(&state, Utc::now()));
 
-        // Once the backoff time passes, the work is due again.
         state.pending.as_mut().unwrap().next_attempt_at =
             Some(Utc::now() - ChronoDuration::seconds(1));
-        assert_eq!(automatic_action(&state, Utc::now()), AutoAction::Deploy);
+        assert!(automatic_deploy_due(&state, Utc::now()));
     }
 
     #[test]
@@ -1402,41 +1360,6 @@ mod tests {
         assert_eq!(status.last_deployed_revision, Some(revision));
     }
 
-    #[tokio::test]
-    async fn a_migrated_journal_keeps_a_seen_publication_settled() {
-        // A journal from the phase-scoped design may carry lastSeen and
-        // lastDeployed but no deployedModsRevision. The already-seen
-        // publication stays settled — config state can never re-debt it.
-        let dir = tempfile::tempdir().unwrap();
-        let revision = Utc::now();
-        let api = spawn_sync_api(pack_manifest(), revision).await;
-        let mut config = worker_config(dir.path(), "127.0.0.1:0".into());
-        config.profile_id = SYNC_PROFILE.into();
-        config.sync_url = Some(api.url.clone());
-        let journal = crate::worker::journal::Journal::load(dir.path()).unwrap();
-        {
-            let mut state = journal.state.lock().await;
-            state.last_seen_revision = Some(revision);
-            state.last_deployed_revision = Some(revision);
-            journal.save(&state).unwrap();
-        }
-        let ctx = std::sync::Arc::new(
-            super::WorkerContext::new(
-                config,
-                super::Secrets {
-                    refresh_token: Some("refresh-seed".into()),
-                    ..worker_secrets()
-                },
-                journal,
-            )
-            .unwrap(),
-        );
-        super::poll_once(&ctx).await;
-        let state = ctx.journal.state.lock().await;
-        assert!(state.pending.is_none());
-        assert_eq!(state.last_deployed_revision, Some(revision));
-    }
-
     fn status_config(dir: &std::path::Path) -> super::WorkerConfig {
         super::WorkerConfig {
             worker_id: "w".to_owned(),
@@ -1529,7 +1452,7 @@ mod tests {
         .await;
         assert!(!response.status().is_success());
         let state = ctx.journal.state.lock().await;
-        assert!(!state.automation.auto_deploy_mods);
+        assert!(!state.auto_deploy_mods);
         assert_eq!(
             state.restart_policy,
             crate::profile::server::settings::RestartPolicy::Manual
@@ -1896,7 +1819,7 @@ mod tests {
             // `WorkerContext::new` alone does not, so the journal
             // carries them here.
             let mut state = journal.state.lock().await;
-            state.automation.auto_deploy_mods = false;
+            state.auto_deploy_mods = false;
             state.automation_seeded = true;
             state.last_error = Some("automatic deployment failed: previous attempt".to_owned());
             journal.save(&state).unwrap();
@@ -1909,9 +1832,8 @@ mod tests {
 
         {
             let state = ctx.journal.state.lock().await;
-            let pending = state.pending.as_ref().expect("mod work stays owed");
+            assert!(state.pending.is_some(), "mod work stays owed");
             assert_eq!(sync_api.metadata_requests(), 1);
-            assert!(pending.owed_mods.is_some());
             assert_eq!(
                 state.last_deployed_revision, None,
                 "nothing ran, so nothing may be acknowledged"
@@ -1984,7 +1906,7 @@ mod tests {
         assert_eq!(response.status(), super::StatusCode::NO_CONTENT);
         {
             let state = ctx.journal.state.lock().await;
-            assert!(state.automation.auto_deploy_mods);
+            assert!(state.auto_deploy_mods);
             assert!(
                 state.pending.as_ref().unwrap().next_attempt_at.is_none(),
                 "enabling automation clears stale backoff"
@@ -2037,7 +1959,7 @@ mod tests {
         let journal = crate::worker::journal::Journal::load(dir.path()).unwrap();
         {
             let mut state = journal.state.lock().await;
-            state.automation.auto_deploy_mods = true;
+            state.auto_deploy_mods = true;
         }
         let staged = dir.path().join("cache").join("Author-Mod").join("1.0.0");
         std::fs::create_dir_all(&staged).unwrap();
@@ -2102,7 +2024,7 @@ mod tests {
         let journal = crate::worker::journal::Journal::load(dir.path()).unwrap();
         {
             let mut state = journal.state.lock().await;
-            state.automation.auto_deploy_mods = true;
+            state.auto_deploy_mods = true;
         }
         // The staged package tree carries a bundled config alongside the
         // payload; the pre-seeded cache keeps staging offline.
@@ -2163,7 +2085,7 @@ mod tests {
         let api_port = free_port();
 
         let mut config = worker_config(dir.path(), format!("127.0.0.1:{api_port}"));
-        config.automation.auto_deploy_mods = true;
+        config.auto_deploy_mods = true;
         config.remote = RemoteServerSettings {
             protocol: RemoteProtocol::Ftp,
             host: "127.0.0.1".to_owned(),
@@ -2215,12 +2137,12 @@ mod tests {
         {
             let journal = Journal::load(dir.path()).unwrap();
             let state = journal.state.lock().await;
-            assert!(!state.automation.auto_deploy_mods);
+            assert!(!state.auto_deploy_mods);
         }
 
         // A restart with a config claiming automation is on keeps the
         // journal's values — it is authoritative once seeded.
-        config.automation.auto_deploy_mods = true;
+        config.auto_deploy_mods = true;
         let shutdown = tokio_util::sync::CancellationToken::new();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(super::run(
@@ -2251,7 +2173,7 @@ mod tests {
 
         // The config now disagrees with both saved values. The journal
         // remains authoritative for automation and restart policy.
-        config.automation.auto_deploy_mods = false;
+        config.auto_deploy_mods = false;
         config.restart_policy = RestartPolicy::Immediate;
         let shutdown = tokio_util::sync::CancellationToken::new();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();

@@ -13,7 +13,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use eyre::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use super::settings::{HostProvider, HostSettings};
 
@@ -32,17 +32,8 @@ pub struct HostStatus {
     pub players: Option<u32>,
 }
 
-/// What the provider supports, so the UI and policy engine can block
-/// policies that cannot be honored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HostCapabilities {
-    pub can_restart: bool,
-    pub reports_players: bool,
-}
-
 pub trait HostControl: Send + Sync {
-    fn capabilities(&self) -> HostCapabilities;
+    fn can_restart(&self) -> bool;
     fn restart<'a>(&'a self) -> BoxFuture<'a, Result<()>>;
     fn status<'a>(&'a self) -> BoxFuture<'a, Result<HostStatus>>;
     fn name(&self) -> &'static str;
@@ -54,11 +45,8 @@ pub trait HostControl: Send + Sync {
 struct NoHostControl;
 
 impl HostControl for NoHostControl {
-    fn capabilities(&self) -> HostCapabilities {
-        HostCapabilities {
-            can_restart: false,
-            reports_players: false,
-        }
+    fn can_restart(&self) -> bool {
+        false
     }
 
     fn restart<'a>(&'a self) -> BoxFuture<'a, Result<()>> {
@@ -136,13 +124,8 @@ impl DatHostControl {
 }
 
 impl HostControl for DatHostControl {
-    fn capabilities(&self) -> HostCapabilities {
-        HostCapabilities {
-            can_restart: true,
-            // DatHost only reports player counts for games with a metrics
-            // probe; a missing field maps to `None` and fails closed.
-            reports_players: true,
-        }
+    fn can_restart(&self) -> bool {
+        true
     }
 
     fn restart<'a>(&'a self) -> BoxFuture<'a, Result<()>> {
@@ -191,28 +174,23 @@ pub fn from_settings(settings: &HostSettings, password: Option<&str>) -> Box<dyn
     match settings.provider {
         HostProvider::None => Box::new(NoHostControl),
         HostProvider::DatHost => {
-            let (server_id, username, password) = (
-                settings.dat_host_server_id.trim(),
-                settings.dat_host_username.trim(),
-                password,
-            );
-            if server_id.is_empty() || username.is_empty() || password.is_none() {
-                warn_missing();
-                return Box::new(NoHostControl);
+            let server_id = settings.dat_host_server_id.trim();
+            let username = settings.dat_host_username.trim();
+            if let Some(password) = password
+                && !server_id.is_empty()
+                && !username.is_empty()
+            {
+                Box::new(DatHostControl::new(
+                    server_id.to_owned(),
+                    username.to_owned(),
+                    password.to_owned(),
+                ))
+            } else {
+                tracing::warn!("host provider credentials are incomplete; host control disabled");
+                Box::new(NoHostControl)
             }
-            Box::new(DatHostControl::new(
-                server_id.to_owned(),
-                username.to_owned(),
-                password.unwrap_or_default().to_owned(),
-            ))
         }
     }
-}
-
-fn warn_missing() {
-    tracing::warn!(
-        "host provider configured but credentials are incomplete; host control disabled"
-    );
 }
 
 #[cfg(all(test, feature = "worker"))]

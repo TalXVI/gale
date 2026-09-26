@@ -9,18 +9,13 @@
 	import RemoteConnectionSettings from './RemoteConnectionSettings.svelte';
 	import RemoteDeploymentSettings from './RemoteDeploymentSettings.svelte';
 	import HostProviderSettings from './HostProviderSettings.svelte';
-	import { ServerFormState } from './serverForm.svelte';
-	import { RemoteSync } from './remoteSync.svelte';
+	import type { ServerFormState } from './serverForm.svelte';
+	import type { RemoteSync } from './remoteSync.svelte';
 	import { Tabs } from 'bits-ui';
 	import profiles from '$lib/state/profile.svelte';
 	import { m } from '$lib/paraglide/messages';
 
-	type Props = {
-		form?: ServerFormState;
-		sync?: RemoteSync;
-	};
-
-	let { form = new ServerFormState(), sync = new RemoteSync(form) }: Props = $props();
+	let { form, sync }: { form: ServerFormState; sync: RemoteSync } = $props();
 
 	// The active profile owns the settings — switching profiles discards
 	// any unsaved edits, drops the old profile's sync state, and reloads
@@ -34,16 +29,14 @@
 		// The status panel remounts once loading finishes and issues the
 		// live refresh itself; a still-mounted panel is covered here.
 		void form.load().then(() => {
+			if (profiles.activeId !== id) return;
 			if (sync.mounted && !sync.loadingStatus && sync.status === null && form.remoteConfigured)
 				void sync.loadStatus(true).catch(() => {});
 		});
 	});
 </script>
 
-<div
-	data-testid="server-page-scroll"
-	class="mx-auto flex w-full max-w-4xl grow flex-col gap-1 overflow-y-auto px-6 pt-2 pb-6"
->
+<div class="mx-auto flex w-full max-w-4xl grow flex-col gap-1 overflow-y-auto px-6 pt-2 pb-6">
 	<LargeHeading>{m.serverPage_title()}</LargeHeading>
 	<p class="text-primary-600 dark:text-primary-300">
 		{m.serverPage_subtitle()}

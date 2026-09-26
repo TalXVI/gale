@@ -34,7 +34,7 @@ use suppaftp::{FtpError, Status};
 use tracing::{debug, info, warn};
 
 use super::{
-    host::{HostCapabilities, HostControl, HostStatus},
+    host::{HostControl, HostStatus},
     lease::{self, Lease, LeaseRecord, Ownership},
     paths::{DeployPath, DeployPathBuf, RemotePath, RemotePathBuf},
     plan::{
@@ -180,8 +180,6 @@ pub struct Session {
     /// A live lease held by another executor, if one was observed.
     pub lease: Option<LeaseRecord>,
     pub warnings: Vec<String>,
-    /// Whether legacy manifest records were adopted on open.
-    pub migrated: bool,
 }
 
 /// Everything [`open_session`] needs besides a connection.
@@ -203,11 +201,7 @@ pub fn open_session(
         layout,
     };
 
-    let LoadedState {
-        state,
-        warnings,
-        migrated,
-    } = read_authoritative_state(ops.as_mut(), &mapper)?;
+    let LoadedState { state, warnings } = read_authoritative_state(ops.as_mut(), &mapper)?;
 
     let host_managed = detect_host_managed(ops.as_mut(), &mapper, &state)?;
     let lease_file = spec.lease_dir.join(state::LEASE_FILE_NAME)?;
@@ -231,7 +225,6 @@ pub fn open_session(
         base_seq,
         lease,
         warnings,
-        migrated,
     })
 }
 
@@ -240,14 +233,10 @@ pub fn open_session(
 /// persistence sequence guard all work on fresh state rather than what
 /// was loaded when the session opened.
 fn refresh_state(session: &mut Session) -> Result<()> {
-    let LoadedState {
-        state,
-        warnings,
-        migrated,
-    } = read_authoritative_state(session.ops.as_mut(), &session.mapper)?;
+    let LoadedState { state, warnings } =
+        read_authoritative_state(session.ops.as_mut(), &session.mapper)?;
     session.base_seq = state.operation_seq;
     session.state = state;
-    session.migrated = migrated;
     for warning in warnings {
         if !session.warnings.contains(&warning) {
             session.warnings.push(warning);
@@ -265,7 +254,6 @@ fn read_authoritative_state(ops: &mut dyn RemoteOps, mapper: &RemoteMapper) -> R
             ops,
             &mapper.spec,
             &mapper.remote_path(&mapper.spec.state_path),
-            &mapper.remote_path(&mapper.spec.legacy_manifest_path),
         )
     };
     match read(ops) {
@@ -317,28 +305,26 @@ pub fn preview_with_progress(
         false,
     ) {
         Ok(lease) => Some(lease),
-        Err(err) => match err.downcast::<lease::LeaseBusy>() {
-            Ok(busy) => {
-                info!(phase = "preview.busy", owner = %busy.record.owner, stale = busy.stale, "preview found an existing deployment lease; taking a read-only snapshot");
-                let snapshot = take_snapshot(session, publication, desired, selection, progress)?;
-                progress.phase(SyncPhase::BuildingPlan);
-                let plan = plan::build_plan(
-                    publication,
-                    desired,
-                    &snapshot,
-                    selection,
-                    context,
-                    &session.mapper.spec,
-                )?;
-                progress.phase(SyncPhase::FinalizingPreview);
-                return Ok(Preview {
-                    plan,
-                    busy: Some(busy),
-                    warnings: session.warnings.clone(),
-                });
-            }
-            Err(err) => return Err(err),
-        },
+        Err(err) => {
+            let busy = err.downcast::<lease::LeaseBusy>()?;
+            info!(phase = "preview.busy", owner = %busy.record.owner, stale = busy.stale, "preview found an existing deployment lease; taking a read-only snapshot");
+            let snapshot = take_snapshot(session, publication, desired, selection, progress)?;
+            progress.phase(SyncPhase::BuildingPlan);
+            let plan = plan::build_plan(
+                publication,
+                desired,
+                &snapshot,
+                selection,
+                context,
+                &session.mapper.spec,
+            )?;
+            progress.phase(SyncPhase::FinalizingPreview);
+            return Ok(Preview {
+                plan,
+                busy: Some(busy),
+                warnings: session.warnings.clone(),
+            });
+        }
     };
 
     let snapshot = take_snapshot(session, publication, desired, selection, progress);
@@ -430,7 +416,7 @@ async fn complete_impl(
             .await
             .context("deployment finalization task failed")??;
 
-    if let Some(progress) = progress.as_deref_mut() {
+    if let Some(progress) = progress {
         progress.succeeded();
     }
 
@@ -642,8 +628,7 @@ pub(super) async fn apply_restart_policy_reporting(
         return RestartOutcome::NotRequired;
     }
 
-    let HostCapabilities { can_restart, .. } = host.capabilities();
-    if !can_restart {
+    if !host.can_restart() {
         if let Some(progress) = progress.as_deref_mut() {
             progress.item("Waiting for a manual restart");
         }
@@ -668,7 +653,7 @@ pub(super) async fn apply_restart_policy_reporting(
                 do_restart(host, Some(status), progress).await
             }
             _ => {
-                if let Some(progress) = progress.as_deref_mut() {
+                if let Some(progress) = progress {
                     progress.item("Waiting until the server is empty");
                 }
                 RestartOutcome::AwaitingEmpty
@@ -1043,15 +1028,13 @@ fn take_snapshot(
             let deploy = DeployPathBuf::new(path.as_str())
                 .map_err(|_| eyre::eyre!("config path is not deployable: {path}"))?;
             let remote = session.mapper.remote_path(&deploy);
-            let hash = match read_snapshot_file(
+            let hash = read_snapshot_file(
                 session.ops.as_mut(),
                 &remote,
                 MAX_CONFIG_READ,
                 "snapshot.config",
-            )? {
-                Some(bytes) => Some(ContentHash::from_hash(blake3::hash(&bytes))),
-                None => None,
-            };
+            )?
+            .map(|bytes| ContentHash::from_hash(blake3::hash(&bytes)));
             config_remote.insert(path, hash);
             progress.advance(index + 1, None);
         }
@@ -3392,7 +3375,7 @@ mod tests {
             ..Default::default()
         };
         match RemoteConnection::connect(&settings, "pw")? {
-            ConnectionAttempt::Connected(conn) => Ok(Box::new(conn)),
+            ConnectionAttempt::Connected(conn) => Ok(conn),
             _ => eyre::bail!("unexpected trust prompt from the fake FTP server"),
         }
     }
@@ -3416,7 +3399,7 @@ mod tests {
             ..Default::default()
         };
         match RemoteConnection::connect(&settings, "pw")? {
-            ConnectionAttempt::Connected(conn) => Ok(conn),
+            ConnectionAttempt::Connected(conn) => Ok(*conn),
             _ => eyre::bail!("pinned fake FTPS certificate was not accepted"),
         }
     }
@@ -3442,7 +3425,7 @@ mod tests {
             ..Default::default()
         };
         match RemoteConnection::connect(&settings, "pw")? {
-            ConnectionAttempt::Connected(conn) => Ok(Box::new(conn)),
+            ConnectionAttempt::Connected(conn) => Ok(conn),
             _ => eyre::bail!("pinned fake FTPS certificate was not accepted"),
         }
     }
@@ -4069,28 +4052,6 @@ mod tests {
         );
     }
 
-    /// An existing-but-unreadable legacy manifest must never silently
-    /// become an empty authoritative state — opening fails closed.
-    #[test]
-    fn an_unreadable_legacy_manifest_fails_closed() {
-        use remote::fake_ftp::{FakeFtp, Options};
-
-        let server = FakeFtp::valheim_host(Options {
-            refuse_retr: true,
-            ..Default::default()
-        });
-        server.seed_file(
-            "/BepInEx/config/.gale-server-manifest.json",
-            br#"{"version":1,"files":{}}"#,
-        );
-
-        let err = open_ftp(server.addr).err().expect("must fail");
-        assert!(
-            format!("{err:#}").contains("refuses to return"),
-            "expected a refused read, got: {err:#}"
-        );
-    }
-
     /// A remote state that moved under this session is never overwritten:
     /// the sequence guard fires over the real transport too.
     #[test]
@@ -4579,11 +4540,8 @@ mod tests {
         }
 
         impl HostControl for RestartHost {
-            fn capabilities(&self) -> HostCapabilities {
-                HostCapabilities {
-                    can_restart: true,
-                    reports_players: false,
-                }
+            fn can_restart(&self) -> bool {
+                true
             }
 
             fn restart<'a>(&'a self) -> BoxFuture<'a, Result<()>> {

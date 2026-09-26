@@ -26,7 +26,6 @@ pub const API_BASE: &str = "/v1";
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreviewRequest {
-    #[serde(default)]
     pub run_id: String,
     pub selection: DeploySelection,
     /// The restart policy the subsequent deploy will use. Bound into the
@@ -41,7 +40,6 @@ pub struct PreviewRequest {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeployRequest {
-    #[serde(default)]
     pub run_id: String,
     pub selection: DeploySelection,
     pub plan_hash: String,
@@ -85,8 +83,7 @@ pub struct StatusResponse {
     pub last_operation: Option<OperationRecord>,
     /// The last deployment failure the worker recorded.
     pub last_error: Option<String>,
-    /// The current publication-poll failure. Absent on older workers.
-    #[serde(default)]
+    /// The current publication-poll failure.
     pub poll_error: Option<String>,
     /// Live remote state, present only for `?refresh=true` requests.
     pub server: Option<ServerStateSummary>,

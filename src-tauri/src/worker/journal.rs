@@ -16,7 +16,7 @@ use tokio::sync::Mutex;
 use crate::profile::{
     export::ModRevision,
     server::{
-        settings::{RestartPolicy, WorkerAutomation},
+        settings::RestartPolicy,
         state::{OperationKind, OperationRecord},
     },
 };
@@ -24,7 +24,7 @@ use crate::worker::api::BusyOperation;
 
 pub const JOURNAL_FILE: &str = "gale-worker-state.json";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct WorkerJournal {
     /// The newest publication `updated_at` the worker has observed.
@@ -51,8 +51,7 @@ pub struct WorkerJournal {
     /// The current sync refresh token (rotated on each token grant).
     /// Seeded from `GALE_WORKER_REFRESH_TOKEN` on first run.
     pub refresh_token: Option<String>,
-    #[serde(flatten)]
-    pub automation: WorkerAutomation,
+    pub auto_deploy_mods: bool,
     pub restart_policy: RestartPolicy,
     /// Whether automation and restart policy were seeded from the config file.
     /// The config seeds once; afterwards `/v1/config` and this journal are
@@ -60,32 +59,12 @@ pub struct WorkerJournal {
     pub automation_seeded: bool,
     pub last_operation: Option<OperationRecord>,
     /// The last deployment failure, reported through the status endpoint.
-    /// Legacy journals also used this field for `poll failed: ...` errors.
     pub last_error: Option<String>,
     /// The current publication-poll failure, cleared by the next successful poll.
     pub poll_error: Option<String>,
     /// An operation that was in flight when the worker stopped. The remote
     /// lease is the real lock; this marker is diagnostic only.
     pub interrupted_operation: Option<BusyOperation>,
-}
-
-impl Default for WorkerJournal {
-    fn default() -> Self {
-        Self {
-            last_seen_revision: None,
-            pending: None,
-            last_deployed_revision: None,
-            deployed_mods_revision: None,
-            refresh_token: None,
-            automation: WorkerAutomation::default(),
-            restart_policy: RestartPolicy::default(),
-            automation_seeded: false,
-            last_operation: None,
-            last_error: None,
-            poll_error: None,
-            interrupted_operation: None,
-        }
-    }
 }
 
 /// A publication whose mod payload still needs to reach the server.
@@ -97,12 +76,8 @@ impl Default for WorkerJournal {
 pub struct PendingWork {
     /// The publication `updated_at` whose mod payload is owed.
     pub revision: DateTime<Utc>,
-    /// The mod revision owed to the server, recorded when the
-    /// publication was observed. `None` means the revision is unknown —
-    /// a journal written before it was tracked — so the work stays owed
-    /// until a deployment or a fresh remote read settles the truth.
-    #[serde(default)]
-    pub owed_mods: Option<ModRevision>,
+    /// The mod revision owed to the server.
+    pub owed_mods: ModRevision,
     /// Consecutive failed deployment attempts.
     #[serde(default)]
     pub attempts: u32,
@@ -112,12 +87,6 @@ pub struct PendingWork {
     /// The last deployment failure, for status reporting.
     #[serde(default)]
     pub last_error: Option<String>,
-    /// Legacy phase flag, read only during load-time migration. Journals
-    /// from the phase-scoped design wrote `modsPending: false` when the
-    /// marker held nothing but config debt; config debt no longer
-    /// exists, so those markers are dropped on load. Never serialized.
-    #[serde(default, skip_serializing)]
-    mods_pending: Option<bool>,
 }
 
 impl PendingWork {
@@ -126,57 +95,15 @@ impl PendingWork {
     pub fn new(revision: DateTime<Utc>, owed_mods: ModRevision) -> Self {
         Self {
             revision,
-            owed_mods: Some(owed_mods),
+            owed_mods,
             attempts: 0,
             next_attempt_at: None,
             last_error: None,
-            mods_pending: None,
         }
     }
 }
 
 impl WorkerJournal {
-    /// Separates poll errors written by older workers into their own field.
-    fn migrate_legacy_poll_error(&mut self) {
-        let Some(message) = self
-            .last_error
-            .as_deref()
-            .and_then(|error| error.strip_prefix("poll failed: "))
-        else {
-            return;
-        };
-        if self.poll_error.is_none() {
-            self.poll_error = Some(format!(
-                "Publication check failed: {}",
-                message.split(": ").next().unwrap_or(message)
-            ));
-        }
-        self.last_error = self
-            .pending
-            .as_ref()
-            .and_then(|work| work.last_error.as_ref())
-            .map(|error| format!("automatic deployment failed: {error}"));
-    }
-
-    /// Discharges markers written by the phase-scoped design that owe
-    /// nothing but config evaluation (`modsPending: false`). Config debt
-    /// no longer exists, so those markers would otherwise sit forever.
-    /// Their publications' mod payloads were already deployed, which is
-    /// all `last_deployed_revision` tracks now.
-    fn migrate_config_debt(&mut self) {
-        let Some(work) = self.pending.take() else {
-            return;
-        };
-        if work.mods_pending == Some(false) {
-            self.last_deployed_revision = Some(
-                self.last_deployed_revision
-                    .map_or(work.revision, |prev| prev.max(work.revision)),
-            );
-        } else {
-            self.pending = Some(work);
-        }
-    }
-
     /// Records the latest publication. The worker only owes the mod
     /// payload: when the publication's mod revision already matches the
     /// remote's last-reported one the publication settles immediately,
@@ -215,7 +142,7 @@ impl WorkerJournal {
 
         let settled = self.pending.as_ref().is_some_and(|work| {
             (mods_deployed && work.revision <= publication)
-                || (work.owed_mods.is_some() && work.owed_mods == self.deployed_mods_revision)
+                || self.deployed_mods_revision.as_ref() == Some(&work.owed_mods)
         });
         let resolved_revision = settled
             .then(|| self.pending.take())
@@ -242,15 +169,11 @@ impl WorkerJournal {
     /// already satisfies is discharged without a deployment — a manual
     /// deployment from another executor settles it here.
     ///
-    /// Owed work whose revision was never recorded (a journal written
-    /// before `owed_mods` was tracked) stays owed: the remote having *a*
-    /// revision deployed does not prove it is the publication's.
     pub fn observe_remote_mods(&mut self, remote_mods: &Option<ModRevision>) {
         self.deployed_mods_revision = remote_mods.clone();
 
         if let Some(work) = self.pending.as_ref()
-            && work.owed_mods.is_some()
-            && work.owed_mods == *remote_mods
+            && remote_mods.as_ref() == Some(&work.owed_mods)
         {
             let revision = work.revision;
             self.pending = None;
@@ -272,16 +195,13 @@ pub struct Journal {
 impl Journal {
     pub fn load(state_dir: &std::path::Path) -> Result<Self> {
         let path = state_dir.join(JOURNAL_FILE);
-        let mut state: WorkerJournal = match std::fs::read(&path) {
+        let state: WorkerJournal = match std::fs::read(&path) {
             Ok(bytes) => {
                 serde_json::from_slice(&bytes).context("worker journal is not valid JSON")?
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => WorkerJournal::default(),
             Err(err) => return Err(err).context("failed to read worker journal"),
         };
-        state.migrate_config_debt();
-        state.migrate_legacy_poll_error();
-
         Ok(Self {
             path,
             state: Mutex::new(state),
@@ -404,32 +324,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_journal_automation_migrates_and_saves_canonically() {
-        for (auto_sync, auto_mods) in [(true, true), (true, false), (false, true), (false, false)] {
-            let dir = tempfile::tempdir().unwrap();
-            let old = serde_json::json!({
-                "autoSync": auto_sync,
-                "autoMods": auto_mods,
-                "restartPolicy": "whenEmpty",
-                "automationSeeded": true,
-            });
-            let path = dir.path().join(JOURNAL_FILE);
-            std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
-            let journal = Journal::load(dir.path()).unwrap();
-            let state = journal.state.lock().await;
-            assert_eq!(state.automation.auto_deploy_mods, auto_sync && auto_mods);
-            assert!(state.automation_seeded);
-            assert_eq!(state.restart_policy, RestartPolicy::WhenEmpty);
-            journal.save(&state).unwrap();
-            let saved: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-            assert_eq!(saved["autoDeployMods"], auto_sync && auto_mods);
-            assert!(saved.get("autoSync").is_none());
-            assert!(saved.get("autoMods").is_none());
-        }
-    }
-
-    #[tokio::test]
     async fn poll_and_deployment_errors_survive_restart_independently() {
         let dir = tempfile::tempdir().unwrap();
         let journal = Journal::load(dir.path()).unwrap();
@@ -462,66 +356,6 @@ mod tests {
         let state = journal.state.lock().await;
         assert!(state.poll_error.is_none());
         assert!(state.last_error.is_some());
-    }
-
-    #[tokio::test]
-    async fn legacy_poll_errors_migrate_without_erasing_pending_deployment_failures() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut old = serde_json::to_value(WorkerJournal::default()).unwrap();
-        old.as_object_mut().unwrap().remove("pollError");
-        old["lastError"] = serde_json::json!(
-            "poll failed: sync token request failed: HTTP status server error (500 Internal Server Error) for url (https://example.test/api/auth/token)"
-        );
-        let mut work = PendingWork::new(Utc::now(), mod_rev('a'));
-        work.last_error = Some("upload failed".to_owned());
-        old["pending"] = serde_json::to_value(work).unwrap();
-        std::fs::write(
-            dir.path().join(JOURNAL_FILE),
-            serde_json::to_vec(&old).unwrap(),
-        )
-        .unwrap();
-
-        let journal = Journal::load(dir.path()).unwrap();
-        let state = journal.state.lock().await;
-        assert_eq!(
-            state.poll_error.as_deref(),
-            Some("Publication check failed: sync token request failed")
-        );
-        assert_eq!(
-            state.last_error.as_deref(),
-            Some("automatic deployment failed: upload failed")
-        );
-        assert_eq!(
-            state.pending.as_ref().unwrap().last_error.as_deref(),
-            Some("upload failed")
-        );
-        drop(state);
-        journal.record_poll_error(None).await.unwrap();
-
-        let reloaded = Journal::load(dir.path()).unwrap();
-        let state = reloaded.state.lock().await;
-        assert!(
-            state.poll_error.is_none(),
-            "a recovered legacy poll stays recovered"
-        );
-        assert!(state.last_error.is_some());
-    }
-
-    #[tokio::test]
-    async fn legacy_deployment_error_stays_a_deployment_error() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join(JOURNAL_FILE),
-            br#"{"lastError":"automatic deployment failed: upload failed"}"#,
-        )
-        .unwrap();
-        let journal = Journal::load(dir.path()).unwrap();
-        let state = journal.state.lock().await;
-        assert_eq!(
-            state.last_error.as_deref(),
-            Some("automatic deployment failed: upload failed")
-        );
-        assert!(state.poll_error.is_none());
     }
 
     #[test]
@@ -565,7 +399,7 @@ mod tests {
 
         let work = state.pending.as_ref().unwrap();
         assert_eq!(work.revision, revision);
-        assert_eq!(work.owed_mods.as_ref(), Some(&mod_rev('b')));
+        assert_eq!(work.owed_mods, mod_rev('b'));
         assert_eq!(state.last_deployed_revision, None);
     }
 
@@ -605,7 +439,7 @@ mod tests {
         state.acknowledge_deployment(revision, false, Some(mod_rev('0')));
 
         let pending = state.pending.as_ref().expect("mod work remains owed");
-        assert_eq!(pending.owed_mods.as_ref(), Some(&owed));
+        assert_eq!(pending.owed_mods, owed);
         assert_eq!(
             state.last_deployed_revision, None,
             "a config-only operation must not mark the publication deployed"
@@ -640,27 +474,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unknown_owed_revision_stays_owed() {
-        // A pending marker written before `owed_mods` was tracked has no
-        // recorded revision: the remote having *a* deployment does not
-        // prove it is this publication's, so it stays owed until a
-        // deployment settles it.
-        let mut state = WorkerJournal::default();
-        let revision = Utc::now();
-        state.pending = Some(PendingWork {
-            revision,
-            mods_pending: None,
-            owed_mods: None,
-            attempts: 0,
-            next_attempt_at: None,
-            last_error: None,
-        });
-
-        state.observe_remote_mods(&Some(mod_rev('a')));
-        assert!(state.pending.is_some());
-    }
-
-    #[tokio::test]
     async fn a_newer_publication_supersedes_without_acknowledging() {
         // Pending work for an older revision is discharged by a
         // deployment of a newer publication — but only when that
@@ -685,86 +498,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_config_only_pending_marker_migrates_to_deployed() {
-        // Journals from the phase-scoped design may hold markers that
-        // owed only config evaluation (`modsPending: false`). Config
-        // debt no longer exists: the marker is dropped on load and the
-        // publication counts as deployed, since its mod payload was.
-        let dir = tempfile::tempdir().unwrap();
-        let revision = Utc::now();
-        std::fs::write(
-            dir.path().join(JOURNAL_FILE),
-            serde_json::to_vec(&serde_json::json!({
-                "lastSeenRevision": revision,
-                "deployedModsRevision": mod_rev('a').as_str(),
-                "evaluatedConfigRevision": "configs-a",
-                "lastConfigSyncAt": "2024-01-01T00:00:00Z",
-                "pending": {
-                    "revision": revision,
-                    "modsPending": false,
-                    "configsPending": true,
-                    "owedMods": mod_rev('a').as_str(),
-                    "attempts": 0,
-                },
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        let journal = Journal::load(dir.path()).unwrap();
-        {
-            let mut state = journal.state.lock().await;
-            assert!(
-                state.pending.is_none(),
-                "legacy config debt must not survive as owed work"
-            );
-            assert_eq!(state.last_deployed_revision, Some(revision));
-
-            // Config divergence after migration still creates nothing.
-            let later = revision + chrono::Duration::seconds(1);
-            state.observe_publication(later, &mod_rev('a'));
-            assert!(state.pending.is_none());
-            assert_eq!(state.last_deployed_revision, Some(later));
-            journal.save(&state).unwrap();
-        }
-
-        // The dropped marker and legacy config fields stay dropped.
-        let saved: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(dir.path().join(JOURNAL_FILE)).unwrap()).unwrap();
-        assert!(saved["pending"].is_null());
-        assert!(saved.get("evaluatedConfigRevision").is_none());
-        assert!(saved.get("lastConfigSyncAt").is_none());
-    }
-
-    #[tokio::test]
-    async fn a_pending_marker_with_owed_mods_migrates_to_owed_work() {
-        // Legacy markers with `modsPending: true` (or no flag at all,
-        // written before phase tracking) still owe their mod payload.
-        let dir = tempfile::tempdir().unwrap();
-        let revision = Utc::now();
-        std::fs::write(
-            dir.path().join(JOURNAL_FILE),
-            serde_json::to_vec(&serde_json::json!({
-                "pending": {
-                    "revision": revision,
-                    "modsPending": true,
-                    "configsPending": true,
-                    "owedMods": mod_rev('a').as_str(),
-                    "attempts": 1,
-                },
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        let journal = Journal::load(dir.path()).unwrap();
-        let state = journal.state.lock().await;
-        let pending = state.pending.as_ref().expect("owed mods survive migration");
-        assert_eq!(pending.owed_mods.as_ref(), Some(&mod_rev('a')));
-        assert_eq!(pending.attempts, 1);
-    }
-
-    #[tokio::test]
     async fn pending_work_survives_a_restart() {
         // The core unattended-sync guarantee: a publication observed but
         // not yet deployed is still owed after the journal reloads.
@@ -776,8 +509,7 @@ mod tests {
             state.last_seen_revision = Some(revision);
             state.pending = Some(PendingWork {
                 revision,
-                mods_pending: None,
-                owed_mods: Some(mod_rev('a')),
+                owed_mods: mod_rev('a'),
                 attempts: 2,
                 next_attempt_at: Some(revision + chrono::Duration::minutes(5)),
                 last_error: Some("upload failed".to_owned()),
@@ -789,7 +521,7 @@ mod tests {
         let state = journal.state.lock().await;
         let pending = state.pending.as_ref().unwrap();
         assert_eq!(pending.revision, revision);
-        assert_eq!(pending.owed_mods.as_ref(), Some(&mod_rev('a')));
+        assert_eq!(pending.owed_mods, mod_rev('a'));
         assert_eq!(pending.attempts, 2);
         assert_eq!(pending.last_error.as_deref(), Some("upload failed"));
         assert_eq!(state.last_seen_revision, Some(revision));

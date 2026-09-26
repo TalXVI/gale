@@ -210,10 +210,10 @@ impl SyncClient {
             return Ok(PublicationProbe::None);
         };
 
-        if let Some(seen) = since {
-            if metadata.updated_at <= seen {
-                return Ok(PublicationProbe::Unchanged(metadata));
-            }
+        if let Some(seen) = since
+            && metadata.updated_at <= seen
+        {
+            return Ok(PublicationProbe::Unchanged(metadata));
         }
 
         let bytes = self.archive_bytes(&token, &metadata).await?;
