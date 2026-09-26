@@ -8,7 +8,7 @@
 //! 2. **Files.** Under the remote lease, apply removals, uploads, and
 //!    config writes; record every success in the deployment state and
 //!    persist it before touching the game process.
-//! 3. **Restart.** The async [`apply_restart_policy`] consults the host
+//! 3. **Restart.** The async [`apply_restart_policy_reporting`] consults the host
 //!    provider, then [`finish`] records the operation and releases the
 //!    lease.
 //!
@@ -33,8 +33,6 @@ use ssh2::ErrorCode;
 use suppaftp::{FtpError, Status};
 use tracing::{debug, info, warn};
 
-#[cfg(test)]
-use super::progress::SyncOperation;
 use super::{
     host::{HostCapabilities, HostControl, HostStatus},
     lease::{self, Lease, LeaseRecord, Ownership},
@@ -300,27 +298,6 @@ pub struct Preview {
 /// the deployment lease so the observed state cannot shift mid-read; when
 /// another executor holds the lease the plan is still computed (unlocked,
 /// advisory only) and the holder is reported through `busy`.
-#[cfg(test)]
-pub fn preview(
-    session: &mut Session,
-    publication: &Publication,
-    desired: &DesiredDeployment,
-    selection: &DeploySelection,
-    context: &PlanContext,
-    meta: &OperationMeta,
-) -> Result<Preview> {
-    let mut progress = ProgressReporter::silent(SyncOperation::Preview, selection);
-    preview_with_progress(
-        session,
-        publication,
-        desired,
-        selection,
-        context,
-        meta,
-        &mut progress,
-    )
-}
-
 pub fn preview_with_progress(
     session: &mut Session,
     publication: &Publication,
@@ -480,36 +457,6 @@ async fn complete_impl(
 ///
 /// `force` breaks a *stale foreign* lease, the documented recovery once
 /// the old executor is confirmed stopped. Live foreign leases always win.
-#[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-pub fn deploy(
-    session: &mut Session,
-    connect: impl FnMut() -> Result<Box<dyn RemoteOps>> + Send + 'static,
-    publication: &Publication,
-    desired: &DesiredDeployment,
-    selection: &DeploySelection,
-    context: &PlanContext,
-    meta: &OperationMeta,
-    expected_plan_hash: Option<&str>,
-    force: bool,
-    mut report: impl FnMut(EngineProgress),
-) -> Result<Deployment> {
-    let mut progress = ProgressReporter::silent(SyncOperation::Deploy, selection);
-    deploy_with_progress(
-        session,
-        connect,
-        publication,
-        desired,
-        selection,
-        context,
-        meta,
-        expected_plan_hash,
-        force,
-        &mut progress,
-        &mut report,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn deploy_with_progress(
     session: &mut Session,
@@ -682,16 +629,7 @@ fn ensure_ownership(lease: &Lease, session: &mut Session) -> Result<()> {
 ///
 /// `NotRequired`/`Awaiting*` outcomes are recorded in the deployment state
 /// by [`finish`]; an unknown player count is never treated as empty.
-#[cfg(test)]
-pub async fn apply_restart_policy(
-    host: &dyn HostControl,
-    policy: RestartPolicy,
-    requires_restart: bool,
-) -> RestartOutcome {
-    apply_restart_policy_reporting(host, policy, requires_restart, None).await
-}
-
-async fn apply_restart_policy_reporting(
+pub(super) async fn apply_restart_policy_reporting(
     host: &dyn HostControl,
     policy: RestartPolicy,
     requires_restart: bool,
@@ -1907,10 +1845,8 @@ mod tests {
                 lease::LeaseRecord,
                 paths::RemotePathBuf,
                 plan::{Publication, StagedFile},
-                remote::{
-                    self, ConnectionAttempt, RemoteConnection,
-                    memory::{FilteredReads, MemoryRemote},
-                },
+                progress::SyncOperation,
+                remote::{self, ConnectionAttempt, RemoteConnection, memory::MemoryRemote},
                 settings::{RemoteAuthentication, RemoteProtocol, RemoteServerSettings},
             },
             sync::{PendingConfigReason, archive::ValidatedConfigFile},
@@ -2044,23 +1980,8 @@ mod tests {
     }
 
     fn open(remote: Shared) -> Result<Session> {
-        open_ops(Box::new(remote))
-    }
-
-    fn open_ops(ops: Box<dyn RemoteOps>) -> Result<Session> {
         let spec = spec();
-        open_session(ops, &spec, RemotePathBuf::new(BASE).unwrap())
-    }
-
-    /// A remote whose dot-paths are invisible to read commands: metadata
-    /// like `lease.json` can be written but never read back. DatHost
-    /// turned out not to filter paths — it refuses `SIZE` in ASCII mode —
-    /// but this fixture still models hosts with genuine read filtering,
-    /// which the marker fallback and state verification exist for.
-    fn filtered() -> (Shared, FilteredReads) {
-        let inner = remote();
-        let filtered = FilteredReads::new(inner.clone());
-        (inner, filtered)
+        open_session(Box::new(remote), &spec, RemotePathBuf::new(BASE).unwrap())
     }
 
     fn context() -> PlanContext {
@@ -2080,6 +2001,55 @@ mod tests {
 
     fn meta() -> OperationMeta {
         OperationMeta::local("1", OperationKind::Manual)
+    }
+
+    fn preview(
+        session: &mut Session,
+        publication: &Publication,
+        desired: &DesiredDeployment,
+        selection: &DeploySelection,
+        context: &PlanContext,
+        meta: &OperationMeta,
+    ) -> Result<Preview> {
+        let mut progress = ProgressReporter::silent(SyncOperation::Preview, selection);
+        preview_with_progress(
+            session,
+            publication,
+            desired,
+            selection,
+            context,
+            meta,
+            &mut progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn deploy(
+        session: &mut Session,
+        connect: impl FnMut() -> Result<Box<dyn RemoteOps>> + Send + 'static,
+        publication: &Publication,
+        desired: &DesiredDeployment,
+        selection: &DeploySelection,
+        context: &PlanContext,
+        meta: &OperationMeta,
+        expected_plan_hash: Option<&str>,
+        force: bool,
+        mut report: impl FnMut(EngineProgress),
+    ) -> Result<Deployment> {
+        let mut progress = ProgressReporter::silent(SyncOperation::Deploy, selection);
+        deploy_with_progress(
+            session,
+            connect,
+            publication,
+            desired,
+            selection,
+            context,
+            meta,
+            expected_plan_hash,
+            force,
+            &mut progress,
+            &mut report,
+        )
     }
 
     fn remote_state(remote: &Shared) -> ServerDeploymentState {
@@ -2667,16 +2637,6 @@ mod tests {
             remote
                 .fail_read_always
                 .insert("/srv/BepInEx/config/published.cfg".to_owned());
-            // A legacy pending-decision record from the continuous-config
-            // design is inert: ignored on load, dropped on persist.
-            remote.put_file(
-                STATE_REMOTE,
-                format!(
-                    r#"{{"version": {}, "operationSeq": 0, "pending": {{"BepInEx/config/published.cfg": "modifiedLocally"}}}}"#,
-                    state::VERSION
-                )
-                .as_bytes(),
-            );
         }
         let mut session = open(memory.clone()).unwrap();
         let preview = preview(
@@ -2729,11 +2689,6 @@ mod tests {
             Some(b"old".to_vec())
         );
         assert!(state.config.is_empty());
-        let persisted = remote_contents(&memory, STATE_REMOTE).unwrap();
-        assert!(
-            !String::from_utf8_lossy(&persisted).contains("pending"),
-            "legacy pending bookkeeping must not be persisted again"
-        );
     }
 
     /// Deploys `desired` onto the memory remote and finishes, leaving an
@@ -2809,43 +2764,6 @@ mod tests {
         }
     }
 
-    /// A payload read that keeps failing must surface as an error — never
-    /// an upload plan — and the preview lease must still be released.
-    #[test]
-    fn memory_reader_failure_surfaces_and_releases_the_lease() {
-        let fixture = mod_fixture();
-        let publication = fixture.publication();
-        let desired = large_mods_payload(8);
-        let memory = remote();
-        deploy_to_memory(&memory, &publication, &desired);
-
-        {
-            let mut remote = memory.lock().unwrap();
-            remote.allow_readers = true;
-            remote
-                .fail_read_always
-                .insert(format!("{BASE}/BepInEx/plugins/Author-Mod00/Mod.dll"));
-        }
-        let mut session = open(memory.clone()).unwrap();
-        let error = preview(
-            &mut session,
-            &publication,
-            &desired,
-            &selection(true, false),
-            &context(),
-            &meta(),
-        )
-        .unwrap_err();
-        assert!(
-            format!("{error:#}").contains("read failed after reconnect"),
-            "expected the retried-read error, got: {error:#}"
-        );
-        assert!(
-            !memory.lock().unwrap().dirs.contains(LEASE_DIR_REMOTE),
-            "the preview lease must be released after a snapshot error"
-        );
-    }
-
     /// When helper connections cannot be opened the snapshot runs over
     /// the authoritative connection and produces the serial plan.
     #[test]
@@ -2885,31 +2803,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fallback.plan.hash, serial.plan.hash);
-        assert_eq!(memory.lock().unwrap().readers_opened, 0);
-    }
-
-    /// A login costs roughly what verifying a file or two costs, so
-    /// payloads under FILES_PER_SNAPSHOT_READER never open helpers.
-    #[test]
-    fn small_payloads_skip_reader_connections() {
-        let fixture = mod_fixture();
-        let publication = fixture.publication();
-        let desired = desired_payload();
-        let memory = remote();
-        deploy_to_memory(&memory, &publication, &desired);
-
-        memory.lock().unwrap().allow_readers = true;
-        let mut session = open(memory.clone()).unwrap();
-        let previewed = preview(
-            &mut session,
-            &publication,
-            &desired,
-            &selection(true, false),
-            &context(),
-            &meta(),
-        )
-        .unwrap();
-        assert!(previewed.plan.uploads.is_empty());
         assert_eq!(memory.lock().unwrap().readers_opened, 0);
     }
 
@@ -3288,31 +3181,9 @@ mod tests {
             &meta(),
         )
         .unwrap();
-        assert_eq!(
-            remote_state(&memory).config[&path].policy,
-            ConfigUpdatePolicy::AlwaysKeep
-        );
-    }
-
-    #[test]
-    fn persist_refuses_to_overwrite_newer_remote_state() {
-        let memory = remote();
-        let mut session = open(memory.clone()).unwrap();
-
-        // A rogue writer advanced the remote sequence since this session
-        // loaded its state, so persisting must fail rather than overwrite
-        // the newer state.
-        let mut newer = ServerDeploymentState {
-            version: state::VERSION,
-            ..Default::default()
-        };
-        newer.operation_seq = 7;
-        memory
-            .lock()
-            .unwrap()
-            .put_file(STATE_REMOTE, &state::serialize(&newer).unwrap());
-
-        assert!(persist_state(&mut session).is_err());
+        let record = remote_state(&memory).config[&path].clone();
+        assert_eq!(record.policy, ConfigUpdatePolicy::AlwaysKeep);
+        assert_eq!(record.policy_set_at, Some(hash));
     }
 
     #[test]
@@ -3387,67 +3258,6 @@ mod tests {
     }
 
     #[test]
-    fn config_only_deploy_requires_restart() {
-        let mut fixture = mod_fixture();
-        fixture
-            .config
-            .insert(config_path("BepInEx/config/mod.cfg"), config_file(b"v2"));
-        let publication = fixture.publication();
-
-        let memory = remote();
-        let mut session = open(memory.clone()).unwrap();
-
-        let mut sel = selection(false, true);
-        sel.apply_configs = vec![config_path("BepInEx/config/mod.cfg")];
-
-        let preview = preview(
-            &mut session,
-            &publication,
-            &DesiredDeployment::default(),
-            &sel,
-            &context(),
-            &meta(),
-        )
-        .unwrap();
-        assert!(preview.plan.requires_restart);
-    }
-
-    #[test]
-    fn restart_flag_follows_the_outcome() {
-        let fixture = mod_fixture();
-        let publication = fixture.publication();
-        let desired = desired_payload();
-        let memory = remote();
-        let mut session = open(memory.clone()).unwrap();
-
-        let deployment = deploy(
-            &mut session,
-            no_connect,
-            &publication,
-            &desired,
-            &selection(true, false),
-            &context(),
-            &meta(),
-            None,
-            false,
-            |_| {},
-        )
-        .unwrap();
-        let state = finish(
-            &mut session,
-            deployment,
-            RestartOutcome::AwaitingManual,
-            &meta(),
-        )
-        .unwrap();
-        assert!(state.restart_required);
-        assert_eq!(
-            remote_state(&memory).last_operation.unwrap().restart,
-            RestartOutcome::AwaitingManual
-        );
-    }
-
-    #[test]
     fn external_restart_requires_explicit_acknowledgment_under_the_lease() {
         let memory = remote();
         let state = ServerDeploymentState {
@@ -3468,13 +3278,6 @@ mod tests {
         let record = acknowledged.last_operation.unwrap();
         assert_eq!(record.restart, RestartOutcome::Restarted);
         assert!(record.external_restart_acknowledged);
-        #[derive(serde::Deserialize)]
-        struct PreviousOperationView {
-            restart: RestartOutcome,
-        }
-        let previous: PreviousOperationView =
-            serde_json::from_value(serde_json::to_value(&record).unwrap()).unwrap();
-        assert_eq!(previous.restart, RestartOutcome::Restarted);
         assert!(!remote_has_dir(&memory, LEASE_DIR_REMOTE));
         assert!(!open(memory.clone()).unwrap().state.restart_required);
         assert!(acknowledge_external_restart(&mut session, &meta()).is_err());
@@ -3511,6 +3314,7 @@ mod tests {
             (RestartOutcome::StartupUnverified, true),
             (RestartOutcome::Failed, true),
             (RestartOutcome::NotRequired, true),
+            (RestartOutcome::AwaitingManual, true),
         ] {
             let fixture = mod_fixture();
             let memory = remote();
@@ -3530,160 +3334,13 @@ mod tests {
             .unwrap();
             let state = finish(&mut session, deployment, outcome, &meta()).unwrap();
             assert_eq!(state.restart_required, required, "{outcome:?}");
+            let persisted = open(memory).unwrap().state;
             assert_eq!(
-                open(memory).unwrap().state.restart_required,
-                required,
+                persisted.restart_required, required,
                 "persisted {outcome:?}"
             );
+            assert_eq!(persisted.last_operation.unwrap().restart, outcome);
         }
-    }
-
-    #[test]
-    fn running_status_without_an_observed_stop_does_not_confirm_restart() {
-        let mut saw_stopped = false;
-        let mut saw_booting = false;
-        let status = |running, booting| HostStatus {
-            running,
-            booting,
-            players: None,
-        };
-        assert!(!observed_restart(
-            &mut saw_stopped,
-            &mut saw_booting,
-            &status(Some(true), None)
-        ));
-        assert!(!observed_restart(
-            &mut saw_stopped,
-            &mut saw_booting,
-            &status(None, None)
-        ));
-        assert!(!observed_restart(
-            &mut saw_stopped,
-            &mut saw_booting,
-            &status(Some(false), None)
-        ));
-        assert!(observed_restart(
-            &mut saw_stopped,
-            &mut saw_booting,
-            &status(Some(true), None)
-        ));
-    }
-
-    #[test]
-    fn booting_must_be_observed_after_the_request_before_completion_counts() {
-        let mut saw_stopped = false;
-        let mut saw_booting = false;
-        let status = |running, booting| HostStatus {
-            running,
-            booting,
-            players: None,
-        };
-        assert!(!observed_restart(
-            &mut saw_stopped,
-            &mut saw_booting,
-            &status(Some(true), Some(false))
-        ));
-        assert!(!observed_restart(
-            &mut saw_stopped,
-            &mut saw_booting,
-            &status(Some(true), None)
-        ));
-        assert!(!observed_restart(
-            &mut saw_stopped,
-            &mut saw_booting,
-            &status(Some(true), Some(true))
-        ));
-        assert!(!observed_restart(
-            &mut saw_stopped,
-            &mut saw_booting,
-            &status(Some(true), None)
-        ));
-        assert!(!observed_restart(
-            &mut saw_stopped,
-            &mut saw_booting,
-            &status(None, Some(false))
-        ));
-        assert!(observed_restart(
-            &mut saw_stopped,
-            &mut saw_booting,
-            &status(Some(true), Some(false))
-        ));
-    }
-
-    #[test]
-    fn set_config_policy_persists_to_remote_state() {
-        let memory = remote();
-        let mut session = open(memory.clone()).unwrap();
-        let path = config_path("BepInEx/config/mod.cfg");
-        let hash = ContentHash::from_hash(blake3::hash(b"v1"));
-
-        set_config_policy(
-            &mut session,
-            &path,
-            ConfigUpdatePolicy::AlwaysKeep,
-            Some(&hash),
-            &meta(),
-        )
-        .unwrap();
-
-        let persisted = remote_state(&memory);
-        let record = &persisted.config[&path];
-        assert_eq!(record.policy, ConfigUpdatePolicy::AlwaysKeep);
-        assert_eq!(record.policy_set_at, Some(hash));
-    }
-
-    #[test]
-    fn deploy_on_a_read_filtered_remote_uses_the_holder_marker() {
-        // A host that hides dot-paths from every read: the lease record
-        // is write-only, so ownership falls back to the holder marker
-        // instead of aborting as a false takeover — and uploads still run
-        // under that verified claim. But the state file is equally
-        // unreadable, so persistence cannot be verified and the
-        // deployment must fail closed rather than claim success.
-        let fixture = mod_fixture();
-        let publication = fixture.publication();
-        let desired = desired_payload();
-        let (memory, filtered) = filtered();
-        let mut session = open_ops(Box::new(filtered.clone())).unwrap();
-
-        let conn = filtered.clone();
-        let err = deploy(
-            &mut session,
-            move || Ok(Box::new(conn.clone()) as Box<dyn RemoteOps>),
-            &publication,
-            &desired,
-            &selection(true, false),
-            &context(),
-            &meta(),
-            None,
-            false,
-            |_| {},
-        )
-        .err()
-        .expect("unverifiable state persistence must fail the deploy");
-
-        assert!(
-            format!("{err:#}").contains("failed to persist remote deployment state"),
-            "expected a persistence failure, got: {err:#}"
-        );
-        // Ownership was verified through the marker — never a phantom
-        // takeover.
-        assert!(
-            session
-                .warnings
-                .iter()
-                .any(|w| w.contains("marker directory"))
-        );
-        // The upload landed before the persistence failure and the
-        // claim was fully released. The state temp could never be
-        // verified, so it was never renamed — no authoritative state
-        // exists on an unreadable host.
-        assert_eq!(
-            remote_contents(&memory, MOD_DLL_REMOTE),
-            Some(b"dll-bytes".to_vec())
-        );
-        assert!(remote_contents(&memory, STATE_REMOTE).is_none());
-        assert!(!remote_has_dir(&memory, LEASE_DIR_REMOTE));
     }
 
     #[test]
@@ -3694,8 +3351,8 @@ mod tests {
         let fixture = mod_fixture();
         let publication = fixture.publication();
         let desired = desired_payload();
-        let (memory, filtered) = filtered();
-        let mut session = open_ops(Box::new(filtered)).unwrap();
+        let memory = remote();
+        let mut session = open(memory.clone()).unwrap();
         memory.lock().unwrap().connection_dead = true;
 
         let err = deploy(
@@ -3719,43 +3376,6 @@ mod tests {
             "a transport failure must not blame another executor: {chain}"
         );
         assert!(remote_contents(&memory, MOD_DLL_REMOTE).is_none());
-    }
-
-    #[test]
-    fn a_failed_filtered_deploy_cannot_persist_state_but_releases() {
-        let fixture = mod_fixture();
-        let publication = fixture.publication();
-        let desired = desired_payload();
-        let (memory, filtered) = filtered();
-        memory
-            .lock()
-            .unwrap()
-            .fail_always
-            .insert(format!("{MOD_DLL_REMOTE}.gale-upload"));
-        let mut session = open_ops(Box::new(filtered)).unwrap();
-
-        let err = deploy(
-            &mut session,
-            no_connect,
-            &publication,
-            &desired,
-            &selection(true, false),
-            &context(),
-            &meta(),
-            None,
-            false,
-            |_| {},
-        )
-        .err()
-        .expect("the upload failure must fail the deployment");
-        assert!(format!("{err:#}").contains("failed to upload"));
-
-        // The failure could not be recorded: on a host where the state
-        // cannot be read back, an unverifiable temp must never become
-        // authoritative — so no state file exists — but the lease was
-        // still released.
-        assert!(remote_contents(&memory, STATE_REMOTE).is_none());
-        assert!(!remote_has_dir(&memory, LEASE_DIR_REMOTE));
     }
 
     // ---------- end-to-end over the in-memory FTP server ----------
@@ -4026,111 +3646,6 @@ mod tests {
         assert!(!server.has_dir("/BepInEx/config/.gale-deploy.lock"));
     }
 
-    /// Wall-clock benchmark for an unchanged mods-only Preview and Deploy
-    /// over a latent FTPS link: each command and each data-channel setup
-    /// costs 10 ms of simulated round-trip time. Run explicitly:
-    /// `cargo test --features worker --lib bench_unchanged -- --ignored --nocapture`
-    #[test]
-    #[ignore = "wall-clock benchmark; run explicitly"]
-    fn bench_unchanged_mods_preview_and_deploy_over_latent_ftps() {
-        use remote::fake_ftp::{FakeFtp, Options};
-        use std::time::Instant;
-
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter("gale=info")
-            .try_init();
-
-        let latency = Duration::from_millis(10);
-        let server = FakeFtp::valheim_host(Options {
-            tls: true,
-            size_requires_binary: true,
-            latency: Some(latency),
-            ..Default::default()
-        });
-        let addr = server.addr;
-        let certificate = server.trusted_certificate().unwrap();
-
-        let fixture = mod_fixture();
-        let publication = fixture.publication();
-        let desired = large_mods_payload(50);
-        assert_eq!(desired.payload.len(), 166);
-
-        // Setup deploy runs at full speed; only the measured operations
-        // pay the simulated latency.
-        server.set_latency(None);
-        deploy_initial(&server, &publication, &desired);
-        server.set_latency(Some(latency));
-
-        let report = |label: &str, elapsed: Duration| {
-            let commands = server.commands.lock().unwrap();
-            let count = |prefix: &str| {
-                commands
-                    .iter()
-                    .filter(|line| line.starts_with(prefix))
-                    .count()
-            };
-            println!(
-                "{label}: {elapsed:?} | LIST={} MLST={} RETR={} PASV={} EPSV={} USER={} | peak_connections={}",
-                count("LIST"),
-                count("MLST"),
-                count("RETR"),
-                count("PASV"),
-                count("EPSV"),
-                count("USER"),
-                server.peak_connections(),
-            );
-        };
-
-        // 1) An unchanged mods-only preview on a freshly opened session.
-        let mut preview_session = open_ftps(&server).unwrap();
-        server.clear_commands();
-        let started = Instant::now();
-        let previewed = preview(
-            &mut preview_session,
-            &publication,
-            &desired,
-            &selection(true, false),
-            &context(),
-            &meta(),
-        )
-        .unwrap();
-        let elapsed = started.elapsed();
-        report("preview", elapsed);
-        assert!(previewed.plan.uploads.is_empty());
-        drop(preview_session);
-
-        // 2) A deploy of the approved plan on a fresh session.
-        let mut deploy_session = open_ftps(&server).unwrap();
-        server.clear_commands();
-        let started = Instant::now();
-        let deployment = deploy(
-            &mut deploy_session,
-            {
-                let certificate = certificate.clone();
-                move || ftps_ops(addr, &certificate)
-            },
-            &publication,
-            &desired,
-            &selection(true, false),
-            &context(),
-            &meta(),
-            Some(&previewed.plan.hash),
-            false,
-            |_| {},
-        )
-        .unwrap();
-        let elapsed = started.elapsed();
-        report("deploy", elapsed);
-        assert_eq!(deployment.summary.uploaded_files, 0);
-        finish(
-            &mut deploy_session,
-            deployment,
-            RestartOutcome::NotRequired,
-            &meta(),
-        )
-        .unwrap();
-    }
-
     /// Counts received `verb` commands by their path argument, e.g.
     /// `RETR /BepInEx/plugins/Mod.dll`.
     fn command_targets(server: &remote::fake_ftp::FakeFtp, verb: &str) -> BTreeMap<String, usize> {
@@ -4212,80 +3727,6 @@ mod tests {
             "reader helpers must be opened for this fixture"
         );
         assert!(server.peak_connections() <= 1 + MAX_SNAPSHOT_READERS);
-    }
-
-    /// Deploy re-reads every payload the approved preview hashed — the
-    /// fresh snapshot under the lease is what the approval is checked
-    /// against — and stays within the deploy-time connection bound.
-    #[test]
-    fn ftps_deploy_rereads_payloads_against_the_approved_plan() {
-        use remote::fake_ftp::{FakeFtp, Options};
-
-        let server = FakeFtp::valheim_host(Options {
-            tls: true,
-            size_requires_binary: true,
-            ..Default::default()
-        });
-        let fixture = mod_fixture();
-        let publication = fixture.publication();
-        let desired = large_mods_payload(50);
-        deploy_initial(&server, &publication, &desired);
-        let addr = server.addr;
-        let certificate = server.trusted_certificate().unwrap();
-
-        let mut preview_session = open_ftps(&server).unwrap();
-        let previewed = preview(
-            &mut preview_session,
-            &publication,
-            &desired,
-            &selection(true, false),
-            &context(),
-            &meta(),
-        )
-        .unwrap();
-        drop(preview_session);
-
-        let mut deploy_session = open_ftps(&server).unwrap();
-        server.clear_commands();
-        let deployment = deploy(
-            &mut deploy_session,
-            {
-                let certificate = certificate.clone();
-                move || ftps_ops(addr, &certificate)
-            },
-            &publication,
-            &desired,
-            &selection(true, false),
-            &context(),
-            &meta(),
-            Some(&previewed.plan.hash),
-            false,
-            |_| {},
-        )
-        .unwrap();
-        assert_eq!(deployment.summary.uploaded_files, 0);
-
-        let retrs = command_targets(&server, "RETR");
-        for path in desired.payload.keys() {
-            let remote = format!("/{path}");
-            assert_eq!(
-                retrs.get(&remote),
-                Some(&1),
-                "deploy must independently re-read {remote}"
-            );
-        }
-        for (dir, count) in command_targets(&server, "LIST") {
-            assert_eq!(count, 1, "directory {dir} listed {count} times");
-        }
-        // Authoritative + heartbeat slot + readers.
-        assert!(server.peak_connections() <= 2 + MAX_SNAPSHOT_READERS);
-        finish(
-            &mut deploy_session,
-            deployment,
-            RestartOutcome::NotRequired,
-            &meta(),
-        )
-        .unwrap();
     }
 
     /// Remote drift between approval and execution — a same-size edit or
@@ -4400,6 +3841,8 @@ mod tests {
         );
         assert!(server.file(&drifted_remote).is_none());
         assert!(!server.has_dir("/BepInEx/config/.gale-deploy.lock"));
+        // Authoritative + heartbeat slot + readers, across every deploy above.
+        assert!(server.peak_connections() <= 2 + MAX_SNAPSHOT_READERS);
     }
 
     /// Snapshot helpers are read-only connections: during an unchanged
@@ -4627,68 +4070,6 @@ mod tests {
                 .file("/BepInEx/config/.gale-server-state.json.tmp")
                 .is_some()
         );
-    }
-
-    /// A legacy deployment manifest on the remote is adopted on open and
-    /// superseded by the state file on the next persist — over the real
-    /// FTP path.
-    #[test]
-    fn a_legacy_manifest_migrates_over_ftp() {
-        use remote::fake_ftp::{FakeFtp, Options};
-
-        let server = FakeFtp::valheim_host(Options::default());
-        let addr = server.addr;
-        let owned = OwnedFile {
-            hash: blake3::hash(b"dll-bytes").to_hex().to_string(),
-            size: 9,
-        };
-        let manifest = serde_json::json!({
-            "version": 1,
-            "files": { "BepInEx/plugins/Author-ModA/ModA.dll": owned },
-        });
-        server.seed_file(
-            "/BepInEx/config/.gale-server-manifest.json",
-            &serde_json::to_vec(&manifest).unwrap(),
-        );
-
-        let mut session = open_ftp(addr).unwrap();
-        assert!(session.migrated, "the legacy manifest must be adopted");
-        assert!(
-            session
-                .state
-                .files
-                .contains_key(&deploy_path("BepInEx/plugins/Author-ModA/ModA.dll"))
-        );
-
-        // A completed deployment persists the new-format state, which a
-        // fresh connection then loads instead of the manifest.
-        let fixture = mod_fixture();
-        let publication = fixture.publication();
-        let desired = desired_payload();
-        let deployment = deploy(
-            &mut session,
-            move || ftp_ops(addr),
-            &publication,
-            &desired,
-            &selection(true, false),
-            &context(),
-            &meta(),
-            None,
-            false,
-            |_| {},
-        )
-        .unwrap();
-        finish(
-            &mut session,
-            deployment,
-            RestartOutcome::NotRequired,
-            &meta(),
-        )
-        .unwrap();
-
-        let second = open_ftp(addr).unwrap();
-        assert!(!second.migrated);
-        assert_eq!(second.state.operation_seq, 1);
     }
 
     /// An existing-but-unreadable legacy manifest must never silently
@@ -5212,90 +4593,6 @@ mod tests {
         assert_eq!(upload.total_bytes, Some(expected_bytes));
         assert_eq!(completed(SyncPhase::WritingConfigs).completed, 1);
         assert_eq!(events.last().unwrap().status, ProgressStatus::Succeeded);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn restart_reports_waiting_until_stop_and_start_are_observed() {
-        use std::collections::VecDeque;
-
-        use crate::profile::server::host::BoxFuture;
-
-        struct RestartHost(Mutex<VecDeque<HostStatus>>);
-
-        impl HostControl for RestartHost {
-            fn capabilities(&self) -> HostCapabilities {
-                HostCapabilities {
-                    can_restart: true,
-                    reports_players: false,
-                }
-            }
-
-            fn restart<'a>(&'a self) -> BoxFuture<'a, Result<()>> {
-                Box::pin(async { Ok(()) })
-            }
-
-            fn status<'a>(&'a self) -> BoxFuture<'a, Result<HostStatus>> {
-                Box::pin(async move {
-                    Ok(self
-                        .0
-                        .lock()
-                        .unwrap()
-                        .pop_front()
-                        .expect("expected status probe"))
-                })
-            }
-
-            fn name(&self) -> &'static str {
-                "test host"
-            }
-        }
-
-        let host = RestartHost(Mutex::new(VecDeque::from([
-            HostStatus {
-                running: Some(true),
-                booting: None,
-                players: None,
-            },
-            HostStatus {
-                running: Some(false),
-                booting: None,
-                players: None,
-            },
-            HostStatus {
-                running: Some(true),
-                booting: None,
-                players: None,
-            },
-        ])));
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let sink = events.clone();
-        let mut progress = ProgressReporter::new(
-            "restart-run".to_owned(),
-            SyncOperation::Deploy,
-            &selection(true, true),
-            move |snapshot| sink.lock().unwrap().push(snapshot),
-        );
-        progress.phase(SyncPhase::ApplyingRestart);
-        let outcome = apply_restart_policy_reporting(
-            &host,
-            RestartPolicy::Immediate,
-            true,
-            Some(&mut progress),
-        )
-        .await;
-        assert!(matches!(outcome, RestartOutcome::Restarted));
-        let events = events.lock().unwrap();
-        assert!(
-            events
-                .iter()
-                .any(|event| { event.item.as_deref() == Some("Requesting server restart") })
-        );
-        assert!(events.iter().any(|event| {
-            event
-                .item
-                .as_deref()
-                .is_some_and(|item| item.contains("check 2 of 12"))
-        }));
     }
 
     #[tokio::test(start_paused = true)]

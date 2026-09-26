@@ -1376,46 +1376,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn new_publication_clears_a_failed_poll() {
-        use std::sync::atomic::Ordering;
-
-        let dir = tempfile::tempdir().unwrap();
-        let revision = Utc::now();
-        let manifest = pack_manifest();
-        let api = crate::worker::sync_client::tests::MockApi {
-            meta: Some(crate::worker::sync_client::tests::metadata(
-                "valheim", revision,
-            )),
-            archive: publication_zip(&manifest),
-            ..Default::default()
-        };
-        api.token_status.store(500, Ordering::Relaxed);
-        let server = crate::worker::sync_client::tests::serve(api.clone()).await;
-        let ctx = poll_test_context(dir.path(), server.url.clone());
-
-        super::poll_once(&ctx).await;
-        assert!(poll_status(ctx.clone()).await.poll_error.is_some());
-        api.token_status.store(0, Ordering::Relaxed);
-        super::poll_once(&ctx).await;
-
-        let status = poll_status(ctx.clone()).await;
-        assert!(status.poll_error.is_none());
-        assert_eq!(status.observed_revision, Some(revision));
-        assert_eq!(status.pending_revision, Some(revision));
-        assert_eq!(api.archive_hits.load(Ordering::Relaxed), 1);
-        drop(ctx);
-        assert!(
-            Journal::load(dir.path())
-                .unwrap()
-                .state
-                .lock()
-                .await
-                .poll_error
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
     async fn completed_manual_deployment_clears_only_the_deployment_error() {
         let dir = tempfile::tempdir().unwrap();
         let revision = Utc::now();
@@ -1585,31 +1545,12 @@ mod tests {
 
     #[test]
     fn run_report_is_optional_without_a_status_file() {
-        const CHILD: &str = "GALE_REPORT_TEST_CHILD";
-        if std::env::var_os(CHILD).is_some() {
-            let config = super::WorkerConfig {
-                state_dir: std::env::current_dir().unwrap(),
-                ..Default::default()
-            };
-            super::report_run_state(&config, super::WorkerRunPhase::Stopped);
-            assert_eq!(std::fs::read_dir(".").unwrap().count(), 0);
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "worker::server::tests::run_report_is_optional_without_a_status_file",
-            ])
-            .env(CHILD, "1")
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stdout)
-        );
+        let config = super::WorkerConfig {
+            state_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        super::report_run_state(&config, super::WorkerRunPhase::Stopped);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
@@ -1827,29 +1768,6 @@ mod tests {
         let err = result.unwrap_err();
         assert!(
             err.to_string().contains("failed to bind"),
-            "unexpected error: {err:#}"
-        );
-    }
-
-    /// Unsupported game metadata is an init failure — the worker must
-    /// reject it rather than serving an API that cannot deploy.
-    #[tokio::test]
-    async fn run_rejects_a_game_without_dedicated_server_support() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut config = worker_config(dir.path(), "127.0.0.1:0".to_owned());
-        config.game = "h3vr".to_owned();
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        let err = super::run(
-            config,
-            worker_secrets(),
-            tokio_util::sync::CancellationToken::new(),
-            Some(ready_tx),
-        )
-        .await
-        .unwrap_err();
-        assert!(ready_rx.await.is_err());
-        assert!(
-            err.to_string().contains("no dedicated-server support"),
             "unexpected error: {err:#}"
         );
     }

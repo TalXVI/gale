@@ -268,9 +268,6 @@ Object.assign(window, {
 	setWorkerPending: (pendingRevision: string | null) => {
 		worker.pendingRevision = pendingRevision;
 	},
-	setWorkerDeployed: (revision: string | null) => {
-		worker.lastDeployedRevision = revision;
-	},
 	failWorkerRefresh: (on: boolean) => {
 		workerRefreshFails = on;
 	},

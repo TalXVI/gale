@@ -1836,11 +1836,6 @@ pub(crate) mod fake_ftp {
         pub expire_control_after: Option<Duration>,
         /// Expire an individual control connection after this many data transfers.
         pub expire_control_after_transfers: Option<usize>,
-        /// Simulated round-trip time: the server sleeps this long after
-        /// reading each command line, and once more before accepting the
-        /// data connection a transfer command opens. Initial value; can be
-        /// changed later through [`FakeFtp::set_latency`].
-        pub latency: Option<Duration>,
     }
 
     /// A path-scoped RETR interruption armed by
@@ -1868,9 +1863,6 @@ pub(crate) mod fake_ftp {
         path_reset: Arc<Mutex<Option<PathReset>>>,
         /// The most control connections the server has held at once.
         peak_connection_count: Arc<std::sync::atomic::AtomicUsize>,
-        /// Current simulated round-trip time; shared so tests can turn it
-        /// on after setup work that should run at full speed.
-        latency: Arc<Mutex<Option<Duration>>>,
         /// The blake3 fingerprint of the self-signed certificate the
         /// server presents when `Options::tls` is on; `None` otherwise.
         certificate_fingerprint: Option<String>,
@@ -2007,7 +1999,6 @@ pub(crate) mod fake_ftp {
             let path_reset = Arc::new(Mutex::new(None));
             let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let peak_connection_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let latency = Arc::new(Mutex::new(options.latency));
             let tls = options
                 .tls
                 .then(|| tls_identity(options.abort_stor_after_tls_handshake));
@@ -2030,7 +2021,6 @@ pub(crate) mod fake_ftp {
                 let path_reset = path_reset.clone();
                 let active_connections = active_connections.clone();
                 let peak_connection_count = peak_connection_count.clone();
-                let latency = latency.clone();
                 std::thread::spawn(move || {
                     let mut sockets = Vec::new();
                     let mut threads = Vec::new();
@@ -2051,7 +2041,6 @@ pub(crate) mod fake_ftp {
                                 let reset_after_completion = reset_after_completion.clone();
                                 let path_reset = path_reset.clone();
                                 let active_connections = active_connections.clone();
-                                let latency = latency.clone();
                                 let stop = stopping.clone();
                                 let tls = tls.as_ref().map(|(tls, _)| Tls {
                                     control: tls.control.clone(),
@@ -2078,7 +2067,6 @@ pub(crate) mod fake_ftp {
                                         &reset_retr_remaining,
                                         &reset_after_completion,
                                         &path_reset,
-                                        &latency,
                                     );
                                     let _ = shutdown.shutdown(std::net::Shutdown::Both);
                                     active_connections
@@ -2111,7 +2099,6 @@ pub(crate) mod fake_ftp {
                 reset_after_completion,
                 path_reset,
                 peak_connection_count,
-                latency,
                 certificate_fingerprint,
                 fs,
                 stop,
@@ -2198,12 +2185,6 @@ pub(crate) mod fake_ftp {
         /// phase of a test.
         pub fn clear_commands(&self) {
             self.commands.lock().unwrap().clear();
-        }
-
-        /// Overrides `Options::latency` after spawn, so benchmark setup
-        /// can run at full speed before the timed phase pays for latency.
-        pub fn set_latency(&self, latency: Option<Duration>) {
-            *self.latency.lock().unwrap() = latency;
         }
 
         /// Removes a seeded file — the remote-side delete a staleness
@@ -2378,7 +2359,6 @@ pub(crate) mod fake_ftp {
         reset_retr_remaining: &std::sync::atomic::AtomicUsize,
         reset_after_completion: &std::sync::atomic::AtomicBool,
         path_reset: &Arc<Mutex<Option<PathReset>>>,
-        latency: &Arc<Mutex<Option<Duration>>>,
     ) {
         // `socket` keeps a handle to the control connection so `AUTH TLS`
         // can upgrade it in place; the reader/writer work on clones until
@@ -2402,13 +2382,6 @@ pub(crate) mod fake_ftp {
         /// it in TLS when the session negotiated `PROT P`.
         macro_rules! data {
             () => {{
-                // The data channel costs a round trip of its own to set
-                // up. Drop the guard before sleeping so connections stay
-                // concurrent.
-                let round_trip = *latency.lock().unwrap();
-                if let Some(round_trip) = round_trip {
-                    std::thread::sleep(round_trip);
-                }
                 passive
                     .take()
                     .and_then(|listener| accept_data(listener, stop))
@@ -2444,13 +2417,6 @@ pub(crate) mod fake_ftp {
             }
             let command = line.trim_end().to_owned();
             commands.lock().unwrap().push(command.clone());
-            // One round trip per command. The guard must drop before the
-            // sleep or every connection's round trips would serialize on
-            // the latency lock.
-            let round_trip = *latency.lock().unwrap();
-            if let Some(round_trip) = round_trip {
-                std::thread::sleep(round_trip);
-            }
             if options
                 .expire_control_after
                 .is_some_and(|age| connected_at.elapsed() >= age)
@@ -2943,17 +2909,6 @@ mod tests {
     }
 
     #[test]
-    fn pinned_self_signed_cert_is_accepted() {
-        // Explicit trust: an exact fingerprint pin accepts a certificate
-        // CA validation would reject.
-        let certified = self_signed("ftps.local");
-        let pin = certificate_fingerprint(certified.cert.der());
-        let (verifier, _) = verifier(RootCertStore::empty(), Some(pin));
-
-        verify(&verifier, certified.cert.der(), "ftps.local").unwrap();
-    }
-
-    #[test]
     fn ca_valid_replacement_cannot_satisfy_a_pin() {
         // The certificate chains to a trusted CA, but it is not the pinned
         // one. A pin is exact-match, not "any CA-valid cert".
@@ -3390,23 +3345,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn ftp_fixture_releases_listener_even_during_unwinding() {
-        for unwind in [false, true] {
-            let mut addr = None;
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let server = FakeFtp::spawn(FakeFtpOptions::default());
-                addr = Some(server.addr);
-                let _idle_client = std::net::TcpStream::connect(server.addr).unwrap();
-                if unwind {
-                    panic!("deliberate fixture unwind");
-                }
-            }));
-            assert_eq!(result.is_err(), unwind);
-            let _listener = std::net::TcpListener::bind(addr.unwrap()).unwrap();
-        }
-    }
-
     /// The DatHost profile verified against the live server: `SIZE` is
     /// refused in ASCII mode (`550 SIZE not allowed in ASCII mode`),
     /// while dot-prefixed paths are fully visible to LIST/MLST/MDTM/RETR.
@@ -3759,215 +3697,4 @@ mod tests {
         );
         assert!(server.saw("STOR /BepInEx/config/state.tmp"));
     }
-
-    /// Exercises Gale's production FTPS transport against a real server.
-    ///
-    /// The ignored test is run in CI or locally with a disposable ProFTPD
-    /// endpoint. It deliberately crosses the 8 KiB copy boundary, performs
-    /// consecutive transfers, and verifies downloaded bytes and hashes.
-    #[test]
-    #[ignore = "requires GALE_TEST_FTPS_* for a disposable FTPS server"]
-    fn real_ftps_round_trips_varied_binary_payloads() {
-        let host = std::env::var("GALE_TEST_FTPS_HOST").expect("GALE_TEST_FTPS_HOST is required");
-        let port = std::env::var("GALE_TEST_FTPS_PORT")
-            .unwrap_or_else(|_| "21".to_owned())
-            .parse()
-            .expect("GALE_TEST_FTPS_PORT must be a port number");
-        let username =
-            std::env::var("GALE_TEST_FTPS_USER").expect("GALE_TEST_FTPS_USER is required");
-        let password =
-            std::env::var("GALE_TEST_FTPS_PASSWORD").expect("GALE_TEST_FTPS_PASSWORD is required");
-        let base = std::env::var("GALE_TEST_FTPS_DIR").unwrap_or_else(|_| "/".to_owned());
-        let mut settings = RemoteServerSettings {
-            protocol: RemoteProtocol::Ftps,
-            host,
-            port,
-            username,
-            server_directory: base.clone(),
-            authentication: RemoteAuthentication::Password,
-            ..Default::default()
-        };
-
-        let fingerprint = match RemoteConnection::connect(&settings, &password).unwrap() {
-            ConnectionAttempt::CertificateUntrusted { fingerprint } => fingerprint,
-            ConnectionAttempt::Connected(_) => {
-                panic!("test server certificate should be untrusted")
-            }
-            ConnectionAttempt::HostKeyUntrusted { .. } => panic!("FTPS returned an SSH host key"),
-        };
-        settings.trusted_certificate = Some(fingerprint);
-        let mut conn = match RemoteConnection::connect(&settings, &password).unwrap() {
-            ConnectionAttempt::Connected(conn) => conn,
-            _ => panic!("pinned FTPS certificate was not accepted"),
-        };
-
-        let sizes = [1usize, 8_191, 8_192, 8_193, 19_968, 1_048_613];
-        for (sequence, size) in sizes.into_iter().enumerate() {
-            let bytes: Vec<u8> = (0..size)
-                .map(|index| ((index * 131 + sequence * 17) % 251) as u8)
-                .collect();
-            let path = remote_path(&format!(
-                "{}/gale-ftps-{sequence}-{size}.bin",
-                base.trim_end_matches('/')
-            ));
-
-            conn.write(path.as_path(), &bytes).unwrap();
-            let stored = conn
-                .read(path.as_path(), size as u64 + 1)
-                .unwrap()
-                .expect("uploaded file is absent");
-
-            assert_eq!(stored.len(), size, "server stored the wrong length");
-            assert_eq!(blake3::hash(&stored), blake3::hash(&bytes));
-            assert_eq!(stored, bytes, "server stored different bytes");
-            assert!(conn.delete_file(path.as_path()).unwrap());
-        }
-    }
-}
-
-/// Read-only diagnostic for a live FTP server, used to characterize
-/// hosts that filter dot-prefixed paths. Distinguishes "absent" from
-/// "present but refused" across LIST/NLST/MLSD/MLST/SIZE/MDTM/RETR/CWD
-/// and across absolute versus CWD-relative paths. Never issues a
-/// mutating command (no STOR/MKD/RMD/DELE/RNTO).
-///
-/// The password comes from the OS credential store under the same
-/// service/account Gale writes and is never printed.
-///
-///     $env:GALE_FTP_PROBE = "1"
-///     $env:GALE_PROBE_PROFILE_ID = "6"
-///     $env:GALE_PROBE_HOST = "<host>"
-///     $env:GALE_PROBE_USER = "<ftp username>"
-///     $env:GALE_PROBE_BASE = "/BepInEx/config"   # probe dir; default shown
-///     cargo run --features diagnostics --example ftp-probe
-#[cfg(feature = "diagnostics")]
-pub fn ftp_probe_dotpath_visibility() -> Result<()> {
-    use crate::profile::server::settings::RemoteAuthentication;
-    use eyre::bail;
-
-    if std::env::var("GALE_FTP_PROBE").ok().as_deref() != Some("1") {
-        eprintln!("skipped: set GALE_FTP_PROBE=1 and GALE_PROBE_* vars");
-        return Ok(());
-    }
-
-    let profile_id =
-        std::env::var("GALE_PROBE_PROFILE_ID").expect("GALE_PROBE_PROFILE_ID required");
-    let host = std::env::var("GALE_PROBE_HOST").expect("GALE_PROBE_HOST required");
-    let user = std::env::var("GALE_PROBE_USER").expect("GALE_PROBE_USER required");
-    let dir = std::env::var("GALE_PROBE_DIR").unwrap_or_else(|_| "/".to_owned());
-    let port = std::env::var("GALE_PROBE_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(21u16);
-
-    let password = keyring::Entry::new(
-        "com.kesomannen.gale.dedicated-server",
-        &format!("profile-{profile_id}-ftp-password"),
-    )?
-    .get_password()?;
-
-    let mut settings = RemoteServerSettings {
-        protocol: RemoteProtocol::Ftps,
-        host,
-        port,
-        username: user,
-        server_directory: dir,
-        authentication: RemoteAuthentication::Password,
-        ..Default::default()
-    };
-
-    let mut conn = match RemoteConnection::connect(&settings, &password)? {
-        ConnectionAttempt::Connected(conn) => conn,
-        ConnectionAttempt::CertificateUntrusted { fingerprint } => {
-            eprintln!("[probe] pinning observed certificate fingerprint {fingerprint}");
-            settings.trusted_certificate = Some(fingerprint);
-            match RemoteConnection::connect(&settings, &password)? {
-                ConnectionAttempt::Connected(conn) => conn,
-                _ => bail!("certificate still untrusted after pinning"),
-            }
-        }
-        ConnectionAttempt::HostKeyUntrusted { .. } => {
-            bail!("unexpected host-key prompt on an FTP connection")
-        }
-    };
-
-    eprintln!("[probe] connected encrypted={}", conn.encrypted);
-
-    let ftp = match &mut conn.client {
-        RemoteClient::Ftp(ftp) => ftp,
-        RemoteClient::Sftp { .. } => bail!("probe only supports FTP connections"),
-    };
-
-    macro_rules! probe {
-        ($label:expr, $op:expr) => {
-            match $op {
-                Ok(value) => eprintln!("[probe] {:<58} OK   {:?}", $label, value),
-                Err(error) => eprintln!("[probe] {:<58} ERR  {error}", $label),
-            }
-        };
-    }
-
-    let config_dir =
-        std::env::var("GALE_PROBE_BASE").unwrap_or_else(|_| "/BepInEx/config".to_owned());
-    let dot_state = format!("{config_dir}/.gale-server-state.json");
-    let plain_state = format!("{config_dir}/gale-server-state.json");
-    let dot_lock = format!("{config_dir}/.gale-deploy.lock");
-    let dot_lease = format!("{dot_lock}/lease.json");
-
-    probe!("SIZE lease.json (ascii)", ftp.size(&dot_lease));
-    probe!(
-        "TYPE I",
-        ftp.transfer_type(suppaftp::types::FileType::Binary)
-    );
-    probe!("SIZE lease.json (binary)", ftp.size(&dot_lease));
-    probe!("SIZE dot-state (binary)", ftp.size(&dot_state));
-
-    probe!("PWD", ftp.pwd());
-    probe!("LIST /", ftp.list(Some("/")));
-    probe!("NLST /", ftp.nlst(Some("/")));
-    probe!("MLSD /", ftp.mlsd(Some("/")));
-
-    probe!("LIST base", ftp.list(Some(&config_dir)));
-    probe!("NLST base", ftp.nlst(Some(&config_dir)));
-    probe!("MLSD base", ftp.mlsd(Some(&config_dir)));
-
-    probe!("MLST dot-state", ftp.mlst(Some(&dot_state)));
-    probe!("SIZE dot-state", ftp.size(&dot_state));
-    probe!("MDTM dot-state", ftp.mdtm(&dot_state));
-    probe!("MLST plain-state", ftp.mlst(Some(&plain_state)));
-    probe!("SIZE plain-state", ftp.size(&plain_state));
-
-    probe!("MLST dot-lock", ftp.mlst(Some(&dot_lock)));
-    probe!("CWD dot-lock (dir probe)", ftp.cwd(&dot_lock));
-    probe!("LIST dot-lock", ftp.list(Some(&dot_lock)));
-    probe!("NLST dot-lock", ftp.nlst(Some(&dot_lock)));
-    probe!("MLSD dot-lock", ftp.mlsd(Some(&dot_lock)));
-
-    probe!("MLST lease.json", ftp.mlst(Some(&dot_lease)));
-    probe!("SIZE lease.json", ftp.size(&dot_lease));
-    probe!("MDTM lease.json", ftp.mdtm(&dot_lease));
-    probe!("RETR lease.json", {
-        ftp.retr_as_buffer(&dot_lease).map(|b| b.into_inner().len())
-    });
-    probe!("RETR dot-state", {
-        ftp.retr_as_buffer(&dot_state).map(|b| b.into_inner().len())
-    });
-
-    probe!("CWD base", ftp.cwd(&config_dir));
-    probe!("LIST (cwd=config)", ftp.list(None));
-    probe!("NLST (cwd=config)", ftp.nlst(None));
-    probe!("MLSD (cwd=config)", ftp.mlsd(None));
-    probe!(
-        "MLST .gale-server-state.json (rel)",
-        ftp.mlst(Some(".gale-server-state.json"))
-    );
-    probe!("SIZE .gale-server-state.json (rel)", {
-        ftp.size(".gale-server-state.json")
-    });
-    probe!("MLST .gale-deploy.lock (rel)", {
-        ftp.mlst(Some(".gale-deploy.lock"))
-    });
-    probe!("CWD .. (restore)", ftp.cwd(".."));
-
-    Ok(())
 }

@@ -77,241 +77,223 @@ for (const mode of ['local', 'worker']) {
 			remoteTab.getByRole('button', { name: 'Push configs', exact: true })
 		).toBeEnabled();
 	});
+}
 
-	test(`${mode}: a zero-change preview says so explicitly and keeps Deploy`, async ({ page }) => {
-		await page.goto(`/tests/dialog/?mode=${mode}&unchanged=166&unmanaged=2`);
-		const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
-		await remoteTab.getByRole('button', { name: 'Preview', exact: true }).click();
-		await expect(
-			page.getByText(
-				'No mod file changes found. The server already matches the published mod files.'
-			)
-		).toBeVisible();
-		// The generic review instruction must not imply changes to inspect.
-		await expect(page.getByText('Review the changes, then deploy.')).toHaveCount(0);
-		await expect(
-			page.getByText('Deploying records this publication as deployed without changing any files.')
-		).toBeVisible();
-		// Unmanaged files are reported separately; they are not changes.
-		await expect(
-			page.getByText('2 unmanaged file(s) on the server were left untouched.')
-		).toBeVisible();
-		// Deploy stays available: a zero-diff deploy still records the
-		// publication's mod revision as deployed on the server.
-		await expect(remoteTab.getByRole('button', { name: 'Deploy', exact: true })).toBeEnabled();
+// The config-review behaviors below are identical in both sync modes;
+// they run once against the local path.
+test('a zero-change preview says so explicitly and keeps Deploy', async ({ page }) => {
+	await page.goto(`/tests/dialog/?mode=local&unchanged=166&unmanaged=2`);
+	const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
+	await remoteTab.getByRole('button', { name: 'Preview', exact: true }).click();
+	await expect(
+		page.getByText('No mod file changes found. The server already matches the published mod files.')
+	).toBeVisible();
+	// The generic review instruction must not imply changes to inspect.
+	await expect(page.getByText('Review the changes, then deploy.')).toHaveCount(0);
+	await expect(
+		page.getByText('Deploying records this publication as deployed without changing any files.')
+	).toBeVisible();
+	// Unmanaged files are reported separately; they are not changes.
+	await expect(
+		page.getByText('2 unmanaged file(s) on the server were left untouched.')
+	).toBeVisible();
+	// Deploy stays available: a zero-diff deploy still records the
+	// publication's mod revision as deployed on the server.
+	await expect(remoteTab.getByRole('button', { name: 'Deploy', exact: true })).toBeEnabled();
 
-		await page.goto(`/tests/dialog/?mode=${mode}&uploads=2&unchanged=164`);
-		await page
-			.getByRole('tabpanel', { name: 'Remote server' })
-			.getByRole('button', { name: 'Preview', exact: true })
-			.click();
-		await expect(page.getByText('No mod file changes found')).toHaveCount(0);
-		await expect(page.getByText('Review the changes, then deploy.')).toBeVisible();
+	await page.goto(`/tests/dialog/?mode=local&uploads=2&unchanged=164`);
+	await page
+		.getByRole('tabpanel', { name: 'Remote server' })
+		.getByRole('button', { name: 'Preview', exact: true })
+		.click();
+	await expect(page.getByText('No mod file changes found')).toHaveCount(0);
+	await expect(page.getByText('Review the changes, then deploy.')).toBeVisible();
+});
+
+test('decisions do not reorder or scroll a long review list', async ({ page }) => {
+	await page.setViewportSize({ width: 900, height: 650 });
+	await page.goto(`/tests/dialog/?mode=local&many=1`);
+	const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
+	await remoteTab.getByText('Server config files', { exact: true }).click();
+	await remoteTab.getByRole('button', { name: 'Preview config changes', exact: true }).click();
+	await remoteTab.getByRole('button', { name: 'Show files needing review' }).click();
+	// Wait for the review font before measuring decision-induced scrolling.
+	await page.evaluate(() => document.fonts.ready.then(() => undefined));
+	const rows = page.getByTestId('server-config-row');
+	const list = rows.first().locator('..');
+	const pageScroll = page.getByTestId('server-page-scroll');
+	const before = await rows.evaluateAll((elements) =>
+		elements.map((row) => row.getAttribute('data-path'))
+	);
+	const row = rows.nth(20);
+	const restoreRow = rows.filter({ hasText: 'file-087.cfg' });
+	await pageScroll.evaluate((element) => {
+		element.scrollTop = element.scrollHeight / 2;
 	});
-
-	test(`${mode}: decisions do not reorder or scroll a long review list`, async ({ page }) => {
-		await page.setViewportSize({ width: 900, height: 650 });
-		await page.goto(`/tests/dialog/?mode=${mode}&many=1`);
-		const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
-		await remoteTab.getByText('Server config files', { exact: true }).click();
-		await remoteTab.getByRole('button', { name: 'Preview config changes', exact: true }).click();
-		await remoteTab.getByRole('button', { name: 'Show files needing review' }).click();
-		// Wait for the review font before measuring decision-induced scrolling.
-		await page.evaluate(() => document.fonts.ready.then(() => undefined));
-		const rows = page.getByTestId('server-config-row');
-		const list = rows.first().locator('..');
-		const pageScroll = page.getByTestId('server-page-scroll');
-		const before = await rows.evaluateAll((elements) =>
-			elements.map((row) => row.getAttribute('data-path'))
-		);
-		const row = rows.nth(20);
-		const restoreRow = rows.filter({ hasText: 'file-087.cfg' });
-		await pageScroll.evaluate((element) => {
-			element.scrollTop = element.scrollHeight / 2;
-		});
-		await list.evaluate((element) => {
-			element.scrollTop = 500;
-		});
-		const positions = async () => ({
-			inner: await list.evaluate((element) => element.scrollTop),
-			outer: await pageScroll.evaluate((element) => element.scrollTop)
-		});
-		const checkDecision = async (
-			selectedRow: typeof row,
-			action: string,
-			focusedAction: string,
-			remaining: number
-		) => {
-			await selectedRow.scrollIntoViewIfNeeded();
-			const beforeScroll = await positions();
-			expect(beforeScroll.inner).toBeGreaterThan(0);
-			expect(beforeScroll.outer).toBeGreaterThan(0);
-			await selectedRow.getByRole('button', { name: action }).click();
-			await expect(page.getByText(`${remaining} files still need a decision`)).toBeVisible();
-			await expect(selectedRow.getByRole('button', { name: focusedAction })).toBeFocused();
-			expect(await positions()).toEqual(beforeScroll);
-			expect(
-				await rows.evaluateAll((elements) => elements.map((item) => item.getAttribute('data-path')))
-			).toEqual(before);
-		};
-		await checkDecision(row, 'Apply', 'Undo', 30);
-		await checkDecision(row, 'Undo', 'Apply', 31);
-		await checkDecision(row, 'Decline', 'Undo', 30);
-		await checkDecision(row, 'Undo', 'Decline', 31);
-		await checkDecision(restoreRow, 'Restore', 'Undo', 30);
-		await remoteTab.getByRole('button', { name: 'Preview config changes', exact: true }).click();
-		await expect(
-			remoteTab.getByRole('button', { name: 'Push configs', exact: true })
-		).toBeEnabled();
-		await checkDecision(restoreRow, 'Undo', 'Restore', 31);
-		await expect(
-			remoteTab.getByRole('button', { name: 'Push configs', exact: true })
-		).toBeDisabled();
-		await remoteTab.getByRole('button', { name: 'Show all config files' }).click();
-		await expect(rows).toHaveCount(133);
-		await remoteTab.getByRole('button', { name: 'Show files needing review' }).click();
-		await expect(rows).toHaveCount(31);
+	await list.evaluate((element) => {
+		element.scrollTop = 500;
+	});
+	const positions = async () => ({
+		inner: await list.evaluate((element) => element.scrollTop),
+		outer: await pageScroll.evaluate((element) => element.scrollTop)
+	});
+	const checkDecision = async (
+		selectedRow: typeof row,
+		action: string,
+		focusedAction: string,
+		remaining: number
+	) => {
+		await selectedRow.scrollIntoViewIfNeeded();
+		const beforeScroll = await positions();
+		expect(beforeScroll.inner).toBeGreaterThan(0);
+		expect(beforeScroll.outer).toBeGreaterThan(0);
+		await selectedRow.getByRole('button', { name: action }).click();
+		await expect(page.getByText(`${remaining} files still need a decision`)).toBeVisible();
+		await expect(selectedRow.getByRole('button', { name: focusedAction })).toBeFocused();
+		expect(await positions()).toEqual(beforeScroll);
 		expect(
 			await rows.evaluateAll((elements) => elements.map((item) => item.getAttribute('data-path')))
 		).toEqual(before);
-	});
+	};
+	await checkDecision(row, 'Apply', 'Undo', 30);
+	await checkDecision(row, 'Undo', 'Apply', 31);
+	await checkDecision(row, 'Decline', 'Undo', 30);
+	await checkDecision(row, 'Undo', 'Decline', 31);
+	await checkDecision(restoreRow, 'Restore', 'Undo', 30);
+	await remoteTab.getByRole('button', { name: 'Preview config changes', exact: true }).click();
+	await expect(remoteTab.getByRole('button', { name: 'Push configs', exact: true })).toBeEnabled();
+	await checkDecision(restoreRow, 'Undo', 'Restore', 31);
+	await expect(remoteTab.getByRole('button', { name: 'Push configs', exact: true })).toBeDisabled();
+	await remoteTab.getByRole('button', { name: 'Show all config files' }).click();
+	await expect(rows).toHaveCount(133);
+	await remoteTab.getByRole('button', { name: 'Show files needing review' }).click();
+	await expect(rows).toHaveCount(31);
+	expect(
+		await rows.evaluateAll((elements) => elements.map((item) => item.getAttribute('data-path')))
+	).toEqual(before);
+});
 
-	test(`${mode}: restart preference survives reload and stays profile-specific`, async ({
-		page
-	}) => {
-		await page.goto(`/tests/dialog/?mode=${mode}&profile=first`);
-		const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
-		await remoteTab.getByLabel('Restart after this deploy', { exact: true }).click();
-		await page.getByRole('option', { name: 'When empty', exact: true }).click();
-		await page.reload();
-		await expect(remoteTab.getByLabel('Restart after this deploy', { exact: true })).toHaveText(
-			'When empty'
-		);
-		await page.goto(`/tests/dialog/?mode=${mode}&profile=second`);
-		await expect(
-			page
-				.getByRole('tabpanel', { name: 'Remote server' })
-				.getByLabel('Restart after this deploy', {
-					exact: true
-				})
-		).toHaveText('Never');
-		await page.goto(`/tests/dialog/?mode=${mode}&profile=first`);
-		await expect(
-			page
-				.getByRole('tabpanel', { name: 'Remote server' })
-				.getByLabel('Restart after this deploy', {
-					exact: true
-				})
-		).toHaveText('When empty');
-	});
-
-	test(`${mode}: unresolved configs lead the list and review focus preserves approval inputs`, async ({
-		page
-	}) => {
-		await page.goto(`/tests/dialog/?mode=${mode}&many=1`);
-		const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
-		await remoteTab.getByRole('button', { name: 'Refresh', exact: true }).waitFor();
-		await remoteTab.getByText('Server config files', { exact: true }).click();
-		await remoteTab.getByRole('button', { name: 'Preview config changes', exact: true }).click();
-		const rows = page.getByTestId('server-config-row');
-		await expect(rows).toHaveCount(133);
-		await expect(rows.first()).toHaveAttribute('data-path', 'BepInEx/config/file-003.cfg');
-		await expect(page.getByText('31 files still need a decision')).toBeVisible();
-		await remoteTab.getByRole('button', { name: 'Show files needing review' }).click();
-		await expect(rows).toHaveCount(31);
-		await rows.first().getByRole('button', { name: 'Apply' }).click();
-		await expect(page.getByText('30 files still need a decision')).toBeVisible();
-		await expect(
-			remoteTab.getByRole('button', { name: 'Push configs', exact: true })
-		).toBeDisabled();
-		await remoteTab.getByRole('button', { name: 'Preview config changes', exact: true }).click();
-		await expect(
-			remoteTab.getByRole('button', { name: 'Push configs', exact: true })
-		).toBeEnabled();
-		await remoteTab.getByRole('button', { name: 'Show all config files' }).click();
-		await expect(rows).toHaveCount(133);
-		await expect(
-			remoteTab.getByRole('button', { name: 'Push configs', exact: true })
-		).toBeEnabled();
-		await expect(rows.filter({ hasText: 'file-000.cfg' })).toBeVisible();
-		const selected = await page.evaluate(
-			() =>
-				(window as any).calls.filter((call: any) => call.cmd === 'preview_server_sync').at(-1).args
-					.request.selection
-		);
-		expect(selected).toMatchObject({
-			includeMods: false,
-			includeConfigs: true,
-			applyConfigs: ['BepInEx/config/file-003.cfg']
-		});
-	});
-
-	test(`${mode}: explicit restart confirmation clears the reminder`, async ({ page }) => {
-		await page.goto(`/tests/dialog/?mode=${mode}&restart=1`);
-		const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
-		await remoteTab.getByRole('button', { name: 'Preview', exact: true }).click();
-		await expect(remoteTab.getByRole('button', { name: 'Deploy', exact: true })).toBeEnabled();
-		await remoteTab.getByRole('button', { name: 'I confirmed the restart' }).click();
-		await expect(remoteTab.getByRole('button', { name: 'I confirmed the restart' })).toHaveCount(0);
-		await expect(remoteTab.getByRole('button', { name: 'Deploy', exact: true })).toBeDisabled();
-		const calls = await page.evaluate(() => (window as any).calls);
-		expect(calls.some((call: any) => call.cmd === 'plugin:dialog|message')).toBe(true);
-		expect(calls.some((call: any) => call.cmd === 'acknowledge_external_server_restart')).toBe(
-			true
-		);
-	});
-
-	test(`${mode}: saved future policies stick, failed saves revert`, async ({ page }) => {
-		const errors: string[] = [];
-		page.on('pageerror', (error) => errors.push(error.message));
-		await page.goto(`/tests/dialog/?mode=${mode}&many=1`);
-		const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
-		await remoteTab.getByText('Server config files', { exact: true }).click();
-		await remoteTab.getByRole('button', { name: 'Preview config changes', exact: true }).click();
-		const rows = page.getByTestId('server-config-row');
-		await expect(rows).toHaveCount(133);
-		const order = await rows.evaluateAll((elements) =>
-			elements.map((row) => row.getAttribute('data-path'))
-		);
-		const policy = page.getByLabel('Future updates for BepInEx/config/file-000.cfg', {
+test('restart preference survives reload and stays profile-specific', async ({ page }) => {
+	await page.goto(`/tests/dialog/?mode=local&profile=first`);
+	const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
+	await remoteTab.getByLabel('Restart after this deploy', { exact: true }).click();
+	await page.getByRole('option', { name: 'When empty', exact: true }).click();
+	await page.reload();
+	await expect(remoteTab.getByLabel('Restart after this deploy', { exact: true })).toHaveText(
+		'When empty'
+	);
+	await page.goto(`/tests/dialog/?mode=local&profile=second`);
+	await expect(
+		page.getByRole('tabpanel', { name: 'Remote server' }).getByLabel('Restart after this deploy', {
 			exact: true
-		});
-		await expect(policy).toHaveText('Ask each update');
-		await policy.click();
-		await page.getByRole('option', { name: 'Always apply updates', exact: true }).click();
-		// The command returns nothing; the saved value is reflected locally.
-		await expect(policy).toHaveText('Always apply updates');
-		// A future policy is not a current Apply/Decline decision — but it
-		// does invalidate the approved deployment inputs.
-		await expect(page.getByText('31 files still need a decision')).toBeVisible();
-		await expect(
-			remoteTab.getByRole('button', { name: 'Push configs', exact: true })
-		).toBeDisabled();
-		expect(
-			await rows.evaluateAll((elements) => elements.map((row) => row.getAttribute('data-path')))
-		).toEqual(order);
-		// Filtering the row away and back must not resurrect the old policy.
-		await remoteTab.getByRole('button', { name: 'Show files needing review' }).click();
-		await expect(rows).toHaveCount(31);
-		await remoteTab.getByRole('button', { name: 'Show all config files' }).click();
-		await expect(rows).toHaveCount(133);
-		await expect(policy).toHaveText('Always apply updates');
-		// A failed write snaps back to the last saved policy and reports it.
-		await page.evaluate(() => (window as any).fail('set_server_config_policy'));
-		await policy.click();
-		await page.getByRole('option', { name: 'Always keep my config', exact: true }).click();
-		await expect(policy).toHaveText('Always apply updates');
-		expect(
-			await page.evaluate(
-				() =>
-					(window as any).calls.filter(
-						(call: any) => call.cmd === 'plugin:dialog|message' && call.args.kind === 'error'
-					).length
-			)
-		).toBe(1);
-		expect(errors).toEqual([]);
-	});
+		})
+	).toHaveText('Never');
+	await page.goto(`/tests/dialog/?mode=local&profile=first`);
+	await expect(
+		page.getByRole('tabpanel', { name: 'Remote server' }).getByLabel('Restart after this deploy', {
+			exact: true
+		})
+	).toHaveText('When empty');
+});
 
+test('unresolved configs lead the list and review focus preserves approval inputs', async ({
+	page
+}) => {
+	await page.goto(`/tests/dialog/?mode=local&many=1`);
+	const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
+	await remoteTab.getByRole('button', { name: 'Refresh', exact: true }).waitFor();
+	await remoteTab.getByText('Server config files', { exact: true }).click();
+	await remoteTab.getByRole('button', { name: 'Preview config changes', exact: true }).click();
+	const rows = page.getByTestId('server-config-row');
+	await expect(rows).toHaveCount(133);
+	await expect(rows.first()).toHaveAttribute('data-path', 'BepInEx/config/file-003.cfg');
+	await expect(page.getByText('31 files still need a decision')).toBeVisible();
+	await remoteTab.getByRole('button', { name: 'Show files needing review' }).click();
+	await expect(rows).toHaveCount(31);
+	await rows.first().getByRole('button', { name: 'Apply' }).click();
+	await expect(page.getByText('30 files still need a decision')).toBeVisible();
+	await expect(remoteTab.getByRole('button', { name: 'Push configs', exact: true })).toBeDisabled();
+	await remoteTab.getByRole('button', { name: 'Preview config changes', exact: true }).click();
+	await expect(remoteTab.getByRole('button', { name: 'Push configs', exact: true })).toBeEnabled();
+	await remoteTab.getByRole('button', { name: 'Show all config files' }).click();
+	await expect(rows).toHaveCount(133);
+	await expect(remoteTab.getByRole('button', { name: 'Push configs', exact: true })).toBeEnabled();
+	await expect(rows.filter({ hasText: 'file-000.cfg' })).toBeVisible();
+	const selected = await page.evaluate(
+		() =>
+			(window as any).calls.filter((call: any) => call.cmd === 'preview_server_sync').at(-1).args
+				.request.selection
+	);
+	expect(selected).toMatchObject({
+		includeMods: false,
+		includeConfigs: true,
+		applyConfigs: ['BepInEx/config/file-003.cfg']
+	});
+});
+
+test('explicit restart confirmation clears the reminder', async ({ page }) => {
+	await page.goto(`/tests/dialog/?mode=local&restart=1`);
+	const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
+	await remoteTab.getByRole('button', { name: 'Preview', exact: true }).click();
+	await expect(remoteTab.getByRole('button', { name: 'Deploy', exact: true })).toBeEnabled();
+	await remoteTab.getByRole('button', { name: 'I confirmed the restart' }).click();
+	await expect(remoteTab.getByRole('button', { name: 'I confirmed the restart' })).toHaveCount(0);
+	await expect(remoteTab.getByRole('button', { name: 'Deploy', exact: true })).toBeDisabled();
+	const calls = await page.evaluate(() => (window as any).calls);
+	expect(calls.some((call: any) => call.cmd === 'plugin:dialog|message')).toBe(true);
+	expect(calls.some((call: any) => call.cmd === 'acknowledge_external_server_restart')).toBe(true);
+});
+
+test('saved future policies stick, failed saves revert', async ({ page }) => {
+	const errors: string[] = [];
+	page.on('pageerror', (error) => errors.push(error.message));
+	await page.goto(`/tests/dialog/?mode=local&many=1`);
+	const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
+	await remoteTab.getByText('Server config files', { exact: true }).click();
+	await remoteTab.getByRole('button', { name: 'Preview config changes', exact: true }).click();
+	const rows = page.getByTestId('server-config-row');
+	await expect(rows).toHaveCount(133);
+	const order = await rows.evaluateAll((elements) =>
+		elements.map((row) => row.getAttribute('data-path'))
+	);
+	const policy = page.getByLabel('Future updates for BepInEx/config/file-000.cfg', {
+		exact: true
+	});
+	await expect(policy).toHaveText('Ask each update');
+	await policy.click();
+	await page.getByRole('option', { name: 'Always apply updates', exact: true }).click();
+	// The command returns nothing; the saved value is reflected locally.
+	await expect(policy).toHaveText('Always apply updates');
+	// A future policy is not a current Apply/Decline decision — but it
+	// does invalidate the approved deployment inputs.
+	await expect(page.getByText('31 files still need a decision')).toBeVisible();
+	await expect(remoteTab.getByRole('button', { name: 'Push configs', exact: true })).toBeDisabled();
+	expect(
+		await rows.evaluateAll((elements) => elements.map((row) => row.getAttribute('data-path')))
+	).toEqual(order);
+	// Filtering the row away and back must not resurrect the old policy.
+	await remoteTab.getByRole('button', { name: 'Show files needing review' }).click();
+	await expect(rows).toHaveCount(31);
+	await remoteTab.getByRole('button', { name: 'Show all config files' }).click();
+	await expect(rows).toHaveCount(133);
+	await expect(policy).toHaveText('Always apply updates');
+	// A failed write snaps back to the last saved policy and reports it.
+	await page.evaluate(() => (window as any).fail('set_server_config_policy'));
+	await policy.click();
+	await page.getByRole('option', { name: 'Always keep my config', exact: true }).click();
+	await expect(policy).toHaveText('Always apply updates');
+	expect(
+		await page.evaluate(
+			() =>
+				(window as any).calls.filter(
+					(call: any) => call.cmd === 'plugin:dialog|message' && call.args.kind === 'error'
+				).length
+		)
+	).toBe(1);
+	expect(errors).toEqual([]);
+});
+
+for (const mode of ['local', 'worker']) {
 	for (const operation of [
 		'preview_server_sync',
 		'deploy_server_sync',

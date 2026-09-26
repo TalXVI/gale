@@ -136,12 +136,7 @@ ashpd = { version = "0.13", features = ["settings"] }
 rcgen = "0.13"
 tokio = { version = "1", features = ["test-util"] }
 
-[[example]]
-name = "ftp-probe"
-required-features = ["diagnostics"]
-
 [features]
-diagnostics = []
 custom-protocol = ["tauri/custom-protocol"]
 worker = ["dep:axum", "dep:fd-lock"]
 axum = ["dep:axum"]

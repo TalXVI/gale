@@ -219,7 +219,7 @@ fn warn_missing() {
 mod tests {
     use super::*;
     use crate::profile::server::{
-        engine::apply_restart_policy, settings::RestartPolicy, state::RestartOutcome,
+        engine::apply_restart_policy_reporting, settings::RestartPolicy, state::RestartOutcome,
     };
     use axum::{
         Router,
@@ -389,7 +389,7 @@ mod tests {
                 username: "user".into(),
                 password: "pass".into(),
             };
-            let outcome = apply_restart_policy(&host, policy, required).await;
+            let outcome = apply_restart_policy_reporting(&host, policy, required, None).await;
             task.abort();
             assert_eq!(outcome, expected, "policy {policy:?}, players {players:?}");
             assert_eq!(*api.calls.lock().unwrap(), calls);

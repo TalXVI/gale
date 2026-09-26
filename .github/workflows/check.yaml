@@ -43,7 +43,7 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: 24
-          cache: 'pnpm'
+          cache: "pnpm"
 
       - name: Install frontend dependencies
         run: pnpm install
@@ -70,5 +70,3 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Run worker and desktop regressions
         run: cargo test --manifest-path src-tauri/Cargo.toml --features worker --lib
-      - name: Check opt-in diagnostic
-        run: cargo check --manifest-path src-tauri/Cargo.toml --features diagnostics --example ftp-probe
