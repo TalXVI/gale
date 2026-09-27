@@ -9,17 +9,13 @@
 //! reliable player count, `WhenEmpty` execution must fail closed rather
 //! than guessing the server is empty.
 
-use std::future::Future;
-use std::pin::Pin;
-
 use eyre::{Context, Result, bail};
+use futures_util::future::BoxFuture;
 use serde::Deserialize;
 
 use super::settings::{HostProvider, HostSettings};
 
 const DATHOST_API: &str = "https://dathost.net/api/0.1";
-
-pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// The observable state needed for restart policy decisions. Every field
 /// is optional. An absent value means "unknown", never "empty"/"stopped".

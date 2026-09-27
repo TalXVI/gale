@@ -1,6 +1,7 @@
 <script lang="ts">
 	import type { ServerSyncOperationProgress, ServerSyncPhase } from '$lib/types';
 	import { m } from '$lib/paraglide/messages';
+	import { shortenFileSize } from '$lib/util';
 
 	let {
 		operation,
@@ -39,13 +40,6 @@
 		if (phase === 'scanningPayload' || phase === 'removingFiles')
 			return m.serverSync_progressItems();
 		return m.serverSync_progressFiles();
-	}
-
-	function bytes(value: number): string {
-		if (value < 1000) return `${value} B`;
-		if (value < 1000 * 1000) return `${(value / 1000).toFixed(1)} KB`;
-		if (value < 1000 * 1000 * 1000) return `${(value / (1000 * 1000)).toFixed(1)} MB`;
-		return `${(value / (1000 * 1000 * 1000)).toFixed(1)} GB`;
 	}
 
 	function elapsed(value: number): string {
@@ -118,7 +112,7 @@
 					{progress.completed} / {progress.total}
 					{unit(progress.phase)}
 					{#if progress.totalBytes !== null && progress.completedBytes !== null}
-						· {bytes(progress.completedBytes)} / {bytes(progress.totalBytes)}
+						· {shortenFileSize(progress.completedBytes)} / {shortenFileSize(progress.totalBytes)}
 					{/if}
 				</span>
 			</div>

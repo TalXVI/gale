@@ -74,7 +74,7 @@ test('Local Preview and Deploy show snapshot, mutation, byte, and restart progre
 		totalBytes: 52_100_000,
 		item
 	});
-	await expect(progress).toContainText('12 / 24 files · 18.4 MB / 52.1 MB');
+	await expect(progress).toContainText('12 / 24 files · 17.5MB / 49.7MB');
 	await emit(page, {
 		phase: 'applyingRestart',
 		completedPhases: 12,
@@ -148,7 +148,7 @@ test('Worker polls its run, ignores stale snapshots, and clears progress on succ
 			}),
 		item
 	);
-	await expect(progress).toContainText('12 / 24 files · 18.4 MB / 52.1 MB');
+	await expect(progress).toContainText('12 / 24 files · 17.5MB / 49.7MB');
 	await release(page);
 	await expect(progress).toHaveCount(0);
 });

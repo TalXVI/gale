@@ -90,7 +90,7 @@ pub struct SyncProfileData {
 #[serde(rename_all = "camelCase")]
 pub struct PublishedState {
     /// The remote `updated_at` revision this publication snapshot represents.
-    /// `None` for records written before revision tracking, treated as stale.
+    /// `None` for records written before revision tracking — treated as stale.
     #[serde(default)]
     pub revision: Option<DateTime<Utc>>,
     pub manifest: ProfileManifest,
@@ -187,21 +187,6 @@ impl SyncProfileData {
     /// fetches the canonical publication for this id.
     pub fn id(&self) -> &str {
         &self.id
-    }
-
-    /// The remote `updated_at` identifying the currently known publication.
-    pub fn updated_at(&self) -> DateTime<Utc> {
-        self.updated_at
-    }
-}
-
-impl SyncProfileMetadata {
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-
-    pub fn updated_at(&self) -> DateTime<Utc> {
-        self.updated_at
     }
 }
 
@@ -342,15 +327,14 @@ fn preseed_migration(state: &mut AppliedState, latest: &SyncManifest) {
 }
 
 /// Config snapshots taken around the mod install: `before` the update and
-/// `after` it, so the sync logic can tell installer-written files apart
-/// from user edits.
+/// `after` it, so installer-written files can be told apart from user edits.
 type InstallSnapshots<'a> = (
     &'a BTreeMap<ConfigPath, ContentHash>,
     &'a BTreeMap<ConfigPath, ContentHash>,
 );
 
-/// Applies the config side of a sync archive to `applied`, updating the
-/// state and the profile's config files together.
+/// Applies the config side of a sync archive to `applied`, mutating the state
+/// and the profile's config files together.
 ///
 /// `install` carries the config snapshots taken around a mod install.
 /// `migrate_existing` seeds empty records for a profile that predates
@@ -1004,7 +988,10 @@ async fn delete_profile(id: &str, app: &AppHandle) -> Result<()> {
     Ok(())
 }
 
-async fn get_profile_meta(id: &str, app: &AppHandle) -> Result<Option<SyncProfileMetadata>> {
+pub(crate) async fn get_profile_meta(
+    id: &str,
+    app: &AppHandle,
+) -> Result<Option<SyncProfileMetadata>> {
     let res = request(Method::GET, format!("/profile/{id}/meta"), app)
         .await
         .send()
@@ -1061,15 +1048,6 @@ pub async fn fetch_publication(id: &str, app: &AppHandle) -> Result<FetchedPubli
     let metadata = read_profile(id, app).await?;
     let bytes = download_profile_bytes(id, app).await?;
     publication_from_archive(&metadata, &bytes)
-}
-
-/// Fetches only the publication metadata, the cheap way to check whether
-/// a new revision exists without downloading the archive.
-pub async fn fetch_publication_meta(
-    id: &str,
-    app: &AppHandle,
-) -> Result<Option<SyncProfileMetadata>> {
-    get_profile_meta(id, app).await
 }
 
 async fn get_owned_profiles(app: &AppHandle) -> Result<Vec<ListedSyncProfile>> {

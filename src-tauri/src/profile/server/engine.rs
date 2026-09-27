@@ -124,6 +124,24 @@ impl OperationMeta {
             started_at: Utc::now(),
         }
     }
+
+    /// The operation record finishing now, before operation-specific fields.
+    fn record(&self, status: OperationStatus, restart: RestartOutcome) -> OperationRecord {
+        OperationRecord {
+            id: self.id.clone(),
+            executor: self.executor,
+            kind: self.kind,
+            worker_id: self.worker_id.clone(),
+            publication_revision: None,
+            mods_revision: None,
+            status,
+            summary: OperationSummary::default(),
+            restart,
+            error: None,
+            started_at: self.started_at,
+            finished_at: Utc::now(),
+        }
+    }
 }
 
 /// Maps deploy paths to absolute remote paths for the detected layout.
@@ -209,6 +227,19 @@ pub fn open_session(
     })
 }
 
+impl Session {
+    fn acquire_lease(&mut self, meta: &OperationMeta, force: bool) -> Result<Lease> {
+        lease::acquire(
+            self.ops.as_mut(),
+            &self.mapper.remote_path(&self.mapper.spec.lease_dir),
+            &meta.owner,
+            meta.executor,
+            &meta.id,
+            force,
+        )
+    }
+}
+
 /// Re-reads the authoritative deployment state from the remote. Called
 /// under the deployment lease so planning, policy updates, and the
 /// persistence sequence guard all work on fresh state rather than what
@@ -277,14 +308,7 @@ pub fn preview_with_progress(
     progress: &mut ProgressReporter,
 ) -> Result<Preview> {
     progress.phase(SyncPhase::CheckingLease);
-    let (held, busy) = match lease::acquire(
-        session.ops.as_mut(),
-        &session.mapper.remote_path(&session.mapper.spec.lease_dir),
-        &meta.owner,
-        meta.executor,
-        &meta.id,
-        false,
-    ) {
+    let (held, busy) = match session.acquire_lease(meta, false) {
         Ok(lease) => (Some(lease), None),
         Err(err) => {
             let busy = err.downcast::<lease::LeaseBusy>()?;
@@ -354,16 +378,12 @@ pub async fn preview(
     meta: OperationMeta,
     progress: &mut ProgressReporter,
 ) -> Result<Preview> {
-    let mut blocking_progress = std::mem::replace(
+    with_blocking_session(
+        connect,
+        spec,
+        base,
         progress,
-        ProgressReporter::silent(SyncOperation::Preview, &selection),
-    );
-    let (result, returned) = tokio::task::spawn_blocking(move || {
-        blocking_progress.phase(SyncPhase::Connecting);
-        let result = (|| {
-            let ops = connect()?;
-            blocking_progress.phase(SyncPhase::ReadingState);
-            let mut session = open_session(ops, &spec, base)?;
+        move |mut session, progress| {
             preview_with_progress(
                 &mut session,
                 &publication,
@@ -371,13 +391,36 @@ pub async fn preview(
                 &selection,
                 &context,
                 &meta,
-                &mut blocking_progress,
+                progress,
             )
+        },
+    )
+    .await
+}
+
+/// Opens a session and runs blocking remote work on it behind the async
+/// boundary. The caller's reporter moves into the blocking task and comes
+/// back afterwards, so progress keeps flowing to the same sink.
+async fn with_blocking_session<T: Send + 'static>(
+    connect: impl FnOnce() -> Result<Box<dyn RemoteOps>> + Send + 'static,
+    spec: DeploymentSpec,
+    base: RemotePathBuf,
+    progress: &mut ProgressReporter,
+    work: impl FnOnce(Session, &mut ProgressReporter) -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let placeholder = ProgressReporter::silent(SyncOperation::Preview, &DeploySelection::default());
+    let mut moved = std::mem::replace(progress, placeholder);
+    let (result, returned) = tokio::task::spawn_blocking(move || {
+        let result = (|| {
+            moved.phase(SyncPhase::Connecting);
+            let ops = connect()?;
+            moved.phase(SyncPhase::ReadingState);
+            work(open_session(ops, &spec, base)?, &mut moved)
         })();
-        (result, blocking_progress)
+        (result, moved)
     })
     .await
-    .context("preview task failed")?;
+    .context("remote operation task failed")?;
     *progress = returned;
     result
 }
@@ -400,20 +443,17 @@ pub async fn deploy(
     policy: RestartPolicy,
     progress: &mut ProgressReporter,
 ) -> Result<DeploymentResult> {
-    let mut blocking_progress = std::mem::replace(
-        progress,
-        ProgressReporter::silent(SyncOperation::Deploy, &selection),
-    );
+    let heartbeat = connect.clone();
     let final_meta = meta.clone();
-    let (result, returned) = tokio::task::spawn_blocking(move || {
-        blocking_progress.phase(SyncPhase::Connecting);
-        let result = (|| {
-            let ops = connect()?;
-            blocking_progress.phase(SyncPhase::ReadingState);
-            let mut session = open_session(ops, &spec, base)?;
+    let (session, deployment) = with_blocking_session(
+        connect,
+        spec,
+        base,
+        progress,
+        move |mut session, progress| {
             let deployment = deploy_with_progress(
                 &mut session,
-                connect.clone(),
+                heartbeat,
                 &publication,
                 &desired,
                 &selection,
@@ -421,16 +461,12 @@ pub async fn deploy(
                 &meta,
                 expected_plan_hash.as_deref(),
                 force,
-                &mut blocking_progress,
+                progress,
             )?;
-            Ok::<_, eyre::Report>((session, deployment))
-        })();
-        (result, blocking_progress)
-    })
-    .await
-    .context("deployment task failed")?;
-    *progress = returned;
-    let (session, deployment) = result?;
+            Ok((session, deployment))
+        },
+    )
+    .await?;
     complete_with_progress(session, deployment, host, policy, final_meta, progress).await
 }
 
@@ -496,14 +532,7 @@ pub fn deploy_with_progress(
     progress: &mut ProgressReporter,
 ) -> Result<Deployment> {
     progress.phase(SyncPhase::CheckingLease);
-    let mut lease = lease::acquire(
-        session.ops.as_mut(),
-        &session.mapper.remote_path(&session.mapper.spec.lease_dir),
-        &meta.owner,
-        meta.executor,
-        &meta.id,
-        force,
-    )?;
+    let mut lease = session.acquire_lease(meta, force)?;
     lease::start_heartbeat(&mut lease, connect);
 
     // Under the lease, re-read the authoritative state and re-plan. The
@@ -538,56 +567,81 @@ pub fn deploy_with_progress(
         }
     };
 
-    let result = execute(session, &plan, desired, publication, &lease, progress);
-
-    match result {
-        Ok((summary, mut warnings, failed_config_writes)) => {
-            if lease.is_lost() {
-                warnings.push(
-                    "the deployment lease was lost during execution; another executor may have modified the server"
-                        .to_owned(),
-                );
+    let (summary, mut warnings, failed_config_writes) =
+        match execute(session, &plan, desired, publication, &lease, progress) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                warn!(%error, "deployment failed; recording accurate state");
+                return Err(abort(
+                    session,
+                    lease,
+                    meta,
+                    &plan,
+                    error,
+                    "deployment failed during the file phase",
+                ));
             }
-            // Persist the deployment state after the file phase, before
-            // the caller decides on a restart. A crash here still leaves
-            // correct ownership and revision records. Both guards fail
-            // closed: losing the lease or seeing a newer remote state
-            // aborts the operation.
-            progress.phase(SyncPhase::PersistingState);
-            if let Err(err) = ensure_ownership(&lease, session).and_then(|_| persist_state(session))
-            {
-                let recorded = fail_operation(session, &lease, meta, &plan, &err);
-                lease.release(session.ops.as_mut());
-                return Err(err.wrap_err(format!(
-                    "failed to persist remote deployment state after file changes; remote filesystem may need reconciliation{}",
-                    recorded
-                        .err()
-                        .map(|error| format!("; failure record could not be persisted: {error:#}"))
-                        .unwrap_or_default()
-                )));
-            }
-
-            Ok(Deployment {
-                plan,
-                summary,
-                warnings,
-                failed_config_writes,
-                lease,
-            })
-        }
-        Err(error) => {
-            warn!(%error, "deployment failed; recording accurate state");
-            let recorded = fail_operation(session, &lease, meta, &plan, &error);
-            lease.release(session.ops.as_mut());
-            Err(error.wrap_err(format!(
-                "deployment failed during the file phase; remote filesystem may need reconciliation{}",
-                recorded
-                    .err()
-                    .map(|state_err| format!("; failure record could not be persisted: {state_err:#}"))
-                    .unwrap_or_default()
-            )))
-        }
+        };
+    if lease.is_lost() {
+        warnings.push(
+            "the deployment lease was lost during execution; another executor may have modified the server"
+                .to_owned(),
+        );
     }
+
+    // Persist the deployment state after the file phase, before the caller
+    // decides on a restart. A crash here still leaves correct ownership and
+    // revision records. Both guards fail closed: losing the lease or seeing
+    // a newer remote state aborts the operation.
+    progress.phase(SyncPhase::PersistingState);
+    if let Err(error) = ensure_ownership(&lease, session).and_then(|_| persist_state(session)) {
+        return Err(abort(
+            session,
+            lease,
+            meta,
+            &plan,
+            error,
+            "failed to persist remote deployment state after file changes",
+        ));
+    }
+
+    Ok(Deployment {
+        plan,
+        summary,
+        warnings,
+        failed_config_writes,
+        lease,
+    })
+}
+
+/// Records the failed operation with whatever state is accurate, releases
+/// the lease, and returns `error` annotated with the recording outcome.
+fn abort(
+    session: &mut Session,
+    lease: Lease,
+    meta: &OperationMeta,
+    plan: &DeploymentPlan,
+    error: eyre::Report,
+    context: &str,
+) -> eyre::Report {
+    let recorded = ensure_ownership(&lease, session).and_then(|_| {
+        session.state.restart_required = true;
+        session.state.record_operation(OperationRecord {
+            publication_revision: Some(plan.publication_revision),
+            mods_revision: plan.mods_phase.then(|| plan.mods_revision.clone()),
+            error: Some(error.to_string()),
+            ..meta.record(OperationStatus::Failed, RestartOutcome::NotRequired)
+        });
+        persist_state(session)
+    });
+    lease.release(session.ops.as_mut());
+    let unrecorded = recorded
+        .err()
+        .map(|err| format!("; failure record could not be persisted: {err:#}"))
+        .unwrap_or_default();
+    error.wrap_err(format!(
+        "{context}; remote filesystem may need reconciliation{unrecorded}"
+    ))
 }
 
 /// Fails the operation when the lease verifiably no longer belongs to
@@ -751,33 +805,24 @@ pub fn finish(
         _ => true,
     };
 
+    // A deployment with failed writes is not a success: it is Partial, with
+    // the per-file records describing exactly what landed.
+    let failed_writes = deployment.failed_config_writes.len();
+    let status = if failed_writes == 0 {
+        OperationStatus::Succeeded
+    } else {
+        OperationStatus::Partial
+    };
     session.state.record_operation(OperationRecord {
-        id: meta.id.clone(),
-        executor: meta.executor,
-        kind: meta.kind,
-        worker_id: meta.worker_id.clone(),
         publication_revision: Some(deployment.plan.publication_revision),
         mods_revision: deployment
             .plan
             .mods_phase
             .then(|| deployment.plan.mods_revision.clone()),
-        // A deployment with failed writes is not a success: it is Partial,
-        // with the per-file records describing exactly what landed.
-        status: if deployment.failed_config_writes.is_empty() {
-            OperationStatus::Succeeded
-        } else {
-            OperationStatus::Partial
-        },
         summary: deployment.summary.clone(),
-        restart,
-        error: (!deployment.failed_config_writes.is_empty()).then(|| {
-            format!(
-                "{} selected config file(s) could not be written",
-                deployment.failed_config_writes.len()
-            )
-        }),
-        started_at: meta.started_at,
-        finished_at: Utc::now(),
+        error: (failed_writes > 0)
+            .then(|| format!("{failed_writes} selected config file(s) could not be written")),
+        ..meta.record(status, restart)
     });
 
     let persist = ensure_ownership(&deployment.lease, session).and_then(|_| persist_state(session));
@@ -793,14 +838,7 @@ pub fn acknowledge_external_restart(
     session: &mut Session,
     meta: &OperationMeta,
 ) -> Result<ServerDeploymentState> {
-    let lease = lease::acquire(
-        session.ops.as_mut(),
-        &session.mapper.remote_path(&session.mapper.spec.lease_dir),
-        &meta.owner,
-        meta.executor,
-        &meta.id,
-        false,
-    )?;
+    let lease = session.acquire_lease(meta, false)?;
     let result = (|| {
         refresh_state(session)?;
         ensure!(
@@ -810,51 +848,14 @@ pub fn acknowledge_external_restart(
         ensure_ownership(&lease, session)?;
         session.state.restart_required = false;
         session.state.record_operation(OperationRecord {
-            id: meta.id.clone(),
-            executor: meta.executor,
-            kind: meta.kind,
-            worker_id: meta.worker_id.clone(),
-            publication_revision: None,
             mods_revision: session.state.mods_revision.clone(),
-            status: OperationStatus::Succeeded,
-            summary: OperationSummary::default(),
-            restart: RestartOutcome::Restarted,
-            error: None,
-            started_at: meta.started_at,
-            finished_at: Utc::now(),
+            ..meta.record(OperationStatus::Succeeded, RestartOutcome::Restarted)
         });
         persist_state(session)?;
         Ok(session.state.clone())
     })();
     lease.release(session.ops.as_mut());
     result
-}
-
-/// Records a failed operation and persists whatever state is accurate.
-fn fail_operation(
-    session: &mut Session,
-    lease: &Lease,
-    meta: &OperationMeta,
-    plan: &DeploymentPlan,
-    error: &eyre::Report,
-) -> Result<()> {
-    ensure_ownership(lease, session)?;
-    session.state.restart_required = true;
-    session.state.record_operation(OperationRecord {
-        id: meta.id.clone(),
-        executor: meta.executor,
-        kind: meta.kind,
-        worker_id: meta.worker_id.clone(),
-        publication_revision: Some(plan.publication_revision),
-        mods_revision: plan.mods_phase.then(|| plan.mods_revision.clone()),
-        status: OperationStatus::Failed,
-        summary: OperationSummary::default(),
-        restart: RestartOutcome::NotRequired,
-        error: Some(error.to_string()),
-        started_at: meta.started_at,
-        finished_at: Utc::now(),
-    });
-    persist_state(session)
 }
 
 /// Gathers everything the planner needs to know about the remote: a fresh
@@ -1352,97 +1353,70 @@ fn execute(
     // ---- Uploads: payload first, then published config writes.
     ensure_ownership(lease, session)?;
     let mut ensured = BTreeSet::new();
-    let payload_uploads: Vec<_> = plan
+    let (payload_uploads, config_uploads): (Vec<_>, Vec<_>) = plan
         .uploads
         .iter()
-        .filter(|upload| upload.kind != UploadKind::Config)
-        .collect();
-    let payload_bytes: u64 = payload_uploads.iter().map(|upload| upload.size).sum();
-    let config_total = plan
-        .uploads
-        .iter()
-        .filter(|upload| upload.kind == UploadKind::Config)
-        .count();
+        .partition(|upload| upload.kind == UploadKind::Payload);
+
     if !payload_uploads.is_empty() {
         progress.phase(SyncPhase::UploadingPayload);
-        progress.work(payload_uploads.len(), Some(payload_bytes));
+        let bytes = payload_uploads.iter().map(|upload| upload.size).sum();
+        progress.work(payload_uploads.len(), Some(bytes));
     }
-    let mut uploaded = 0;
-    let mut uploaded_bytes = 0;
-    let mut written_configs = 0;
-    let mut writing_configs = false;
-
-    for upload in &plan.uploads {
-        if upload.kind == UploadKind::Config && !writing_configs {
-            progress.phase(SyncPhase::WritingConfigs);
-            progress.work(config_total, None);
-            writing_configs = true;
-        }
+    for (index, upload) in payload_uploads.into_iter().enumerate() {
         progress.item(upload.path.to_string());
-        let result = match upload.kind {
-            UploadKind::Payload => {
-                let staged = desired.get(&upload.path).ok_or_else(|| {
-                    eyre::eyre!("planned upload missing staged content: {}", upload.path)
-                });
+        // A payload failure means the published mod set is not fully
+        // deployed; remaining uploads are abandoned rather than
+        // half-applying them silently.
+        let staged = desired
+            .get(&upload.path)
+            .ok_or_else(|| eyre::eyre!("planned upload missing staged content: {}", upload.path))?;
+        upload_file(session, &upload.path, &staged.source, &mut ensured)
+            .wrap_err_with(|| format!("failed to upload {}", upload.path))?;
+        session.state.files.insert(
+            upload.path.clone(),
+            OwnedFile {
+                hash: staged.hash.clone(),
+                size: staged.size,
+            },
+        );
+        session.state.restart_required = true;
+        summary.uploaded_files += 1;
+        summary.uploaded_bytes += upload.size;
+        progress.advance(index + 1, Some(summary.uploaded_bytes));
+    }
 
-                staged.and_then(|staged| {
-                    upload_file(session, &upload.path, &staged.source, &mut ensured).map(|_| {
-                        record_staged(session, upload, staged);
-                    })
-                })
-            }
-            UploadKind::Config => {
-                let config_path = ConfigPath::try_from(upload.path.as_str().to_owned())
-                    .map_err(|_| eyre::eyre!("config path is not deployable: {}", upload.path));
-                config_path.and_then(|config_path| {
-                    let file = publication.config.get(&config_path).ok_or_else(|| {
-                        eyre::eyre!("planned config write is not published: {config_path}")
-                    })?;
-                    upload_file(
-                        session,
-                        &upload.path,
-                        &FileSource::Bytes(file.bytes.clone()),
-                        &mut ensured,
-                    )?;
-                    session.state.record_applied(&config_path, &file.hash);
-                    summary.config_writes += 1;
-                    Ok(())
-                })
-            }
-        };
-
-        match result {
+    if !config_uploads.is_empty() {
+        progress.phase(SyncPhase::WritingConfigs);
+        progress.work(config_uploads.len(), None);
+    }
+    for (index, upload) in config_uploads.into_iter().enumerate() {
+        progress.item(upload.path.to_string());
+        let path = ConfigPath::try_from(upload.path.as_str().to_owned())
+            .map_err(|_| eyre::eyre!("config path is not deployable: {}", upload.path))?;
+        let file = publication
+            .config
+            .get(&path)
+            .ok_or_else(|| eyre::eyre!("planned config write is not published: {path}"))?;
+        match upload_file(
+            session,
+            &upload.path,
+            &FileSource::Bytes(file.bytes.clone()),
+            &mut ensured,
+        ) {
             Ok(()) => {
+                session.state.record_applied(&path, &file.hash);
                 session.state.restart_required = true;
-                if matches!(upload.kind, UploadKind::Payload) {
-                    summary.uploaded_files += 1;
-                    summary.uploaded_bytes += upload.size;
-                }
-            }
-            Err(error) if upload.kind == UploadKind::Config => {
-                // A failed config write must not advance the file's record;
-                // it stays pending/reviewable for the next attempt.
-                if let Ok(path) = ConfigPath::try_from(upload.path.as_str().to_owned()) {
-                    failed_config_writes.push(path.clone());
-                }
-                warnings.push(format!("could not write config {}: {error}", upload.path));
+                summary.config_writes += 1;
             }
             Err(error) => {
-                // A payload failure means the published mod set is not fully
-                // deployed; remaining uploads are abandoned rather than
-                // half-applying them silently.
-                return Err(error.wrap_err(format!("failed to upload {}", upload.path)));
+                // A failed config write must not advance the file's record;
+                // it stays pending/reviewable for the next attempt.
+                warnings.push(format!("could not write config {path}: {error}"));
+                failed_config_writes.push(path);
             }
         }
-
-        if upload.kind == UploadKind::Config {
-            written_configs += 1;
-            progress.advance(written_configs, None);
-        } else {
-            uploaded += 1;
-            uploaded_bytes += upload.size;
-            progress.advance(uploaded, Some(uploaded_bytes));
-        }
+        progress.advance(index + 1, None);
     }
 
     // ---- Config decision records (non-write outcomes).
@@ -1472,19 +1446,6 @@ fn execute(
     }
 
     Ok((summary, warnings, failed_config_writes))
-}
-
-/// Records a successful payload upload in the deployment state.
-fn record_staged(session: &mut Session, upload: &plan::PlanUpload, staged: &plan::StagedFile) {
-    if upload.kind == UploadKind::Payload {
-        session.state.files.insert(
-            upload.path.clone(),
-            OwnedFile {
-                hash: staged.hash.clone(),
-                size: staged.size,
-            },
-        );
-    }
 }
 
 /// Streams one staged file to its remote path through a temporary file and
@@ -1719,14 +1680,7 @@ pub fn set_config_policy(
         session.mapper.spec.is_managed_config(path),
         "unsupported server config path: {path}"
     );
-    let lease = lease::acquire(
-        session.ops.as_mut(),
-        &session.mapper.remote_path(&session.mapper.spec.lease_dir),
-        &meta.owner,
-        meta.executor,
-        &meta.id,
-        false,
-    )?;
+    let lease = session.acquire_lease(meta, false)?;
 
     let result = (|| {
         refresh_state(session)?;
@@ -1778,10 +1732,11 @@ fn detect_host_managed(
         return Ok(true);
     }
 
-    let owns_loader = mapper
-        .spec
-        .owns_loader(state.files.keys().map(DeployPathBuf::as_path));
-    if owns_loader {
+    if state
+        .files
+        .keys()
+        .any(|path| mapper.spec.is_loader_owned(path))
+    {
         return Ok(false);
     }
 
@@ -3202,7 +3157,7 @@ mod tests {
             state
                 .config
                 .get(&config_path("BepInEx/config/two.cfg"))
-                .map_or(true, |record| record.applied.is_none())
+                .is_none_or(|record| record.applied.is_none())
         );
     }
 
@@ -4020,9 +3975,8 @@ mod tests {
             &serde_json::to_vec(&moved).unwrap(),
         );
 
-        let err = persist_state(&mut session)
-            .err()
-            .expect("a moved remote sequence must refuse the write");
+        let err =
+            persist_state(&mut session).expect_err("a moved remote sequence must refuse the write");
         assert!(
             format!("{err:#}").contains("changed during this operation"),
             "expected the sequence guard, got: {err:#}"
@@ -4458,8 +4412,8 @@ mod tests {
         let completed = |phase| {
             events
                 .iter()
-                .filter(|event| event.phase == phase)
-                .last()
+                .rev()
+                .find(|event| event.phase == phase)
                 .unwrap()
         };
         let removal = completed(SyncPhase::RemovingFiles);
@@ -4477,7 +4431,7 @@ mod tests {
     async fn restart_verification_requires_evidence_and_stops_promptly() {
         use std::collections::VecDeque;
 
-        use crate::profile::server::host::BoxFuture;
+        use futures_util::future::BoxFuture;
 
         struct RestartHost {
             statuses: Mutex<VecDeque<Result<HostStatus>>>,

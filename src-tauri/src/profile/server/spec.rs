@@ -153,12 +153,6 @@ impl DeploymentSpec {
         path.strip_prefix(self.mirror_root.as_str())
     }
 
-    /// Whether recorded Gale-owned files include a loader deployment,
-    /// meaning Gale (and not the host) owns the loader files on the server.
-    pub fn owns_loader<'a>(&self, mut paths: impl Iterator<Item = &'a DeployPath>) -> bool {
-        paths.any(|path| self.is_loader_owned(path))
-    }
-
     /// Whether `path` is part of the mod loader's own payload.
     pub fn is_loader_owned(&self, path: &DeployPath) -> bool {
         self.loader_owned_globs
@@ -182,22 +176,15 @@ impl DeploymentSpec {
             || self.is_internal(path)
     }
 
-    /// Whether a file from the published mod set may be deployed to `path`.
+    /// Whether Gale deploys `path`, and may therefore remove it once a
+    /// completed deployment recorded it as owned.
     ///
     /// `host_managed` means the remote host provides the loader itself, in
     /// which case loader-owned paths outside the payload dirs are left
-    /// alone. Config-directory paths are never payload-deployed: they are
-    /// written through config rules instead.
+    /// alone. Config-directory paths are never payload: they are written
+    /// through config rules instead.
     pub fn deploys(&self, path: &DeployPath, host_managed: bool) -> bool {
-        if self.is_internal(path) || self.is_excluded(path) || self.is_config(path) {
-            return false;
-        }
-
-        if self.is_mirrored(path) {
-            return true;
-        }
-
-        self.is_loader_owned(path) && !host_managed
+        self.valid_owned_path(path) && (!host_managed || self.is_mirrored(path))
     }
 
     /// Only files in the loader's config directories can be governed by
@@ -218,13 +205,6 @@ impl DeploymentSpec {
         }
 
         self.is_mirrored(path) || self.is_loader_owned(path)
-    }
-
-    /// Whether `path` may be removed during deployment given loader
-    /// ownership. Deletion is bounded to payload scope; under a host-managed
-    /// loader only mirrored payload paths are eligible.
-    pub fn owns_for_removal(&self, path: &DeployPath, host_managed: bool) -> bool {
-        self.valid_owned_path(path) && (!host_managed || self.is_mirrored(path))
     }
 
     fn is_internal(&self, path: &DeployPath) -> bool {
@@ -356,17 +336,15 @@ mod tests {
         assert!(spec.deploys(&path("BepInEx/plugins/Mod/Mod.dll"), true));
         assert!(!spec.deploys(&path("BepInEx/core/bepinex.dll"), true));
         assert!(!spec.deploys(&path("doorstop_config.ini"), true));
-        assert!(!spec.owns_for_removal(&path("BepInEx/core/bepinex.dll"), true));
-        assert!(spec.owns_for_removal(&path("BepInEx/core/bepinex.dll"), false));
+        assert!(spec.deploys(&path("BepInEx/core/bepinex.dll"), false));
     }
 
     #[test]
     fn detects_loader_ownership_from_state_files() {
         let spec = bepinex();
-        let files = [path("BepInEx/core/bepinex.dll")];
 
-        assert!(spec.owns_loader(files.iter().map(|p| p.as_path())));
-        assert!(!spec.owns_loader(std::iter::empty()));
+        assert!(spec.is_loader_owned(&path("BepInEx/core/bepinex.dll")));
+        assert!(!spec.is_loader_owned(&path("BepInEx/plugins/Mod/Mod.dll")));
     }
 
     #[test]

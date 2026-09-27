@@ -1,12 +1,8 @@
 # Dedicated servers
 
-Gale can launch a dedicated server on this computer or deploy a published profile to a remote server. The **Dedicated server** page appears only for games with a `dedicatedServer` entry in `src-tauri/games.json`.
+Gale can launch a dedicated server on this computer or deploy a published profile to a remote server. Open the **Dedicated server** page from the navigation bar. It appears only for games with a `dedicatedServer` entry in `src-tauri/games.json`.
 
-## Using it
-
-Open the **Dedicated server** page from the navigation bar; it only shows for games with dedicated server support.
-
-### Local server
+## Local server
 
 Choose **This computer**, enter the server name, world, port, and optional password, then select **Launch server**. Gale finds the game's dedicated server through its configured platform, prepares the mod loader, and starts the server with the active profile.
 
@@ -14,7 +10,7 @@ Select **Save settings** to save the local settings and, when **Remember passwor
 
 The server must already be installed. Gale manages only the process it starts, so closing Gale never kills an unrelated server process.
 
-### Remote server
+## Remote server
 
 Choose **Remote server** and enter the connection details supplied by the server host.
 
@@ -73,7 +69,7 @@ After restarting through the host panel, use **I confirmed the restart** in the 
 
 ### Local
 
-Gale on your PC connects directly to the server and deploys. Nothing else needs to run. Local mode is the default and works for manual deployments.
+Gale on your PC connects directly to the server and deploys. Nothing else needs to run. Local mode is the default.
 
 ### Worker
 
@@ -222,7 +218,7 @@ A deployment only reports success once its state file reads back byte-identical.
 
 The deployment state file (`BepInEx/config/.gale-server-state.json`, or `config/.gale-server-state.json` in restricted-root layouts) records owned files, content hashes, applied config revisions, per-file policies, the last operation, and restart state. It is the authority for what Gale may remove. A file absent from the publication but never recorded as deployed stays put.
 
-The existing protections apply in both modes: managed vs host-managed BepInEx installations, restricted-root layouts, validated state-path adoption, retried removals, and server-config preservation during mods-only updates.
+The same protections apply in both modes: host-managed BepInEx installations are left alone, restricted-root layouts are detected, a failed removal keeps its ownership record so the next deployment retries it, and mods-only updates never touch server configs.
 
 ## Maintainer notes
 

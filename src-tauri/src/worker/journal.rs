@@ -38,7 +38,6 @@ pub struct WorkerJournal {
     /// deployment and on refreshed status reads. It lets a new
     /// publication's mod revision be classified as owed or already
     /// deployed without opening a remote session.
-    #[serde(default)]
     pub deployed_mods_revision: Option<ModRevision>,
     /// The current sync refresh token (rotated on each token grant).
     /// Seeded from `GALE_WORKER_REFRESH_TOKEN` on first run.
@@ -202,9 +201,9 @@ impl Journal {
     }
 
     /// Persists the current journal state through temp file + rename. The
-    /// journal holds a rotated refresh token, so the file gets owner-only
-    /// permissions, re-applied after the rename so atomic replacement
-    /// cannot widen them.
+    /// journal holds a rotated refresh token, so the temp file is made
+    /// owner-only before the rename publishes it. A leftover temp file from
+    /// a crash keeps its old mode on reopen, hence the explicit chmod.
     pub fn save(&self, state: &WorkerJournal) -> Result<()> {
         let bytes = serde_json::to_vec_pretty(state)?;
         let tmp = self.path.with_extension("json.tmp");
@@ -227,17 +226,11 @@ impl Journal {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-        }
-
-        std::fs::rename(&tmp, &self.path).context("failed to persist worker journal")?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600))
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
                 .context("failed to restrict worker journal permissions")?;
         }
-        Ok(())
+
+        std::fs::rename(&tmp, &self.path).context("failed to persist worker journal")
     }
 
     /// Records a completed operation.

@@ -62,11 +62,10 @@ export const setSettings = (
 		}
 	});
 
-/// `settings: null` launches with the profile's stored settings, so an
-/// already-configured server starts immediately. `rememberPassword` controls
+/// Saves `settings` and launches with them. `rememberPassword` controls
 /// whether the provided (or stored) password stays in the credential store.
 export const launch = (
-	settings: ProfileServerSettings | null,
+	settings: ProfileServerSettings,
 	password: string,
 	rememberPassword: boolean
 ) =>

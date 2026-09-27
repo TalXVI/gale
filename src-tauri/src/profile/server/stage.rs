@@ -165,7 +165,7 @@ pub async fn stage_fetched(
 ///
 /// `progress` receives `(completed, total, mod_name)` for reporting.
 pub async fn stage_publication(
-    publication: &crate::profile::sync::FetchedPublication,
+    publication: &FetchedPublication,
     source: &dyn PayloadSource,
     spec: &DeploymentSpec,
     include_mods: bool,
@@ -217,18 +217,10 @@ fn collect_tree(root: &Path, spec: &DeploymentSpec, desired: &mut DesiredDeploym
         if relative.file_name().ends_with(".old") {
             continue;
         }
-        if spec.is_gale_internal(&relative) {
-            continue;
-        }
-
-        // Config-dir files inside packages are server-owned territory:
-        // the running server generates or migrates them, and only an
-        // explicit config push writes configs. They are never payload.
-        if spec.is_config(&relative) {
-            continue;
-        }
-
-        if !spec.deploys(&relative, false) {
+        // `deploys` also rejects config-dir files inside packages: the
+        // running server generates or migrates its configs, and only an
+        // explicit config push writes them.
+        if spec.is_gale_internal(&relative) || !spec.deploys(&relative, false) {
             continue;
         }
 

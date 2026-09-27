@@ -54,8 +54,7 @@ impl ModLoader<'_> {
         }
     }
 
-    /// Whether `full_name` is the mod loader's own package on
-    /// Thunderstore.
+    /// Checks for the mod loader's own package on Thunderstore.
     fn is_loader_package(&self, full_name: &str) -> bool {
         if let Some(package_name) = self.package_name {
             full_name == package_name

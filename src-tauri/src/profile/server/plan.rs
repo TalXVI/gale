@@ -289,28 +289,25 @@ pub fn build_plan(
         // no matter how much they resemble published content. They are
         // reported as unmanaged instead, so the user sees what else lives
         // in the payload directories.
-        let desired_paths: BTreeSet<&DeployPath> =
-            desired.keys().map(DeployPathBuf::as_path).collect();
-        for path in state.files.keys() {
-            if desired_paths.contains(path.as_path())
-                || !spec.owns_for_removal(path, snapshot.host_managed)
-            {
-                continue;
-            }
-            removals.push(path.clone());
-        }
-        removals.sort();
-        removals.dedup();
+        removals = state
+            .files
+            .keys()
+            .filter(|path| {
+                !desired.contains_key(*path) && spec.deploys(path, snapshot.host_managed)
+            })
+            .cloned()
+            .collect();
 
-        for path in snapshot.payload_files.keys() {
-            if !desired_paths.contains(path.as_path())
-                && !state.files.contains_key(path)
-                && spec.valid_owned_path(path)
-            {
-                unmanaged.push(path.clone());
-            }
-        }
-        unmanaged.sort();
+        unmanaged = snapshot
+            .payload_files
+            .keys()
+            .filter(|path| {
+                !desired.contains_key(*path)
+                    && !state.files.contains_key(*path)
+                    && spec.valid_owned_path(path)
+            })
+            .cloned()
+            .collect();
 
         // Payload dirs left with no surviving remote files after removals
         // can go, deepest first. The payload roots themselves are kept so a
@@ -318,6 +315,7 @@ pub fn build_plan(
         directory_removals = snapshot
             .payload_dirs
             .iter()
+            .rev()
             .filter(|dir| {
                 spec.payload_dirs
                     .iter()
@@ -331,7 +329,6 @@ pub fn build_plan(
             })
             .cloned()
             .collect();
-        directory_removals.sort_by(|a, b| b.cmp(a));
     }
 
     // ---- Config phase: selective application of published config files.
@@ -426,6 +423,10 @@ fn decide_config(
     restore: bool,
     declined: bool,
 ) -> ConfigAction {
+    const DELETED: ConfigAction = ConfigAction::Pending {
+        reason: PendingConfigReason::DeletedLocally,
+    };
+
     if remote == Some(published) {
         return ConfigAction::MarkApplied;
     }
@@ -434,31 +435,27 @@ fn decide_config(
         return ConfigAction::Decline;
     }
 
+    // A recorded hash cannot prove a file still exists. Recreating a file
+    // Gale deployed that was deleted remotely needs the explicit restore
+    // authorization, even when the publication is unchanged or an
+    // automatic update policy was previously selected.
+    let deleted =
+        remote.is_none() && record.is_some_and(|r| r.applied.is_some() || r.written.is_some());
+
     if selected {
-        // Recreating a file Gale deployed that was deleted remotely needs
-        // the explicit restore authorization.
-        if remote.is_none()
-            && record.is_some_and(|r| r.applied.is_some() || r.written.is_some())
-            && !restore
-        {
-            return ConfigAction::Pending {
-                reason: PendingConfigReason::DeletedLocally,
-            };
-        }
-        return ConfigAction::Write;
+        return if deleted && !restore {
+            DELETED
+        } else {
+            ConfigAction::Write
+        };
     }
 
     if record.and_then(|r| r.declined.as_ref()) == Some(published) {
         return ConfigAction::Decline;
     }
 
-    // A recorded hash cannot prove a file still exists. A remote deletion
-    // must reach the restore gate even when the publication is unchanged or
-    // an automatic update policy was previously selected.
-    if remote.is_none() && record.is_some_and(|r| r.applied.is_some() || r.written.is_some()) {
-        return ConfigAction::Pending {
-            reason: PendingConfigReason::DeletedLocally,
-        };
+    if deleted {
+        return DELETED;
     }
 
     // A policy set at the currently advertised hash governs updates, not the
@@ -471,15 +468,7 @@ fn decide_config(
     match (remote, policy) {
         (_, ConfigUpdatePolicy::AlwaysApply) => ConfigAction::Write,
         (_, ConfigUpdatePolicy::AlwaysKeep) => ConfigAction::Decline,
-        (None, ConfigUpdatePolicy::Ask) => {
-            if record.is_some_and(|r| r.applied.is_some() || r.written.is_some()) {
-                ConfigAction::Pending {
-                    reason: PendingConfigReason::DeletedLocally,
-                }
-            } else {
-                ConfigAction::Unapplied
-            }
-        }
+        (None, ConfigUpdatePolicy::Ask) => ConfigAction::Unapplied,
         (Some(remote_hash), ConfigUpdatePolicy::Ask) => {
             // Content Gale wrote and nobody modified on the server may
             // update without asking.

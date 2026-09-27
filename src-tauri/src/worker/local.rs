@@ -16,7 +16,7 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
 use super::{ManagedServiceState, ServiceControlAction};
 
-const TRANSITION_TIMEOUT: Duration = Duration::from_secs(45);
+pub(crate) const TRANSITION_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// SCM service name for the managed worker. One service exists per
 /// machine, which is also the first line of defense against duplicate
@@ -78,12 +78,12 @@ pub fn binaries_differ(candidate: &Path, installed: &Path) -> bool {
     }
 }
 
-fn service_manager() -> Result<ServiceManager> {
+pub(crate) fn service_manager() -> Result<ServiceManager> {
     ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
         .context("failed to open the service control manager")
 }
 
-fn is_not_installed(err: &windows_service::Error) -> bool {
+pub(crate) fn is_not_installed(err: &windows_service::Error) -> bool {
     matches!(err, windows_service::Error::Winapi(io) if io.raw_os_error() == Some(1060))
 }
 

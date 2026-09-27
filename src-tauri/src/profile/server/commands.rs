@@ -6,8 +6,7 @@
 //!   only verify the supplied connection details.
 //! - **Routine synchronization** (`get_server_sync_status`,
 //!   `preview_server_sync`, `deploy_server_sync`, `set_server_config_policy`,
-//!   `configure_worker`) uses the stored settings plus stored credentials,
-//!   so no settings dialog is needed on every deploy.
+//!   `configure_worker`) uses the stored settings plus stored credentials.
 //!
 //! Both execution modes share the wire shapes in `worker::api`, so the
 //! frontend handles Local and Worker results identically.
@@ -40,6 +39,7 @@ use crate::{
             },
             spec::DeploymentSpec,
             stage,
+            state::OperationKind,
             worker_client::WorkerClient,
         },
         sync::{self, ConfigUpdatePolicy, FetchedPublication},
@@ -52,10 +52,8 @@ use crate::{
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LaunchDedicatedServerRequest {
-    /// Settings to launch with. Falls back to the profile's stored settings,
-    /// so an already-configured server can launch immediately.
-    #[serde(default)]
-    pub settings: Option<ProfileServerSettings>,
+    /// Settings to launch with. They are saved to the profile on launch.
+    pub settings: ProfileServerSettings,
     #[serde(default)]
     pub password: String,
     #[serde(default)]
@@ -235,14 +233,11 @@ pub fn set_sync_dialog_preferences(
     preferences: SyncDialogPreferences,
     app: AppHandle,
 ) -> Result<()> {
-    let mut manager = app.lock_manager();
-    let profile = manager.active_profile();
-    let profile_id = profile.id;
-    let (_, profile) = manager.profile_by_id_mut(profile_id)?;
-    let mut settings = profile.server_settings.clone().unwrap_or_default();
-    settings.sync_dialog = preferences;
-    profile.server_settings = Some(settings);
-    Ok(profile.save(&app, true)?)
+    Ok(update_settings_for(
+        &app,
+        active_profile_id(&app),
+        |settings| settings.sync_dialog = preferences,
+    )?)
 }
 
 #[command]
@@ -295,9 +290,9 @@ pub async fn set_dedicated_server_settings(
         request.remember_game_password,
     )?;
 
-    save_settings_for(&app, profile_id, settings.clone())?;
-
-    persist_remote_credentials(&secrets, &settings.remote, &request)?;
+    let remote = settings.remote.clone();
+    update_settings_for(&app, profile_id, |stored| *stored = settings)?;
+    persist_remote_credentials(&secrets, &remote, &request)?;
 
     Ok(())
 }
@@ -430,21 +425,11 @@ pub async fn launch_dedicated_server(
     // Resolve by the captured id. The `pull_profile` call awaited, so the
     // active profile may have changed since then. Never combine profile
     // A's credentials with profile B's settings or launch context.
-    let (game, stored_settings) = {
-        let manager = app.lock_manager();
-        let (game, profile) = manager.profile_by_id(profile_id)?;
-        (game, profile.server_settings.clone())
-    };
-
-    let save_settings = request.settings.is_some();
-    let settings = request
-        .settings
-        .or(stored_settings)
-        .ok_or_eyre("the dedicated server has not been configured yet")?;
+    let game = app.lock_manager().profile_by_id(profile_id)?.0;
+    let settings = request.settings;
     args::validate_game_args(game, &settings.local, &password)?;
-    if save_settings {
-        save_settings_for(&app, profile_id, settings.clone())?;
-    }
+    let saved = settings.clone();
+    update_settings_for(&app, profile_id, |stored| *stored = saved)?;
     secrets.persist(
         ServerSecret::GamePassword,
         &password,
@@ -554,12 +539,11 @@ pub async fn test_remote_server_connection(
     let secrets = ServerSecrets::for_profile(profile_id)?;
     let credential = remote_credential(&secrets, &request.settings, &request.password)?;
 
-    let settings = request.settings.clone();
-    let password = credential.clone();
-
-    let result = tokio::task::spawn_blocking(move || remote::test_connection(&settings, &password))
-        .await
-        .map_err(|err| eyre::eyre!("remote connection worker failed: {err}"))??;
+    let result = tokio::task::spawn_blocking(move || {
+        remote::test_connection(&request.settings, &credential)
+    })
+    .await
+    .map_err(|err| eyre::eyre!("remote connection worker failed: {err}"))??;
 
     Ok(result)
 }
@@ -667,8 +651,8 @@ pub async fn get_server_sync_status(
     // cheap metadata, and a failure is non-fatal when sync isn't
     // configured or unreachable.
     let publication_revision = match &target.sync_id {
-        Some(id) => match sync::fetch_publication_meta(id, &app).await {
-            Ok(Some(meta)) => Some(meta.updated_at()),
+        Some(id) => match sync::get_profile_meta(id, &app).await {
+            Ok(Some(meta)) => Some(meta.updated_at),
             Ok(None) => None,
             Err(err) => {
                 warnings.push(format!("could not check for a new publication: {err:#}"));
@@ -700,14 +684,9 @@ pub async fn get_server_sync_status(
         Ok(Executor::Local(credential)) => {
             open_remote_session(&target.settings, &credential, target.mod_loader)
                 .await
-                .map(|session| {
-                    status.server = Some(ServerStateSummary {
-                        mods_revision: session.state.mods_revision.clone(),
-                        restart_required: session.state.restart_required,
-                        last_operation: session.state.last_operation.clone(),
-                        lease: session.lease.clone(),
-                    });
-                    status.warnings.extend(session.warnings);
+                .map(|mut session| {
+                    status.warnings.append(&mut session.warnings);
+                    status.server = Some(session.into());
                 })
         }
         Err(err) => Err(err),
@@ -841,23 +820,15 @@ pub async fn set_server_config_policy(
                     .map(|file| file.hash.clone()),
                 None => None,
             };
-            let (settings, password, mod_loader, meta) = (
-                target.settings.clone(),
-                credential,
-                target.mod_loader,
-                OperationMeta::local(
-                    &target.profile_id.to_string(),
-                    crate::profile::server::state::OperationKind::Manual,
-                ),
-            );
             tokio::task::spawn_blocking(move || {
-                let mut session = open_session_blocking(&settings, &password, mod_loader)?;
+                let mut session =
+                    open_session_blocking(&target.settings, &credential, target.mod_loader)?;
                 engine::set_config_policy(
                     &mut session,
                     &request.path,
                     request.policy,
                     pinned_at.as_ref(),
-                    &meta,
+                    &target.meta(),
                 )
             })
             .await
@@ -879,15 +850,10 @@ pub async fn acknowledge_external_server_restart(
     match resolve_executor(&target, &request.password, &request.worker_token)? {
         Executor::Worker(client) => client.acknowledge_external_restart().await?,
         Executor::Local(credential) => {
-            let settings = target.settings.clone();
-            let mod_loader = target.mod_loader;
-            let meta = OperationMeta::local(
-                &target.profile_id.to_string(),
-                crate::profile::server::state::OperationKind::Manual,
-            );
             tokio::task::spawn_blocking(move || {
-                let mut session = open_session_blocking(&settings, &credential, mod_loader)?;
-                engine::acknowledge_external_restart(&mut session, &meta).map(|_| ())
+                let mut session =
+                    open_session_blocking(&target.settings, &credential, target.mod_loader)?;
+                engine::acknowledge_external_restart(&mut session, &target.meta()).map(|_| ())
             })
             .await
             .map_err(|err| eyre::eyre!("restart acknowledgment failed: {err}"))??;
@@ -897,8 +863,8 @@ pub async fn acknowledge_external_server_restart(
 }
 
 /// Updates the worker's automation toggles and mirrors the state it
-/// confirmed into the stored settings, so both dialogs reflect the
-/// worker's actual behavior. Returns the worker's confirmed status.
+/// confirmed into the stored settings, so the page reflects the worker's
+/// actual behavior. Returns the worker's confirmed status.
 #[command]
 pub async fn configure_worker(
     request: ConfigureWorkerRequest,
@@ -923,15 +889,10 @@ pub async fn configure_worker(
     )
     .await?;
 
-    // Persist what the worker confirmed, by profile id, so an
-    // active-profile switch during the push cannot redirect the write.
-    let mut manager = app.lock_manager();
-    let (_, profile) = manager.profile_by_id_mut(target.profile_id)?;
-    let mut settings = profile.server_settings.clone().unwrap_or_default();
-    settings.remote.worker.auto_deploy_mods = confirmed.auto_deploy_mods;
-    settings.remote.restart_policy = confirmed.restart_policy;
-    profile.server_settings = Some(settings);
-    profile.save(&app, true)?;
+    update_settings_for(&app, target.profile_id, |settings| {
+        settings.remote.worker.auto_deploy_mods = confirmed.auto_deploy_mods;
+        settings.remote.restart_policy = confirmed.restart_policy;
+    })?;
 
     Ok(confirmed)
 }
@@ -939,7 +900,7 @@ pub async fn configure_worker(
 // ---------- Local-mode orchestration ----------
 
 /// The pinned profile/server context for one operation, captured before
-/// any await so an active-profile switch cannot redirect it (R03).
+/// any await so an active-profile switch cannot redirect it.
 pub(crate) struct SyncTarget {
     pub(crate) profile_id: i64,
     /// The profile's game slug, captured so plan approvals stay bound to
@@ -949,6 +910,26 @@ pub(crate) struct SyncTarget {
     pub(crate) mod_loader: &'static ModLoader<'static>,
     pub(crate) settings: RemoteServerSettings,
     pub(crate) cache_dir: PathBuf,
+}
+
+impl SyncTarget {
+    fn meta(&self) -> OperationMeta {
+        OperationMeta::local(&self.profile_id.to_string(), OperationKind::Manual)
+    }
+
+    /// Emits progress to the page, which matches the run id before showing it.
+    fn reporter(
+        &self,
+        app: &AppHandle,
+        run_id: String,
+        operation: SyncOperation,
+        selection: &DeploySelection,
+    ) -> ProgressReporter {
+        let app = app.clone();
+        ProgressReporter::new(run_id, operation, selection, move |snapshot| {
+            let _ = app.emit("server_sync_operation_progress", snapshot);
+        })
+    }
 }
 
 pub(crate) fn sync_target(app: &AppHandle) -> eyre::Result<SyncTarget> {
@@ -1114,11 +1095,7 @@ async fn local_preview(
     credential: &str,
     run_id: String,
 ) -> eyre::Result<PreviewResponse> {
-    let event_app = app.clone();
-    let mut progress =
-        ProgressReporter::new(run_id, SyncOperation::Preview, selection, move |snapshot| {
-            let _ = event_app.emit("server_sync_operation_progress", snapshot);
-        });
+    let mut progress = target.reporter(app, run_id, SyncOperation::Preview, selection);
     let result = async {
         let spec = DeploymentSpec::for_loader(target.mod_loader)?;
         let (publication, desired) =
@@ -1132,10 +1109,7 @@ async fn local_preview(
             desired,
             selection.clone(),
             plan_context(target, restart_policy),
-            OperationMeta::local(
-                &target.profile_id.to_string(),
-                crate::profile::server::state::OperationKind::Manual,
-            ),
+            target.meta(),
             &mut progress,
         )
         .await
@@ -1155,14 +1129,11 @@ async fn local_deploy(
     request: ServerSyncDeployRequest,
     credential: &str,
 ) -> eyre::Result<DeployResponse> {
-    let event_app = app.clone();
-    let mut progress = ProgressReporter::new(
+    let mut progress = target.reporter(
+        app,
         request.run_id.clone(),
         SyncOperation::Deploy,
         &request.selection,
-        move |snapshot| {
-            let _ = event_app.emit("server_sync_operation_progress", snapshot);
-        },
     );
     let result = async {
         let spec = DeploymentSpec::for_loader(target.mod_loader)?;
@@ -1186,10 +1157,7 @@ async fn local_deploy(
             desired,
             request.selection,
             plan_context(target, request.restart_policy),
-            OperationMeta::local(
-                &target.profile_id.to_string(),
-                crate::profile::server::state::OperationKind::Manual,
-            ),
+            target.meta(),
             Some(request.plan_hash),
             request.force,
             host.as_ref(),
@@ -1222,28 +1190,16 @@ fn active_profile_id(app: &AppHandle) -> i64 {
     app.lock_manager().active_profile().id
 }
 
-/// Saves into the profile captured before any asynchronous work.
-fn save_settings_for(
+/// Updates the settings of a profile captured before any asynchronous
+/// work, so an active-profile switch cannot redirect the write.
+pub(crate) fn update_settings_for(
     app: &AppHandle,
     profile_id: i64,
-    settings: ProfileServerSettings,
+    update: impl FnOnce(&mut ProfileServerSettings),
 ) -> eyre::Result<()> {
     let mut manager = app.lock_manager();
     let (_, profile) = manager.profile_by_id_mut(profile_id)?;
-    profile.server_settings = Some(settings);
-    profile.save(app, true)
-}
-
-pub(crate) fn save_remote_settings_for(
-    app: &AppHandle,
-    profile_id: i64,
-    remote: RemoteServerSettings,
-) -> eyre::Result<()> {
-    let mut manager = app.lock_manager();
-    let (_, profile) = manager.profile_by_id_mut(profile_id)?;
-    let mut settings = profile.server_settings.clone().unwrap_or_default();
-    settings.remote = remote;
-    profile.server_settings = Some(settings);
+    update(profile.server_settings.get_or_insert_default());
     profile.save(app, true)
 }
 
@@ -1407,8 +1363,10 @@ mod tests {
 
         // Private-key auth clears only the key passphrase.
         let secrets = fully_stocked_secrets();
-        let mut remote = RemoteServerSettings::default();
-        remote.authentication = RemoteAuthentication::PrivateKey;
+        let remote = RemoteServerSettings {
+            authentication: RemoteAuthentication::PrivateKey,
+            ..Default::default()
+        };
         let mut request = save_request(remote);
         request.remember_remote_password = false;
         persist_remote_credentials(&secrets, &request.settings.remote, &request).unwrap();
@@ -1417,8 +1375,10 @@ mod tests {
         // FTP/FTPS clears only the FTP password.
         for protocol in [RemoteProtocol::Ftp, RemoteProtocol::Ftps] {
             let secrets = fully_stocked_secrets();
-            let mut remote = RemoteServerSettings::default();
-            remote.protocol = protocol;
+            let remote = RemoteServerSettings {
+                protocol,
+                ..Default::default()
+            };
             let mut request = save_request(remote);
             request.remember_remote_password = false;
             persist_remote_credentials(&secrets, &request.settings.remote, &request).unwrap();
@@ -1427,8 +1387,10 @@ mod tests {
 
         // Agent auth has no transport credential: nothing is cleared.
         let secrets = fully_stocked_secrets();
-        let mut remote = RemoteServerSettings::default();
-        remote.authentication = RemoteAuthentication::Agent;
+        let remote = RemoteServerSettings {
+            authentication: RemoteAuthentication::Agent,
+            ..Default::default()
+        };
         let mut request = save_request(remote);
         request.remember_remote_password = false;
         persist_remote_credentials(&secrets, &request.settings.remote, &request).unwrap();

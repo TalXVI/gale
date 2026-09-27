@@ -1,7 +1,7 @@
 import * as api from '$lib/api';
 import games from '$lib/state/game.svelte';
 import profiles from '$lib/state/profile.svelte';
-import type { ProfileServerSettings, ServerSyncStatus } from '$lib/types';
+import type { ServerSyncStatus } from '$lib/types';
 
 /// High-level remote deployment state, in the same terms the server
 /// page's status line uses.
@@ -33,27 +33,14 @@ export function remoteDeployState(
 		return status.worker.lastDeployedRevision ? 'upToDate' : 'neverDeployed';
 	}
 	if (!status.server) return liveChecked ? 'unavailable' : 'checking';
-	const server = status.server;
-	if (server.modsRevision == null) return 'neverDeployed';
-	const lastOperation = server.lastOperation;
-	if (
-		lastOperation?.status === 'succeeded' &&
-		lastOperation.modsRevision != null &&
-		lastOperation.publicationRevision != null &&
-		status.publicationRevision != null &&
-		lastOperation.publicationRevision >= status.publicationRevision
-	) {
-		return 'upToDate';
+	if (status.server.modsRevision == null) return 'neverDeployed';
+	// Only a mods operation tied to a publication says anything about freshness.
+	const lastOperation = status.server.lastOperation;
+	if (lastOperation?.modsRevision == null || lastOperation.publicationRevision == null) {
+		return 'deployed';
 	}
-	if (
-		lastOperation?.modsRevision != null &&
-		status.publicationRevision != null &&
-		lastOperation.publicationRevision != null &&
-		lastOperation.publicationRevision < status.publicationRevision
-	) {
-		return 'pending';
-	}
-	return 'deployed';
+	if (lastOperation.publicationRevision < status.publicationRevision) return 'pending';
+	return lastOperation.status === 'succeeded' ? 'upToDate' : 'deployed';
 }
 
 export class ServerSync {
@@ -111,7 +98,7 @@ export class ServerSync {
 		try {
 			const settings = await api.profile.server.getSettings({ quiet: true });
 			if (generation !== this.#generation || key !== this.#key) return;
-			if (settings == null || !this.#enableIfWorker(settings)) {
+			if (settings?.remote.syncMode !== 'worker' || settings.remote.host.trim() === '') {
 				this.status = null;
 				return;
 			}
@@ -125,10 +112,6 @@ export class ServerSync {
 	stop() {
 		if (this.#pollTimer) clearInterval(this.#pollTimer);
 		this.#pollTimer = null;
-	}
-
-	#enableIfWorker(settings: ProfileServerSettings) {
-		return settings.remote.syncMode === 'worker' && settings.remote.host.trim() !== '';
 	}
 
 	async #poll(key: string) {

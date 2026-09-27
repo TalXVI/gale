@@ -261,12 +261,7 @@ async fn status(
                         warn!(%err, "failed to persist remote state observation");
                     }
                 }
-                Some(super::api::ServerStateSummary {
-                    mods_revision: session.state.mods_revision.clone(),
-                    restart_required: session.state.restart_required,
-                    last_operation: session.state.last_operation.clone(),
-                    lease: session.lease,
-                })
+                Some(session.into())
             }
             Ok(Err(err)) => {
                 return error_response(&err);

@@ -105,10 +105,7 @@ pub struct Lease {
 }
 
 /// The result of a lease ownership check.
-///
-/// `still_ours` used to collapse every one of these into the same
-/// `false`, which reported a read-filtered or transiently unreadable
-/// record as a takeover and aborted healthy deployments.
+/// An unreadable record is not a takeover, so the outcomes stay distinct.
 #[derive(Debug)]
 pub enum Ownership {
     /// The claim verifiably still belongs to this holder: the stored
@@ -313,26 +310,19 @@ pub fn acquire(
                     }
                     .into());
                 }
+                // Our own stale lease means this executor crashed
+                // mid-operation and restarted, so it is safe to recover.
+                // A foreign one needs an explicit takeover.
+                Some(record) if record.owner == owner || force => {
+                    warn!(owner = %record.owner, "breaking a stale deployment lease");
+                    break_lease(ops, lease_dir, &lease_file, Some(&record))?;
+                }
                 Some(record) => {
-                    if record.owner == owner {
-                        // Our own stale lease: this executor crashed
-                        // mid-operation and restarted, so it is safe to
-                        // recover.
-                        info!(owner, "recovering own stale deployment lease");
-                        break_lease(ops, lease_dir, &lease_file, Some(&record))?;
-                    } else if force {
-                        warn!(
-                            owner = %record.owner,
-                            "taking over a stale foreign deployment lease by request"
-                        );
-                        break_lease(ops, lease_dir, &lease_file, Some(&record))?;
-                    } else {
-                        return Err(LeaseBusy {
-                            record,
-                            stale: true,
-                        }
-                        .into());
+                    return Err(LeaseBusy {
+                        record,
+                        stale: true,
                     }
+                    .into());
                 }
                 // An empty husk or an unreadable record means the claim
                 // never finished, unless a holder marker is present.

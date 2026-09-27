@@ -166,19 +166,14 @@ pub struct RemoteServerSettings {
     /// SHA-256 fingerprint of an FTPS certificate the user has pinned. Unlike
     /// hostname-wide trust this only accepts the exact certificate seen at
     /// trust time, so subsequent arbitrary certificates are rejected.
-    #[serde(default)]
     pub trusted_certificate: Option<String>,
     /// Which executor performs remote synchronization.
-    #[serde(default)]
     pub sync_mode: SyncMode,
     /// Worker connection and automation settings (`syncMode == "worker"`).
-    #[serde(default)]
     pub worker: WorkerSettings,
     /// Hosting provider used for restarts and player-presence checks.
-    #[serde(default)]
     pub host_control: HostSettings,
     /// What may happen to the server process after deployment.
-    #[serde(default)]
     pub restart_policy: RestartPolicy,
 }
 

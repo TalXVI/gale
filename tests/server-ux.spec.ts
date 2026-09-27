@@ -30,10 +30,7 @@ test('Worker settings expose one mod automation toggle with accurate help', asyn
 		.getByRole('button', { name: 'More information' })
 		.hover();
 	await expect(
-		page.getByText(
-			'Automatically deploy newly published mod revisions to the server while Gale is closed.',
-			{ exact: true }
-		)
+		page.getByText('Deploys new published mod revisions while Gale is closed.', { exact: true })
 	).toBeVisible();
 	await expect(remoteTab.getByText(/automatic sync only applies config files/i)).toHaveCount(0);
 	await expect(remoteTab.getByText(/while this device is offline/i)).toHaveCount(0);

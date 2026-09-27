@@ -37,8 +37,6 @@ const FTP_MAX_CONNECTION_AGE: Duration = Duration::from_secs(30);
 const FTP_MAX_TRANSFERS: u64 = 100;
 const SSH_TIMEOUT: Duration = Duration::from_millis(15_000);
 const SFTP_NO_SUCH_FILE: i32 = 2;
-/// FTP servers do not always implement `SIZE` for directories.
-const FTP_SIZE_UNAVAILABLE: &[Status] = &[Status::FileUnavailable, Status::BadCommand];
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(
@@ -531,6 +529,66 @@ impl RemoteConnection {
             }
         }
     }
+
+    /// Streams at most `limit + 1` bytes of `path` into `sink` and returns
+    /// how many arrived, or `None` when the file is absent. Reading one byte
+    /// past `limit` lets callers tell an oversized file from an exact fit.
+    fn retrieve(
+        &mut self,
+        path: &RemotePath,
+        limit: u64,
+        sink: &mut dyn Write,
+    ) -> Result<Option<u64>> {
+        self.renew_ftp_if_needed()?;
+        let copied = match &mut self.client {
+            RemoteClient::Sftp { sftp, .. } => match sftp.open(Path::new(path.as_str())) {
+                Ok(file) => Some(
+                    std::io::copy(&mut file.take(limit.saturating_add(1)), sink)
+                        .with_context(|| format!("SFTP read failed for {path}"))?,
+                ),
+                Err(err) if is_sftp_not_found(&err) => None,
+                Err(err) => return Err(err.into()),
+            },
+            RemoteClient::Ftp(ftp) => {
+                self.transfer_count += 1;
+                let transfer_count = self.transfer_count;
+                let connection_age_ms = self.connected_at.elapsed().as_millis();
+                match ftp.retr_as_stream(path.as_str()) {
+                    Ok(mut stream) => {
+                        let started = Instant::now();
+                        let read =
+                            std::io::copy(&mut (&mut stream).take(limit.saturating_add(1)), sink);
+                        // The control channel owes a completion reply even
+                        // after a failed data read, so always finalize.
+                        let finalize = ftp.finalize_retr_stream(stream);
+                        if read.is_err() || finalize.is_err() {
+                            warn!(command = "RETR", path = %path, transfer_count, connection_age_ms, transfer_duration_ms = started.elapsed().as_millis(), data_error = ?read.as_ref().err(), completion_error = ?finalize.as_ref().err(), "FTP transfer failed");
+                        }
+                        let copied =
+                            read.with_context(|| format!("FTP RETR data read failed for {path}"))?;
+                        finalize
+                            .with_context(|| format!("FTP RETR completion failed for {path}"))?;
+                        debug!(command = "RETR", path = %path, transfer_count, connection_age_ms, transfer_duration_ms = started.elapsed().as_millis(), bytes = copied, "FTP transfer completed");
+                        Some(copied)
+                    }
+                    Err(err) if is_ftp_not_found(&err) => None,
+                    Err(err) => {
+                        warn!(command = "RETR", path = %path, transfer_count, connection_age_ms, error = %err, "FTP transfer command failed");
+                        return Err(err).with_context(|| format!("FTP RETR failed for {path}"));
+                    }
+                }
+            }
+        };
+
+        // A RETR 550 conflates "absent" with "the server refuses to return
+        // this file": filtering hosts use the same status for both.
+        // Cross-check existence so a refused read surfaces as an error
+        // rather than as absence.
+        if copied.is_none() && matches!(self.client, RemoteClient::Ftp(_)) && self.is_file(path)? {
+            bail!("remote server refuses to return the existing file {path}");
+        }
+        Ok(copied)
+    }
 }
 
 enum FtpConnectError {
@@ -627,84 +685,22 @@ impl RemoteOps for RemoteConnection {
         // refused in FTP ASCII mode on some hosts, and an absent file
         // reports the same way. The transfer itself decides existence
         // and the cap is enforced on the received bytes.
-        let size = self.file_size(path).inspect_err(|err| {
-            if matches!(self.client, RemoteClient::Ftp(_)) {
-                warn!(phase = "read.metadata", path = %path, transfer_count = self.transfer_count, connection_age_ms = self.connected_at.elapsed().as_millis(), error = %err, "FTP metadata probe failed before RETR");
-            }
-        })?;
-        if let Some(size) = size {
+        if let Some(size) = self.file_size(path)? {
             ensure!(
                 size <= max,
                 "remote file {path} is {size} bytes, exceeding the {max}-byte limit"
             );
         }
 
-        self.renew_ftp_if_needed()?;
-
-        let transfer = if matches!(self.client, RemoteClient::Ftp(_)) {
-            self.transfer_count += 1;
-            Some((self.transfer_count, self.connected_at.elapsed().as_millis()))
-        } else {
-            None
-        };
-
-        let result: Option<Vec<u8>> = match &mut self.client {
-            RemoteClient::Sftp { sftp, .. } => match sftp.open(Path::new(path.as_str())) {
-                Ok(file) => {
-                    let mut bytes = Vec::new();
-                    file.take(max + 1).read_to_end(&mut bytes)?;
-                    ensure!(
-                        bytes.len() as u64 <= max,
-                        "remote file {path} exceeds the {max}-byte limit"
-                    );
-                    Some(bytes)
-                }
-                Err(err) if is_sftp_not_found(&err) => None,
-                Err(err) => return Err(err.into()),
-            },
-            RemoteClient::Ftp(ftp) => match ftp.retr_as_stream(path.as_str()) {
-                Ok(mut stream) => {
-                    let (transfer_count, connection_age_ms) = transfer.unwrap();
-                    debug!(phase = "read.data", command = "RETR", path = %path, transfer_count, connection_age_ms, "FTP data transfer started");
-                    let transfer_started = Instant::now();
-                    let mut bytes = Vec::new();
-                    let read = (&mut stream)
-                        .take(max.saturating_add(1))
-                        .read_to_end(&mut bytes);
-                    let finalize = ftp.finalize_retr_stream(stream);
-                    if let Err(err) = &read {
-                        warn!(phase = "read.data", command = "RETR", path = %path, transfer_count, connection_age_ms, transfer_duration_ms = transfer_started.elapsed().as_millis(), error = %err, "FTP data channel read failed");
-                    }
-                    if let Err(err) = &finalize {
-                        warn!(phase = "read.completion", command = "RETR", path = %path, transfer_count, connection_age_ms, transfer_duration_ms = transfer_started.elapsed().as_millis(), error = %err, "FTP control channel did not confirm transfer completion");
-                    }
-                    read.with_context(|| format!("FTP RETR data read failed for {path}"))?;
-                    finalize.with_context(|| format!("FTP RETR completion failed for {path}"))?;
-                    ensure!(
-                        bytes.len() as u64 <= max,
-                        "remote file {path} exceeds the {max}-byte limit"
-                    );
-                    debug!(phase = "read.completion", command = "RETR", path = %path, transfer_count, connection_age_ms, transfer_duration_ms = transfer_started.elapsed().as_millis(), bytes = bytes.len(), "FTP control channel confirmed transfer completion");
-                    Some(bytes)
-                }
-                Err(err) if is_ftp_not_found(&err) => None,
-                Err(err) => {
-                    let (transfer_count, connection_age_ms) = transfer.unwrap();
-                    warn!(phase = "read.start", command = "RETR", path = %path, transfer_count, connection_age_ms, error = %err, "FTP transfer command failed");
-                    return Err(err).with_context(|| format!("FTP RETR failed for {path}"));
-                }
-            },
-        };
-
-        // A RETR 550 conflates "absent" with "the server refuses to
-        // return this file", filtering hosts use the same status for
-        // both. Cross-check existence so a refused read surfaces as an
-        // error rather than a silently empty one.
-        if result.is_none() && matches!(self.client, RemoteClient::Ftp(_)) && self.is_file(path)? {
-            bail!("remote server refuses to return the existing file {path}");
+        let mut bytes = Vec::new();
+        if self.retrieve(path, max, &mut bytes)?.is_none() {
+            return Ok(None);
         }
-
-        Ok(result)
+        ensure!(
+            bytes.len() as u64 <= max,
+            "remote file {path} exceeds the {max}-byte limit"
+        );
+        Ok(Some(bytes))
     }
 
     /// The streaming payload read used by snapshot verification. Unlike
@@ -717,70 +713,16 @@ impl RemoteOps for RemoteConnection {
         listed_size: u64,
         sink: &mut dyn Write,
     ) -> Result<bool> {
-        self.renew_ftp_if_needed()?;
-
-        let transfer = if matches!(self.client, RemoteClient::Ftp(_)) {
-            self.transfer_count += 1;
-            Some((self.transfer_count, self.connected_at.elapsed().as_millis()))
-        } else {
-            None
+        let Some(copied) = self.retrieve(path, listed_size, sink)? else {
+            return Ok(false);
         };
-
-        let result: Option<u64> = match &mut self.client {
-            RemoteClient::Sftp { sftp, .. } => match sftp.open(Path::new(path.as_str())) {
-                Ok(file) => Some(
-                    std::io::copy(&mut file.take(listed_size.saturating_add(1)), sink)
-                        .with_context(|| format!("SFTP read failed for {path}"))?,
-                ),
-                Err(err) if is_sftp_not_found(&err) => None,
-                Err(err) => return Err(err.into()),
-            },
-            RemoteClient::Ftp(ftp) => match ftp.retr_as_stream(path.as_str()) {
-                Ok(mut stream) => {
-                    let (transfer_count, connection_age_ms) = transfer.unwrap();
-                    debug!(phase = "verify.data", command = "RETR", path = %path, transfer_count, connection_age_ms, "FTP data transfer started");
-                    let transfer_started = Instant::now();
-                    let read =
-                        std::io::copy(&mut (&mut stream).take(listed_size.saturating_add(1)), sink);
-                    let finalize = ftp.finalize_retr_stream(stream);
-                    if let Err(err) = &read {
-                        warn!(phase = "verify.data", command = "RETR", path = %path, transfer_count, connection_age_ms, transfer_duration_ms = transfer_started.elapsed().as_millis(), error = %err, "FTP data channel read failed");
-                    }
-                    if let Err(err) = &finalize {
-                        warn!(phase = "verify.completion", command = "RETR", path = %path, transfer_count, connection_age_ms, transfer_duration_ms = transfer_started.elapsed().as_millis(), error = %err, "FTP control channel did not confirm transfer completion");
-                    }
-                    let copied =
-                        read.with_context(|| format!("FTP RETR data read failed for {path}"))?;
-                    finalize.with_context(|| format!("FTP RETR completion failed for {path}"))?;
-                    debug!(phase = "verify.completion", command = "RETR", path = %path, transfer_count, connection_age_ms, transfer_duration_ms = transfer_started.elapsed().as_millis(), bytes = copied, "FTP control channel confirmed transfer completion");
-                    Some(copied)
-                }
-                Err(err) if is_ftp_not_found(&err) => None,
-                Err(err) => {
-                    let (transfer_count, connection_age_ms) = transfer.unwrap();
-                    warn!(phase = "verify.start", command = "RETR", path = %path, transfer_count, connection_age_ms, error = %err, "FTP transfer command failed");
-                    return Err(err).with_context(|| format!("FTP RETR failed for {path}"));
-                }
-            },
-        };
-
         // A file that grew past its listing since the snapshot was taken
         // is remote drift, not a truncated download.
-        if let Some(copied) = result {
-            ensure!(
-                copied <= listed_size,
-                "remote file {path} grew past its listed {listed_size} bytes"
-            );
-            return Ok(true);
-        }
-
-        // Same RETR 550 ambiguity as `read`: cross-check existence so a
-        // refused read cannot masquerade as absence.
-        if matches!(self.client, RemoteClient::Ftp(_)) && self.is_file(path)? {
-            bail!("remote server refuses to return the existing file {path}");
-        }
-
-        Ok(false)
+        ensure!(
+            copied <= listed_size,
+            "remote file {path} grew past its listed {listed_size} bytes"
+        );
+        Ok(true)
     }
 
     /// Snapshot helpers are full connections to the same server, cloned
@@ -1096,14 +1038,6 @@ fn is_ftp_command_unsupported(error: &FtpError) -> bool {
     matches!(error, FtpError::UnexpectedResponse(response) if matches!(response.status, Status::NotImplemented | Status::BadCommand))
 }
 
-fn is_ftp_size_unsupported(error: &FtpError) -> bool {
-    matches!(error, FtpError::UnexpectedResponse(response) if FTP_SIZE_UNAVAILABLE.contains(&response.status))
-}
-
-fn is_ftp_tls_unsupported(error: &FtpError) -> bool {
-    is_ftp_command_unsupported(error)
-}
-
 /// What an RFC 3659 `MLST` probe learned about a path. `MLST` reports
 /// `type=` and `size=` facts for one path in a single command, which makes
 /// it the most reliable existence probe on FTP servers that restrict
@@ -1179,7 +1113,7 @@ fn ftp_size(ftp: &mut RustlsFtpStream, path: &str) -> Result<Option<u64>> {
     );
     match ftp.size(path) {
         Ok(size) => Ok(Some(size as u64)),
-        Err(err) if is_ftp_not_found(&err) || is_ftp_size_unsupported(&err) => Ok(None),
+        Err(err) if is_ftp_not_found(&err) || is_ftp_command_unsupported(&err) => Ok(None),
         Err(err) => {
             warn!(phase = "metadata", command = "SIZE", path, error = %err, "FTP metadata command failed");
             Err(err).with_context(|| format!("FTP SIZE failed for {path}"))
@@ -1333,7 +1267,7 @@ fn ftp_store(
 /// unencrypted. Only automatic `ftp` mode degrades; an explicit `ftps`
 /// selection fails instead of sending credentials in the clear.
 fn allows_plaintext_ftp_fallback(settings: &RemoteServerSettings, error: &FtpError) -> bool {
-    settings.protocol == RemoteProtocol::Ftp && is_ftp_tls_unsupported(error)
+    settings.protocol == RemoteProtocol::Ftp && is_ftp_command_unsupported(error)
 }
 
 fn ftp_list_entries(entries: Vec<String>) -> Result<Vec<RemoteEntry>> {
@@ -1847,11 +1781,11 @@ pub(crate) mod fake_ftp {
         after_completion: bool,
     }
 
-    /// A running fake server. `fs` is shared with every accepted
-    /// connection, so tests observe and seed the remote filesystem
-    /// directly.
-    pub struct FakeFtp {
-        pub addr: SocketAddr,
+    /// Everything the accept loop and each connection thread share. One
+    /// clone hands a connection all of it; `FakeFtp` derefs to it so
+    /// tests can seed and inspect the same handles directly.
+    #[derive(Clone)]
+    pub struct Shared {
         /// Every `VERB arg` line received, for protocol assertions.
         pub commands: Arc<Mutex<Vec<String>>>,
         pub sent_bytes: Arc<std::sync::atomic::AtomicUsize>,
@@ -1860,14 +1794,32 @@ pub(crate) mod fake_ftp {
         reset_retr_remaining: Arc<std::sync::atomic::AtomicUsize>,
         reset_after_completion: Arc<std::sync::atomic::AtomicBool>,
         path_reset: Arc<Mutex<Option<PathReset>>>,
+        fs: Arc<Mutex<Fs>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        options: Options,
+        tls: Option<Tls>,
+    }
+
+    /// A running fake server. `shared.fs` is shared with every accepted
+    /// connection, so tests observe and seed the remote filesystem
+    /// directly.
+    pub struct FakeFtp {
+        pub addr: SocketAddr,
+        shared: Shared,
         /// The most control connections the server has held at once.
         peak_connection_count: Arc<std::sync::atomic::AtomicUsize>,
         /// The blake3 fingerprint of the self-signed certificate the
         /// server presents when `Options::tls` is on; `None` otherwise.
         certificate_fingerprint: Option<String>,
-        fs: Arc<Mutex<Fs>>,
-        stop: Arc<std::sync::atomic::AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl std::ops::Deref for FakeFtp {
+        type Target = Shared;
+
+        fn deref(&self) -> &Shared {
+            &self.shared
+        }
     }
 
     #[derive(Default)]
@@ -1944,6 +1896,7 @@ pub(crate) mod fake_ftp {
     /// reset the socket before the client's payload write is attempted.
     /// (Under TLS 1.3 the client sends Finished and payload back-to-back,
     /// leaving no window for the abort to precede the write.)
+    #[derive(Clone)]
     struct Tls {
         control: Arc<ServerConfig>,
         data: Arc<ServerConfig>,
@@ -1985,39 +1938,36 @@ pub(crate) mod fake_ftp {
 
     impl FakeFtp {
         pub fn spawn(options: Options) -> Self {
-            let fs = Arc::new(Mutex::new(Fs {
-                dirs: ["/".to_owned()].into_iter().collect(),
-                ..Default::default()
-            }));
-            let commands = Arc::new(Mutex::new(Vec::new()));
-            let sent_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let retr_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let reset_retr_at = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
-            let reset_retr_remaining = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let reset_after_completion = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let path_reset = Arc::new(Mutex::new(None));
-            let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let peak_connection_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let tls = options
                 .tls
                 .then(|| tls_identity(options.abort_stor_after_tls_handshake));
             let certificate_fingerprint = tls.as_ref().map(|(_, fingerprint)| fingerprint.clone());
+            let shared = Shared {
+                fs: Arc::new(Mutex::new(Fs {
+                    dirs: ["/".to_owned()].into_iter().collect(),
+                    ..Default::default()
+                })),
+                commands: Arc::new(Mutex::new(Vec::new())),
+                sent_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                retr_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                reset_retr_at: Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
+                reset_retr_remaining: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                reset_after_completion: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                path_reset: Arc::new(Mutex::new(None)),
+                stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                options,
+                tls: tls.map(|(tls, _)| tls),
+            };
+            let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let peak_connection_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
-
             listener.set_nonblocking(true).unwrap();
-            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let stopping = stop.clone();
+
             let thread = {
-                let fs = fs.clone();
-                let commands = commands.clone();
-                let sent_bytes = sent_bytes.clone();
-                let retr_count = retr_count.clone();
-                let reset_retr_at = reset_retr_at.clone();
-                let reset_retr_remaining = reset_retr_remaining.clone();
-                let reset_after_completion = reset_after_completion.clone();
-                let path_reset = path_reset.clone();
+                let shared = shared.clone();
+                let stopping = shared.stop.clone();
                 let active_connections = active_connections.clone();
                 let peak_connection_count = peak_connection_count.clone();
                 std::thread::spawn(move || {
@@ -2031,20 +1981,8 @@ pub(crate) mod fake_ftp {
                                     .set_write_timeout(Some(Duration::from_secs(2)))
                                     .unwrap();
                                 sockets.push(stream.try_clone().unwrap());
-                                let fs = fs.clone();
-                                let commands = commands.clone();
-                                let sent_bytes = sent_bytes.clone();
-                                let retr_count = retr_count.clone();
-                                let reset_retr_at = reset_retr_at.clone();
-                                let reset_retr_remaining = reset_retr_remaining.clone();
-                                let reset_after_completion = reset_after_completion.clone();
-                                let path_reset = path_reset.clone();
+                                let shared = shared.clone();
                                 let active_connections = active_connections.clone();
-                                let stop = stopping.clone();
-                                let tls = tls.as_ref().map(|(tls, _)| Tls {
-                                    control: tls.control.clone(),
-                                    data: tls.data.clone(),
-                                });
                                 peak_connection_count.fetch_max(
                                     active_connections
                                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -2053,20 +1991,7 @@ pub(crate) mod fake_ftp {
                                 );
                                 threads.push(std::thread::spawn(move || {
                                     let shutdown = stream.try_clone().unwrap();
-                                    serve(
-                                        stream,
-                                        &fs,
-                                        &commands,
-                                        &options,
-                                        tls,
-                                        &stop,
-                                        &sent_bytes,
-                                        &retr_count,
-                                        &reset_retr_at,
-                                        &reset_retr_remaining,
-                                        &reset_after_completion,
-                                        &path_reset,
-                                    );
+                                    serve(stream, &shared);
                                     let _ = shutdown.shutdown(std::net::Shutdown::Both);
                                     active_connections
                                         .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -2090,17 +2015,9 @@ pub(crate) mod fake_ftp {
 
             Self {
                 addr,
-                commands,
-                sent_bytes,
-                retr_count,
-                reset_retr_at,
-                reset_retr_remaining,
-                reset_after_completion,
-                path_reset,
+                shared,
                 peak_connection_count,
                 certificate_fingerprint,
-                fs,
-                stop,
                 thread: Some(thread),
             }
         }
@@ -2301,10 +2218,11 @@ pub(crate) mod fake_ftp {
     }
 
     /// An accepted passive data connection: plain TCP, or TLS once the
-    /// session negotiated `PROT P`.
+    /// session negotiated `PROT P`. The TLS variant is boxed so a plain
+    /// `DataSocket` stays pointer-sized.
     enum DataSocket {
         Plain(TcpStream),
-        Tls(StreamOwned<ServerConnection, TcpStream>),
+        Tls(Box<StreamOwned<ServerConnection, TcpStream>>),
     }
 
     impl Read for DataSocket {
@@ -2345,20 +2263,20 @@ pub(crate) mod fake_ftp {
         }
     }
 
-    fn serve(
-        stream: TcpStream,
-        fs: &Arc<Mutex<Fs>>,
-        commands: &Arc<Mutex<Vec<String>>>,
-        options: &Options,
-        tls: Option<Tls>,
-        stop: &std::sync::atomic::AtomicBool,
-        sent_bytes: &std::sync::atomic::AtomicUsize,
-        retr_count: &std::sync::atomic::AtomicUsize,
-        reset_retr_at: &std::sync::atomic::AtomicUsize,
-        reset_retr_remaining: &std::sync::atomic::AtomicUsize,
-        reset_after_completion: &std::sync::atomic::AtomicBool,
-        path_reset: &Arc<Mutex<Option<PathReset>>>,
-    ) {
+    fn serve(stream: TcpStream, shared: &Shared) {
+        let Shared {
+            fs,
+            commands,
+            options,
+            tls,
+            stop,
+            sent_bytes,
+            retr_count,
+            reset_retr_at,
+            reset_retr_remaining,
+            reset_after_completion,
+            path_reset,
+        } = shared;
         // `socket` keeps a handle to the control connection so `AUTH TLS`
         // can upgrade it in place; the reader/writer work on clones until
         // then and on the TLS stream afterwards.
@@ -2386,7 +2304,7 @@ pub(crate) mod fake_ftp {
                     .and_then(|listener| accept_data(listener, stop))
                     .and_then(|mut stream| match (protected, tls.as_ref()) {
                         (true, Some(tls)) => tls_accept(&mut stream, &tls.data)
-                            .map(|conn| DataSocket::Tls(StreamOwned::new(conn, stream))),
+                            .map(|conn| DataSocket::Tls(Box::new(StreamOwned::new(conn, stream)))),
                         _ => Some(DataSocket::Plain(stream)),
                     })
             }};

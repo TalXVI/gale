@@ -1,6 +1,5 @@
 <script lang="ts">
 	import { Dialog } from 'bits-ui';
-	import { m } from '$lib/paraglide/messages';
 	import { fade, fly } from 'svelte/transition';
 	import Icon from '@iconify/svelte';
 	import { confirm } from '@tauri-apps/plugin-dialog';
@@ -13,7 +12,6 @@
 		title?: string | null;
 		confirmClose?: { message: string } | null;
 		canClose?: boolean;
-		closeOnOutside?: boolean;
 		large?: boolean;
 		onclose?: () => void;
 		children?: Snippet;
@@ -24,7 +22,6 @@
 		title = null,
 		confirmClose = null,
 		canClose = true,
-		closeOnOutside = true,
 		large = false,
 		onclose,
 		children
@@ -66,13 +63,7 @@
 			{/snippet}
 		</Dialog.Overlay>
 		<Dialog.Content
-			interactOutsideBehavior={canClose && closeOnOutside && confirmClose === null
-				? 'close'
-				: 'ignore'}
-			onInteractOutside={(event) => {
-				if (!canClose || !closeOnOutside || confirmClose !== null) event.preventDefault();
-			}}
-			onEscapeKeydown={close}
+			interactOutsideBehavior={canClose && confirmClose === null ? 'close' : 'ignore'}
 			class="pointer-events-none"
 		>
 			{#if open}
@@ -100,7 +91,6 @@
 							<button
 								class="text-primary-500 hover:text-primary-700 dark:text-primary-400 dark:hover:bg-primary-700 dark:hover:text-primary-300 hover:bg-primary-200 absolute top-5 right-5 rounded-md p-0.5 text-3xl"
 								onclick={close}
-								aria-label={m.ui_closeDialog()}
 							>
 								<Icon icon="mdi:close" />
 							</button>

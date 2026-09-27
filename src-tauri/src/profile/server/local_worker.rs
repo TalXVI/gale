@@ -31,8 +31,8 @@ use crate::{
     profile::{
         server::{
             commands::{
-                persist_credential, remote_credential, save_remote_settings_for, sync_id_for,
-                sync_target, worker_client,
+                persist_credential, remote_credential, sync_id_for, sync_target,
+                update_settings_for, worker_client,
             },
             secrets::{ServerSecret, ServerSecrets},
             settings::{
@@ -210,7 +210,8 @@ pub async fn status(app: &AppHandle) -> Result<LocalWorkerStatus> {
             run,
             worker,
             worker_error,
-            update_available: worker_update_available(),
+            update_available: worker_exe()
+                .is_ok_and(|bundled| local::worker_update_available(&bundled)),
             warnings: Vec::new(),
         })
     }
@@ -374,11 +375,11 @@ async fn provision_windows(
     let install_result = {
         // The elevated wait blocks; keep it off the async executor.
         let exe = exe.clone();
-        tokio::task::spawn_blocking(move || run_elevated(&exe, &elevated_args))
+        tokio::task::spawn_blocking(move || local::run_elevated_worker(&exe, &elevated_args))
             .await
             .context("elevated install task failed")?
     };
-    let log_text = read_log(&log).unwrap_or_default();
+    let log_text = std::fs::read_to_string(&log).unwrap_or_default();
     match install_result {
         Err(err) => {
             return Err(err.wrap_err(
@@ -399,24 +400,20 @@ async fn provision_windows(
     install_tray_companion().context(
         "the Worker is running, but its notification-area companion could not be installed",
     )?;
-    // The staged payload was consumed by the install; drop the staging
-    // dir now rather than leaving secret copies in temp for the rest of
-    // this function. (Drop would catch it anyway; explicit is clearer.)
+    // The install consumed the staged payload; don't leave secret copies
+    // in temp for the rest of setup.
     drop(staging);
 
     // The service is installed and running. Point the profile at it.
     let mut remote = target.settings.clone();
     remote.sync_mode = SyncMode::Worker;
-    remote.worker = WorkerSettings {
-        address: format!("http://{listen}"),
-        hosted: true,
-        auto_deploy_mods: remote.worker.auto_deploy_mods,
-    };
+    remote.worker.address = format!("http://{listen}");
+    remote.worker.hosted = true;
     // Persisting the desktop half of the binding can still fail, leaving
     // a running worker whose profile can't reach it. Status reports it
     // as `incomplete`. Retrying setup reinstalls and relinks the worker,
     // preserving its pending work for the same profile and server.
-    save_remote_settings_for(app, target.profile_id, remote).context(
+    update_settings_for(app, target.profile_id, |settings| settings.remote = remote).context(
         "the worker is installed and running, but saving its settings failed. Run 'Set up worker' again to finish setup",
     )?;
     persist_credential(&secrets, Some(ServerSecret::WorkerToken), &token, true).context(
@@ -428,22 +425,13 @@ async fn provision_windows(
     // only seeds a first run, so the journal's automation setting is
     // authoritative even when it differs from what was just installed.
     // Mirror the worker's actual setting into the profile's settings so the
-    // dialogs and future provisioning see the same truth.
+    // page and future provisioning see the same truth.
     if let Some(live) = worker_status.worker.as_ref() {
-        let mut remote = {
-            let manager = app.lock_manager();
-            let (_, profile) = manager.profile_by_id(target.profile_id)?;
-            profile.server_settings.clone().unwrap_or_default().remote
-        };
-        if remote.sync_mode == SyncMode::Worker
-            && (remote.worker.auto_deploy_mods != live.auto_deploy_mods
-                || remote.restart_policy != live.restart_policy)
-        {
-            remote.worker.auto_deploy_mods = live.auto_deploy_mods;
-            remote.restart_policy = live.restart_policy;
-            save_remote_settings_for(app, target.profile_id, remote)
-                .context("failed to mirror the worker's automation settings")?;
-        }
+        update_settings_for(app, target.profile_id, |settings| {
+            settings.remote.worker.auto_deploy_mods = live.auto_deploy_mods;
+            settings.remote.restart_policy = live.restart_policy;
+        })
+        .context("failed to mirror the worker's automation settings")?;
     }
     // If the service enforces one session per user, the worker login may
     // have invalidated the desktop's chain; a forced grant finds out.
@@ -522,27 +510,32 @@ pub async fn uninstall(app: &AppHandle) -> Result<LocalWorkerStatus> {
         let args = format!("service uninstall --log \"{}\"", log.display());
         let exit = {
             let exe = worker_exe()?;
-            tokio::task::spawn_blocking(move || run_elevated(&exe, &args))
+            tokio::task::spawn_blocking(move || local::run_elevated_worker(&exe, &args))
                 .await
                 .context("elevated uninstall task failed")?
         }?;
         if exit != 0 {
-            let detail = read_log(&log).unwrap_or_default();
+            let detail = std::fs::read_to_string(&log).unwrap_or_default();
             bail!("worker uninstall failed (exit {exit}): {}", detail.trim());
         }
         let _ = std::fs::remove_file(&log);
 
         // Revert the profile's settings only if they still point at the
         // managed worker. A user may have switched modes already.
-        let mut remote = {
-            let manager = app.lock_manager();
-            let (_, profile) = manager.profile_by_id(profile_id)?;
-            profile.server_settings.clone().unwrap_or_default().remote
-        };
-        if remote.sync_mode == SyncMode::Worker && remote.worker.hosted {
-            remote.sync_mode = SyncMode::Local;
-            remote.worker = WorkerSettings::default();
-            save_remote_settings_for(app, profile_id, remote)?;
+        let hosted = app
+            .lock_manager()
+            .profile_by_id(profile_id)?
+            .1
+            .server_settings
+            .as_ref()
+            .is_some_and(|settings| {
+                settings.remote.sync_mode == SyncMode::Worker && settings.remote.worker.hosted
+            });
+        if hosted {
+            update_settings_for(app, profile_id, |settings| {
+                settings.remote.sync_mode = SyncMode::Local;
+                settings.remote.worker = WorkerSettings::default();
+            })?;
             let secrets = ServerSecrets::for_profile(profile_id)?;
             persist_credential(&secrets, Some(ServerSecret::WorkerToken), "", false)?;
         }
@@ -571,21 +564,6 @@ fn require_owned(app: &AppHandle) -> Result<()> {
         "the installed worker belongs to a different profile. Switch to that profile to manage it"
     );
     Ok(())
-}
-
-/// Runs `gale-worker <args>` elevated through the UAC prompt and waits
-/// for it. This is the one privileged step in the lifecycle; everything
-/// else goes through the service's unelevated control rights.
-#[cfg(windows)]
-fn run_elevated(exe: &std::path::Path, params: &str) -> Result<u32> {
-    local::run_elevated_worker(exe, params)
-}
-
-// ---------- shared helpers ----------
-
-#[cfg(windows)]
-fn read_log(path: &std::path::Path) -> Option<String> {
-    std::fs::read_to_string(path).ok()
 }
 
 /// The directory the staged config + secrets are written to. Temp works
@@ -748,17 +726,6 @@ fn pick_port(preferred: Option<u16>) -> Result<u16> {
         .chain(local::PORT_RANGE)
         .find(|&port| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok())
         .ok_or_eyre("no free port is available for the managed worker")
-}
-
-/// True when the installed service binary differs from the bundled one.
-/// A Gale update may have shipped a newer worker that has not been rolled
-/// out. Byte comparison is deliberate: dev builds carry no version.
-#[cfg(windows)]
-fn worker_update_available() -> bool {
-    let Ok(bundled) = worker_exe() else {
-        return false;
-    };
-    local::worker_update_available(&bundled)
 }
 
 /// `gale-worker.exe` next to the app binary (packaged installs), falling

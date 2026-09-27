@@ -18,10 +18,9 @@ import type { ServerFormState } from './serverForm.svelte';
 /// What the user decided for one config path.
 type Decision = 'apply' | 'restore' | 'decline';
 
-/// The status/preview/deploy state machine for the remote tab, formerly
-/// the ServerSyncDialog's script. Credentials come from the connection
-/// fields on the same page. Typed but unsaved values are passed so the
-/// user can preview before saving.
+/// The status/preview/deploy state for the remote tab. Credentials come
+/// from the connection fields on the same page. Typed but unsaved values
+/// are passed so the user can preview before saving.
 export class RemoteSync {
 	#form: ServerFormState;
 
@@ -409,9 +408,8 @@ export class RemoteSync {
 			const entry = this.preview?.plan.configEntries.find((entry) => entry.path === path);
 			if (entry) entry.policy = policy;
 		} catch (error) {
-			// The write never landed. Drop the pending pick so the control
-			// falls back to the last confirmed policy instead of implying an
-			// unsaved value.
+			// The write never landed. Drop the pending pick before reporting
+			// so the control falls back to the last confirmed policy.
 			delete this.policyOverrides[path];
 			await message(error instanceof Error ? error.message : String(error), {
 				title: m.serverPage_title(),

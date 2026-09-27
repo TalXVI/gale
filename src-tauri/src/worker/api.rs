@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use crate::profile::{
     export::{ConfigPath, ModRevision},
     server::{
-        lease::LeaseRecord, plan::DeploySelection, settings::RestartPolicy, state::OperationRecord,
+        engine::Session, lease::LeaseRecord, plan::DeploySelection, settings::RestartPolicy,
+        state::OperationRecord,
     },
     sync::ConfigUpdatePolicy,
 };
@@ -98,6 +99,17 @@ pub struct ServerStateSummary {
     pub last_operation: Option<OperationRecord>,
     /// A live lease held by any executor.
     pub lease: Option<LeaseRecord>,
+}
+
+impl From<Session> for ServerStateSummary {
+    fn from(session: Session) -> Self {
+        Self {
+            mods_revision: session.state.mods_revision,
+            restart_required: session.state.restart_required,
+            last_operation: session.state.last_operation,
+            lease: session.lease,
+        }
+    }
 }
 
 /// `POST /v1/policy` sets a persistent per-file config update policy in
