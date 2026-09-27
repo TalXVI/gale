@@ -260,7 +260,7 @@ test.describe('per-credential remember controls', () => {
 		const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
 		await remoteTab.getByLabel('Hosting provider').click();
 		await page.getByRole('option', { name: 'DatHost' }).click();
-		// Two "Remember password" boxes exist now — the DatHost one is second.
+		// Two "Remember password" boxes exist now. The DatHost one is second.
 		await remoteTab.getByLabel('Remember password').nth(1).uncheck();
 		await page.getByRole('button', { name: 'Save settings' }).click();
 		expect(await lastSave(page)).toMatchObject({
@@ -341,7 +341,7 @@ test.describe('silent automatic refresh', () => {
 	});
 });
 
-test('worker mode polls metadata only — interval ticks never trigger a live refresh', async ({
+test('worker mode polls metadata without a live refresh on each interval tick', async ({
 	page
 }) => {
 	await page.clock.install();
@@ -399,7 +399,7 @@ test('provisioning the local worker leaves no unsaved bar', async ({ page }) => 
 	await remoteTab.getByRole('button', { name: 'Set up worker' }).click();
 
 	// Provision persists hosted-worker mode itself, so the saved baseline
-	// is rebased — nothing remains unsaved, and the service shows running.
+	// is rebased. Nothing remains unsaved, and the service shows running.
 	await expect(page.getByText('Unsaved changes')).toHaveCount(0);
 	await expect(remoteTab.getByText('running', { exact: true })).toBeVisible();
 	const provisioned = await page.evaluate(() =>

@@ -1,6 +1,6 @@
 # Dedicated servers
 
-Gale can launch a dedicated server installed on the same computer, or deploy a published profile to a remote server. Dedicated server support only shows up for games with a `dedicatedServer` entry in `src-tauri/games.json`.
+Gale can launch a dedicated server on this computer or deploy a published profile to a remote server. The **Dedicated server** page appears only for games with a `dedicatedServer` entry in `src-tauri/games.json`.
 
 ## Using it
 
@@ -33,7 +33,7 @@ The status and deploy panel sits at the top of the **Remote server** tab.
 
 ### What gets synchronized
 
-**Preview** and **Deploy** handle the published mod payload — the routine operation. Config files are a separate, explicit action. The server owns its config files after setup, because a mod can migrate or regenerate them when the server starts. A config difference between the publication and the server is not debt and never creates pending work.
+**Preview** and **Deploy** handle published mods. To write config files, use a separate config push. The server owns its configs after setup because mods can change them at startup. Config differences do not create pending work.
 
 To seed a fresh server or intentionally replace a config file, open **Server config files** on the Server page and select **Preview config changes**, then **Push configs**. The push uses the same planner, lease, and approval rules as a mod deployment. Once it completes, Gale does not track the pushed files as outstanding work.
 
@@ -85,16 +85,18 @@ When to use it: automatic mod deployment, or a host that is only reachable from 
 
 Choose **Worker on this PC** as the sync mode and select **Set up worker**. Gale then:
 
-1. Saves the remote transport settings in Local mode — a fresh profile has no worker address yet, so Worker mode would be rejected before setup could begin.
-2. Opens a browser sign-in so the worker gets **its own** Gale sync credentials. Sign-in tokens rotate on every use, so the worker cannot safely share the desktop's token — it needs an independent chain.
+1. Saves the remote connection settings in Local mode. A fresh profile has no worker address, so it cannot enter Worker mode yet.
+2. Opens a browser sign-in to give the worker its own Gale sync credentials. Refresh tokens rotate, so sharing the desktop's token would break one of the sessions.
 3. Stages a worker config and credentials file in a permission-restricted temp directory, then shows **one UAC elevation prompt** that installs and starts the `GaleWorker` Windows service.
 4. Points this profile's sync mode at the worker's loopback address and stores its bearer token.
 
-If setup stops after the service was installed but before the profile was linked — for example the settings save failed — the page reports the worker as _setup incomplete_ instead of leaving it orphaned. Running **Set up worker** again signs in, reinstalls the worker, and finishes the link. Pending work and automation settings are retained when the profile and remote server are unchanged.
+If service installation succeeds but saving the profile settings fails, the page reports _setup incomplete_. Run **Set up worker** again to sign in, reinstall the worker, and finish linking the profile. Gale keeps pending work and automation settings when the profile and remote server have not changed.
 
-Once installed, the service runs as LocalSystem and is independent of the Gale process: it starts with Windows before any user signs in, restarts automatically after a crash, and resumes queued deployments from its journal. The service only reports `Running` to Windows once its API is bound and serving — a start that fails during initialization ends in `Stopped` with a failure exit, so SCM recovery actions behave correctly. Start, Stop, and Restart use the service's configured control permissions. Update (available when Gale ships a newer worker) and Uninstall request UAC elevation.
+The service runs as LocalSystem. It starts with Windows before sign-in, restarts after a crash, and resumes queued deployments from its journal. It reports `Running` only after its API starts serving. An initialization failure reports `Stopped` with a failure exit so Windows can restart it. Start, Stop, and Restart use the service's control permissions. Update and Uninstall request UAC elevation.
 
-The notification-area icon is owned by a separate per-user native helper, never by the Session 0 service. Gale copies the helper to a content-versioned directory under `%LocalAppData%\Gale\worker-tray`, registers that copy in the current user's `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, and starts it after provisioning. The resident helper polls only SCM state, shows the normal Gale icon with the `Gale Worker` tooltip while the service is `Running`, and remains hidden but resident while the service is stopped. A session-local mutex prevents duplicate icons. Gale refreshes the versioned copy on app startup after an app update; Worker uninstall removes the startup entry, signals the helper to exit, and removes its user-local files.
+The notification-area icon belongs to a per-user helper separate from the Session 0 service. Gale copies the helper to a directory named for its content under `%LocalAppData%\Gale\worker-tray`, registers that copy in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, and starts it after setup. The helper checks the service state. It shows the Gale icon and `Gale Worker` tooltip while the service is `Running`, then hides the icon when the service stops. A session-local mutex prevents duplicate icons.
+
+After an app update, Gale refreshes the helper copy at startup. Uninstalling the worker removes the startup entry, stops the helper, and removes its user-local files.
 
 State layout:
 
@@ -107,7 +109,7 @@ C:\ProgramData\Gale\worker\
   private\             ACL'd to SYSTEM + Administrators only
     secrets.env        API token, remote credential, sync refresh token
     gale-worker-state.json   durable journal (pending work, rotated tokens)
-    gale-worker.lock   instance lock — a second worker cannot take it
+    gale-worker.lock   instance lock that blocks a second worker
     ssh.key            staged copy of the SSH key, when key auth is used
 ```
 
@@ -115,10 +117,10 @@ Notes and limitations:
 
 - Windows only. On Linux/macOS the page does not offer this option; use **Worker on another machine**.
 - SSH **agent** authentication cannot run unattended in a service; use a password or a private key. A private key under `%USERPROFILE%` is copied into `private\` at setup, since LocalSystem cannot read your profile directory.
-- One managed worker per machine, bound to one profile: the `GaleWorker` service name and the state-directory lock both reject duplicates, and the worker is permanently bound to the profile it was set up for. Other profiles see it as owned by someone else — they cannot start, stop, update, or uninstall it, and setup will never silently rebind it. To move it, sign in to the owning profile and uninstall first.
+- One managed worker per machine. The `GaleWorker` service name and state-directory lock reject duplicates. The worker stays bound to its setup profile. Other profiles cannot start, stop, update, or uninstall it. To move it, sign in to the owning profile and uninstall first.
 - Gale updates ship a newer `gale-worker.exe` beside the app, but the service keeps running its installed copy so updates never fight a locked executable. The page shows **Update worker** when the bundled copy is newer; updating keeps credentials and pending work.
 - The tray process runs only from its LocalAppData copy and embeds Gale's existing icon. It therefore holds neither the installed service binary nor Gale's bundled Worker/tray files open. Its **Update** command passes the current bundled `gale-worker.exe` to the same elevated `service reinstall` path as the Server page; the tray helper can never become the service update source.
-- `status.json` records why the worker last stopped. If the service is stopped but the report says `running`, the process crashed — SCM failure actions restart it. A `shutdown` report means the machine went down and the service returns on the next boot.
+- `status.json` records why the worker last stopped. If the service is stopped but the report says `running`, the process crashed. Windows service recovery restarts it. A `shutdown` report means the machine went down and the service returns on the next boot.
 
 #### Installing the worker on a separate host
 
@@ -180,20 +182,22 @@ In the remote settings, choose **Worker on another machine** as the sync mode an
 
 Manual **Deploy** through the worker works regardless of `autoDeployMods`. You can change automatic mod deployment and the independent restart policy in the **Deployment** section of the Server page. Gale pushes the values to the running worker, reads them back, and they persist across worker restarts.
 
-The worker tracks only the publication's mod payload. A publication is pending when its mod revision differs from the revision recorded on the server, and settled once that mod revision is confirmed deployed. Published config changes never create pending work, so a publication that changes only configs is observed and acknowledged without any deployment. The worker polls for publications with automatic deployment on or off. When `autoDeployMods` is off, it keeps owed mod work pending until a manual deploy runs it or automatic deployment is enabled. Config files are never evaluated or written automatically; **Push configs** on the Server page is the only path that writes them, and it runs through the worker the same way a mod deploy does.
+The worker tracks the publication's mod payload. It marks a publication pending when its mod revision differs from the deployed revision. A successful mod deployment clears that pending work. Config-only publications settle without a deployment.
+
+The worker polls for publications whether automatic deployment is on or off. With `autoDeployMods` off, mod work stays pending until a manual deploy runs or you turn automation on. The worker never reads or writes config files automatically. To write them, use **Push configs** on the Server page.
 
 #### Moving a managed worker to a VPS
 
 The managed worker's job queue and rotated credentials live in `%ProgramData%\Gale\worker\private`. To move hosting to an external machine without losing pending work or re-doing the sign-in:
 
-1. **Stop the old worker first.** On the Server page choose **Stop**, wait until the service reports `stopped`, and confirm the last `status.json` report is not `running`. Never run two workers against the same server at once — the remote lease prevents simultaneous _deployments_, but the old worker would keep polling and racing the new one.
+1. Stop the old worker first. On the Server page choose **Stop**, wait until the service reports `stopped`, and confirm the last `status.json` report is not `running`. Two workers can keep polling the same server even though the remote lease prevents simultaneous deployments.
 2. **Copy the durable state** to the VPS: `private\gale-worker-state.json` (journal: pending work, retry backoff, rotated refresh token) and `private\secrets.env` (API token and credentials). Copy `gale-worker.json` too as a starting point.
-3. On the VPS, write a new `gale-worker.json`: same `profileId` and `game`, the remote settings copied over, `stateDir` pointing at the copied journal, `listen` on an address Gale can reach. Put the copied secrets in `secretsFile` (or the environment), and `secrets.env`'s rotated token keeps the credential chain alive — do **not** reuse the desktop's sign-in for it.
+3. On the VPS, write a new `gale-worker.json` with the same `profileId`, `game`, and remote settings. Point `stateDir` at the copied journal and set `listen` to an address Gale can reach. Load the copied secrets through `secretsFile` or the environment. Use the worker's rotated token from `secrets.env`, not the desktop's sign-in.
 4. Start the external worker (systemd example above), then switch the profile's sync mode to **Worker on another machine** with the new address and the same bearer token.
 5. **Uninstall the local service** from the Server page (**Uninstall**) once the external worker reports healthy. Uninstall deletes `%ProgramData%\Gale\worker`, so copy the state out first.
-6. Verify the new worker's profile binding — Gale warns if a worker is bound to a different profile — and that `pendingRevision` drains after the first poll.
+6. Verify that the new worker is bound to this profile and that `pendingRevision` clears after the first poll. Gale warns if the worker belongs to a different profile.
 
-If you skip step 2, the new worker simply starts with an empty journal and the desktop sign-in remains the only credential chain — set up fresh credentials on the VPS instead of copying.
+Without the copied state, the new worker starts with an empty journal. Set up fresh worker credentials on the VPS in that case.
 
 ## Deployment coordination
 
@@ -206,9 +210,11 @@ Guarantees:
 - An executor that loses the lease stops making changes. State writes carry the operation sequence, so a stale writer cannot overwrite newer state.
 - Config-policy writes run under the same lease as deployments.
 
-One limitation matters here: FTP/SFTP provide no true fencing, so a write that was already in flight from a lost-lease executor can still land. The conservative answer is built in. Gale never auto-breaks a lease that might still be live. If a lease is stuck because an executor hung, confirm it is actually stopped (check the machine or the worker status), then use the takeover option on the Server page. Treat takeover as the documented recovery path, not routine automation.
+FTP and SFTP cannot stop a write already in flight when its executor loses the lease. Gale therefore never takes over a lease that might still be live. If an executor hangs, check its machine or worker status to confirm it has stopped. Then use the takeover option on the Server page.
 
-Two transport quirks have been observed in the wild and are handled deliberately. DatHost's FTP refuses `SIZE` while the session is in ASCII mode (`550 SIZE not allowed in ASCII mode`); Gale therefore negotiates binary mode (`TYPE I`) at connect — which byte-exact uploads need anyway — and treats `MLST`/`RETR` as authoritative for existence and contents, so a refused `SIZE` can no longer make an existing file look absent. Other hosts may refuse or filter reads more deeply: the claim therefore also contains a `holder-<operation>` marker directory, verifiable through directory probes alone, which proves ownership when the record file cannot be read — and because it keeps the claim directory non-empty, a filtered marker also prevents a competing executor from silently breaking a claim it cannot inspect. If a claim is left behind entirely (crashed executor on such a host), recovery is to remove `.gale-deploy.lock` manually through the host's file manager once no executor is running.
+DatHost's FTP refuses `SIZE` in ASCII mode with `550 SIZE not allowed in ASCII mode`. Gale sets binary mode with `TYPE I` when it connects. It then uses `MLST` and `RETR` to check whether a file exists and read its contents. A refused `SIZE` cannot make an existing file look absent.
+
+Some hosts also filter reads of the lease record. Gale places a `holder-<operation>` directory inside the claim, which it can check with directory probes. The marker keeps the claim directory nonempty, so another executor cannot silently remove a claim it cannot inspect. If a crashed executor leaves a claim on such a host, confirm that no executor is running, then remove `.gale-deploy.lock` through the host's file manager.
 
 A deployment only reports success once its state file reads back byte-identical. A host that can accept writes but cannot return them fails the deployment rather than silently losing the ownership records later operations depend on.
 
@@ -230,10 +236,10 @@ The backend lives in `src-tauri/src/profile/server`:
 - `remote.rs`: SFTP/FTP/FTPS operations; FTPS certificate pinning and verification.
 - `stage.rs`: publication → staged payloads; configs-only operations never touch mod sources.
 - `commands.rs`: Tauri commands, executor dispatch (Local vs Worker), credentials, progress events.
-- `local_worker.rs`: desktop orchestration for the managed Windows worker — provisioning, elevated install/uninstall via `ShellExecuteExW`, SCM status/start/stop, ProgramData layout.
+- `local_worker.rs`: desktop orchestration for the managed Windows worker, including provisioning, elevated install and uninstall, service control, and the ProgramData layout.
 - `runtime.rs`: the local server process and its profile lock, including the stopping state.
 - `worker_client.rs`: desktop client for the worker API (loopback-only plaintext rule).
-- `src-tauri/src/worker/`: the worker, with its HTTP API (`server.rs`), durable journal (`journal.rs`) — pending work there always means an owed mod payload — config (`config.rs`), secrets-file loading (`secrets.rs`), sync client (`sync_client.rs`), shared wire types (`api.rs`), managed-service layout constants (`local.rs`), and the SCM service entry/install/uninstall (`service.rs`, Windows only).
+- `src-tauri/src/worker/`: the HTTP API (`server.rs`), journal (`journal.rs`), config (`config.rs`), secrets loader (`secrets.rs`), sync client (`sync_client.rs`), shared API types (`api.rs`), managed-service paths (`local.rs`), and Windows service code (`service.rs`). Pending journal work always means a mod payload is owed.
 
 Frontend bindings are in `src/lib/api/profile/server.ts`, the page is `src/lib/components/server/ServerPage.svelte`, and user-facing text lives in `messages/en.json` via Paraglide.
 

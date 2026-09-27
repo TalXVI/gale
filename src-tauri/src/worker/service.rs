@@ -48,7 +48,7 @@ const DESCRIPTION: &str =
     "Deploys Gale profile publications to a dedicated server. Managed by the Gale app.";
 /// Windows ERROR_SERVICE_DOES_NOT_EXIST.
 const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
-/// Windows ERROR_SERVICE_MARKED_FOR_DELETE — returned while any handle
+/// Windows ERROR_SERVICE_MARKED_FOR_DELETE, returned while any handle
 /// to the service remains open after `delete()`.
 const ERROR_SERVICE_MARKED_FOR_DELETE: i32 = 1072;
 /// How long to wait for service state transitions.
@@ -163,7 +163,7 @@ fn run_service(
     // StartPending covers all of initialization: config and secrets
     // loading, the instance lock, the journal, and the API bind. The SCM
     // only sees Running once `server::run` signals readiness, so a failed
-    // start is reported as Stopped with a nonzero code — which the
+    // start is reported as Stopped with a nonzero code, which the
     // configured failure actions count like any other failure.
     set_status(
         ServiceState::StartPending,
@@ -174,7 +174,7 @@ fn run_service(
     )?;
 
     // Everything fallible that remains is inside `load_and_build`, so no
-    // `?` can bypass the Stopped/nonzero finalizer below — including
+    // `?` can bypass the Stopped/nonzero finalizer below, including
     // Tokio runtime construction.
     let (config, result) = match load_and_build(args) {
         Ok(init) => {
@@ -241,8 +241,8 @@ fn run_service(
 
 /// Everything the worker needs to start serving, collected as one
 /// fallible unit. `service_main_inner` calls this after reporting
-/// StartPending so that any failure — malformed config, unreadable
-/// secrets, even Tokio runtime construction — lands on the common
+/// StartPending so that failures in config, secrets, or Tokio runtime
+/// construction reach the common
 /// Stopped/nonzero finalizer rather than escaping through `?`.
 struct WorkerInit {
     config: WorkerConfig,
@@ -264,7 +264,7 @@ fn load_and_build(args: &ServiceArgs) -> Result<WorkerInit> {
     })
 }
 
-/// Service logs go to a file — there is no console or stderr to see.
+/// Service logs go to a file because the service has no visible console or stderr.
 fn init_file_log(path: &Path) {
     let Ok(file) = std::fs::OpenOptions::new()
         .create(true)
@@ -327,7 +327,7 @@ fn acquire_update_lock(log: &Path) -> Result<UpdateLock> {
                 Ok(Acquired::TimedOut(handle)) => {
                     drop_handle(handle);
                     bail!(
-                        "another Worker install, update, or uninstall is still running — wait for it to finish and try again"
+                        "another Worker install, update, or uninstall is still running. Wait for it to finish and try again"
                     )
                 }
                 Err(err) => Err(err),
@@ -422,7 +422,7 @@ fn install_inner(staging: &Path, log: &Path) -> Result<()> {
 
     apply_directory_acls(&root, &private).context("failed to set directory permissions")?;
 
-    // A different binding makes the old journal meaningless — its pending
+    // A different binding makes the old journal meaningless. Its pending
     // work and rotated token belong to another profile/remote. Read the
     // old binding before stopping the old service so nothing rewrites
     // the journal mid-check.
@@ -462,7 +462,7 @@ fn install_inner(staging: &Path, log: &Path) -> Result<()> {
         state.refresh_token = staged_secrets.refresh_token;
         journal.save(&state)?;
     }
-    // A staged SSH key accompanies private-key configs — the service
+    // A staged SSH key accompanies private-key configs. The service
     // cannot reach user-profile paths as LocalSystem.
     let staged_key = staging.join(local::SSH_KEY_FILE);
     if staged_key.is_file() {
@@ -492,8 +492,8 @@ fn start_installed_worker(
 }
 
 /// `gale-worker service uninstall --log <file>`. Stops and deletes the
-/// service, then removes `%ProgramData%\Gale\worker` — durable state goes
-/// with it, so migration docs tell users to copy it first.
+/// service, then removes `%ProgramData%\Gale\worker`. This deletes durable
+/// state, so migration docs tell users to copy it first.
 pub fn uninstall(log: &Path) -> Result<()> {
     let _lock = lock_service_change(log)?;
     if let Err(err) = uninstall_inner(log) {
@@ -732,7 +732,7 @@ fn grant_user_control() -> Result<()> {
 /// instead of group names because icacls localizes names on non-English
 /// Windows.
 fn apply_directory_acls(root: &Path, private: &Path) -> Result<()> {
-    // Root: SYSTEM + Administrators full control, all users read — Gale
+    // Root: SYSTEM + Administrators full control, all users read. Gale
     // reads status.json and worker.log unelevated.
     icacls(
         root,
@@ -742,7 +742,7 @@ fn apply_directory_acls(root: &Path, private: &Path) -> Result<()> {
             "*S-1-5-32-545:(OI)(CI)RX",
         ],
     )?;
-    // Private: SYSTEM + Administrators only — secrets.env and the journal
+    // Private: SYSTEM + Administrators only, secrets.env and the journal
     // carry the worker's bearer token and sync refresh token.
     icacls(private, &["*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"])
 }

@@ -60,7 +60,7 @@ export function parsePort(value: string, label: string) {
 /// All editable server settings, credentials-in-flight, and the
 /// save/discard bookkeeping for the dedicated-server page. The form
 /// fields are shared between the local and remote tabs; secret inputs
-/// never persist — they exist only until a save or discard.
+/// never persist. They exist only until a save or discard.
 export class ServerFormState {
 	form = $state<ProfileServerSettings>(defaultSettings());
 	port = $state('');
@@ -118,15 +118,15 @@ export class ServerFormState {
 			this.workerToken !== '' ||
 			this.datHostPassword !== ''
 	);
-	/// Transport-relevant form drift — a typed secret does not count, so
+	/// Transport-relevant form drift. A typed secret does not count, so
 	/// the user can still preview and deploy with an unsaved credential.
 	settingsChanged = $derived(this.#savedJson !== '' && this.#liveJson !== this.#savedJson);
 	dirty = $derived(
 		this.#savedJson !== '' && (this.#liveJson !== this.#savedJson || this.secretsDirty)
 	);
 
-	/// The saved settings decide whether the remote panels mount at all —
-	/// unsaved edits never enable or disable the status/deploy surface.
+	/// The saved settings decide whether the remote panels mount at all.
+	/// Unsaved edits never enable or disable the status/deploy panel.
 	remoteConfigured = $derived.by(() => {
 		if (!this.hasSavedSettings || !this.#savedJson) return false;
 		const saved = JSON.parse(this.#savedJson) as {
@@ -184,8 +184,8 @@ export class ServerFormState {
 			if (localWorker?.ownership === 'incomplete' && this.syncChoice === 'local') {
 				this.syncChoice = 'hostedWorker';
 			}
-			// The worker's journal is the authoritative automation state —
-			// for the managed worker its live report wins over the stored
+			// The worker's journal holds the automation state. For the managed
+			// worker, its live report wins over the stored
 			// copy, which only seeds new installs.
 			const liveWorker = this.syncChoice === 'hostedWorker' ? this.localWorker?.worker : null;
 			this.form.remote.worker.autoDeployMods =
@@ -228,8 +228,8 @@ export class ServerFormState {
 				this.syncChoice = 'hostedWorker';
 			}
 		} catch {
-			// A background refresh keeps the last known service state —
-			// only a foreground call reports the worker as unknown.
+			// A background refresh keeps the last known service state.
+			// Only a foreground call reports the worker as unknown.
 			if (!background) this.localWorker = null;
 		}
 	}
@@ -393,7 +393,7 @@ export class ServerFormState {
 				workerToken: { value: this.workerToken, remember: this.rememberWorkerToken },
 				datHostPassword: { value: this.datHostPassword, remember: this.rememberDatHostPassword }
 			});
-			// Automation may have changed — re-read the worker's own
+			// Automation may have changed. Re-read the worker's own
 			// state so the pending banner reflects what it will actually do.
 			await this.refreshLocalWorker();
 			this.form = current;
@@ -406,7 +406,7 @@ export class ServerFormState {
 			void serverSync.reconfigure();
 			pushInfoToast({ message: m.dedicatedServerDialog_saved() });
 		} catch {
-			// The save failed — the backend leaves stored settings
+			// The save failed. The backend leaves stored settings
 			// untouched when the worker did not accept the change. Snap
 			// the automation controls back to the worker's actual state.
 			await this.refreshLocalWorker();
@@ -417,7 +417,7 @@ export class ServerFormState {
 	}
 
 	/// Restores the last loaded/saved values and clears typed credentials.
-	/// The current tab survives — it is not a saved value anymore.
+	/// The current tab survives. It is not a saved value anymore.
 	discard() {
 		this.clearSecrets();
 		if (!this.#savedJson) return;
@@ -441,19 +441,17 @@ export class ServerFormState {
 		this.rememberDatHostPassword = saved.rememberDatHostPassword;
 	}
 
-	/// Reverts the automation controls to the last state the worker
-	/// confirmed — its live report for the managed worker, else the last
-	/// values it acknowledged.
+	/// Reverts the automation controls to the managed worker's live report
+	/// or the last values saved for this profile.
 	reconcileAutomation() {
 		const liveWorker = this.syncChoice === 'hostedWorker' ? this.localWorker?.worker : null;
 		const saved = JSON.parse(this.#savedJson) as { form: ProfileServerSettings };
 		this.form.remote.worker.autoDeployMods =
 			liveWorker?.autoDeployMods ?? saved.form.remote.worker.autoDeployMods;
-		this.form.remote.restartPolicy =
-			liveWorker?.restartPolicy ?? saved.form.remote.restartPolicy;
+		this.form.remote.restartPolicy = liveWorker?.restartPolicy ?? saved.form.remote.restartPolicy;
 	}
 
-	/// Saves the current transport settings first — provisioning derives
+	/// Saves the current transport settings first. Provisioning derives
 	/// the worker's config from the *saved* settings, so unsaved edits
 	/// would otherwise leave worker and desktop pointing at different
 	/// remotes.
@@ -480,10 +478,9 @@ export class ServerFormState {
 				this.remotePassword,
 				this.datHostPassword
 			);
-			if (this.localWorker.address)
-				this.form.remote.worker.address = this.localWorker.address;
+			if (this.localWorker.address) this.form.remote.worker.address = this.localWorker.address;
 			this.syncChoice = 'hostedWorker';
-			// A reprovisioned worker keeps its journal — adopt whatever
+			// A reprovisioned worker keeps its journal. Adopt whatever
 			// automation setting it actually runs.
 			this.reconcileAutomation();
 			// Provisioning persisted the remote settings itself (hosted
@@ -529,7 +526,7 @@ export class ServerFormState {
 			this.localWorker = await api.profile.server.uninstallLocalWorker();
 			this.syncChoice = 'local';
 			this.form.remote.worker.address = '';
-			// The backend reverted the profile to Local sync — patch the
+			// The backend reverted the profile to Local sync. Patch the
 			// saved baseline the same way so other unsaved edits stay dirty.
 			if (this.#savedJson) {
 				const saved = JSON.parse(this.#savedJson);

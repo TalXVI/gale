@@ -9,7 +9,7 @@
 		id: string;
 		label: string;
 		value?: string;
-		/// A credential is already stored — the empty field then shows
+		/// A credential is already stored. The empty field then shows
 		/// dots styled like real text instead of a muted placeholder.
 		saved?: boolean;
 		disabled?: boolean;

@@ -57,7 +57,7 @@ pub enum WorkerOwnership {
     /// Installed for this profile and fully bound (settings + token).
     Owned,
     /// Installed for this profile's sync id, but the desktop binding
-    /// never completed — an earlier provisioning failed after the
+    /// never completed. An earlier provisioning failed after the
     /// service was already running. Running setup again finishes it.
     Incomplete,
     /// Installed for a different profile. All control is refused; the
@@ -68,7 +68,7 @@ pub enum WorkerOwnership {
 /// Resolves who the installed binding belongs to. `bound` is whether the
 /// profile's settings + keyring actually point at the installed worker.
 /// A binding whose profile id does not match is foreign even when the
-/// profile currently has no sync id — never treat "unknown" as "mine".
+/// profile currently has no sync id. Never treat "unknown" as "mine".
 #[cfg(windows)]
 fn ownership_of(
     installed_profile: Option<&str>,
@@ -92,12 +92,12 @@ fn ownership_of(
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalWorkerStatus {
-    /// `false` off Windows — provisioning is unavailable there.
+    /// `false` off Windows. Provisioning is unavailable there.
     pub supported: bool,
     pub service: ManagedServiceState,
     /// The installed worker's loopback API address, when its config is readable.
     pub address: Option<String>,
-    /// Whether the installed worker belongs to this profile — controls
+    /// Whether the installed worker belongs to this profile. Controls
     /// must only be offered for `Owned` (or `Incomplete`, to finish
     /// setup), never for `Foreign`.
     pub ownership: WorkerOwnership,
@@ -110,7 +110,7 @@ pub struct LocalWorkerStatus {
     /// Why `worker` is absent (unreachable, bad token, ...).
     pub worker_error: Option<String>,
     /// True when the bundled `gale-worker.exe` differs from the copy the
-    /// installed service runs — an app update left a newer worker behind.
+    /// installed service runs. An app update left a newer worker behind.
     /// `update` swaps it in without re-running the OAuth provisioning.
     pub update_available: bool,
     /// Provisioning warnings that are not fatal (e.g. the worker sign-in
@@ -167,7 +167,7 @@ pub async fn status(app: &AppHandle) -> Result<LocalWorkerStatus> {
         let mut worker = None;
         let mut worker_error = None;
         match ownership {
-            // Another profile owns the service — never contact it with
+            // Another profile owns the service. Never contact it with
             // this profile's credentials.
             WorkerOwnership::Foreign => {
                 worker_error =
@@ -175,7 +175,7 @@ pub async fn status(app: &AppHandle) -> Result<LocalWorkerStatus> {
             }
             WorkerOwnership::Incomplete => {
                 worker_error =
-                    Some("setup did not finish — run 'Set up worker' to complete it".to_owned());
+                    Some("Setup did not finish. Run 'Set up worker' to complete it".to_owned());
             }
             WorkerOwnership::Owned if service_state == ManagedServiceState::Running => {
                 let secrets = ServerSecrets::for_profile(profile_id)?;
@@ -217,7 +217,7 @@ pub async fn status(app: &AppHandle) -> Result<LocalWorkerStatus> {
 }
 
 /// Whether the profile's persisted settings and keyring actually point at
-/// the installed worker — the desktop half of the binding. Provisioning
+/// the installed worker. This is the desktop half of the binding. Provisioning
 /// can leave this incomplete if the install succeeded but saving settings
 /// or the bearer token failed.
 #[cfg(windows)]
@@ -275,7 +275,7 @@ async fn provision_windows(
         .ok_or_eyre("publish this profile before hosting a worker on this PC")?;
     ensure!(
         auth::user_info(app).is_some(),
-        "sign in to Gale sync first — the worker gets its own login"
+        "sign in to Gale sync first. The worker needs its own login"
     );
 
     // Preflight everything that would strand a half-provisioned worker:
@@ -283,11 +283,11 @@ async fn provision_windows(
     // OAuth or credentials are staged.
     let exe = worker_exe()?;
     // The installed worker belongs to one profile forever; refuse to
-    // replace another profile's, and check again after OAuth — the prompt
+    // replace another profile's, and check again after OAuth. The prompt
     // takes minutes and the dialog could have installed one meanwhile.
     ensure!(
         installed_config().is_none_or(|config| config.profile_id == sync_id),
-        "the installed worker belongs to a different profile — manage it from that profile"
+        "the installed worker belongs to a different profile. Manage it from that profile"
     );
     Staging::sweep_stale();
 
@@ -338,7 +338,7 @@ async fn provision_windows(
     let creds = auth::oauth_credentials(app).await?;
     ensure!(
         installed_config().is_none_or(|config| config.profile_id == sync_id),
-        "a worker for a different profile was installed while setup was running — manage it from that profile"
+        "a worker for a different profile was installed during setup. Manage it from that profile"
     );
 
     let config = WorkerConfig {
@@ -413,19 +413,19 @@ async fn provision_windows(
         auto_deploy_mods: remote.worker.auto_deploy_mods,
     };
     // Persisting the desktop half of the binding can still fail, leaving
-    // a running worker whose profile can't reach it — status reports it
+    // a running worker whose profile can't reach it. Status reports it
     // as `incomplete`. Retrying setup reinstalls and relinks the worker,
     // preserving its pending work for the same profile and server.
     save_remote_settings_for(app, target.profile_id, remote).context(
-        "the worker is installed and running, but saving its settings failed — run 'Set up worker' again to finish setup",
+        "the worker is installed and running, but saving its settings failed. Run 'Set up worker' again to finish setup",
     )?;
     persist_credential(&secrets, Some(ServerSecret::WorkerToken), &token, true).context(
-        "the worker is installed and running, but storing its token failed — run 'Set up worker' again to finish setup",
+        "the worker is installed and running, but storing its token failed. Run 'Set up worker' again to finish setup",
     )?;
 
     let mut worker_status = status(app).await?;
-    // A reprovisioned worker keeps its journal — the config written above
-    // only seeds a first run — so the journal's automation setting is
+    // A reprovisioned worker keeps its journal. The config written above
+    // only seeds a first run, so the journal's automation setting is
     // authoritative even when it differs from what was just installed.
     // Mirror the worker's actual setting into the profile's settings so the
     // dialogs and future provisioning see the same truth.
@@ -449,7 +449,7 @@ async fn provision_windows(
     // have invalidated the desktop's chain; a forced grant finds out.
     if auth::verify_session(app).await.is_err() {
         worker_status.warnings.push(
-            "the worker sign-in invalidated Gale's own session — sign in to sync again".to_owned(),
+            "the worker sign-in invalidated Gale's own session. Sign in to sync again".to_owned(),
         );
     }
     Ok(worker_status)
@@ -458,7 +458,7 @@ async fn provision_windows(
 // ---------- control ----------
 
 /// Starts, stops, or restarts the installed service through the SCM.
-/// These calls are unelevated — install grants interactive users control.
+/// These calls are unelevated because installation grants interactive users control.
 pub async fn control(app: &AppHandle, action: ServiceControlAction) -> Result<LocalWorkerStatus> {
     #[cfg(not(windows))]
     {
@@ -512,7 +512,7 @@ pub async fn uninstall(app: &AppHandle) -> Result<LocalWorkerStatus> {
     }
     #[cfg(windows)]
     {
-        // Capture the profile before the elevated wait — the settings
+        // Capture the profile before the elevated wait. The settings
         // revert below must land on the profile that owned the worker
         // even if the user switches profiles while UAC is open.
         let profile_id = app.lock_manager().active_profile().id;
@@ -533,7 +533,7 @@ pub async fn uninstall(app: &AppHandle) -> Result<LocalWorkerStatus> {
         let _ = std::fs::remove_file(&log);
 
         // Revert the profile's settings only if they still point at the
-        // managed worker — a user may have switched modes already.
+        // managed worker. A user may have switched modes already.
         let mut remote = {
             let manager = app.lock_manager();
             let (_, profile) = manager.profile_by_id(profile_id)?;
@@ -560,7 +560,7 @@ pub async fn uninstall(app: &AppHandle) -> Result<LocalWorkerStatus> {
 /// Backend ownership gate for every operation that touches the globally
 /// installed `GaleWorker` service: the active profile's sync id must
 /// match the installed binding. A worker bound to another profile is
-/// that profile's to manage — never controllable from here.
+/// that profile's to manage. Never controllable from here.
 #[cfg(windows)]
 fn require_owned(app: &AppHandle) -> Result<()> {
     let config = installed_config().ok_or_eyre("the managed worker is not installed")?;
@@ -568,7 +568,7 @@ fn require_owned(app: &AppHandle) -> Result<()> {
     let sync_id = sync_id_for(app, profile_id);
     ensure!(
         sync_id.as_deref() == Some(config.profile_id.as_str()),
-        "the installed worker belongs to a different profile — switch to that profile to manage it"
+        "the installed worker belongs to a different profile. Switch to that profile to manage it"
     );
     Ok(())
 }
@@ -602,7 +602,7 @@ struct Staging {
 #[cfg(windows)]
 impl Staging {
     /// How old an abandoned staging dir must be before `sweep_stale`
-    /// reclaims it — long enough that a legitimately in-flight provision
+    /// reclaims it, long enough that a legitimately in-flight provision
     /// (OAuth + UAC round trips) is never touched.
     const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
@@ -622,12 +622,12 @@ impl Staging {
     ) -> Result<Self> {
         let path = root.join(format!("gale-worker-provision-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&path).context("failed to create the worker staging directory")?;
-        // Arm the cleanup guard before any fallible step — a failed ACL,
+        // Arm the cleanup guard before any fallible step. A failed ACL,
         // config write, secrets write, or key copy must not strand a
         // partially staged directory.
         let staging = Self { path };
         // A bearer token and possibly an SSH private key are about to
-        // land here — restrict the dir to this user (plus SYSTEM/Admins,
+        // land here. Restrict the dir to this user (plus SYSTEM/Admins,
         // who must read it elevated) before writing anything sensitive.
         restrict_dir(&staging.path)?;
         config.save(&staging.path.join(local::CONFIG_FILE))?;
@@ -710,7 +710,7 @@ fn restrict_dir(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// The installed worker's binding, read leniently — status must degrade
+/// Reads the installed worker's binding leniently. Status must degrade
 /// gracefully when the config was written by a different version.
 #[cfg(windows)]
 fn installed_config() -> Option<WorkerConfig> {
@@ -750,8 +750,8 @@ fn pick_port(preferred: Option<u16>) -> Result<u16> {
         .ok_or_eyre("no free port is available for the managed worker")
 }
 
-/// True when the installed service binary differs from the bundled one —
-/// i.e. a Gale update shipped a newer worker that has not been rolled
+/// True when the installed service binary differs from the bundled one.
+/// A Gale update may have shipped a newer worker that has not been rolled
 /// out. Byte comparison is deliberate: dev builds carry no version.
 #[cfg(windows)]
 fn worker_update_available() -> bool {
@@ -793,7 +793,7 @@ fn bundled_exe(name: &str) -> Result<PathBuf> {
     }
 
     bail!(
-        "{} was not found next to Gale or in target/ — package it with the app or run `cargo build --features worker --bin gale-worker`",
+        "{} was not found next to Gale or in target/. Package it with the app or run `cargo build --features worker --bin gale-worker`",
         name
     )
 }
@@ -836,13 +836,13 @@ mod tests {
         );
 
         // Installed for this profile but the desktop binding never
-        // completed — finish-setup territory, not foreign.
+        // completed. This needs setup, and it is not foreign.
         assert_eq!(
             ownership_of(Some("sync-A"), Some("sync-A"), false),
             WorkerOwnership::Incomplete
         );
 
-        // A different sync id owns the service — every operation must be
+        // A different sync id owns the service. Every operation must be
         // refused for this profile, whether or not it has synced before.
         assert_eq!(
             ownership_of(Some("sync-A"), Some("sync-B"), true),
@@ -896,7 +896,7 @@ mod tests {
             ..Secrets::default()
         };
 
-        // Dropping the guard removes the dir — every early return path
+        // Dropping the guard removes the dir. Every early return path
         // in provisioning gets this for free.
         let path;
         {
@@ -922,9 +922,9 @@ mod tests {
         assert!(unrelated.exists(), "unrelated temp entries are off-limits");
     }
 
-    /// A failure partway through staging — here, an SSH key that does
-    /// not exist, failing after config and secrets were already written —
-    /// must remove the directory. The cleanup guard is armed right after
+    /// A failure partway through staging must remove the directory. This test
+    /// uses a missing SSH key after config and secrets have been written.
+    /// The cleanup guard is armed right after
     /// `create_dir_all`, so no partial payload survives an early return.
     #[test]
     fn a_failed_ssh_key_copy_removes_the_partial_staging_dir() {

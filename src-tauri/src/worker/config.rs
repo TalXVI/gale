@@ -3,7 +3,7 @@
 //! Secrets are kept out of this file. They come from the environment
 //! (`GALE_WORKER_TOKEN` and friends) or from a `KEY=value` file referenced
 //! by `secretsFile`, which is how the Gale-managed Windows service passes
-//! them in — see `worker::secrets`.
+//! them in. See `worker::secrets`.
 //!
 //! Example:
 //!

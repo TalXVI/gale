@@ -51,10 +51,8 @@ impl DeploySelection {
         published: &BTreeMap<ConfigPath, ValidatedConfigFile>,
         spec: &DeploymentSpec,
     ) -> Result<()> {
-        // A mods-only selection must be config-free, not just config-
-        // ignoring: silently dropping caller-supplied config decisions
-        // would hide intent. Reject them so an incoherent selection
-        // fails loudly instead.
+        // Reject config decisions in a mods-only selection. Silently
+        // dropping them would hide the caller's intent.
         ensure!(
             self.include_configs
                 || (self.apply_configs.is_empty()
@@ -142,7 +140,7 @@ pub struct RemoteSnapshot {
     pub payload_hashes: BTreeMap<DeployPathBuf, ContentHash>,
     /// Remote content hash for every config path a decision is needed on
     /// (published ∪ recorded ∪ explicitly selected); `None` = absent
-    /// remotely. Empty when the selection skips the config phase — a
+    /// remotely. It is empty when the selection skips the config phase. A
     /// mods-only operation never reads remote configs.
     pub config_remote: BTreeMap<ConfigPath, Option<ContentHash>>,
     pub host_managed: bool,

@@ -17,7 +17,7 @@
 
 	let { form, sync }: { form: ServerFormState; sync: RemoteSync } = $props();
 
-	// The active profile owns the settings — switching profiles discards
+	// The active profile owns the settings. Switching profiles discards
 	// any unsaved edits, drops the old profile's sync state, and reloads
 	// credentials from scratch.
 	let loadedProfile: number | null | undefined = undefined;

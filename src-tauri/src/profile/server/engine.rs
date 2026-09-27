@@ -594,8 +594,8 @@ pub fn deploy_with_progress(
 /// this executor. A foreign owner means another deployment may be
 /// mutating the server, so this one must stop before its next phase
 /// rather than interleave its writes with the new owner's. A check that
-/// cannot complete is retried and then aborts with the actual reason —
-/// an unreadable lease record is not proof of a takeover.
+/// cannot complete is retried and then aborts with the actual reason.
+/// An unreadable lease record is not proof of a takeover.
 fn ensure_ownership(lease: &Lease, session: &mut Session) -> Result<()> {
     let mut last_error = None;
     for attempt in 0..OWNERSHIP_CHECK_ATTEMPTS {
@@ -608,7 +608,7 @@ fn ensure_ownership(lease: &Lease, session: &mut Session) -> Result<()> {
             Ownership::Held => return Ok(()),
             Ownership::HeldViaMarker => {
                 // Ownership is proven by the marker directory because the
-                // host will not return the lease record on reads. Surface
+                // host will not return the lease record on reads. Report
                 // it once per session so support can tell this apart from
                 // a normal deployment.
                 const WARNING: &str = "this host does not return the lease record on reads; \
@@ -900,8 +900,8 @@ fn take_snapshot(
 
         // List the payload tree level by level: every directory in a
         // level is listed in parallel, then its children form the next
-        // level. Equivalent to the old recursive walk — the files/dirs
-        // maps are order-independent — while keeping each connection
+        // level. The files/dirs maps are order-independent, so this is
+        // equivalent to the old recursive walk while keeping each connection
         // strictly serial.
         let scan_started = Instant::now();
         let mut frontier: Vec<DeployPathBuf> = spec.payload_dirs.clone();
@@ -1011,14 +1011,14 @@ fn take_snapshot(
             "completed owned payload hashes"
         );
 
-        // Helpers are done before the config phase — and before any
-        // mutation — so the authoritative connection is free again.
+        // Helpers are done before the config phase, and before any
+        // mutation, so the authoritative connection is free again.
         drop(readers);
     }
 
     // Hash every config path a decision could touch: published files,
     // recorded ones, and explicitly selected paths. A mods-only operation
-    // never reads config files — the server owns them.
+    // never reads config files. The server owns them.
     let mut config_remote = BTreeMap::new();
     if selection.include_configs {
         let mut paths: BTreeSet<ConfigPath> = BTreeSet::new();
@@ -1087,7 +1087,7 @@ fn read_snapshot_file(
 
 /// Opens up to `requested` read-only helper connections for the payload
 /// scan and verify phases. Connections that fail to open are logged and
-/// skipped — the snapshot still runs over however many opened, and an
+/// skipped. The snapshot still runs over however many opened, and an
 /// empty result means the caller falls back to the authoritative
 /// connection entirely.
 fn open_snapshot_readers(ops: &dyn RemoteOps, requested: usize) -> Vec<Box<dyn RemoteReader>> {
@@ -1125,8 +1125,8 @@ fn open_snapshot_readers(ops: &dyn RemoteOps, requested: usize) -> Vec<Box<dyn R
     readers
 }
 
-/// Runs `work` on every item, spread over `readers` — one scoped thread
-/// per reader claiming items in order — or inline when only the
+/// Runs `work` on every item. Each reader uses one scoped thread to claim
+/// items in order. It runs inline when only the
 /// authoritative connection is available. `started` and `done` run on the
 /// calling thread for progress reporting. The first failure stops new
 /// work; the error returned is the one with the lowest item index, and
@@ -1231,8 +1231,8 @@ struct PayloadVerification {
     retried: bool,
 }
 
-/// Streams `remote` through a fresh hasher — one reconnect-and-retry on
-/// transport failure, mirroring `read_snapshot_file` for the read-only
+/// Streams `remote` through a fresh hasher. Retries once after a transport
+/// failure, as `read_snapshot_file` does for the read-only
 /// helper connections.
 fn verify_snapshot_payload(
     reader: &mut dyn RemoteReader,
@@ -1626,7 +1626,7 @@ fn is_replace_conflict(error: &eyre::Report) -> bool {
 ///
 /// The temporary file is verified byte-for-byte on a fresh connection
 /// before it may replace the target, and the target is verified again
-/// on a fresh connection after replacement — a truncated or refused
+/// on a fresh connection after replacement. A truncated or refused
 /// transfer can never silently become the authoritative state.
 pub fn persist_state(session: &mut Session) -> Result<()> {
     let target = session.mapper.remote_path(&session.mapper.spec.state_path);
@@ -1676,7 +1676,7 @@ pub fn persist_state(session: &mut Session) -> Result<()> {
     // before it may replace the target, and the target is verified again
     // on a fresh connection after replacement. A host that cannot return
     // it would silently lose ownership records, config policies, and the
-    // operation sequence on the next session — that failure must surface
+    // operation sequence on the next session. Report that failure
     // here, not after a subsequent deploy has already trusted it.
     session
         .ops
@@ -2574,7 +2574,7 @@ mod tests {
     #[test]
     fn mods_only_never_reads_writes_or_records_configs() {
         // The hard boundary: includeMods without includeConfigs performs
-        // literally zero config interaction — no reconciliation reads, no
+        // literally zero config interaction. No reconciliation reads. No
         // writes, no entries, no conflicts, no config state mutation.
         let mut fixture = mod_fixture();
         fixture.config.insert(
@@ -2647,8 +2647,8 @@ mod tests {
         assert!(state.config.is_empty());
     }
 
-    /// Deploys `desired` onto the memory remote and finishes, leaving an
-    /// unchanged remote — the shared setup for the reader-pool tests.
+    /// Deploys `desired` onto the memory remote and finishes with an
+    /// unchanged remote. Reader-pool tests share this setup.
     fn deploy_to_memory(
         memory: &Shared,
         publication: &FetchedPublication,
@@ -2763,8 +2763,8 @@ mod tests {
     }
 
     /// The zero-config boundary holds with the pool active: a mods-only
-    /// preview opens reader helpers but performs no config reads — any
-    /// config read is armed to fail the operation.
+    /// preview opens reader helpers but performs no config reads. Any
+    /// config read fails the operation.
     #[test]
     fn mods_only_preview_with_readers_never_reads_configs() {
         let mut fixture = mod_fixture();
@@ -3292,8 +3292,8 @@ mod tests {
     #[test]
     fn deploy_does_not_confuse_a_dead_transport_with_a_takeover() {
         // The transport dies after the session opens. Whatever fails
-        // first must report the transport problem — never a phantom
-        // competing executor — and must not touch payload files.
+        // first must report the transport problem, not a phantom
+        // competing executor. It must leave payload files untouched.
         let fixture = mod_fixture();
         let publication = fixture.publication();
         let desired = desired_payload();
@@ -3599,7 +3599,7 @@ mod tests {
     /// An unchanged mods-only preview over FTPS: scanning and hashing run
     /// on read-only helper connections, so every payload file and
     /// directory is touched exactly once and no payload path pays an MLST
-    /// probe — the listing already supplied its size.
+    /// probe. The listing already supplied its size.
     #[test]
     fn ftps_preview_verifies_each_file_and_directory_exactly_once() {
         use remote::fake_ftp::{FakeFtp, Options};
@@ -3667,8 +3667,8 @@ mod tests {
         assert!(server.peak_connections() <= 1 + MAX_SNAPSHOT_READERS);
     }
 
-    /// Remote drift between approval and execution — a same-size edit or
-    /// a deletion — must fail the deploy as stale rather than overwrite.
+    /// A same-size edit or deletion between approval and execution
+    /// must fail the deploy as stale rather than overwrite the remote file.
     #[test]
     fn ftps_deploy_rejects_payload_drift_after_the_approved_preview() {
         use remote::fake_ftp::{FakeFtp, Options};
@@ -3832,7 +3832,7 @@ mod tests {
         }
         assert!(saw_mutation, "lease acquire/release must have run");
     }
-    /// dot-prefixed paths fully visible — exercised through the real FTP
+    /// dot-prefixed paths fully visible, exercised through the real FTP
     /// transport. A completed deployment must write, verify, and reload
     /// its exact recorded state through a fresh connection, and a second
     /// operation must remove an owned file while preserving unmanaged
@@ -3877,8 +3877,8 @@ mod tests {
         assert_eq!(first.operation_seq, 1);
         drop(session);
 
-        // A fresh connection reloads the exact recorded state — the same
-        // authoritative record a worker executor would see.
+        // A fresh connection reloads the exact recorded state that a
+        // worker executor would see.
         let mut second = open_ftp(addr).unwrap();
         assert_eq!(
             state::serialize(&second.state).unwrap(),
@@ -3938,7 +3938,7 @@ mod tests {
     }
 
     /// A host that refuses to return even freshly-written state cannot
-    /// prove persistence — the deployment must fail closed. The holder
+    /// prove persistence. The deployment must fail closed. The holder
     /// marker still verifies the lease (its record is equally refused),
     /// and the claim is released cleanly.
     #[test]
@@ -3984,7 +3984,7 @@ mod tests {
         );
         // The upload landed and the lease was released. The state temp
         // was written but could never be verified, so it was never
-        // renamed — an unverifiable write must not become the
+        // renamed. An unverifiable write must not become the
         // authoritative state.
         assert!(
             server
@@ -4072,7 +4072,7 @@ mod tests {
     }
 
     /// A store that truncates the state temp file but still answers `226`
-    /// fails the read-back check — and that failure must not have already
+    /// fails the read-back check, and that failure must not have already
     /// destroyed the previously valid state. A fresh FTPS connection
     /// proves the exact original bytes survive.
     #[test]
@@ -4180,7 +4180,7 @@ mod tests {
     }
 
     /// A persistent config policy set under the lease survives a full
-    /// reconnect — decisions are part of the durable state.
+    /// reconnect because decisions are part of the durable state.
     #[test]
     fn a_config_policy_persists_across_reconnects_over_ftp() {
         use remote::fake_ftp::{FakeFtp, Options};

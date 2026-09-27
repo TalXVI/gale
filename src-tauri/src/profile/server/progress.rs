@@ -214,7 +214,7 @@ mod tests {
     #[test]
     fn mods_only_operations_have_no_config_phases() {
         // The phase list is part of the zero-config boundary: a mods-only
-        // operation must never surface a config phase to the user.
+        // operation must never show a config phase to the user.
         let mods_only = ProgressReporter::new(
             "run".to_owned(),
             SyncOperation::Deploy,

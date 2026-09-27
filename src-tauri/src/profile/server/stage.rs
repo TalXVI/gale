@@ -381,8 +381,8 @@ mod tests {
     #[tokio::test]
     async fn packaged_config_files_are_never_staged() {
         // A mod package can bundle files under config dirs. Those are
-        // server-owned territory — the running server generates or
-        // migrates them — so they must not enter the deployment set even
+        // server-owned territory. The running server generates or
+        // migrates them, so they must not enter the deployment set even
         // when the payload is staged for a mods deployment.
         let package = tempfile::tempdir().unwrap();
         let config_dir = package.path().join("BepInEx/config");

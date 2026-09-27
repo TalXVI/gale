@@ -37,7 +37,7 @@ pub const PORT_RANGE: RangeInclusive<u16> = DEFAULT_PORT..=8496;
 pub const CONFIG_FILE: &str = "gale-worker.json";
 pub const SECRETS_FILE: &str = "secrets.env";
 pub const STATUS_FILE: &str = "status.json";
-/// A staged copy of the user's SSH private key — the service runs as
+/// A staged copy of the user's SSH private key. The service runs as
 /// LocalSystem and cannot read keys under `%USERPROFILE%`.
 pub const SSH_KEY_FILE: &str = "ssh.key";
 #[cfg(feature = "worker")]
@@ -60,7 +60,7 @@ pub fn root_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(base).join("Gale").join("worker")
 }
 
-/// `%ProgramData%\Gale\worker\private` — secrets, journal, and lock.
+/// `%ProgramData%\Gale\worker\private`, including secrets, journal, and lock.
 pub fn private_dir() -> std::path::PathBuf {
     root_dir().join(PRIVATE_DIR)
 }
@@ -194,7 +194,7 @@ pub fn run_elevated_worker(exe: &Path, params: &str) -> Result<u32> {
     };
 
     unsafe { ShellExecuteExW(&mut info) }.context(
-        "the elevation prompt was cancelled or failed — managing the worker needs elevation",
+        "the elevation prompt was cancelled or failed. Managing the worker needs elevation",
     )?;
     if info.hProcess.is_invalid() {
         bail!("the elevated worker command produced no process handle");
@@ -241,7 +241,7 @@ pub fn wait_for_state(
 }
 
 /// Confirms the worker's listen address accepts TCP connections. SCM
-/// state alone cannot prove the API survived past the Running report —
+/// state alone cannot prove the API survived past the Running report,
 /// a crashed process can linger in Running briefly.
 pub fn await_listen_ready(listen: &str) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(15);

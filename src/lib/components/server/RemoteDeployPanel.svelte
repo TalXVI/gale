@@ -15,7 +15,7 @@
 	const formId = $props.id();
 
 	/// Deploy needs the stored settings to match the form. A typed
-	/// credential does not block it — the sync requests pick it up so the
+	/// credential does not block it. The sync requests pick it up so the
 	/// user can preview before saving.
 	const settingsDirty = $derived(!form.hasSavedSettings || form.settingsChanged);
 	/// Nothing published means there is nothing to preview or deploy.

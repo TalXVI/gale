@@ -20,13 +20,13 @@ type Decision = 'apply' | 'restore' | 'decline';
 
 /// The status/preview/deploy state machine for the remote tab, formerly
 /// the ServerSyncDialog's script. Credentials come from the connection
-/// fields on the same page — typed-but-unsaved values are passed so the
+/// fields on the same page. Typed but unsaved values are passed so the
 /// user can preview before saving.
 export class RemoteSync {
 	#form: ServerFormState;
 
 	/// Which payload the current preview targets. Mods are the routine
-	/// deployment; configs are a separate explicit push — the server owns
+	/// deployment; configs are a separate explicit push. The server owns
 	/// its config files after setup, so they are never bundled into the
 	/// primary sync operation.
 	previewScope = $state<'mods' | 'configs'>('mods');
@@ -49,7 +49,7 @@ export class RemoteSync {
 	elapsedSeconds = $state(0);
 	lastRefreshAt = $state<Date | null>(null);
 	/// Set once the first live refresh attempt settles, success or
-	/// failure — "checking" is only honest while that call is in flight.
+	/// failure. "Checking" only applies while that call is in flight.
 	liveChecked = $state(false);
 	#startedAt = 0;
 	#elapsedTimer: ReturnType<typeof setInterval> | null = null;
@@ -250,7 +250,7 @@ export class RemoteSync {
 			}
 
 			// A non-refresh response carries only publication metadata in
-			// either mode — keep the last live server state.
+			// either mode. Keep the last live server state.
 			if (!refresh && next.server == null) {
 				next.server = this.status?.server ?? null;
 			}
@@ -271,8 +271,8 @@ export class RemoteSync {
 		}
 	}
 
-	/// Drops everything tied to the previous profile — status, preview,
-	/// results — so a profile switch never leaks the old profile's state.
+	/// Drops status, preview, and results for the previous profile so a
+	/// profile switch never leaks its state.
 	/// The panel's own mount() is not re-run, so preferences reload here.
 	reset() {
 		this.#statusSeq++;
@@ -409,7 +409,7 @@ export class RemoteSync {
 			const entry = this.preview?.plan.configEntries.find((entry) => entry.path === path);
 			if (entry) entry.policy = policy;
 		} catch (error) {
-			// The write never landed — drop the pending pick so the control
+			// The write never landed. Drop the pending pick so the control
 			// falls back to the last confirmed policy instead of implying an
 			// unsaved value.
 			delete this.policyOverrides[path];

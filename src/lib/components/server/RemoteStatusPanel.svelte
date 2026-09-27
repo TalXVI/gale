@@ -65,7 +65,7 @@
 			null
 	);
 
-	// Interval ticks never open a transport session — worker refresh=true
+	// Interval ticks never open a transport session. Worker refresh=true
 	// also hits the game host through the worker, so both modes only
 	// re-read metadata while the page sits open. They also run silently:
 	// a transient failure keeps the last known status instead of

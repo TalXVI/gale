@@ -188,7 +188,7 @@ test('saved future policies stick, failed saves revert', async ({ page }) => {
 	await page.getByRole('option', { name: 'Always apply updates', exact: true }).click();
 	// The command returns nothing; the saved value is reflected locally.
 	await expect(policy).toHaveText('Always apply updates');
-	// A future policy is not a current Apply/Decline decision — but it
+	// A future policy is not a current Apply/Decline decision, but it
 	// does invalidate the approved deployment inputs.
 	await expect(page.getByText('3 files still need a decision')).toBeVisible();
 	await expect(remoteTab.getByRole('button', { name: 'Push configs', exact: true })).toBeDisabled();

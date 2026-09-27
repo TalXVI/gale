@@ -310,8 +310,8 @@ mod tests {
     /// the dialog saves transport settings in `local` mode before the
     /// worker exists (no address yet), and provisioning itself flips the
     /// profile to hosted worker mode. Worker mode with no address must
-    /// keep failing — that's how a misconfigured external worker is
-    /// caught — while local mode tolerates the empty address.
+    /// keep failing. That's how a misconfigured external worker is
+    /// caught, while local mode tolerates the empty address.
     #[test]
     fn worker_mode_requires_an_address_but_local_does_not() {
         let transport = RemoteServerSettings {

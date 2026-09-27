@@ -30,8 +30,8 @@ pub struct WorkerJournal {
     /// only ever tracks the mod payload.
     pub pending: Option<PendingWork>,
     /// The newest publication revision whose mod payload is confirmed
-    /// deployed on the server. A deployment that skips the mods phase —
-    /// an explicit config push — never advances it.
+    /// deployed on the server. A deployment that skips the mods phase,
+    /// such as an explicit config push, never advances it.
     pub last_deployed_revision: Option<DateTime<Utc>>,
     /// The mod revision the remote deployment state last reported as
     /// applied, mirrored from `.gale-server-state.json` after each
@@ -57,7 +57,7 @@ pub struct WorkerJournal {
 }
 
 /// A publication whose mod payload still needs to reach the server.
-/// The marker's existence is the debt — there is no partially completed
+/// The marker records owed work. There is no partially completed
 /// pending work because configs are never owed: the marker is either
 /// outstanding or dropped.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,7 +101,7 @@ impl WorkerJournal {
     /// Records the latest publication. The worker only owes the mod
     /// payload: when the publication's mod revision already matches the
     /// remote's last-reported one the publication settles immediately,
-    /// regardless of any config differences — the server is
+    /// regardless of any config differences. The server is
     /// authoritative for its config files.
     pub fn observe_publication(&mut self, revision: DateTime<Utc>, mods_revision: &ModRevision) {
         self.pending = (self.deployed_mods_revision.as_ref() != Some(mods_revision))
@@ -114,9 +114,9 @@ impl WorkerJournal {
     /// Records a deployment against outstanding work. A deployment
     /// discharges the pending publication only when it actually ran the
     /// mods phase for a covering publication (`pending.revision <=
-    /// publication` — deploying a newer publication supersedes the older
+    /// publication`, since deploying a newer publication supersedes the older
     /// one's work), or when the remote state it read back already
-    /// reports the owed mod revision — another executor may have
+    /// reports the owed mod revision. Another executor may have
     /// deployed it.
     ///
     /// `remote_mods` is the remote state's post-deployment mod revision,
@@ -159,7 +159,7 @@ impl WorkerJournal {
 
     /// Merges a freshly read remote state into the journal. The mod
     /// mirror tracks what the remote reports, and pending work it
-    /// already satisfies is discharged without a deployment — a manual
+    /// already satisfies is discharged without a deployment. A manual
     /// deployment from another executor settles it here.
     ///
     pub fn observe_remote_mods(&mut self, remote_mods: &Option<ModRevision>) {
@@ -446,7 +446,7 @@ mod tests {
     #[tokio::test]
     async fn a_newer_publication_supersedes_without_acknowledging() {
         // Pending work for an older revision is discharged by a
-        // deployment of a newer publication — but only when that
+        // deployment of a newer publication, but only when that
         // deployment actually ran the mods phase.
         let mut state = WorkerJournal::default();
         let older = Utc::now() - chrono::Duration::hours(1);
@@ -460,8 +460,7 @@ mod tests {
         assert_eq!(pending.revision, older);
         assert_eq!(state.last_deployed_revision, None);
 
-        // A mods deploy of the newer publication clears the older
-        // revision's leftover work — it is obsolete.
+        // Deploying newer mods clears pending work for the older revision.
         state.acknowledge_deployment(newer, true, Some(mod_rev('c')));
         assert!(state.pending.is_none());
         assert_eq!(state.last_deployed_revision, Some(newer));

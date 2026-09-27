@@ -29,7 +29,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Bound on draining an upload's data channel to EOF after the TLS/TCP
 /// close handshake. A healthy server closes its side as soon as the
 /// client's FIN arrives, so exceeding this means the peer is holding the
-/// channel open — the upload must fail rather than stall the deployment.
+/// channel open. The upload must fail rather than stall the deployment.
 const FTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// Live failures begin near 40 seconds or 170 transfers on one control
 /// connection. Retire it before either observed boundary.
@@ -90,13 +90,13 @@ pub trait RemoteOps: Send {
     /// Streams the file at `path` into `sink`, bounded to `listed_size`
     /// bytes from the listing that supplied it. `Ok(false)` means the file
     /// is absent; `Ok(true)` means bytes were written (fewer than
-    /// `listed_size` if the file shrank — the caller detects divergence
+    /// `listed_size` if the file shrank. The caller detects divergence
     /// through the hash). A file larger than its listed size is an error.
     ///
     /// The default implementation buffers through [`Self::read`]:
     /// semantically identical, just without streaming. Transports override
-    /// it to skip the redundant metadata probe — the listing already
-    /// reported the size — and to hash the bytes as they arrive.
+    /// it to skip the metadata probe because the listing reported the size,
+    /// and to hash the bytes as they arrive.
     fn read_listed(
         &mut self,
         path: &RemotePath,
@@ -113,7 +113,7 @@ pub trait RemoteOps: Send {
         }
     }
     /// A factory for extra read-only connections used by snapshot scanning
-    /// and verification. `None` means this transport cannot open helpers —
+    /// and verification. `None` means this transport cannot open helpers,
     /// the snapshot falls back to the authoritative connection.
     fn reader_connector(&self) -> Option<ReaderConnector> {
         None
@@ -505,8 +505,8 @@ impl RemoteConnection {
             .context("FTP authentication failed")
             .map_err(FtpConnectError::Other)?;
 
-        // Binary mode is required for byte-exact transfers — ASCII mode
-        // may newline-mangle payloads — and some servers (e.g. DatHost's
+        // Binary mode is required for byte-exact transfers. ASCII mode
+        // may newline-mangle payloads, and some servers (e.g. DatHost's
         // ProFTPD) refuse SIZE entirely while in ASCII mode, which would
         // make existing files look absent.
         stream
@@ -623,9 +623,9 @@ impl RemoteOps for RemoteConnection {
 
     fn read(&mut self, path: &RemotePath, max: u64) -> Result<Option<Vec<u8>>> {
         // A concrete size lets oversized downloads be refused before the
-        // transfer starts. When the server cannot report one — `SIZE` is
+        // transfer starts. When the server cannot report one, `SIZE` is
         // refused in FTP ASCII mode on some hosts, and an absent file
-        // reports the same way — the transfer itself decides existence
+        // reports the same way. The transfer itself decides existence
         // and the cap is enforced on the received bytes.
         let size = self.file_size(path).inspect_err(|err| {
             if matches!(self.client, RemoteClient::Ftp(_)) {
@@ -697,7 +697,7 @@ impl RemoteOps for RemoteConnection {
         };
 
         // A RETR 550 conflates "absent" with "the server refuses to
-        // return this file" — filtering hosts use the same status for
+        // return this file", filtering hosts use the same status for
         // both. Cross-check existence so a refused read surfaces as an
         // error rather than a silently empty one.
         if result.is_none() && matches!(self.client, RemoteClient::Ftp(_)) && self.is_file(path)? {
@@ -708,8 +708,8 @@ impl RemoteOps for RemoteConnection {
     }
 
     /// The streaming payload read used by snapshot verification. Unlike
-    /// [`Self::read`] it does not probe the file first — the listing that
-    /// selected this file already reported its size — and it hashes the
+    /// [`Self::read`] it does not probe the file first. The listing that
+    /// selected this file already reported its size, and it hashes the
     /// data channel straight into `sink` instead of a buffer.
     fn read_listed(
         &mut self,
@@ -1166,7 +1166,7 @@ fn parse_mlst_facts(line: &str) -> MlstFacts {
     parsed
 }
 
-/// `SIZE` as an existence/size probe — the pre-RFC-3659 fallback. A 550
+/// `SIZE` as an existence/size probe for servers without RFC 3659. A 550
 /// or 500/502 response means the size cannot be determined this way,
 /// either because the path is absent or because the server refuses the
 /// command (as with ProFTPD in ASCII mode).
@@ -1592,7 +1592,7 @@ pub(crate) mod memory {
     /// commands: `read`/`file_size`/`is_file` report them missing and
     /// `list` omits them, while writes, mkdir, deletes, and `is_dir` still
     /// work. That mirrors hosts which filter hidden paths from FTP read
-    /// commands — the condition behind a false "lease taken over" abort.
+    /// commands. The condition behind a false "lease taken over" abort.
     ///
     /// `filter_lists` also hides them from directory listings, the
     /// strictest observed variant; with it off, listings still expose
@@ -1776,8 +1776,8 @@ pub(crate) mod memory {
 
 /// An in-memory FTP endpoint for end-to-end tests. Unlike
 /// [`memory::MemoryRemote`], which stubs [`RemoteOps`] directly, this
-/// serves the actual wire protocol — USER/PASS/TYPE/PWD/CWD/PASV/LIST/
-/// MLST/SIZE/MDTM/RETR/STOR/RNFR/RNTO/DELE/MKD/RMD — so tests exercise
+/// serves the actual wire protocol: USER/PASS/TYPE/PWD/CWD/PASV/LIST/
+/// MLST/SIZE/MDTM/RETR/STOR/RNFR/RNTO/DELE/MKD/RMD, so tests exercise
 /// `RemoteConnection`'s real command and error handling.
 ///
 /// The knobs reproduce observed hosting behaviors: DatHost's ProFTPD
@@ -1801,13 +1801,13 @@ pub(crate) mod fake_ftp {
     /// Behaviors the fake server can exhibit.
     #[derive(Default, Clone, Copy)]
     pub struct Options {
-        /// Refuse `SIZE` until the client sends `TYPE I` — DatHost's
+        /// Refuse `SIZE` until the client sends `TYPE I`. DatHost's
         /// ProFTPD answers `550 SIZE not allowed in ASCII mode`.
         pub size_requires_binary: bool,
         /// Refuse all SIZE requests, including binary mode.
         pub refuse_size: bool,
         /// Refuse `RETR` even for files that exist and are provable via
-        /// `MLST` — a deeper read filter.
+        /// `MLST`. This models a deeper read filter.
         pub refuse_retr: bool,
         /// Refuse deletion with the same status used for absent files.
         pub refuse_dele: bool,
@@ -1819,16 +1819,15 @@ pub(crate) mod fake_ftp {
         pub tls: bool,
         /// On `STOR`, complete the data-channel TLS handshake, then
         /// kill the socket before the payload can be received while
-        /// still answering `226 transfer complete` — a mid-transfer
-        /// abort the client must not report as success.
+        /// still answering `226 transfer complete`. The client must not
+        /// report this mid-transfer abort as success.
         pub abort_stor_after_tls_handshake: bool,
         /// On `STOR`, keep only this prefix of the received payload but
-        /// still answer `226 transfer complete` — the observed host
-        /// behavior where a store reports success while persisting a
-        /// truncated file.
+        /// still answer `226 transfer complete`. This models a host that
+        /// reports success after saving a truncated file.
         pub truncate_stor_to: Option<usize>,
         /// On `STOR`, hold the data connection open after the payload
-        /// arrives — no `close_notify`, no FIN — so the client's close
+        /// arrives. No `close_notify`. No FIN, so the client's close
         /// handshake never sees EOF: a wedged server the drain bound
         /// must turn into an upload failure.
         pub hold_stor_eof: bool,
@@ -1940,7 +1939,7 @@ pub(crate) mod fake_ftp {
 
     /// Per-connection TLS configs: `control` covers the control channel
     /// and ordinary data transfers, while `data` covers the data channel
-    /// when `abort_stor_after_tls_handshake` is on — it is pinned to
+    /// when `abort_stor_after_tls_handshake` is on. It is pinned to
     /// TLS 1.2 so the server owns the final handshake flight and can
     /// reset the socket before the client's payload write is attempted.
     /// (Under TLS 1.3 the client sends Finished and payload back-to-back,
@@ -2151,7 +2150,7 @@ pub(crate) mod fake_ftp {
         }
 
         /// Break the control connection on the next `count` RETRs of
-        /// exactly `path` — the path-scoped counterpart of
+        /// exactly `path`. This is the path-scoped counterpart of
         /// [`Self::reset_on_retrs`], which cannot identify a file once
         /// payload reads run on parallel connections.
         pub fn reset_on_retr_of(&self, path: &str, count: usize, after_completion: bool) {
@@ -2170,7 +2169,7 @@ pub(crate) mod fake_ftp {
         }
 
         /// How many received command lines start with `prefix`
-        /// (e.g. `RETR ` — include the trailing space to exclude
+        /// (e.g. `RETR `, include the trailing space to exclude
         /// similarly-named commands).
         pub fn count(&self, prefix: &str) -> usize {
             self.commands
@@ -2187,8 +2186,8 @@ pub(crate) mod fake_ftp {
             self.commands.lock().unwrap().clear();
         }
 
-        /// Removes a seeded file — the remote-side delete a staleness
-        /// test performs between Preview and Deploy.
+        /// Removes a seeded file to simulate a remote deletion between
+        /// Preview and Deploy in staleness tests.
         pub fn remove_file(&self, path: &str) {
             self.fs.lock().unwrap().files.remove(&normalize(path));
         }
@@ -2336,7 +2335,7 @@ pub(crate) mod fake_ftp {
     impl DataSocket {
         /// rustls does not emit `close_notify` on drop; without it the
         /// client's read reports `UnexpectedEof` after the payload.
-        /// `write_tls` flushes the alert without reading — `flush` would
+        /// `write_tls` flushes the alert without reading, `flush` would
         /// block waiting for client data that never comes.
         fn close(self) {
             if let Self::Tls(mut conn) = self {
@@ -2395,7 +2394,7 @@ pub(crate) mod fake_ftp {
 
         /// The client connects the passive data socket before reading
         /// the command's final response, so a refused command must still
-        /// accept and close it — a rustls data stream that is dropped
+        /// accept and close it. A rustls data stream that is dropped
         /// before its handshake runs `complete_io` and waits on a
         /// channel that was never accepted.
         macro_rules! reap_data {
@@ -2605,7 +2604,7 @@ pub(crate) mod fake_ftp {
                     }
                     let mut bytes = Vec::new();
                     match data!() {
-                        // The TLS 1.2 handshake completed inside `data!` —
+                        // The TLS 1.2 handshake completed inside `data!`,
                         // the server just sent the final flight, so the
                         // client is still finishing its side and has not
                         // written its payload yet. Resetting the socket now
@@ -2781,7 +2780,7 @@ mod tests {
     }
 
     /// Only automatic `ftp` mode may drop to plaintext when the server
-    /// refuses AUTH TLS. A strict `ftps` selection must surface the
+    /// refuses AUTH TLS. A strict `ftps` selection must report the
     /// failure instead of logging in unencrypted.
     #[test]
     fn strict_ftps_never_falls_back_to_plaintext() {
@@ -3318,7 +3317,7 @@ mod tests {
     /// refused in ASCII mode (`550 SIZE not allowed in ASCII mode`),
     /// while dot-prefixed paths are fully visible to LIST/MLST/MDTM/RETR.
     /// Before the fix, `read` gated on `file_size`/`is_file`, so a
-    /// retrievable file looked absent — the false "lease taken over".
+    /// retrievable file looked absent and caused a false "lease taken over" error.
     #[test]
     fn reads_stay_correct_when_size_is_refused_in_ascii() {
         let server = FakeFtp::valheim_host(FakeFtpOptions {
@@ -3346,7 +3345,7 @@ mod tests {
                 .unwrap()
         );
 
-        // Genuinely absent paths still read as absent — not confused
+        // Genuinely absent paths still read as absent, not confused
         // with the SIZE refusal.
         let absent = remote_path("/BepInEx/config/.gale-server-state.json");
         assert_eq!(conn.read(absent.as_path(), 64 * 1024).unwrap(), None);
@@ -3456,7 +3455,7 @@ mod tests {
     }
 
     /// An absent path reports `false`; the only MLST is the post-550
-    /// existence cross-check, which runs after RETR — never before it.
+    /// existence cross-check, which runs after RETR.
     #[test]
     fn ftps_read_listed_reports_absent_without_probing_first() {
         let server = FakeFtp::valheim_host(FakeFtpOptions {
@@ -3609,7 +3608,7 @@ mod tests {
     /// Regression test for an FTPS data channel that dies after the TLS
     /// handshake: the fake completes the handshake, kills the socket
     /// before the payload lands, then still answers `226 transfer
-    /// complete`. `write` must surface the aborted transfer instead of
+    /// complete`. `write` must report the aborted transfer instead of
     /// reporting success for bytes the server never stored.
     #[test]
     fn ftps_write_reports_an_aborted_data_transfer() {

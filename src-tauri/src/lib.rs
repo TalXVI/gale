@@ -22,8 +22,8 @@ pub mod worker;
 
 /// Installs aws-lc-rs as the process-level rustls `CryptoProvider`.
 ///
-/// The dependency graph compiles two providers — `aws_lc_rs` (this
-/// crate, reqwest, suppaftp) and `ring` (tauri-plugin-updater) — so
+/// The dependency graph compiles two providers, `aws_lc_rs` (this
+/// crate, reqwest, suppaftp) and `ring` (tauri-plugin-updater), so
 /// rustls' feature-based auto-detection is ambiguous and any
 /// `ClientConfig::builder()` without an installed default panics. Every
 /// process that can open a TLS connection, the desktop app and

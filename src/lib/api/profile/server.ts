@@ -38,7 +38,7 @@ export type CredentialInput = { value: string; remember: boolean };
 
 /// Persists settings and credentials together. An empty value leaves a
 /// stored credential untouched; each `remember` flag controls only its
-/// own credential — `false` clears that one.
+/// own credential. Setting it to `false` clears that credential.
 export const setSettings = (
 	settings: ProfileServerSettings,
 	credentials: {
@@ -160,7 +160,7 @@ export const acknowledgeExternalRestart = (password = '', workerToken = '') =>
 	});
 
 /// Pushes the automation configuration to the bound worker and returns
-/// the status it confirmed — the values the worker actually runs.
+/// the status it confirmed. These are the values the worker actually runs.
 export const configureWorker = (
 	autoDeployMods: boolean,
 	restartPolicy: RestartPolicy,

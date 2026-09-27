@@ -13,10 +13,10 @@ export type RemoteDeployState =
 	| 'pending'
 	| 'upToDate'
 	| 'neverDeployed'
-	/// A live refresh was attempted and produced no server state — the
+	/// A live refresh was attempted and produced no server state. The
 	/// transport is unreachable, unconfigured, or the call failed.
 	| 'unavailable'
-	/// Mods are on the server but freshness is unknown — e.g. the last
+	/// Mods are on the server but freshness is unknown. For example, the last
 	/// operation was a config push or predates publication tracking.
 	| 'deployed';
 
@@ -25,7 +25,7 @@ export function remoteDeployState(
 	liveChecked = false
 ): RemoteDeployState {
 	if (!status) return liveChecked ? 'unavailable' : 'checking';
-	// Nothing published means nothing is deployable — never claim
+	// Nothing published means nothing is deployable. Never claim
 	// "up to date" without a publication to compare against.
 	if (status.publicationRevision == null) return 'neverDeployed';
 	if (status.worker) {
@@ -57,7 +57,7 @@ export function remoteDeployState(
 }
 
 export class ServerSync {
-	/// Last worker-mode status this game+profile observed — polled by the
+	/// Last worker-mode status this game+profile observed, polled by the
 	/// navbar and updated by the remote tab whenever it loads status.
 	status = $state<ServerSyncStatus | null>(null);
 
@@ -74,7 +74,7 @@ export class ServerSync {
 	#key: string | null = null;
 	#pollTimer: ReturnType<typeof setInterval> | null = null;
 	#pollInFlight: number | null = null;
-	/// Bumped whenever the polling target changes — an in-flight request
+	/// Bumped whenever the polling target changes. An in-flight request
 	/// from an older generation is ignored on success and failure alike.
 	#generation = 0;
 
@@ -118,7 +118,7 @@ export class ServerSync {
 			void this.#poll(key);
 			this.#pollTimer = setInterval(() => void this.#poll(key), 60_000);
 		} catch {
-			// Settings could not be read — nothing reliable to poll for.
+			// Settings could not be read. Nothing reliable to poll for.
 		}
 	}
 
@@ -133,7 +133,7 @@ export class ServerSync {
 
 	async #poll(key: string) {
 		const generation = this.#generation;
-		// Only a poll of the current generation blocks another one — a
+		// Only a poll of the current generation blocks another one. A
 		// stale request must not delay the new target's first poll.
 		if (this.#pollInFlight === generation) return;
 		this.#pollInFlight = generation;
@@ -141,15 +141,15 @@ export class ServerSync {
 			const status = await api.profile.server.getSyncStatus(false, '', '', {
 				quiet: true
 			});
-			// The target moved while the request was in flight — this
+			// The target moved while the request was in flight. This
 			// answer belongs to a different profile.
 			if (generation !== this.#generation || key !== this.#key) return;
-			// Anything but a worker observation cannot describe the badge —
-			// keep the last known state.
+			// Only a worker observation can describe the badge. Keep the last
+			// known state for other responses.
 			if (!this.#isWorkerObservation(status)) return;
 			this.status = status;
 		} catch {
-			// A failed poll keeps the last known status — the navbar dot
+			// A failed poll keeps the last known status. The navbar dot
 			// must not flap on a transient error.
 		} finally {
 			if (this.#pollInFlight === generation) this.#pollInFlight = null;

@@ -11,7 +11,7 @@
 //! the stored record still names this holder before touching it, so an old
 //! owner can never delete or overwrite a newer executor's lease. A
 //! `holder-<operation>` marker directory inside the claim is the fallback
-//! proof on hosts that filter the record file from read commands — the
+//! proof on hosts that filter the record file from read commands. The
 //! marker also keeps the claim non-empty, so a claim that cannot be
 //! inspected cannot be silently removed either.
 //!
@@ -88,12 +88,12 @@ pub struct Lease {
     file: RemotePathBuf,
     /// A directory named `holder-<operation_id>` inside the claim. It is
     /// the ownership fallback on hosts where the record file cannot be
-    /// read back — whether because the server filters dot-paths like
+    /// read back, whether because the server filters dot-paths like
     /// `.gale-deploy.lock` from reads, or refuses `RETR`/`SIZE` on them
     /// while `MKD`, `STOR`, `CWD`, `DELE`, and `RMD` all still work. The
     /// marker is still verifiable (`is_dir`/`CWD`/`MLST`), can only exist
     /// inside the claim this executor made, and must be removed before
-    /// the claim directory itself can be — so its continued presence
+    /// the claim directory itself can be, so its continued presence
     /// proves the claim is still ours.
     marker: RemotePathBuf,
     pub record: LeaseRecord,
@@ -115,14 +115,14 @@ pub enum Ownership {
     /// record names this operation.
     Held,
     /// The record cannot be read back, but the holder marker proves the
-    /// claim is intact — the host filters lease reads (e.g. FTP servers
+    /// claim is intact. The host filters lease reads (e.g. FTP servers
     /// that refuse SIZE/RETR/LIST on dot-prefixed paths).
     HeldViaMarker,
     /// The claim verifiably no longer belongs to this holder: a foreign
     /// record was read (`holder` names its owner), or our marker was
     /// removed, which only happens when the claim is dismantled.
     Lost { holder: Option<String> },
-    /// Neither the record nor the marker could be checked — a transport
+    /// Neither the record nor the marker could be checked. A transport
     /// failure, not evidence of a takeover.
     Unverifiable(eyre::Report),
 }
@@ -224,7 +224,7 @@ impl Lease {
             Ownership::Lost { .. } => {
                 // Another owner holds the lease now, so theirs stays.
                 // Our marker, keyed to this operation's id, is the only
-                // piece that is still ours to remove — cleaning it keeps
+                // piece that is still ours to remove. Cleaning it keeps
                 // the new holder's eventual rmdir from failing on it.
                 ops.delete_dir(&self.marker).ok();
                 warn!(
@@ -335,7 +335,7 @@ pub fn acquire(
                     }
                 }
                 // An empty husk or an unreadable record means the claim
-                // never finished — unless a holder marker is present.
+                // never finished, unless a holder marker is present.
                 // Hosts that filter dot-paths from reads hide the record
                 // of a *live* claim, but cannot hide the marker from a
                 // directory listing; either way it must not be broken
@@ -496,8 +496,8 @@ fn check_ownership(
         Err(err) => Some(err),
     };
 
-    // The record could not be read — missing, malformed, torn mid-write,
-    // or filtered by the host. The marker decides: it only exists inside
+    // The record could not be read. It may be missing, malformed, torn
+    // mid-write, or filtered by the host. The marker decides: it only exists inside
     // the claim this holder made, and a competing claim must remove it
     // before the lease directory can be reused. No other executor knows
     // its name (the record that carries it is exactly what is unreadable),
@@ -510,7 +510,7 @@ fn check_ownership(
             Ok(true) => Ownership::Lost { holder: None },
             // Neither marker nor claim directory can be observed. That
             // either means the claim really is gone, or this host filters
-            // even directory probes on the lease path — the checks cannot
+            // even directory probes on the lease path. The checks cannot
             // tell those apart, so the honest answer is unverifiable.
             Ok(false) => Ownership::Unverifiable(read_error.unwrap_or_else(|| {
                 eyre::eyre!("the lease directory at {lease_dir} is not observable on this host")
@@ -524,7 +524,7 @@ fn check_ownership(
 /// Marker directory name prefix; the operation id follows it.
 const HOLDER_PREFIX: &str = "holder-";
 
-/// `lease_dir/holder-<operation_id>` — the fallback ownership proof.
+/// `lease_dir/holder-<operation_id>` is the fallback ownership proof.
 fn marker_path(lease_dir: &RemotePathBuf, operation_id: &str) -> RemotePathBuf {
     let name = super::paths::DeployPathBuf::new(format!("{HOLDER_PREFIX}{operation_id}"))
         .expect("operation ids are path-safe");
@@ -826,7 +826,7 @@ mod tests {
 
         // If the claim directory itself is also gone, the checks cannot
         // tell "dismantled" from "this host filters even directory
-        // probes" — that degrades to Unverifiable, not a takeover claim.
+        // probes". That degrades to Unverifiable, not a takeover claim.
         inner.lock().unwrap().dirs.remove(LEASE_DIR);
         assert!(matches!(
             lease.check_ownership(&mut filtered),

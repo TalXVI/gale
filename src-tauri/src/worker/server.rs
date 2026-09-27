@@ -682,7 +682,7 @@ async fn poll_once(ctx: &Arc<WorkerContext>) {
             return;
         };
 
-        // Re-check under the operation lock — the action check above
+        // Re-check under the operation lock. The action check above
         // may be stale. Owed work is always the mod payload, so the
         // automatic selection is mods-only: configs are never part of
         // unattended synchronization.
@@ -792,7 +792,7 @@ fn lock_instance(state_dir: &std::path::Path) -> Result<std::fs::File> {
 /// is the one that knows whether the stop was a request or an OS shutdown.
 ///
 /// `ready` fires once the API listener is bound and the poll loop is
-/// armed — the point where the service can truthfully report `Running`
+/// armed. At that point, the service can report `Running`
 /// to the SCM. It is never fired when initialization fails, so a service
 /// start that returns early reports `Stopped` instead.
 pub async fn run(
@@ -1198,7 +1198,7 @@ mod tests {
         assert_eq!(report.profile_id, "p");
         assert!(report.pid > 0);
 
-        // Later phases overwrite the file — the reader always sees the
+        // Later phases overwrite the file. The reader always sees the
         // most recent terminal state.
         super::report_run_state(&config, super::WorkerRunPhase::Shutdown);
         let report: super::WorkerRunReport =
@@ -1328,7 +1328,7 @@ mod tests {
         settings.worker.address = format!("http://127.0.0.1:{api_port}");
         let client = WorkerClient::new(&settings, "token".to_owned()).unwrap();
 
-        // Without refresh the handler returns journal state only — no
+        // Without refresh the handler returns journal state only. No
         // remote session is opened.
         let status = client.status(false).await.unwrap();
         assert!(status.server.is_none());
@@ -1349,8 +1349,8 @@ mod tests {
             "unexpected error: {err:#}"
         );
 
-        // Malformed refresh values are rejected outright — never
-        // silently coerced into a wrong status.
+        // Reject malformed refresh values instead of silently
+        // coercing them into a wrong status.
         let http = reqwest::Client::new();
         for query in ["refresh=1", "refresh=yes", "refresh=bogus"] {
             let response = http
@@ -1371,8 +1371,8 @@ mod tests {
     }
 
     /// The readiness signal mirrors what the service reports to the SCM:
-    /// it fires only once the API listener is bound — never while init
-    /// is still running, and never when init fails.
+    /// it fires only after the API listener is bound. It stays silent
+    /// while initialization runs and when initialization fails.
     #[tokio::test]
     async fn run_signals_ready_only_after_binding() {
         let dir = tempfile::tempdir().unwrap();
@@ -1397,7 +1397,7 @@ mod tests {
     }
 
     /// An occupied port is an init failure: `run` errors and the ready
-    /// sender drops without firing — the service-side caller observes
+    /// sender drops without firing. The service-side caller observes
     /// `Err` and must report Stopped, never Running.
     #[tokio::test]
     async fn run_fails_when_the_port_is_occupied() {
@@ -1675,7 +1675,7 @@ mod tests {
         );
         assert_eq!(stor_count(&ftp), 0, "owed mods must not deploy");
 
-        // A restart preserves the owed work exactly — journal on disk.
+        // A restart preserves owed work in the journal on disk.
         drop(ctx);
         let journal = crate::worker::journal::Journal::load(dir.path()).unwrap();
         {
@@ -1684,8 +1684,8 @@ mod tests {
         }
 
         // Enabling automation reconsiders the owed mods without a new
-        // publication. A stale backoff must not gate them — /v1/config
-        // clears it. The pre-seeded payload cache keeps the staging
+        // publication. A stale backoff must not gate them. /v1/config
+        // clears it. The pre-seeded payload cache keeps staging
         // offline.
         {
             let mut state = journal.state.lock().await;
@@ -1800,7 +1800,7 @@ mod tests {
         drop(state);
 
         // The mods phase ran and the divergent server config survived
-        // untouched — no pending decision was created for it either.
+        // untouched. No pending decision was created for it either.
         assert!(stor_count(&ftp) > 0);
         let remote_state: serde_json::Value =
             serde_json::from_slice(&ftp.file("/BepInEx/config/.gale-server-state.json").unwrap())
@@ -1956,7 +1956,7 @@ mod tests {
         }
 
         // A restart with a config claiming automation is on keeps the
-        // journal's values — it is authoritative once seeded.
+        // journal's values. It is authoritative once seeded.
         config.remote.worker.auto_deploy_mods = true;
         let shutdown = tokio_util::sync::CancellationToken::new();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();

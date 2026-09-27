@@ -71,7 +71,7 @@ impl Secrets {
             let Some((key, value)) = trimmed.split_once('=') else {
                 continue;
             };
-            // Values are verbatim — passwords and passphrases may carry
+            // Values are verbatim. Passwords and passphrases may carry
             // meaningful whitespace or '=' characters, so nothing is
             // trimmed. `lines()` already guarantees no \n or \r survives.
             let value = Some(value.to_owned());
@@ -131,7 +131,7 @@ impl Secrets {
         }
     }
 
-    /// The API bearer token. Required — an unauthenticated worker would
+    /// The API bearer token is required. An unauthenticated worker would
     /// let any loopback caller drive deployments. An empty stored value
     /// counts as unset: a zero-length token must never authenticate.
     #[cfg(feature = "worker")]
@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn values_round_trip_verbatim() {
         // Passwords and passphrases may legitimately contain whitespace
-        // or '=' — the format must carry them unchanged.
+        // or '='. The format must carry them unchanged.
         let secrets = Secrets {
             token: Some("  padded  ".to_owned()),
             remote_password: Some("trailing \t".to_owned()),
@@ -199,7 +199,7 @@ mod tests {
         assert_eq!(parsed.token.as_deref(), Some("  padded  "));
         assert_eq!(parsed.remote_password.as_deref(), Some("trailing \t"));
         assert_eq!(parsed.refresh_token.as_deref(), Some("a=b=c"));
-        // An empty stored value stays empty — distinct from absent.
+        // An empty stored value stays empty, distinct from absent.
         assert_eq!(parsed.dat_host_password.as_deref(), Some(""));
     }
 

@@ -31,8 +31,8 @@ pub enum ServiceControlAction {
 }
 
 pub(crate) mod api;
-/// Config-file contract — the worker runtime loads it, and the Windows
-/// desktop writes it when provisioning the managed service.
+/// Config-file contract loaded by the worker runtime. The Windows desktop
+/// writes it when provisioning the managed service.
 #[cfg(any(windows, feature = "worker"))]
 pub(crate) mod config;
 /// Shared layout constants for the managed Windows service.

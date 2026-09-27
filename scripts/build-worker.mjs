@@ -45,7 +45,7 @@ if (isWindows) {
 	});
 }
 
-// Referenced by `bundle.windows.wix.fragmentPaths` — the ComponentGroup
+// Referenced by `bundle.windows.wix.fragmentPaths`. The ComponentGroup
 // id is wired into the MSI's External feature via `componentGroupRefs`.
 // In dev the staged binary only feeds `worker_exe()`'s sibling lookup.
 writeFileSync(

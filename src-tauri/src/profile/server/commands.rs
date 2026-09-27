@@ -64,7 +64,7 @@ pub struct LaunchDedicatedServerRequest {
 
 /// Settings + optional credentials, saved together from the settings
 /// page. Empty credential fields leave stored credentials untouched;
-/// each `remember*` flag controls only its own credential — `false`
+/// each `remember*` flag controls only its own credential, `false`
 /// clears that one and nothing else.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -170,7 +170,7 @@ pub struct ConfigureWorkerRequest {
     pub worker_token: String,
 }
 
-/// What the UI needs to render the server-sync surface regardless of
+/// What the UI needs to render the server sync panel regardless of
 /// execution mode.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -272,7 +272,7 @@ pub async fn set_dedicated_server_settings(
     if settings.remote.sync_mode == SyncMode::Worker
         && worker_config_differs(stored.as_ref(), &settings)
     {
-        // The running worker is authoritative for automation — the
+        // The running worker is authoritative for automation. The
         // stored copy only seeds new workers. Push the requested
         // configuration first and persist the values the worker
         // confirmed: a worker that cannot be reached must not look
@@ -304,7 +304,7 @@ pub async fn set_dedicated_server_settings(
 
 /// Persists each remote credential independently: a provided value is
 /// stored per its own `remember` flag, an empty one leaves the stored
-/// value alone unless `remember` is off — which clears just that
+/// value alone unless `remember` is off, which clears just that
 /// credential and nothing else.
 fn persist_remote_credentials(
     secrets: &ServerSecrets,
@@ -346,7 +346,7 @@ pub(crate) fn persist_credential(
     Ok(())
 }
 
-/// Whether the requested settings change what the bound worker runs —
+/// Whether the requested settings change what the bound worker runs,
 /// the automation toggles, the restart policy, or which worker is
 /// addressed. Skipping an unchanged configuration keeps a settings save
 /// from depending on the worker being reachable.
@@ -378,13 +378,13 @@ async fn configure_running_worker(
     let status = client
         .status(false)
         .await
-        .context("the worker did not answer — its automation settings were not changed")?;
+        .context("the worker did not answer. Its automation settings were not changed")?;
     // A worker is always bound to a sync profile id. Without this
-    // profile's own id the binding cannot be verified — reconfiguring
+    // profile's own id the binding cannot be verified. Reconfiguring
     // anyway could silently change a worker owned by another profile.
     let Some(expected) = expected_profile else {
         bail!(
-            "this profile is not published — publish it before Gale can verify \
+            "this profile is not published. Publish it before Gale can verify \
              and configure a worker (the worker is bound to '{}')",
             status.profile_id,
         );
@@ -732,8 +732,8 @@ pub async fn get_server_sync_status(
 }
 
 /// Whether the executor's required secret is absent from both the request
-/// and the credential store — the only refresh failure that entering a
-/// credential can fix. Other failures surface as plain warnings.
+/// and the credential store. The only refresh failure that entering a
+/// credential can fix. Other failures appear as plain warnings.
 fn credential_missing(
     secrets: &ServerSecrets,
     settings: &RemoteServerSettings,
@@ -923,7 +923,7 @@ pub async fn configure_worker(
     )
     .await?;
 
-    // Persist what the worker confirmed — by profile id, so an
+    // Persist what the worker confirmed, by profile id, so an
     // active-profile switch during the push cannot redirect the write.
     let mut manager = app.lock_manager();
     let (_, profile) = manager.profile_by_id_mut(target.profile_id)?;
@@ -1386,7 +1386,7 @@ mod tests {
     const DATHOST: usize = 4;
     const TOKEN: usize = 5;
 
-    /// Only the flag's own credential is dropped — index `cleared` is the
+    /// Only the flag's own credential is dropped. Index `cleared` is the
     /// one slot that flips to false.
     fn assert_only_cleared(cleared: usize, stored: [bool; 6]) {
         let mut expected = ALL;

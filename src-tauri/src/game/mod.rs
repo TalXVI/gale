@@ -130,8 +130,8 @@ fn bundled_games() -> &'static [GameData<'static>] {
     BUNDLED.as_slice()
 }
 
-/// Applies the bundled dedicated-server definitions over an externally
-/// sourced game list — a downloaded cache or an upstream refresh.
+/// Applies the bundled dedicated-server definitions over a game list from
+/// a downloaded cache or an upstream refresh.
 /// Bundled metadata is authoritative for dedicated-server support:
 /// upstream still supplies every other field (and can add support for
 /// games the bundle doesn't define), but it cannot remove or redefine
@@ -377,8 +377,8 @@ mod tests {
     }
 
     /// Loading a legacy cache restores the bundled dedicated-server
-    /// metadata. Goes through `read_games_cache` — the same function
-    /// `get_cached_games` calls for the release startup path — pointed
+    /// metadata. This test calls `read_games_cache`, which
+    /// `get_cached_games` also uses at startup, and points it
     /// at a temp dir so no test touches the real app-data cache.
     #[test]
     fn legacy_cache_load_recovers_dedicated_server() {

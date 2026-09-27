@@ -70,7 +70,7 @@ test.describe('navbar server badge', () => {
 		await expect.poll(async () => (await statusCalls(page)).length).toBe(3);
 		await page.evaluate(() => (window as any).release());
 
-		// Profile 2's own observation badges it amber — profile 1's stale
+		// Profile 2's own observation badges it amber. Profile 1's stale
 		// green answer is discarded and never comes back.
 		await expect(dot(page)).toHaveAttribute('data-badge', 'pending');
 	});

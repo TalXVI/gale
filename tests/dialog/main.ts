@@ -81,7 +81,7 @@ const configEntries = manyConfigs
 			}
 		];
 // The plan mirrors the requested selection: config entries only exist
-// when the preview targeted configs — a mods sync never computes them.
+// when the preview targeted configs. A mods sync never computes them.
 function planFor(selection: { includeMods: boolean; includeConfigs: boolean }) {
 	return {
 		hash: 'approved-plan',
@@ -221,7 +221,7 @@ Object.assign(window, {
 });
 
 mockIPC(async (cmd, args) => {
-	// The profile a call belongs to is fixed when it arrives — a held
+	// The profile a call belongs to is fixed when it arrives. A held
 	// response still describes the profile it was issued for.
 	const callProfile = activeId;
 	if (cmd === 'get_server_sync_progress') {
@@ -294,7 +294,7 @@ mockIPC(async (cmd, args) => {
 			return null;
 		case 'get_dedicated_server_settings':
 			if (settings == null) return null;
-			// Profile 2 is a plain manual-sync profile — the navbar must
+			// Profile 2 is a plain manual-sync profile. The navbar must
 			// never poll or badge it as a worker remote. `?worker2=1`
 			// makes it a second worker-mode profile instead.
 			if (callProfile === 2) {
@@ -381,8 +381,8 @@ mockIPC(async (cmd, args) => {
 		case 'log_err':
 			return;
 		case 'get_server_sync_status':
-			// The second profile has never been published or deployed —
-			// a profile switch must show its state, not profile 1's.
+			// The second profile has never been published or deployed.
+			// A profile switch must show its state, not profile 1's.
 			// `?worker2=1` instead makes it a worker remote with pending
 			// work, so its badge shows amber.
 			if (callProfile === 2)
@@ -406,7 +406,7 @@ mockIPC(async (cmd, args) => {
 			const syncStatus = {
 				mode: workerMode ? 'worker' : 'local',
 				worker: workerMode ? worker : null,
-				// A publication normally exists — `nopub` models a profile
+				// A publication normally exists. `nopub` models a profile
 				// that has never been published.
 				publicationRevision: params.has('nopub') ? null : '2026-09-22T00:00:00Z',
 				server: serverState(),

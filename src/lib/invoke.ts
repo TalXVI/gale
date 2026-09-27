@@ -21,7 +21,7 @@ type InvokeError = {
 };
 
 type InvokeOptions = {
-	/// Background calls skip the error toast — the failure is still
+	/// Background calls skip the error toast. The failure is still
 	/// logged and still throws to the caller.
 	quiet?: boolean;
 };

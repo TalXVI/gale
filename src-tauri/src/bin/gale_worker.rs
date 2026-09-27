@@ -83,9 +83,9 @@ enum ServiceAction {
 fn main() -> Result<()> {
     // rustls' provider auto-detection is ambiguous in this build (ring
     // and aws-lc-rs are both compiled in), and nothing else in this
-    // process installs a default. Pick one before any TLS use — FTPS
-    // sessions, HTTPS publication fetches, and package downloads all
-    // build ClientConfigs that would otherwise panic.
+    // process installs a default. Install one before FTPS sessions,
+    // HTTPS publication fetches, or package downloads. Each builds a
+    // ClientConfig that would otherwise panic.
     gale::install_crypto_provider();
 
     let args = Args::parse();
