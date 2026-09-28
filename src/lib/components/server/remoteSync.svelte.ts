@@ -18,17 +18,20 @@ import type { ServerFormState } from './serverForm.svelte';
 /// What the user decided for one config path.
 type Decision = 'apply' | 'restore' | 'decline';
 
+/// Which payload a preview or deploy targets.
+type PreviewScope = 'mods' | 'configs';
+
 /// The status/preview/deploy state for the remote tab. Credentials come
 /// from the connection fields on the same page. Typed but unsaved values
 /// are passed so the user can preview before saving.
 export class RemoteSync {
 	#form: ServerFormState;
 
-	/// Which payload the current preview targets. Mods are the routine
-	/// deployment; configs are a separate explicit push. The server owns
-	/// its config files after setup, so they are never bundled into the
-	/// primary sync operation.
-	previewScope = $state<'mods' | 'configs'>('mods');
+	/// The scope of `this.preview`, committed when a preview succeeds.
+	/// Mods are the routine deployment; configs are a separate explicit
+	/// push. The server owns its config files after setup, so they are
+	/// never bundled into the primary sync operation.
+	previewScope = $state<PreviewScope>('mods');
 	decisions = $state<Record<string, Decision>>({});
 	status = $state<ServerSyncStatus | null>(null);
 	preview = $state<ServerSyncPreview | null>(null);
@@ -39,8 +42,13 @@ export class RemoteSync {
 		JSON.stringify({ selection: this.selection(), restartPolicy: this.restartPolicy })
 	);
 	previewDirty = $derived(!this.preview || this.approvedInput !== this.currentInput);
+	/// The workflow the shared Preview action continues. A fresh start
+	/// is always mods; configs are entered through the section's own
+	/// button.
+	activeScope = $derived<PreviewScope>(this.preview ? this.previewScope : 'mods');
 	loadingStatus = $state(false);
-	previewing = $state(false);
+	previewingScope = $state<PreviewScope | null>(null);
+	previewing = $derived(this.previewingScope !== null);
 	deploying = $state(false);
 	progress = $state<OperationProgress | null>(null);
 	activeRun = $state<{ id: string; operation: 'preview' | 'deploy' } | null>(null);
@@ -326,14 +334,14 @@ export class RemoteSync {
 		return this.status?.mode === 'worker';
 	}
 
-	selection(): DeploySelection {
+	selection(scope: PreviewScope = this.previewScope): DeploySelection {
 		const applyConfigs: string[] = [];
 		const restoreConfigs: string[] = [];
 		const declineConfigs: string[] = [];
 
 		// A mods operation must serialize as literally config-free. Only
 		// the config workflow may carry decisions into the selection.
-		if (this.previewScope === 'configs') {
+		if (scope === 'configs') {
 			for (const [path, decision] of Object.entries(this.decisions)) {
 				if (decision === 'decline') {
 					declineConfigs.push(path);
@@ -347,22 +355,39 @@ export class RemoteSync {
 		}
 
 		return {
-			includeMods: this.previewScope === 'mods',
-			includeConfigs: this.previewScope === 'configs',
+			includeMods: scope === 'mods',
+			includeConfigs: scope === 'configs',
 			applyConfigs,
 			restoreConfigs,
 			declineConfigs
 		};
 	}
 
-	async previewSync(configs = false) {
-		this.previewScope = configs ? 'configs' : 'mods';
-		if (!configs) this.decisions = {};
+	previewConfigs() {
+		return this.#preview('configs');
+	}
+
+	repreview() {
+		return this.#preview(this.activeScope);
+	}
+
+	/// Leaves the config review without a backend request; the shared
+	/// Preview action falls back to the mods workflow.
+	exitConfigs() {
+		this.preview = null;
+		this.decisions = {};
+		this.approvedInput = '';
+		this.reviewOnly = false;
+		this.policyOverrides = {};
+		this.previewScope = 'mods';
+	}
+
+	async #preview(scope: PreviewScope) {
 		const runId = this.beginOperation('preview');
-		this.previewing = true;
+		this.previewingScope = scope;
 		this.result = null;
 		try {
-			const selected = this.selection();
+			const selected = this.selection(scope);
 			const policy = this.restartPolicy;
 			// The restart policy is bound into the plan hash, so the approval
 			// is only valid while this selection stands.
@@ -376,6 +401,8 @@ export class RemoteSync {
 			if (this.isWorker()) void this.pollWorkerProgress(runId);
 			const nextPreview = await operation;
 			if (!this.completeOperation(runId)) return;
+			this.previewScope = scope;
+			if (scope === 'mods') this.decisions = {};
 			this.preview = nextPreview;
 			this.policyOverrides = {};
 			this.approvedInput = JSON.stringify({ selection: selected, restartPolicy: policy });
@@ -386,7 +413,7 @@ export class RemoteSync {
 				kind: 'error'
 			});
 		} finally {
-			this.previewing = false;
+			this.previewingScope = null;
 		}
 	}
 

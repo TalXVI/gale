@@ -459,3 +459,133 @@ test('bulk decisions preserve scroll position and focus', async ({ page }) => {
 	await expect(declineAll).toBeFocused();
 	await expect(rows).toHaveCount(16);
 });
+
+const modsOnlySelection = {
+	includeMods: true,
+	includeConfigs: false,
+	applyConfigs: [],
+	restoreConfigs: [],
+	declineConfigs: []
+};
+const decidedConfigSelection = {
+	includeMods: false,
+	includeConfigs: true,
+	applyConfigs: ['BepInEx/config/test.cfg'],
+	restoreConfigs: ['BepInEx/config/test.cfg'],
+	declineConfigs: []
+};
+
+test('re-previewing config decisions stays config-only while mods are pending', async ({
+	page
+}) => {
+	await page.goto('/tests/dialog/?mode=worker&wpending=1');
+	const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
+	await expect(page.getByText('Update pending')).toBeVisible();
+
+	await remoteTab.getByText('Server config files', { exact: true }).click();
+	await remoteTab.getByRole('button', { name: 'Preview config changes', exact: true }).click();
+	expect(await lastSelection(page, 'preview_server_sync')).toMatchObject({
+		includeMods: false,
+		includeConfigs: true
+	});
+
+	await remoteTab
+		.getByRole('button', { name: 'Restore BepInEx/config/test.cfg', exact: true })
+		.click();
+	await expect(remoteTab.getByRole('button', { name: 'Push configs', exact: true })).toBeDisabled();
+
+	// Inside the config workflow the shared button takes over: there is
+	// no mods Preview or Deploy while it runs.
+	await expect(remoteTab.getByRole('button', { name: 'Preview', exact: true })).toHaveCount(0);
+	await expect(remoteTab.getByRole('button', { name: 'Deploy', exact: true })).toHaveCount(0);
+	const repreview = remoteTab.getByRole('button', { name: 'Preview config changes', exact: true });
+	await expect(repreview).toHaveCount(1);
+	await repreview.click();
+
+	expect(await lastSelection(page, 'preview_server_sync')).toEqual(decidedConfigSelection);
+	const previews = await page.evaluate(() =>
+		(window as any).calls.filter((call: any) => call.cmd === 'preview_server_sync')
+	);
+	expect(previews).toHaveLength(2);
+	for (const call of previews) {
+		expect(call.args.request.selection.includeMods).toBe(false);
+	}
+
+	await expect(remoteTab.getByRole('button', { name: 'Push configs', exact: true })).toBeEnabled();
+	await expect(remoteTab.getByRole('button', { name: 'Deploy', exact: true })).toHaveCount(0);
+	await remoteTab.getByRole('button', { name: 'Push configs', exact: true }).click();
+	await expect(page.getByText('Config synchronization finished.')).toBeVisible();
+	expect(await lastSelection(page, 'deploy_server_sync')).toEqual(decidedConfigSelection);
+
+	const calls = await page.evaluate(() => (window as any).calls);
+	for (const call of calls) {
+		if (call.cmd === 'preview_server_sync' || call.cmd === 'deploy_server_sync') {
+			expect(call.args.request.selection.includeMods).toBe(false);
+		}
+	}
+
+	// A config-only push never discharges the owed mod payload.
+	await remoteTab.getByRole('button', { name: 'Refresh', exact: true }).click();
+	await expect(page.getByText('Update pending')).toBeVisible();
+});
+
+test('a mods preview and re-preview stay mods-only; deploying them discharges pending mods', async ({
+	page
+}) => {
+	await page.goto('/tests/dialog/?mode=worker&wpending=1');
+	const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
+
+	await remoteTab.getByRole('button', { name: 'Preview', exact: true }).click();
+	expect(await lastSelection(page, 'preview_server_sync')).toEqual(modsOnlySelection);
+
+	await remoteTab.getByRole('button', { name: 'Preview', exact: true }).click();
+	expect(await lastSelection(page, 'preview_server_sync')).toEqual(modsOnlySelection);
+	expect(
+		await page.evaluate(
+			() => (window as any).calls.filter((call: any) => call.cmd === 'preview_server_sync').length
+		)
+	).toBe(2);
+	await expect(remoteTab.getByRole('button', { name: 'Deploy', exact: true })).toBeEnabled();
+
+	await expect(remoteTab.getByRole('button', { name: 'Push configs', exact: true })).toHaveCount(0);
+	await remoteTab.getByText('Server config files', { exact: true }).click();
+	await expect(
+		remoteTab.getByRole('button', { name: 'Preview config changes', exact: true })
+	).toBeVisible();
+
+	await remoteTab.getByRole('button', { name: 'Deploy', exact: true }).click();
+	await expect(page.getByText('Mod deployment finished.')).toBeVisible();
+	expect(await lastSelection(page, 'deploy_server_sync')).toEqual(modsOnlySelection);
+
+	// The mock discharges the pending revision only on a mods deploy,
+	// so the banner clears here while test A keeps it.
+	await remoteTab.getByRole('button', { name: 'Refresh', exact: true }).click();
+	await expect(page.getByText('Update pending')).toHaveCount(0);
+});
+
+test('leaving the config workflow returns the shared preview to mods', async ({ page }) => {
+	await page.goto('/tests/dialog/?mode=local');
+	const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
+	await remoteTab.getByText('Server config files', { exact: true }).click();
+	await remoteTab.getByRole('button', { name: 'Preview config changes', exact: true }).click();
+	await remoteTab
+		.getByRole('button', { name: 'Restore BepInEx/config/test.cfg', exact: true })
+		.click();
+
+	const callCounts = () =>
+		page.evaluate(() => {
+			const calls = (window as any).calls;
+			const count = (cmd: string) => calls.filter((call: any) => call.cmd === cmd).length;
+			return { preview: count('preview_server_sync'), deploy: count('deploy_server_sync') };
+		});
+	const before = await callCounts();
+
+	await remoteTab.getByRole('button', { name: 'Back to mod deployment', exact: true }).click();
+	expect(await callCounts()).toEqual(before);
+	await expect(page.getByTestId('server-config-row')).toHaveCount(0);
+	const sharedPreview = remoteTab.getByRole('button', { name: 'Preview', exact: true });
+	await expect(sharedPreview).toHaveCount(1);
+
+	await sharedPreview.click();
+	expect(await lastSelection(page, 'preview_server_sync')).toEqual(modsOnlySelection);
+});

@@ -106,13 +106,22 @@ const configEntries = manyConfigs
 			];
 // The plan mirrors the requested selection: config entries only exist
 // when the preview targeted configs. A mods sync never computes them.
+// While the worker owes a mod payload, a mods-phase plan uploads it.
 function planFor(selection: { includeMods: boolean; includeConfigs: boolean }) {
+	const uploads =
+		selection.includeMods && workerMode && worker.pendingRevision
+			? Array.from({ length: 3 }, (_, index) => ({
+					path: `BepInEx/plugins/Pending/mod-${index}.dll`,
+					size: 1024,
+					kind: 'payload'
+				}))
+			: [];
 	return {
 		hash: 'approved-plan',
-		uploads: [],
+		uploads,
 		removals: [],
 		unmanaged: Array.from({ length: plannedUnmanaged }, (_, index) => `Extra/file-${index}.dat`),
-		uploadBytes: 0,
+		uploadBytes: uploads.reduce((sum, upload) => sum + upload.size, 0),
 		unchangedFiles: selection.includeMods ? plannedUnchanged : 0,
 		modsPhase: selection.includeMods,
 		configsPhase: selection.includeConfigs,
@@ -509,9 +518,18 @@ mockIPC(async (cmd, args) => {
 			// The real command returns nothing; the page reflects the saved
 			// policy itself rather than waiting on a mutated preview.
 			return;
-		case 'deploy_server_sync':
+		case 'deploy_server_sync': {
+			const selection = (args as any).request.selection;
+			const plan = planFor(selection);
+			// Mirrors WorkerJournal::acknowledge_deployment: a mods-phase
+			// deploy settles the owed publication. Config-only pushes do
+			// not discharge owed mod work.
+			if (workerMode && selection.includeMods) {
+				worker.lastDeployedRevision = worker.pendingRevision ?? '2026-09-22T00:00:00Z';
+				worker.pendingRevision = null;
+			}
 			return {
-				plan: planFor((args as any).request.selection),
+				plan,
 				state: {},
 				summary: {
 					uploadedFiles: 0,
@@ -524,6 +542,7 @@ mockIPC(async (cmd, args) => {
 				failedConfigWrites: [],
 				warnings: []
 			};
+		}
 		default:
 			throw new Error(`Unexpected IPC: ${cmd}`);
 	}

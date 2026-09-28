@@ -289,11 +289,11 @@
 	<div class="ml-auto flex flex-wrap items-center gap-2">
 		<Button
 			icon="mdi:cloud-search"
-			loading={sync.previewing && sync.previewScope === 'mods'}
+			loading={sync.previewingScope !== null && sync.previewingScope === sync.activeScope}
 			disabled={sync.busy || settingsDirty || noPublication}
-			onclick={() => sync.previewSync()}
+			onclick={() => sync.repreview()}
 		>
-			{m.serverSync_preview()}
+			{sync.activeScope === 'configs' ? m.serverSync_previewConfigs() : m.serverSync_preview()}
 		</Button>
 		{#if sync.preview?.busy?.stale}
 			<Button
@@ -316,7 +316,7 @@
 					noPublication}
 				onclick={() => sync.deploy()}
 			>
-				{sync.previewScope === 'configs' ? m.serverSync_deployConfigs() : m.serverSync_deploy()}
+				{sync.activeScope === 'configs' ? m.serverSync_deployConfigs() : m.serverSync_deploy()}
 			</Button>
 		{/if}
 	</div>
@@ -330,13 +330,19 @@
 		<p class="text-primary-600 dark:text-primary-300 text-sm">
 			{m.serverSync_configSectionHelp()}
 		</p>
-		<Button
-			icon="mdi:cloud-search"
-			loading={sync.previewing && sync.previewScope === 'configs'}
-			disabled={sync.busy || settingsDirty || noPublication}
-			onclick={() => sync.previewSync(true)}
-		>
-			{m.serverSync_previewConfigs()}
-		</Button>
+		{#if sync.activeScope === 'configs'}
+			<Button icon="mdi:arrow-left" disabled={sync.busy} onclick={() => sync.exitConfigs()}>
+				{m.serverSync_exitConfigs()}
+			</Button>
+		{:else}
+			<Button
+				icon="mdi:cloud-search"
+				loading={sync.previewingScope === 'configs'}
+				disabled={sync.busy || settingsDirty || noPublication}
+				onclick={() => sync.previewConfigs()}
+			>
+				{m.serverSync_previewConfigs()}
+			</Button>
+		{/if}
 	</div>
 </details>

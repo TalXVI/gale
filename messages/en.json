@@ -222,6 +222,7 @@
 	"serverSync_deployed_modsDone": "Mod deployment finished.",
 	"serverSync_deployFailedTitle": "Deployment failed",
 	"serverSync_dirtyHint": "Selection changed. Preview again before deploying.",
+	"serverSync_exitConfigs": "Back to mod deployment",
 	"serverSync_failedConfigs": "Could not write selected config files ({count}). Those changes were not applied.",
 	"serverSync_futurePolicy": "Future updates for {path}",
 	"serverSync_futureUpdates": "Future updates",
