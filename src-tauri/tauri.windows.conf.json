@@ -1,5 +1,12 @@
 {
 	"build": {
-		"features": ["worker"]
+		"features": [
+			"worker"
+		]
+	},
+	"bundle": {
+		"targets": [
+			"msi"
+		]
 	}
 }
