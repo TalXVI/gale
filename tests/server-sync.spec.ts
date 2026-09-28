@@ -1,5 +1,18 @@
 import { test, expect } from '@playwright/test';
 
+for (const [scenario, expected] of [
+	['', 'Deleted from server'],
+	['&many=1', 'Modified on server']
+] as const) {
+	test(`server config review describes the remote copy: ${expected}`, async ({ page }) => {
+		await page.goto(`/tests/dialog/?status=upToDate${scenario}`);
+		const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
+		await remoteTab.getByText('Server config files', { exact: true }).click();
+		await remoteTab.getByRole('button', { name: 'Preview config changes' }).click();
+		await expect(page.getByTestId('server-config-row').first().getByText(expected)).toBeVisible();
+	});
+}
+
 test('worker poll and deployment errors render independently', async ({ page }) => {
 	await page.goto('/tests/dialog/?mode=worker');
 	const pollError = 'Publication check failed: sync token request failed';

@@ -87,14 +87,14 @@ export type SyncUser = {
 
 export type SyncPublishMode =
 	| { kind: 'mods' }
-	| { kind: 'config'; files: string[] }
-	| { kind: 'both'; files: string[] };
+	| { kind: 'config'; files: string[]; removeFiles: string[] }
+	| { kind: 'both'; files: string[]; removeFiles: string[] };
 
-export type SyncConfigFileStatus = 'new' | 'modified' | 'published';
+export type SyncConfigFileStatus = 'new' | 'modified' | 'published' | 'removed';
 
 export type SyncConfigFileInfo = {
 	path: string;
-	size: number;
+	size: number | null;
 	status: SyncConfigFileStatus;
 };
 

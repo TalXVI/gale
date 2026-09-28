@@ -42,15 +42,23 @@ pub(super) async fn publication_guard() -> MutexGuard<'static, ()> {
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum PublishMode {
     Mods,
-    Config { files: Vec<ConfigPath> },
-    Both { files: Vec<ConfigPath> },
+    Config {
+        files: Vec<ConfigPath>,
+        #[serde(default, rename = "removeFiles")]
+        remove_files: Vec<ConfigPath>,
+    },
+    Both {
+        files: Vec<ConfigPath>,
+        #[serde(default, rename = "removeFiles")]
+        remove_files: Vec<ConfigPath>,
+    },
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncConfigFileInfo {
     pub path: ConfigPath,
-    pub size: u64,
+    pub size: Option<u64>,
     pub status: SyncConfigFileStatus,
 }
 
@@ -60,6 +68,7 @@ pub enum SyncConfigFileStatus {
     New,
     Modified,
     Published,
+    Removed,
 }
 
 fn snapshot_dir(profile_dir: &Path) -> PathBuf {
@@ -229,26 +238,56 @@ fn merge_publication(
 ) -> Result<(ProfileManifest, BTreeMap<ConfigPath, Vec<u8>>)> {
     let (manifest, selection) = match mode {
         PublishMode::Mods => (live_manifest, None),
-        PublishMode::Config { files } => {
-            ensure!(!files.is_empty(), "no config files selected");
-            (published_manifest, Some(files))
+        PublishMode::Config {
+            files,
+            remove_files,
+        } => {
+            ensure!(
+                !files.is_empty() || !remove_files.is_empty(),
+                "no config files selected"
+            );
+            (published_manifest, Some((files, remove_files)))
         }
-        PublishMode::Both { files } => (live_manifest, Some(files)),
+        PublishMode::Both {
+            files,
+            remove_files,
+        } => (live_manifest, Some((files, remove_files))),
     };
 
     let mut config = published_bytes;
 
-    if let Some(files) = selection {
-        let mut seen = HashSet::new();
-        for path in files {
+    if let Some((files, remove_files)) = selection {
+        let mut writes = HashSet::new();
+        for path in &files {
+            ensure!(writes.insert(path), "duplicate config selection: {path}");
             ensure!(
-                seen.insert(path.clone()),
-                "duplicate config selection: {path}"
+                live_config.contains_key(path),
+                "selected config file is missing locally: {path}"
             );
-            let Some(bytes) = live_config.get(&path) else {
-                bail!("selected config file is missing locally: {path}");
-            };
-            config.insert(path, bytes.clone());
+        }
+
+        let mut removals = HashSet::new();
+        for path in &remove_files {
+            ensure!(
+                !writes.contains(path),
+                "config file is both updated and removed: {path}"
+            );
+            ensure!(removals.insert(path), "duplicate config removal: {path}");
+            ensure!(
+                config.contains_key(path),
+                "config file is not published: {path}"
+            );
+            ensure!(
+                !live_config.contains_key(path),
+                "config file still exists locally: {path}"
+            );
+        }
+
+        for path in files {
+            config.insert(path.clone(), live_config[&path].clone());
+        }
+        for path in remove_files {
+            config.remove(&path);
         }
     }
 
@@ -534,23 +573,42 @@ pub(super) async fn list_config_files(
         )
     };
 
-    live_config
-        .into_iter()
+    Ok(config_file_info(live_config, published_config))
+}
+
+fn config_file_info(
+    live_config: BTreeMap<ConfigPath, Vec<u8>>,
+    published_config: BTreeMap<ConfigPath, ContentHash>,
+) -> Vec<SyncConfigFileInfo> {
+    let mut files: Vec<_> = live_config
+        .iter()
         .map(|(path, bytes)| {
-            let status = match published_config.get(&path) {
-                Some(hash) if ContentHash::from_hash(blake3::hash(&bytes)) == *hash => {
+            let status = match published_config.get(path) {
+                Some(hash) if ContentHash::from_hash(blake3::hash(bytes)) == *hash => {
                     SyncConfigFileStatus::Published
                 }
                 Some(_) => SyncConfigFileStatus::Modified,
                 None => SyncConfigFileStatus::New,
             };
-            Ok(SyncConfigFileInfo {
-                path,
-                size: bytes.len() as u64,
+            SyncConfigFileInfo {
+                path: path.clone(),
+                size: Some(bytes.len() as u64),
                 status,
-            })
+            }
         })
-        .collect()
+        .collect();
+    files.extend(
+        published_config
+            .keys()
+            .filter(|path| !live_config.contains_key(*path))
+            .map(|path| SyncConfigFileInfo {
+                path: path.clone(),
+                size: None,
+                status: SyncConfigFileStatus::Removed,
+            }),
+    );
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    files
 }
 
 #[cfg(test)]
@@ -720,6 +778,23 @@ mod tests {
     }
 
     #[test]
+    fn missing_published_config_is_listed_as_removed() {
+        let a = config_path("BepInEx/config/a.cfg");
+        let b = config_path("BepInEx/config/b.cfg");
+        let live = BTreeMap::from([(a.clone(), b"a".to_vec())]);
+        let published = published_state_with(&[
+            ("BepInEx/config/a.cfg", b"a"),
+            ("BepInEx/config/b.cfg", b"b"),
+        ]);
+
+        let files = config_file_info(live, published.config);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, a);
+        assert_eq!(files[1].path, b);
+        assert_eq!(serde_json::to_value(&files[1].status).unwrap(), "removed");
+    }
+
+    #[test]
     fn merge_modes() {
         let published_manifest = base_manifest();
         let live_manifest = ProfileManifest {
@@ -757,6 +832,7 @@ mod tests {
         let (manifest, config) = merge_publication(
             PublishMode::Config {
                 files: vec![sel_path.clone()],
+                remove_files: vec![],
             },
             published_manifest.clone(),
             published_bytes.clone(),
@@ -775,6 +851,7 @@ mod tests {
         let (manifest, config) = merge_publication(
             PublishMode::Both {
                 files: vec![sel_path.clone()],
+                remove_files: vec![],
             },
             published_manifest.clone(),
             published_bytes.clone(),
@@ -790,7 +867,10 @@ mod tests {
         assert_eq!(config[&old_path], b"old");
 
         let (_, config) = merge_publication(
-            PublishMode::Both { files: vec![] },
+            PublishMode::Both {
+                files: vec![],
+                remove_files: vec![],
+            },
             published_manifest.clone(),
             published_bytes.clone(),
             live_manifest.clone(),
@@ -801,7 +881,10 @@ mod tests {
 
         assert!(
             merge_publication(
-                PublishMode::Config { files: vec![] },
+                PublishMode::Config {
+                    files: vec![],
+                    remove_files: vec![],
+                },
                 published_manifest.clone(),
                 published_bytes.clone(),
                 live_manifest.clone(),
@@ -813,6 +896,7 @@ mod tests {
             merge_publication(
                 PublishMode::Config {
                     files: vec![sel_path.clone(), sel_path.clone()],
+                    remove_files: vec![],
                 },
                 published_manifest.clone(),
                 published_bytes.clone(),
@@ -825,6 +909,7 @@ mod tests {
             merge_publication(
                 PublishMode::Config {
                     files: vec![config_path("missing.cfg")],
+                    remove_files: vec![],
                 },
                 published_manifest,
                 published_bytes,
@@ -833,6 +918,83 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn published_config_is_removed_only_when_explicitly_selected() {
+        let a = config_path("BepInEx/config/a.cfg");
+        let b = config_path("BepInEx/config/b.cfg");
+        let published = BTreeMap::from([(a.clone(), b"a".to_vec()), (b.clone(), b"b".to_vec())]);
+        let live = BTreeMap::from([(a.clone(), b"a".to_vec())]);
+
+        let (_, retained) = merge_publication(
+            serde_json::from_value(serde_json::json!({
+                "kind": "config", "files": [a], "removeFiles": []
+            }))
+            .unwrap(),
+            base_manifest(),
+            published.clone(),
+            base_manifest(),
+            &live,
+        )
+        .unwrap();
+        assert_eq!(retained[&b], b"b");
+
+        let (_, removed) = merge_publication(
+            serde_json::from_value(serde_json::json!({
+                "kind": "config", "files": [], "removeFiles": [b]
+            }))
+            .unwrap(),
+            base_manifest(),
+            published,
+            base_manifest(),
+            &live,
+        )
+        .unwrap();
+        assert_eq!(removed, live);
+
+        let (archive, state) = build_publication("Test", base_manifest(), &removed).unwrap();
+        assert!(!state.config.contains_key(&b));
+        assert!(!archive::validate(&archive).unwrap().config.contains_key(&b));
+    }
+
+    #[test]
+    fn invalid_publication_removals_are_rejected() {
+        let a = config_path("BepInEx/config/a.cfg");
+        let b = config_path("BepInEx/config/b.cfg");
+        let c = config_path("BepInEx/config/c.cfg");
+        let published = BTreeMap::from([(a.clone(), b"a".to_vec()), (b.clone(), b"b".to_vec())]);
+        let live = BTreeMap::from([(a.clone(), b"a".to_vec())]);
+
+        for (request, expected) in [
+            (
+                serde_json::json!({ "kind": "config", "files": [], "removeFiles": [c] }),
+                "not published",
+            ),
+            (
+                serde_json::json!({ "kind": "config", "files": [a], "removeFiles": [a] }),
+                "both updated and removed",
+            ),
+            (
+                serde_json::json!({ "kind": "config", "files": [], "removeFiles": [b, b] }),
+                "duplicate config removal",
+            ),
+            (
+                serde_json::json!({ "kind": "config", "files": [], "removeFiles": [a] }),
+                "still exists locally",
+            ),
+        ] {
+            let mode = serde_json::from_value(request).unwrap();
+            let error = merge_publication(
+                mode,
+                base_manifest(),
+                published.clone(),
+                base_manifest(),
+                &live,
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
     }
 
     #[test]

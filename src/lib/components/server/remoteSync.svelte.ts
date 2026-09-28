@@ -481,8 +481,8 @@ export class RemoteSync {
 				return m.serverSync_actionDeclined();
 			case 'pending':
 				return entry.reason === 'deletedLocally'
-					? m.syncConfigReviewDialog_reason_deletedLocally()
-					: m.syncConfigReviewDialog_reason_modifiedLocally();
+					? m.serverSync_reason_deletedFromServer()
+					: m.serverSync_reason_modifiedOnServer();
 			case 'unapplied':
 				return m.serverSync_actionUnapplied();
 		}

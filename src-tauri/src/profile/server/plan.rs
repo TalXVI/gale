@@ -887,6 +887,50 @@ mod tests {
     }
 
     #[test]
+    fn removed_publication_config_is_absent_from_preview_and_cannot_be_selected() {
+        let fixture = fixture();
+        let path = config_path("BepInEx/config/server-only.cfg");
+        let mut snapshot = empty_snapshot();
+        snapshot
+            .config_remote
+            .insert(path.clone(), Some(hash_of(b"server")));
+        snapshot.state.config.insert(
+            path.clone(),
+            AppliedFile {
+                applied: Some(hash_of(b"formerly-published")),
+                ..Default::default()
+            },
+        );
+
+        let plan = build_plan(
+            &fixture.publication(),
+            &DesiredDeployment::default(),
+            &snapshot,
+            &selection(false, true),
+            &context(),
+            &spec(),
+        )
+        .unwrap();
+        assert!(plan.config_entries.is_empty());
+        assert!(plan.uploads.is_empty());
+        assert!(plan.removals.is_empty());
+
+        let mut select_old_config = selection(false, true);
+        select_old_config.apply_configs.push(path);
+        assert!(
+            build_plan(
+                &fixture.publication(),
+                &DesiredDeployment::default(),
+                &snapshot,
+                &select_old_config,
+                &context(),
+                &spec(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn remote_deleted_applied_config_needs_restore_authorization() {
         let mut fixture = fixture();
         let path = config_path("BepInEx/config/mod.cfg");

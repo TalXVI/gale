@@ -306,6 +306,19 @@ mockIPC(async (cmd, args) => {
 			return params.has('authUser') && !mockAuthExpired
 				? { discordId: '1', name: 'owner', displayName: 'Owner', avatar: null }
 				: null;
+		case 'get_sync_config_files':
+			return [
+				{ path: 'BepInEx/config/new.cfg', size: 10, status: 'new' },
+				{ path: 'BepInEx/config/modified.cfg', size: 20, status: 'modified' },
+				{ path: 'BepInEx/config/published.cfg', size: 30, status: 'published' },
+				{
+					path: 'BepInEx/config/ArgusMagnus.ServersideQoL.cfg',
+					size: null,
+					status: 'removed'
+				}
+			];
+		case 'push_sync_profile':
+			return;
 		case 'get_dedicated_server_settings':
 			if (settings == null) return null;
 			// Profile 2 is a plain manual-sync profile. The navbar must
@@ -499,6 +512,9 @@ document.documentElement.classList.add('dark');
 if (params.get('component') === 'regression') {
 	const { default: RegressionHarness } = await import('./RegressionHarness.svelte');
 	mount(RegressionHarness, { target: document.getElementById('app')! });
+} else if (params.get('component') === 'publish') {
+	const { default: PublishHarness } = await import('./PublishHarness.svelte');
+	mount(PublishHarness, { target: document.getElementById('app')! });
 } else {
 	const { default: Harness } = await import('./Harness.svelte');
 	const { default: profiles } = await import('$lib/state/profile.svelte');

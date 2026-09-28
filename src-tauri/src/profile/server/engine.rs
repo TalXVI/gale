@@ -2409,6 +2409,56 @@ mod tests {
     }
 
     #[test]
+    fn publication_config_removal_leaves_remote_copy_untouched() {
+        let path = config_path("BepInEx/config/server-only.cfg");
+        let publication = mod_fixture().publication();
+        let memory = remote();
+        let mut previous = ServerDeploymentState {
+            version: state::VERSION,
+            ..Default::default()
+        };
+        previous.record_applied(&path, &config_file(b"formerly-published").hash);
+        {
+            let mut remote = memory.lock().unwrap();
+            remote.put_file(STATE_REMOTE, &state::serialize(&previous).unwrap());
+            remote.put_file("/srv/BepInEx/config/server-only.cfg", b"server-customized");
+        }
+
+        let mut session = open(memory.clone()).unwrap();
+        let selected = selection(false, true);
+        let previewed = preview(
+            &mut session,
+            &publication,
+            &DesiredDeployment::default(),
+            &selected,
+            &context(),
+            &meta(),
+        )
+        .unwrap();
+        assert!(previewed.plan.config_entries.is_empty());
+        assert!(previewed.plan.uploads.is_empty());
+        assert!(previewed.plan.removals.is_empty());
+
+        let deployed = deploy(
+            &mut session,
+            no_connect,
+            &publication,
+            &DesiredDeployment::default(),
+            &selected,
+            &context(),
+            &meta(),
+            None,
+            false,
+        )
+        .unwrap();
+        finish(&mut session, deployed, RestartOutcome::NotRequired, &meta()).unwrap();
+        assert_eq!(
+            remote_contents(&memory, "/srv/BepInEx/config/server-only.cfg"),
+            Some(b"server-customized".to_vec())
+        );
+    }
+
+    #[test]
     fn out_of_scope_published_text_does_not_write_or_recreate_config_records() {
         let ordinary = config_path("BepInEx/config/mod.cfg");
         let translation = config_path("BepInEx/plugins/Mod/translations/en.json");
