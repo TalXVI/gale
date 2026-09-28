@@ -84,9 +84,17 @@
 					<span class="text-orange-600 dark:text-orange-400">
 						{m.serverSync_reviewRemaining({ count: sync.remainingDecisions })}
 					</span>
-					<Button disabled={sync.busy} onclick={() => (sync.reviewOnly = !sync.reviewOnly)}>
-						{sync.reviewOnly ? m.serverSync_showAllConfigs() : m.serverSync_reviewOnly()}
-					</Button>
+					<div class="flex flex-wrap items-center gap-2">
+						<Button disabled={sync.busy} onclick={() => sync.decideAll('apply')}>
+							{m.serverSync_applyAll()}
+						</Button>
+						<Button disabled={sync.busy} onclick={() => sync.decideAll('decline')}>
+							{m.serverSync_declineAll()}
+						</Button>
+						<Button disabled={sync.busy} onclick={() => (sync.reviewOnly = !sync.reviewOnly)}>
+							{sync.reviewOnly ? m.serverSync_showAllConfigs() : m.serverSync_reviewOnly()}
+						</Button>
+					</div>
 				</div>
 				<p class="text-primary-600 dark:text-primary-300 mt-2 text-sm">
 					{m.serverSync_policyHelp()}

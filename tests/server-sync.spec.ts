@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, type Page } from '@playwright/test';
 
 for (const [scenario, expected] of [
 	['', 'Deleted from server'],
@@ -261,3 +261,201 @@ for (const operation of ['preview_server_sync', 'deploy_server_sync', 'set_serve
 		await expect(preview).toBeEnabled();
 	});
 }
+
+// `?mixed=1` seeds 16 config entries: 8 pending (5 modified on the
+// server, 3 deleted from it) plus markApplied/write/unapplied/decline
+// rows the bulk buttons must leave alone.
+const mixedPending = Array.from(
+	{ length: 8 },
+	(_, index) => `BepInEx/config/mixed-${String(index).padStart(2, '0')}.cfg`
+);
+const mixedDeleted = mixedPending.slice(5);
+
+function lastSelection(page: Page, cmd: string) {
+	return page.evaluate(
+		(command) =>
+			(window as any).calls.filter((call: any) => call.cmd === command).at(-1).args.request
+				.selection,
+		cmd
+	);
+}
+
+test('bulk decisions stage every pending config without a server call', async ({ page }) => {
+	await page.goto('/tests/dialog/?mode=local&mixed=1');
+	const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
+	await remoteTab.getByText('Server config files', { exact: true }).click();
+	const preview = remoteTab.getByRole('button', { name: 'Preview config changes', exact: true });
+	await preview.click();
+	const rows = page.getByTestId('server-config-row');
+	await expect(rows).toHaveCount(16);
+	await expect(rows.filter({ hasText: 'Modified on server' })).toHaveCount(5);
+	await expect(rows.filter({ hasText: 'Deleted from server' })).toHaveCount(3);
+	await expect(page.getByText('8 files still need a decision')).toBeVisible();
+
+	// Per-file picks the bulk buttons must overwrite; the 'unapplied'
+	// row keeps its pick because bulk decisions only touch pending.
+	await remoteTab
+		.getByRole('button', { name: 'Decline BepInEx/config/mixed-00.cfg', exact: true })
+		.click();
+	await remoteTab
+		.getByRole('button', { name: 'Restore BepInEx/config/mixed-05.cfg', exact: true })
+		.click();
+	await remoteTab
+		.getByRole('button', { name: 'Apply BepInEx/config/mixed-11.cfg', exact: true })
+		.click();
+	await expect(page.getByText('6 files still need a decision')).toBeVisible();
+
+	const callCounts = () =>
+		page.evaluate(() => {
+			const calls = (window as any).calls;
+			const count = (cmd: string) => calls.filter((call: any) => call.cmd === cmd).length;
+			return {
+				preview: count('preview_server_sync'),
+				deploy: count('deploy_server_sync'),
+				policy: count('set_server_config_policy')
+			};
+		});
+
+	const beforeApply = await callCounts();
+	await remoteTab.getByRole('button', { name: 'Apply all', exact: true }).click();
+	expect(await callCounts()).toEqual(beforeApply);
+	await expect(page.getByText('0 files still need a decision')).toBeVisible();
+	// The declined pending row was overwritten; the unapplied row's
+	// individual Apply stands.
+	await expect(rows.filter({ hasText: 'Will apply' })).toHaveCount(9);
+	await expect(rows.filter({ hasText: 'Will decline' })).toHaveCount(0);
+
+	await preview.click();
+	let selected = await lastSelection(page, 'preview_server_sync');
+	expect([...selected.applyConfigs].sort()).toEqual(
+		[...mixedPending, 'BepInEx/config/mixed-11.cfg'].sort()
+	);
+	expect([...selected.restoreConfigs].sort()).toEqual([...mixedDeleted].sort());
+	expect(selected.declineConfigs).toEqual([]);
+
+	const beforeDecline = await callCounts();
+	await remoteTab.getByRole('button', { name: 'Decline all', exact: true }).click();
+	expect(await callCounts()).toEqual(beforeDecline);
+	await expect(page.getByText('0 files still need a decision')).toBeVisible();
+	await expect(rows.filter({ hasText: 'Will decline' })).toHaveCount(8);
+	await expect(rows.filter({ hasText: 'Will apply' })).toHaveCount(1);
+
+	await preview.click();
+	selected = await lastSelection(page, 'preview_server_sync');
+	expect([...selected.declineConfigs].sort()).toEqual([...mixedPending].sort());
+	expect(selected.applyConfigs).toEqual(['BepInEx/config/mixed-11.cfg']);
+	expect(selected.restoreConfigs).toEqual([]);
+
+	await remoteTab.getByRole('button', { name: 'Push configs', exact: true }).click();
+	await expect(page.getByText('Config synchronization finished.')).toBeVisible();
+	const deployed = await lastSelection(page, 'deploy_server_sync');
+	expect([...deployed.declineConfigs].sort()).toEqual([...mixedPending].sort());
+	expect(deployed.applyConfigs).toEqual(['BepInEx/config/mixed-11.cfg']);
+	expect(deployed.restoreConfigs).toEqual([]);
+});
+
+test('bulk decisions under the review filter still cover every pending entry', async ({ page }) => {
+	await page.goto('/tests/dialog/?mode=local&mixed=1');
+	const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
+	await remoteTab.getByText('Server config files', { exact: true }).click();
+	const preview = remoteTab.getByRole('button', { name: 'Preview config changes', exact: true });
+	await preview.click();
+	const rows = page.getByTestId('server-config-row');
+	await expect(rows).toHaveCount(16);
+	await remoteTab.getByRole('button', { name: 'Show files needing review', exact: true }).click();
+	await expect(rows).toHaveCount(8);
+
+	await remoteTab.getByRole('button', { name: 'Apply all', exact: true }).click();
+	await expect(page.getByText('0 files still need a decision')).toBeVisible();
+	await remoteTab.getByRole('button', { name: 'Show all config files', exact: true }).click();
+	await expect(rows).toHaveCount(16);
+	await preview.click();
+	let selected = await lastSelection(page, 'preview_server_sync');
+	expect([...selected.applyConfigs].sort()).toEqual([...mixedPending].sort());
+	expect([...selected.restoreConfigs].sort()).toEqual([...mixedDeleted].sort());
+	expect(selected.declineConfigs).toEqual([]);
+	// Non-pending rows were never staged.
+	const applied = page.locator('[data-path="BepInEx/config/mixed-08.cfg"]');
+	await expect(applied).toContainText('Up to date');
+	await expect(applied).not.toContainText('Will');
+	const declined = page.locator('[data-path="BepInEx/config/mixed-13.cfg"]');
+	await expect(declined).toContainText('Declined');
+	await expect(declined).not.toContainText('Will');
+
+	await remoteTab.getByRole('button', { name: 'Show files needing review', exact: true }).click();
+	await expect(rows).toHaveCount(8);
+	await remoteTab.getByRole('button', { name: 'Decline all', exact: true }).click();
+	await remoteTab.getByRole('button', { name: 'Show all config files', exact: true }).click();
+	await preview.click();
+	selected = await lastSelection(page, 'preview_server_sync');
+	expect([...selected.declineConfigs].sort()).toEqual([...mixedPending].sort());
+	expect(selected.applyConfigs).toEqual([]);
+	expect(selected.restoreConfigs).toEqual([]);
+});
+
+test('bulk decisions preserve scroll position and focus', async ({ page }) => {
+	await page.setViewportSize({ width: 1400, height: 650 });
+	await page.goto('/tests/dialog/?mode=local&mixed=1');
+	const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
+	await remoteTab.getByText('Server config files', { exact: true }).click();
+	await remoteTab.getByRole('button', { name: 'Preview config changes', exact: true }).click();
+	const rows = page.getByTestId('server-config-row');
+	await expect(rows).toHaveCount(16);
+	const applyAll = remoteTab.getByRole('button', { name: 'Apply all', exact: true });
+	const declineAll = remoteTab.getByRole('button', { name: 'Decline all', exact: true });
+
+	const inner = rows.first().locator('xpath=..');
+	expect(await inner.evaluate((el) => el.scrollHeight > el.clientHeight)).toBe(true);
+	const outerHandle = await inner.evaluateHandle((el) => {
+		let node = el.parentElement;
+		while (node) {
+			const { overflowY } = getComputedStyle(node);
+			if ((overflowY === 'auto' || overflowY === 'scroll') && node.scrollHeight > node.clientHeight)
+				return node;
+			node = node.parentElement;
+		}
+		return null;
+	});
+	const outer = outerHandle.asElement();
+	expect(outer).not.toBeNull();
+
+	const innerTop = await inner.evaluate((el) => {
+		el.scrollTop = Math.floor((el.scrollHeight - el.clientHeight) / 2);
+		return el.scrollTop;
+	});
+	expect(innerTop).toBeGreaterThan(0);
+	const outerTop = await outer!.evaluate(
+		(el, anchor) => {
+			el.scrollTop += anchor.getBoundingClientRect().top - window.innerHeight / 2;
+			return el.scrollTop;
+		},
+		await applyAll.elementHandle()
+	);
+	expect(outerTop).toBeGreaterThan(0);
+	const windowY = await page.evaluate(() => window.scrollY);
+	const settle = () =>
+		page.evaluate(
+			() =>
+				new Promise<void>((resolve) =>
+					requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+				)
+		);
+
+	await applyAll.click();
+	await expect(page.getByText('0 files still need a decision')).toBeVisible();
+	await settle();
+	expect(await inner.evaluate((el) => el.scrollTop)).toBe(innerTop);
+	expect(await outer!.evaluate((el) => el.scrollTop)).toBe(outerTop);
+	expect(await page.evaluate(() => window.scrollY)).toBe(windowY);
+	await expect(applyAll).toBeFocused();
+	await expect(rows).toHaveCount(16);
+
+	await declineAll.click();
+	await expect(rows.filter({ hasText: 'Will decline' })).toHaveCount(8);
+	await settle();
+	expect(await inner.evaluate((el) => el.scrollTop)).toBe(innerTop);
+	expect(await outer!.evaluate((el) => el.scrollTop)).toBe(outerTop);
+	expect(await page.evaluate(() => window.scrollY)).toBe(windowY);
+	await expect(declineAll).toBeFocused();
+	await expect(rows).toHaveCount(16);
+});

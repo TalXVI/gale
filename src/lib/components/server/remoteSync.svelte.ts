@@ -395,6 +395,16 @@ export class RemoteSync {
 		else this.decisions[path] = decision;
 	}
 
+	/// Stages one decision for every pending entry, overwriting earlier
+	/// per-file picks. Apply restores files the server deleted.
+	decideAll(decision: 'apply' | 'decline') {
+		for (const entry of this.preview?.plan.configEntries ?? []) {
+			if (entry.action !== 'pending') continue;
+			this.decisions[entry.path] =
+				decision === 'apply' && entry.reason === 'deletedLocally' ? 'restore' : decision;
+		}
+	}
+
 	/// A persistent per-file policy for *future* revisions, distinct from
 	/// the one-time Apply/Decline decision for the current conflict.
 	async setPolicy(path: string, policy: SyncConfigUpdatePolicy) {

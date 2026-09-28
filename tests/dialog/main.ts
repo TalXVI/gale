@@ -73,14 +73,37 @@ const configEntries = manyConfigs
 			reason: 'modifiedLocally',
 			policy: 'ask'
 		}))
-	: [
-			{
-				path: 'BepInEx/config/test.cfg',
-				action: 'pending',
-				reason: 'deletedLocally',
-				policy: 'ask'
-			}
-		];
+	: params.has('mixed')
+		? [
+				...Array.from({ length: 5 }, (_, index) => ({
+					path: `BepInEx/config/mixed-${String(index).padStart(2, '0')}.cfg`,
+					action: 'pending',
+					reason: 'modifiedLocally',
+					policy: 'ask'
+				})),
+				...Array.from({ length: 3 }, (_, index) => ({
+					path: `BepInEx/config/mixed-${String(index + 5).padStart(2, '0')}.cfg`,
+					action: 'pending',
+					reason: 'deletedLocally',
+					policy: 'ask'
+				})),
+				{ path: 'BepInEx/config/mixed-08.cfg', action: 'markApplied', policy: 'ask' },
+				{ path: 'BepInEx/config/mixed-09.cfg', action: 'markApplied', policy: 'ask' },
+				{ path: 'BepInEx/config/mixed-10.cfg', action: 'write', policy: 'ask' },
+				{ path: 'BepInEx/config/mixed-11.cfg', action: 'unapplied', policy: 'ask' },
+				{ path: 'BepInEx/config/mixed-12.cfg', action: 'unapplied', policy: 'ask' },
+				{ path: 'BepInEx/config/mixed-13.cfg', action: 'decline', policy: 'ask' },
+				{ path: 'BepInEx/config/mixed-14.cfg', action: 'markApplied', policy: 'ask' },
+				{ path: 'BepInEx/config/mixed-15.cfg', action: 'write', policy: 'ask' }
+			]
+		: [
+				{
+					path: 'BepInEx/config/test.cfg',
+					action: 'pending',
+					reason: 'deletedLocally',
+					policy: 'ask'
+				}
+			];
 // The plan mirrors the requested selection: config entries only exist
 // when the preview targeted configs. A mods sync never computes them.
 function planFor(selection: { includeMods: boolean; includeConfigs: boolean }) {
