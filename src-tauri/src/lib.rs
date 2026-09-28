@@ -124,7 +124,7 @@ fn is_flatpak() -> bool {
     clippy::too_many_lines,
     reason = "tauri's generate_handler macro cannot be split"
 )]
-pub fn run() {
+pub fn run(context: tauri::Context) {
     logger::setup().unwrap_or_else(|err| {
         eprintln!("failed to set up logger: {err:#}");
     });
@@ -266,7 +266,7 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(handle_single_instance))
         .plugin(tauri_plugin_store::Builder::new().build())
         .setup(setup)
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while running tauri application")
         .run(event_handler);
 }

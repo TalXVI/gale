@@ -5,7 +5,7 @@
 	"scripts": {
 		"dev": "vite dev",
 		"build": "vite build",
-		"build:worker": "node scripts/build-worker.mjs",
+		"build:worker": "cargo build --manifest-path src-tauri/Cargo.toml --features worker --bin gale-worker --bin gale-worker-tray",
 		"preview": "vite preview",
 		"prepare": "svelte-kit sync",
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
