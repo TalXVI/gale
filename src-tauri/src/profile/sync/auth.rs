@@ -6,16 +6,18 @@ use std::{
 
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
-use eyre::{Context, OptionExt, Result, eyre};
+use eyre::{Context, OptionExt, Result, bail, eyre};
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager, Url};
-use tokio::sync::broadcast;
+use tauri::{AppHandle, Emitter, Manager, Url};
+use tokio::sync::{Mutex as AsyncMutex, broadcast};
 use tracing::{debug, error, info, warn};
 
 use crate::{db::Db, state::ManagerExt};
 
 pub struct State {
     creds: Mutex<Option<AuthCredentials>>,
+    refresh_lock: AsyncMutex<()>,
     callback_channel: broadcast::Sender<String>,
 }
 
@@ -23,6 +25,7 @@ impl State {
     pub fn new(stored_creds: Option<AuthCredentials>) -> Self {
         Self {
             creds: Mutex::new(stored_creds),
+            refresh_lock: AsyncMutex::new(()),
             callback_channel: broadcast::channel(1).0,
         }
     }
@@ -32,9 +35,23 @@ impl State {
     }
 
     pub fn set_creds(&self, creds: Option<AuthCredentials>, db: &Db) -> Result<()> {
+        let mut stored = self.creds();
         db.save_auth(creds.as_ref())?;
-        *self.creds() = creds;
+        *stored = creds;
         Ok(())
+    }
+
+    fn clear_if_current(&self, refresh_token: &str, db: &Db) -> Result<bool> {
+        let mut stored = self.creds();
+        if !stored
+            .as_ref()
+            .is_some_and(|creds| creds.refresh_token == refresh_token)
+        {
+            return Ok(false);
+        }
+        db.save_auth(None)?;
+        *stored = None;
+        Ok(true)
     }
 }
 
@@ -84,6 +101,7 @@ pub async fn login_with_oauth(app: &AppHandle) -> Result<User> {
 
     info!("logged in as {}", user.name);
 
+    let _refresh_guard = app.sync_auth().refresh_lock.lock().await;
     app.sync_auth().set_creds(Some(creds), app.db())?;
 
     Ok(user)
@@ -132,6 +150,7 @@ pub async fn oauth_credentials(app: &AppHandle) -> Result<AuthCredentials> {
 /// OAuth login may invalidate the earlier chain, so worker provisioning
 /// calls this afterwards to find out whether the desktop session survived.
 pub async fn verify_session(app: &AppHandle) -> Result<()> {
+    let _refresh_guard = app.sync_auth().refresh_lock.lock().await;
     let refresh_token = {
         let state = app.sync_auth();
         let creds = state.creds();
@@ -141,7 +160,12 @@ pub async fn verify_session(app: &AppHandle) -> Result<()> {
             .ok_or_eyre("not logged in")?
     };
 
-    request_token(refresh_token, app).await.map(|_| ())
+    refresh_desktop_token(refresh_token, app).await.map(|_| ())
+}
+
+pub async fn logout(app: &AppHandle) -> Result<()> {
+    let _refresh_guard = app.sync_auth().refresh_lock.lock().await;
+    app.sync_auth().set_creds(None, app.db())
 }
 
 pub fn handle_callback(url: String, app: &AppHandle) -> Result<()> {
@@ -182,30 +206,63 @@ struct TokenResponse {
     refresh_token: String,
 }
 
-pub async fn access_token(app: &AppHandle) -> Option<String> {
-    let refresh_token = {
+pub async fn access_token(app: &AppHandle) -> Result<Option<String>> {
+    let _refresh_guard = app.sync_auth().refresh_lock.lock().await;
+    let (refresh_token, access_token, expiry) = {
         let state = app.sync_auth();
         let creds = state.creds.lock().unwrap();
-        let creds = creds.as_ref()?;
-
-        let Some(expiry) = DateTime::from_timestamp(creds.token_expiry, 0) else {
-            warn!("token expiry date is invalid");
-            return None;
+        let Some(creds) = creds.as_ref() else {
+            return Ok(None);
         };
-
-        if Utc::now() < expiry {
-            return Some(creds.access_token.clone());
-        }
-
-        creds.refresh_token.clone()
+        (
+            creds.refresh_token.clone(),
+            creds.access_token.clone(),
+            DateTime::from_timestamp(creds.token_expiry, 0),
+        )
     };
 
-    match request_token(refresh_token, app).await {
-        Ok(token) => Some(token),
-        Err(err) => {
-            error!("failed to refresh access token: {:#}", err);
-            None
+    let Some(expiry) = expiry else {
+        warn!("token expiry date is invalid");
+        expire_session(app, &refresh_token)?;
+        bail!("sync session expired; sign in again");
+    };
+    if Utc::now() < expiry {
+        return Ok(Some(access_token));
+    }
+
+    refresh_desktop_token(refresh_token, app).await.map(Some)
+}
+
+fn is_refresh_rejected(error: &eyre::Report) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
+        .any(|error| {
+            matches!(
+                error.status(),
+                Some(StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED)
+            )
+        })
+}
+
+fn expire_session(app: &AppHandle, refresh_token: &str) -> Result<()> {
+    if app.sync_auth().clear_if_current(refresh_token, app.db())?
+        && let Err(error) = app.emit("sync_session_expired", ())
+    {
+        warn!(%error, "failed to notify the UI that the sync session expired");
+    }
+    Ok(())
+}
+
+async fn refresh_desktop_token(refresh_token: String, app: &AppHandle) -> Result<String> {
+    match request_token(refresh_token.clone(), app).await {
+        Ok(token) => Ok(token),
+        Err(error) if is_refresh_rejected(&error) => {
+            error!("failed to refresh access token: {error:#}");
+            expire_session(app, &refresh_token)?;
+            bail!("sync session expired; sign in again")
         }
+        Err(error) => Err(error.wrap_err("could not refresh sync session; try again")),
     }
 }
 
@@ -218,15 +275,7 @@ struct GrantTokenRequest {
 async fn request_token(refresh_token: String, app: &AppHandle) -> Result<String> {
     debug!("refreshing access token");
 
-    let response: TokenResponse = app
-        .http()
-        .post(format!("{}/auth/token", *super::API_URL))
-        .json(&GrantTokenRequest { refresh_token })
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let response = token_grant(app.http(), super::API_URL.as_ref(), &refresh_token).await?;
 
     let creds =
         AuthCredentials::from_tokens(response.access_token.clone(), response.refresh_token)?;
@@ -234,4 +283,54 @@ async fn request_token(refresh_token: String, app: &AppHandle) -> Result<String>
     app.sync_auth().set_creds(Some(creds), app.db())?;
 
     Ok(response.access_token)
+}
+
+async fn token_grant(
+    client: &reqwest_middleware::ClientWithMiddleware,
+    api_url: &str,
+    refresh_token: &str,
+) -> Result<TokenResponse> {
+    client
+        .post(format!("{api_url}/auth/token"))
+        .json(&GrantTokenRequest {
+            refresh_token: refresh_token.to_owned(),
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await
+        .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn rejected_refresh_is_detected_as_expired_session() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 2048];
+            let read = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("POST /auth/token HTTP/1.1"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let client = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let error = token_grant(&client, &url, "invalid-refresh")
+            .await
+            .expect_err("the fake auth server rejects the refresh token");
+        assert!(is_refresh_rejected(&error));
+        server.await.unwrap();
+    }
 }

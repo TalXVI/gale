@@ -1,4 +1,5 @@
 import * as api from '$lib/api';
+import { listen } from '@tauri-apps/api/event';
 import type { SyncUser } from '$lib/types';
 
 class AuthState {
@@ -23,5 +24,6 @@ class AuthState {
 const auth = new AuthState();
 
 auth.refresh();
+void listen('sync_session_expired', () => void auth.refresh());
 
 export default auth;

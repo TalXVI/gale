@@ -757,6 +757,7 @@
 	"toolBar_launch_vanilla": "Launch vanilla",
 	"toolBar_launchServer_started": "Server launched.",
 	"toolBar_launchGame_message": "Please wait for mod installations to complete before launching.",
+	"ui_closeDialog": "Close dialog",
 	"ui_moreInformation": "More information",
 	"unknown": "Unknown",
 	"unknownModsBanner_content": "Some mods in this profile could not be resolved.",

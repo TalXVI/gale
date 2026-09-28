@@ -42,14 +42,23 @@ async fn request(
     method: Method,
     path: impl Display,
     app: &AppHandle,
-) -> reqwest_middleware::RequestBuilder {
+) -> Result<reqwest_middleware::RequestBuilder> {
     let url = format!("{}{path}", *API_URL);
 
+    let token = required_token(&method, auth::access_token(app).await)?;
     let mut req = app.http().request(method, url);
-    if let Some(token) = auth::access_token(app).await {
+    if let Some(token) = token {
         req = req.bearer_auth(token);
     }
-    req
+    Ok(req)
+}
+
+fn required_token(method: &Method, token: Result<Option<String>>) -> Result<Option<String>> {
+    match token? {
+        Some(token) => Ok(Some(token)),
+        None if *method == Method::GET => Ok(None),
+        None => bail!("sign in to sync before modifying a profile"),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -198,7 +207,7 @@ async fn upload_profile_file(
 ) -> Result<CreateSyncProfileResponse> {
     let len = bytes.len();
     let res = request(method, endpoint, app)
-        .await
+        .await?
         .body(bytes)
         .send()
         .await?;
@@ -954,7 +963,7 @@ const MAX_DOWNLOAD_BYTES: usize = 16 * 1024 * 1024;
 
 pub(super) async fn download_profile_bytes(id: &str, app: &AppHandle) -> Result<Vec<u8>> {
     let mut response = request(Method::GET, format!("/profile/{id}"), app)
-        .await
+        .await?
         .send()
         .await?
         .error_for_status()?;
@@ -980,7 +989,7 @@ pub(super) async fn download_profile_bytes(id: &str, app: &AppHandle) -> Result<
 
 async fn delete_profile(id: &str, app: &AppHandle) -> Result<()> {
     request(Method::DELETE, format!("/profile/{id}"), app)
-        .await
+        .await?
         .send()
         .await?
         .error_for_status()?;
@@ -993,7 +1002,7 @@ pub(crate) async fn get_profile_meta(
     app: &AppHandle,
 ) -> Result<Option<SyncProfileMetadata>> {
     let res = request(Method::GET, format!("/profile/{id}/meta"), app)
-        .await
+        .await?
         .send()
         .await?
         .error_for_status();
@@ -1052,7 +1061,7 @@ pub async fn fetch_publication(id: &str, app: &AppHandle) -> Result<FetchedPubli
 
 async fn get_owned_profiles(app: &AppHandle) -> Result<Vec<ListedSyncProfile>> {
     let user: FullUserInfo = request(Method::GET, "/user/me", app)
-        .await
+        .await?
         .send()
         .await?
         .error_for_status()?
@@ -1067,6 +1076,19 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+
+    #[test]
+    fn mutating_requests_cannot_continue_without_authentication() {
+        let error = required_token(&Method::PUT, Ok(None)).unwrap_err();
+        assert!(format!("{error:#}").contains("sign in"));
+        let error = required_token(
+            &Method::PUT,
+            Err(eyre!("sync session expired; sign in again")),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("session expired"));
+        assert!(required_token(&Method::GET, Ok(None)).unwrap().is_none());
+    }
     use crate::{
         profile::export::{R2Mod, manifest_revision},
         thunderstore::{Backend, ModId, PackageIdent},

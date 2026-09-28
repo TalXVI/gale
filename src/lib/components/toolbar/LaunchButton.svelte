@@ -44,6 +44,11 @@
 	let launchOptions = $state<LaunchOption[]>([]);
 
 	const mode = new PersistedState<Mode>('launchMode', 'modded');
+	const currentMode: Mode = $derived(mode.current === 'vanilla' ? 'vanilla' : 'modded');
+
+	$effect(() => {
+		if (mode.current !== currentMode) mode.current = currentMode;
+	});
 
 	const activeGameName = $derived(games.active?.name ?? m.unknown());
 
@@ -81,7 +86,7 @@
 	async function doLaunch(args?: string) {
 		launchDialogOpen = true;
 		try {
-			await api.profile.launch.launchGame(mode.current === 'vanilla', args);
+			await api.profile.launch.launchGame(currentMode === 'vanilla', args);
 		} catch {
 			launchDialogOpen = false;
 		}
@@ -98,7 +103,7 @@
 	<button onclick={() => launchGame()} class="flex items-center pr-2 pl-4">
 		<Icon icon="mdi:play-circle" class="mr-2 text-xl" />
 		<span>
-			{labels[mode.current]}
+			{labels[currentMode]}
 		</span>
 	</button>
 
@@ -117,13 +122,13 @@
 </div>
 
 <Dialog
-	title={(mode.current === 'vanilla'
+	title={(currentMode === 'vanilla'
 		? m.toolBar_dialog_launch_vanilla_title
 		: m.toolBar_dialog_launch_modded_title)({ name: activeGameName })}
 	bind:open={launchDialogOpen}
 >
 	<p class="text-primary-500 dark:text-primary-400">
-		{#if mode.current === 'modded'}
+		{#if currentMode === 'modded'}
 			{m.toolBar_dialog_launch_modded_content()}
 		{/if}
 	</p>

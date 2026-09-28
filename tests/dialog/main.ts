@@ -60,6 +60,7 @@ const worker = {
 if (params.has('deployed')) worker.lastDeployedRevision = '2026-09-21T00:00:00Z';
 if (params.has('wpending')) worker.pendingRevision = '2026-09-23T12:00:00Z';
 let workerRefreshFails = false;
+let mockAuthExpired = false;
 const profileId = params.get('profile') ?? 'first';
 let activeId = 1;
 const preferences = JSON.parse(
@@ -133,7 +134,7 @@ function serverState() {
 }
 
 const calls: { cmd: string; args: any }[] = [];
-let held = '';
+let held = params.has('launchMode') ? 'plugin:store|entries' : '';
 const heldResolvers = new Set<() => void>();
 const heldInitialSettings = new Set<() => void>();
 const failing = new Set<string>();
@@ -142,6 +143,7 @@ if (params.has('holdStatus')) held = 'get_server_sync_status';
 let workerProgress: Record<string, unknown> | null = null;
 let progressPolls = 0;
 const progressListeners = new Set<number>();
+const authListeners = new Set<number>();
 let localWorker: Record<string, unknown> = {
 	supported: true,
 	service: 'notInstalled',
@@ -215,6 +217,16 @@ Object.assign(window, {
 			(window as any).__TAURI_INTERNALS__.runCallback(handler, {
 				event: 'server_sync_operation_progress',
 				payload: progressPayload(patch)
+			});
+		}
+	},
+	authListenerCount: () => authListeners.size,
+	expireAuth: () => {
+		mockAuthExpired = true;
+		for (const handler of authListeners) {
+			(window as any).__TAURI_INTERNALS__.runCallback(handler, {
+				event: 'sync_session_expired',
+				payload: null
 			});
 		}
 	}
@@ -291,7 +303,9 @@ mockIPC(async (cmd, args) => {
 		case 'get_categories':
 			return [];
 		case 'get_user':
-			return null;
+			return params.has('authUser') && !mockAuthExpired
+				? { discordId: '1', name: 'owner', displayName: 'Owner', avatar: null }
+				: null;
 		case 'get_dedicated_server_settings':
 			if (settings == null) return null;
 			// Profile 2 is a plain manual-sync profile. The navbar must
@@ -361,6 +375,10 @@ mockIPC(async (cmd, args) => {
 		case 'test_worker_connection':
 			return { workerId: 'test-worker', autoDeployMods: false };
 		case 'plugin:event|listen':
+			if ((args as any).event === 'sync_session_expired') {
+				authListeners.add((args as any).handler);
+				return (args as any).handler;
+			}
 			if ((args as any).event === 'server_sync_operation_progress') {
 				progressListeners.add((args as any).handler);
 				return (args as any).handler;
@@ -368,15 +386,26 @@ mockIPC(async (cmd, args) => {
 			return calls.length;
 		case 'plugin:event|unlisten':
 			progressListeners.delete((args as any).id);
+			authListeners.delete((args as any).id);
 			return;
 		case 'plugin:dialog|message':
+			if (params.get('component') === 'regression' && (args as any).buttons === 'OkCancel')
+				return params.has('confirmClose') ? 'Ok' : 'Cancel';
 			return cancelStop ? 'Cancel' : 'Ok';
 		case 'plugin:store|load':
 			return;
 		case 'plugin:store|entries':
-			return [];
+			return params.has('launchMode')
+				? [['launchMode', JSON.stringify(params.get('launchMode'))]]
+				: [];
 		case 'plugin:store|set':
 		case 'plugin:store|save':
+			return;
+		case 'has_pending_installations':
+			return false;
+		case 'get_prefs':
+			return { gamePrefs: { valheim: { platform: 'steam', launchMode: { type: 'direct' } } } };
+		case 'launch_game':
 			return;
 		case 'log_err':
 			return;
@@ -467,12 +496,17 @@ mockIPC(async (cmd, args) => {
 document.documentElement.classList.add('dark');
 
 // Install IPC before importing the application's event subscriptions.
-const { default: Harness } = await import('./Harness.svelte');
-const { default: profiles } = await import('$lib/state/profile.svelte');
-Object.assign(window, {
-	switchProfile: async (id: number) => {
-		activeId = id;
-		await profiles.refresh();
-	}
-});
-mount(Harness, { target: document.getElementById('app')! });
+if (params.get('component') === 'regression') {
+	const { default: RegressionHarness } = await import('./RegressionHarness.svelte');
+	mount(RegressionHarness, { target: document.getElementById('app')! });
+} else {
+	const { default: Harness } = await import('./Harness.svelte');
+	const { default: profiles } = await import('$lib/state/profile.svelte');
+	Object.assign(window, {
+		switchProfile: async (id: number) => {
+			activeId = id;
+			await profiles.refresh();
+		}
+	});
+	mount(Harness, { target: document.getElementById('app')! });
+}
