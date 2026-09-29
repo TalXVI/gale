@@ -193,6 +193,7 @@ fn decode_jwt<T: DeserializeOwned>(token: &str) -> Result<T> {
 }
 
 /// The `exp` claim of a sync access token, as issued by the sync service.
+#[cfg(feature = "worker")]
 pub(crate) fn access_token_expiry(access_token: &str) -> Result<DateTime<Utc>> {
     #[derive(Debug, Deserialize)]
     struct Expiry {
