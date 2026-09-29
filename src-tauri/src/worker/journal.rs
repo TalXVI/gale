@@ -3,8 +3,8 @@
 //! The journal survives restarts and is what makes the worker idempotent:
 //! a refresh token rotation, a seen publication revision, and the last
 //! operation record all live here rather than in memory. Writes go through
-//! a temp file + rename so a crash mid-write cannot corrupt the previous
-//! state.
+//! a temp file flushed to disk and renamed so a crash mid-write cannot
+//! corrupt the previous state.
 
 use std::path::PathBuf;
 
@@ -236,6 +236,7 @@ impl Journal {
             use std::io::Write;
             file.write_all(&bytes)
                 .context("failed to write worker journal")?;
+            file.sync_all().context("failed to flush worker journal")?;
         }
         #[cfg(unix)]
         {

@@ -54,7 +54,7 @@ use crate::{
 pub struct WorkerContext {
     config: WorkerConfig,
     secrets: Secrets,
-    journal: Journal,
+    journal: Arc<Journal>,
     sync: SyncClient,
     mod_loader: &'static game::mod_loader::ModLoader<'static>,
     spec: DeploymentSpec,
@@ -89,7 +89,7 @@ impl WorkerContext {
             mod_loader: &game.mod_loader,
             config,
             secrets,
-            journal,
+            journal: Arc::new(journal),
             spec,
             operation_lock: Mutex::new(()),
             progress: Arc::new(std::sync::Mutex::new(None)),
@@ -839,7 +839,8 @@ pub async fn run(
     info!(listen = %ctx.config.listen, profile = %ctx.config.profile_id, "gale-worker listening");
     report_run_state(&ctx.config, WorkerRunPhase::Running);
 
-    tokio::spawn(poll_loop(ctx.clone(), shutdown.clone()));
+    let poll_stop = shutdown.child_token();
+    let poll_task = tokio::spawn(poll_loop(ctx.clone(), poll_stop.clone()));
 
     if let Some(ready) = ready {
         let _ = ready.send(());
@@ -849,6 +850,12 @@ pub async fn run(
         .with_graceful_shutdown(shutdown.cancelled_owned())
         .await
         .context("worker API server failed");
+
+    // The process exits right after this returns, so a rotation that
+    // already started must reach the journal first.
+    poll_stop.cancel();
+    let _ = poll_task.await;
+    ctx.sync.settle().await;
 
     report_run_state(&ctx.config, WorkerRunPhase::Stopped);
     result
@@ -2056,5 +2063,57 @@ mod tests {
 
         shutdown.cancel();
         task.await.unwrap().unwrap();
+    }
+
+    /// A shutdown landing mid-rotation must still let the grant commit:
+    /// the process exits right after `run` returns, so a rotation that
+    /// already reached the sync service has to reach the journal first.
+    #[tokio::test]
+    async fn shutdown_waits_for_an_in_flight_rotation_to_commit() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (auth, url, _task) = crate::worker::sync_client::tests::serve_rotating_auth(
+            &["rt-0"],
+            Duration::from_secs(1),
+        )
+        .await;
+        {
+            let journal = Journal::load(dir.path()).unwrap();
+            let mut state = journal.state.lock().await;
+            state.refresh_token = Some("rt-0".to_owned());
+            journal.save(&state).unwrap();
+        }
+
+        let mut config = worker_config(dir.path(), format!("127.0.0.1:{}", free_port()));
+        config.profile_id = SYNC_PROFILE.to_owned();
+        config.sync_url = Some(url);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(super::run(
+            config,
+            worker_secrets(),
+            shutdown.clone(),
+            Some(ready_tx),
+        ));
+        ready_rx.await.expect("the worker never became ready");
+
+        // The first poll grants immediately on start.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while auth.grants.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the initial grant never reached the sync service");
+
+        shutdown.cancel();
+        task.await.unwrap().unwrap();
+
+        let journal = Journal::load(dir.path()).unwrap();
+        assert_eq!(
+            journal.state.lock().await.refresh_token.as_deref(),
+            Some("rt-1")
+        );
     }
 }

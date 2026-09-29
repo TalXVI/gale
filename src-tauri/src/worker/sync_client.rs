@@ -11,7 +11,8 @@
 //! same `publication_from_archive` path the desktop uses, so a
 //! "canonical publication" is the identical artifact on both sides.
 
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use eyre::{Context, OptionExt, Result, bail, ensure};
@@ -25,6 +26,10 @@ static DEFAULT_API_URL: &str = "https://gale.kesomannen.com/api";
 
 /// Same bound as the desktop's `download_profile_bytes`.
 const MAX_DOWNLOAD_BYTES: usize = 16 * 1024 * 1024;
+
+/// Bounds how long a hung grant can hold the refresh lock — and delay
+/// shutdown, which waits on it through `settle`.
+const GRANT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,10 +49,21 @@ struct TokenResponse {
 /// again.
 pub const SYNC_REAUTHORIZATION_REQUIRED: &str = "Gale sync rejected the Worker's sign-in (it expired or was revoked). Sign the Worker in again: run 'Set up worker' for a Worker hosted on this PC, or give a manually run Worker a new GALE_WORKER_REFRESH_TOKEN and restart it.";
 
+/// Surfaced as the poll error when a rotated credential could not be
+/// persisted; the text tells the operator what a restart would lose.
+pub const SYNC_CREDENTIAL_NOT_SAVED: &str = "The Worker received a new Gale sync sign-in but could not save it to its state directory, so it has paused syncing and keeps retrying the save. If the Worker restarts before the save succeeds, sign it in again.";
+
 /// A granted access token, reused until shortly before its `exp`.
 struct CachedAccessToken {
     token: String,
     expires_at: DateTime<Utc>,
+}
+
+/// The credentials guarded by `refresh_lock`: the cached access token
+/// plus a marker for a rotation the journal has not persisted yet.
+struct CredentialSlot {
+    access: Option<CachedAccessToken>,
+    unsaved: bool,
 }
 
 pub struct SyncClient {
@@ -61,7 +77,7 @@ pub struct SyncClient {
     /// Refresh tokens rotate once per grant, so reading and replacing
     /// them is serialized here. The slot also caches the current access
     /// token: one grant serves as many polls as its expiry allows.
-    refresh_lock: tokio::sync::Mutex<Option<CachedAccessToken>>,
+    refresh_lock: Arc<tokio::sync::Mutex<CredentialSlot>>,
 }
 
 impl SyncClient {
@@ -70,7 +86,10 @@ impl SyncClient {
             config,
             seed_refresh_token,
             http: reqwest::Client::new(),
-            refresh_lock: tokio::sync::Mutex::new(None),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(CredentialSlot {
+                access: None,
+                unsaved: false,
+            })),
         }
     }
 
@@ -90,6 +109,15 @@ impl SyncClient {
     /// otherwise. Every grant rotates the refresh token, which is
     /// persisted back into the journal.
     ///
+    /// Once a grant may have rotated the credential it runs to
+    /// completion independently of whoever triggered it: the work is
+    /// spawned holding an owned lock guard, so a dropped caller (the
+    /// shutdown select, a cancelled request handler) cannot strand a
+    /// rotation, and shutdown waits for it through `settle`. The request
+    /// itself is bounded by `GRANT_TIMEOUT`; a response lost to the
+    /// timeout after the service rotated is the protocol's unavoidable
+    /// window.
+    ///
     /// A 400/401 answer means the credential itself was rejected — there
     /// is no recovery short of a new sign-in, so the journal latches
     /// `sync_reauthorization_required` and no further token requests are
@@ -97,83 +125,42 @@ impl SyncClient {
     /// `GALE_WORKER_REFRESH_TOKEN` seed is supplied. Every other failure
     /// (network, 429, 5xx, malformed body) stays retryable: the journal
     /// is left untouched and the next poll tries again.
-    async fn access_token(&self, journal: &Journal) -> Result<String> {
-        let mut cache = self.refresh_lock.lock().await;
-        if let Some(cached) = cache.as_ref()
+    async fn access_token(&self, journal: &Arc<Journal>) -> Result<String> {
+        let mut slot = self.refresh_lock.clone().lock_owned().await;
+
+        // A credential the service issued but the journal could not
+        // persist is the only credential that still works, so it must
+        // reach disk before anything else happens.
+        if slot.unsaved {
+            let state = journal.state.lock().await;
+            if let Err(err) = journal.save(&state) {
+                return Err(err.wrap_err(SYNC_CREDENTIAL_NOT_SAVED));
+            }
+            slot.unsaved = false;
+        }
+
+        if let Some(cached) = slot.access.as_ref()
             && Utc::now() + chrono::Duration::seconds(60) < cached.expires_at
         {
             return Ok(cached.token.clone());
         }
 
-        let candidate = {
-            let state = journal.state.lock().await;
-            if state.sync_reauthorization_required {
-                // The journal holds the rejected credential; a seed equal
-                // to it is the same dead token. Only a differing seed is
-                // a newly supplied sign-in worth one attempt.
-                match self.seed_refresh_token.as_deref() {
-                    Some(seed) if Some(seed) != state.refresh_token.as_deref() => seed.to_owned(),
-                    _ => bail!("{SYNC_REAUTHORIZATION_REQUIRED}"),
-                }
-            } else {
-                state
-                    .refresh_token
-                    .clone()
-                    .or_else(|| self.seed_refresh_token.clone())
-                    .ok_or_eyre(format!(
-                        "no refresh token in journal and {} is unset",
-                        secrets::ENV_REFRESH_TOKEN
-                    ))?
-            }
-        };
+        tokio::spawn(grant(
+            self.http.clone(),
+            format!("{}/auth/token", self.api_url()),
+            self.seed_refresh_token.clone(),
+            journal.clone(),
+            slot,
+        ))
+        .await
+        .context("sync token grant task failed")?
+    }
 
-        let response = self
-            .http
-            .post(format!("{}/auth/token", self.api_url()))
-            .json(&GrantTokenRequest {
-                refresh_token: candidate.clone(),
-            })
-            .send()
-            .await
-            .context("failed to reach the sync service")?;
-
-        if matches!(
-            response.status(),
-            StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED
-        ) {
-            // Persist the rejected value — including a seed the journal
-            // never held — so the same credential is recognized as spent
-            // instead of being retried on every poll.
-            let mut state = journal.state.lock().await;
-            state.refresh_token = Some(candidate);
-            state.sync_reauthorization_required = true;
-            journal.save(&state)?;
-            *cache = None;
-            bail!("{SYNC_REAUTHORIZATION_REQUIRED}");
-        }
-
-        let tokens: TokenResponse = response
-            .error_for_status()
-            .context("sync token request failed")?
-            .json()
-            .await
-            .context("sync token response was malformed")?;
-
-        let mut state = journal.state.lock().await;
-        state.refresh_token = Some(tokens.refresh_token);
-        state.sync_reauthorization_required = false;
-        journal.save(&state)?;
-
-        // A token whose expiry cannot be decoded is used once and never
-        // cached; that decode failure must not fail the poll.
-        *cache = sync::auth::access_token_expiry(&tokens.access_token)
-            .map(|expires_at| CachedAccessToken {
-                token: tokens.access_token.clone(),
-                expires_at,
-            })
-            .ok();
-
-        Ok(tokens.access_token)
+    /// Waits for a grant already running to commit: the spawned task
+    /// holds the refresh lock, so acquiring it here means the journal
+    /// is settled. Shutdown calls this before the process exits.
+    pub async fn settle(&self) {
+        let _guard = self.refresh_lock.lock().await;
     }
 
     /// Fetches the profile's current metadata. Returns `None` when the
@@ -251,7 +238,7 @@ impl SyncClient {
     /// means most polls need no grant at all.
     pub async fn poll(
         &self,
-        journal: &Journal,
+        journal: &Arc<Journal>,
         since: Option<DateTime<Utc>>,
     ) -> Result<Option<FetchedPublication>> {
         let token = self.access_token(journal).await?;
@@ -274,6 +261,96 @@ impl SyncClient {
     }
 }
 
+/// Runs one credential grant to completion. The owned guard keeps the
+/// refresh lock held until the journal commit finishes, so the commit
+/// cannot be lost when the future that triggered the grant is dropped.
+async fn grant(
+    http: reqwest::Client,
+    url: String,
+    seed: Option<String>,
+    journal: Arc<Journal>,
+    mut slot: tokio::sync::OwnedMutexGuard<CredentialSlot>,
+) -> Result<String> {
+    let candidate = {
+        let state = journal.state.lock().await;
+        if state.sync_reauthorization_required {
+            // The journal holds the rejected credential; a seed equal
+            // to it is the same dead token. Only a differing seed is
+            // a newly supplied sign-in worth one attempt.
+            match seed.as_deref() {
+                Some(seed) if Some(seed) != state.refresh_token.as_deref() => seed.to_owned(),
+                _ => bail!("{SYNC_REAUTHORIZATION_REQUIRED}"),
+            }
+        } else {
+            state
+                .refresh_token
+                .clone()
+                .or_else(|| seed.clone())
+                .ok_or_eyre(format!(
+                    "no refresh token in journal and {} is unset",
+                    secrets::ENV_REFRESH_TOKEN
+                ))?
+        }
+    };
+
+    let response = http
+        .post(url)
+        .json(&GrantTokenRequest {
+            refresh_token: candidate.clone(),
+        })
+        .timeout(GRANT_TIMEOUT)
+        .send()
+        .await
+        .context("failed to reach the sync service")?;
+
+    if matches!(
+        response.status(),
+        StatusCode::BAD_REQUEST | StatusCode::UNAUTHORIZED
+    ) {
+        // Persist the rejected value — including a seed the journal
+        // never held — so the same credential is recognized as spent
+        // instead of being retried on every poll.
+        let mut state = journal.state.lock().await;
+        state.refresh_token = Some(candidate);
+        state.sync_reauthorization_required = true;
+        journal.save(&state)?;
+        slot.access = None;
+        bail!("{SYNC_REAUTHORIZATION_REQUIRED}");
+    }
+
+    let tokens: TokenResponse = response
+        .error_for_status()
+        .context("sync token request failed")?
+        .json()
+        .await
+        .context("sync token response was malformed")?;
+
+    let mut state = journal.state.lock().await;
+    state.refresh_token = Some(tokens.refresh_token);
+    state.sync_reauthorization_required = false;
+    if let Err(err) = journal.save(&state) {
+        // The commit point is a durable journal save. The rotated token
+        // is the only credential that still works, so it stays in memory
+        // for the next recommit and `unsaved` pauses syncing until the
+        // save lands: a Worker that is syncing normally is always
+        // restart-safe.
+        slot.unsaved = true;
+        slot.access = None;
+        return Err(err.wrap_err(SYNC_CREDENTIAL_NOT_SAVED));
+    }
+
+    // A token whose expiry cannot be decoded is used once and never
+    // cached; that decode failure must not fail the poll.
+    slot.access = sync::auth::access_token_expiry(&tokens.access_token)
+        .map(|expires_at| CachedAccessToken {
+            token: tokens.access_token.clone(),
+            expires_at,
+        })
+        .ok();
+
+    Ok(tokens.access_token)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::collections::HashSet;
@@ -281,6 +358,7 @@ pub(crate) mod tests {
         Arc, LazyLock,
         atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering},
     };
+    use std::time::Duration;
 
     use axum::{
         Json, Router,
@@ -483,17 +561,19 @@ pub(crate) mod tests {
     /// regression: each grant consumes the presented token and mints the
     /// next (`rt-{n}`), `lose_next_rotation` consumes the token but
     /// answers 500 without minting (the rotation is lost), and unknown
-    /// tokens get a 400. Issued access tokens are already expired so
-    /// every poll performs a grant.
+    /// tokens get a 400. `respond_delay` holds the response back *after*
+    /// the rotation so a caller can be dropped mid-commit. Issued access
+    /// tokens are already expired so every poll performs a grant.
     #[derive(Clone)]
-    struct RotatingAuth {
+    pub(crate) struct RotatingAuth {
         /// Refresh tokens the service currently accepts.
         valid: Arc<tokio::sync::Mutex<HashSet<String>>>,
         /// Minting counter; the next token is `rt-{n}`.
         next: Arc<AtomicUsize>,
         /// Total `/auth/token` requests received.
-        grants: Arc<AtomicUsize>,
+        pub(crate) grants: Arc<AtomicUsize>,
         lose_next_rotation: Arc<AtomicBool>,
+        respond_delay: Duration,
     }
 
     impl RotatingAuth {
@@ -519,6 +599,12 @@ pub(crate) mod tests {
         }
         let minted = format!("rt-{}", auth.next.fetch_add(1, Ordering::Relaxed));
         valid.insert(minted.clone());
+        // The token is already consumed and its successor registered, so
+        // the delay must not hold the lock that a second request needs.
+        drop(valid);
+        if !auth.respond_delay.is_zero() {
+            tokio::time::sleep(auth.respond_delay).await;
+        }
         Json(json!({
             "accessToken": jwt_with_expiry(1),
             "refreshToken": minted,
@@ -528,8 +614,9 @@ pub(crate) mod tests {
 
     /// Serves the rotating-auth mock. `/profile/{id}/meta` always 404s,
     /// so a successful grant resolves to `None` without archive work.
-    async fn serve_rotating_auth(
+    pub(crate) async fn serve_rotating_auth(
         seed_tokens: &[&str],
+        respond_delay: Duration,
     ) -> (RotatingAuth, String, tokio::task::JoinHandle<()>) {
         let auth = RotatingAuth {
             valid: Arc::new(tokio::sync::Mutex::new(
@@ -538,6 +625,7 @@ pub(crate) mod tests {
             next: Arc::new(AtomicUsize::new(1)),
             grants: Arc::new(AtomicUsize::new(0)),
             lose_next_rotation: Arc::new(AtomicBool::new(false)),
+            respond_delay,
         };
         let app = Router::new()
             .route("/auth/token", post(rotating_grant))
@@ -643,9 +731,9 @@ pub(crate) mod tests {
         }
     }
 
-    async fn journal() -> (tempfile::TempDir, Journal) {
+    async fn journal() -> (tempfile::TempDir, Arc<Journal>) {
         let dir = tempfile::tempdir().unwrap();
-        let journal = Journal::load(dir.path()).unwrap();
+        let journal = Arc::new(Journal::load(dir.path()).unwrap());
         {
             let mut state = journal.state.lock().await;
             state.refresh_token = Some("refresh-seed".to_owned());
@@ -814,7 +902,7 @@ pub(crate) mod tests {
 
             // The latch is durable: a restarted worker keeps the rejected
             // credential on record and does not present it again.
-            let journal = Journal::load(dir.path()).unwrap();
+            let journal = Arc::new(Journal::load(dir.path()).unwrap());
             {
                 let state = journal.state.lock().await;
                 assert!(state.sync_reauthorization_required, "{status}");
@@ -913,10 +1001,10 @@ pub(crate) mod tests {
     /// journal field survives untouched.
     #[tokio::test]
     async fn a_lost_rotation_latches_until_a_new_sign_in() {
-        let (auth, url, _task) = serve_rotating_auth(&["rt-0"]).await;
+        let (auth, url, _task) = serve_rotating_auth(&["rt-0"], Duration::ZERO).await;
 
         let dir = tempfile::tempdir().unwrap();
-        let journal = Journal::load(dir.path()).unwrap();
+        let journal = Arc::new(Journal::load(dir.path()).unwrap());
         let revision = Utc::now();
         let deployed_revision = revision - chrono::Duration::hours(1);
         let baseline = {
@@ -992,7 +1080,7 @@ pub(crate) mod tests {
     /// newly supplied sign-in — the manual-worker's recovery path.
     #[tokio::test]
     async fn a_different_seed_is_the_manual_recovery_path() {
-        let (auth, url, _task) = serve_rotating_auth(&[]).await;
+        let (auth, url, _task) = serve_rotating_auth(&[], Duration::ZERO).await;
         let (_dir, journal) = journal().await;
 
         // The seeded token is unknown to the service: permanent
@@ -1042,5 +1130,85 @@ pub(crate) mod tests {
             journal.state.lock().await.refresh_token.as_deref(),
             Some("refresh-rotated")
         );
+    }
+
+    /// A caller dropped mid-grant (the shutdown select or a cancelled
+    /// request handler) must not strand a rotation the service already
+    /// made: the grant still commits to the journal, so the next poll
+    /// uses the rotated token rather than presenting the consumed one.
+    #[tokio::test]
+    async fn a_dropped_caller_cannot_strand_a_rotation() {
+        let (auth, url, _task) = serve_rotating_auth(&["rt-0"], Duration::from_millis(500)).await;
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::load(dir.path()).unwrap());
+        {
+            let mut state = journal.state.lock().await;
+            state.refresh_token = Some("rt-0".to_owned());
+            journal.save(&state).unwrap();
+        }
+        let client = SyncClient::new(config(url), None);
+
+        // The service mints rt-1, then holds the response past this
+        // timeout: the caller is gone before the grant could commit.
+        let elapsed =
+            tokio::time::timeout(Duration::from_millis(100), client.poll(&journal, None)).await;
+        assert!(elapsed.is_err(), "the delayed grant outlives its caller");
+
+        assert!(client.poll(&journal, None).await.unwrap().is_none());
+        assert_eq!(auth.grants.load(Ordering::Relaxed), 2);
+        assert!(!journal.state.lock().await.sync_reauthorization_required);
+
+        let journal = Journal::load(dir.path()).unwrap();
+        let state = journal.state.lock().await;
+        assert_eq!(state.refresh_token.as_deref(), Some("rt-2"));
+        assert!(!state.sync_reauthorization_required);
+    }
+
+    /// A rotation whose journal commit fails pauses syncing instead of
+    /// moving on: the new credential lives only in memory until the
+    /// save succeeds, so no further grant is attempted and no cached
+    /// access token is served.
+    #[tokio::test]
+    async fn an_unsaved_rotation_pauses_sync_until_it_is_saved() {
+        let (auth, url, _task) = serve_rotating_auth(&["rt-0"], Duration::ZERO).await;
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(Journal::load(dir.path()).unwrap());
+        let revision = Utc::now();
+        let baseline = {
+            let mut state = journal.state.lock().await;
+            state.pending = Some(PendingWork::new(revision, mod_rev('b')));
+            state.last_deployed_revision = Some(revision - chrono::Duration::hours(1));
+            state.deployed_mods_revision = Some(mod_rev('a'));
+            state.auto_deploy_mods = true;
+            state.restart_policy = RestartPolicy::WhenEmpty;
+            state.last_operation = Some(operation("op-1"));
+            state.refresh_token = Some("rt-0".to_owned());
+            journal.save(&state).unwrap();
+            without_credentials(&state)
+        };
+        let client = SyncClient::new(config(url), None);
+
+        // A directory at the temp path makes every journal save fail.
+        std::fs::create_dir(dir.path().join("gale-worker-state.json.tmp")).unwrap();
+        let error = client.poll(&journal, None).await.err().unwrap();
+        assert_eq!(error.to_string(), SYNC_CREDENTIAL_NOT_SAVED);
+        assert_eq!(auth.grants.load(Ordering::Relaxed), 1);
+
+        // Syncing pauses on the unsaved credential rather than granting
+        // again from memory.
+        let error = client.poll(&journal, None).await.err().unwrap();
+        assert_eq!(error.to_string(), SYNC_CREDENTIAL_NOT_SAVED);
+        assert_eq!(auth.grants.load(Ordering::Relaxed), 1);
+
+        // Once the recommit lands, syncing resumes on the rotated chain.
+        std::fs::remove_dir(dir.path().join("gale-worker-state.json.tmp")).unwrap();
+        assert!(client.poll(&journal, None).await.unwrap().is_none());
+        assert_eq!(auth.grants.load(Ordering::Relaxed), 2);
+
+        let journal = Journal::load(dir.path()).unwrap();
+        let state = journal.state.lock().await;
+        assert_eq!(state.refresh_token.as_deref(), Some("rt-2"));
+        assert!(!state.sync_reauthorization_required);
+        assert_eq!(without_credentials(&state), baseline);
     }
 }
