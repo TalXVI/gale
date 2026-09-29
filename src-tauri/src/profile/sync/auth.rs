@@ -10,7 +10,7 @@ use eyre::{Context, OptionExt, Result, bail, eyre};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tauri::{AppHandle, Emitter, Manager, Url};
-use tokio::sync::{Mutex as AsyncMutex, broadcast};
+use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tracing::{debug, error, info, warn};
 
 use crate::{db::Db, state::ManagerExt};
@@ -18,7 +18,10 @@ use crate::{db::Db, state::ManagerExt};
 pub struct State {
     creds: Mutex<Option<AuthCredentials>>,
     refresh_lock: AsyncMutex<()>,
-    callback_channel: broadcast::Sender<String>,
+    /// The `gale://auth/callback` URL carries no flow identifier, so
+    /// OAuth flows are exclusive and each callback resolves at most one
+    /// of them. The slot frees itself when the waiting flow is dropped.
+    oauth_callback: Mutex<Option<oneshot::Sender<String>>>,
 }
 
 impl State {
@@ -26,7 +29,7 @@ impl State {
         Self {
             creds: Mutex::new(stored_creds),
             refresh_lock: AsyncMutex::new(()),
-            callback_channel: broadcast::channel(1).0,
+            oauth_callback: Mutex::new(None),
         }
     }
 
@@ -52,6 +55,32 @@ impl State {
         db.save_auth(None)?;
         *stored = None;
         Ok(true)
+    }
+
+    /// Registers the waiting end of a new OAuth flow. A dropped
+    /// (timed-out or cancelled) flow closes its sender, so an abandoned
+    /// flow never blocks the next sign-in.
+    fn begin_oauth(&self) -> Result<oneshot::Receiver<String>> {
+        let mut slot = self.oauth_callback.lock().unwrap();
+        if slot.as_ref().is_some_and(|sender| !sender.is_closed()) {
+            bail!(
+                "another Gale sync sign-in is already waiting for the browser. Finish it or wait a minute, then try again"
+            );
+        }
+        let (sender, receiver) = oneshot::channel();
+        *slot = Some(sender);
+        Ok(receiver)
+    }
+
+    /// Delivers the callback to the one waiting flow. The URL carries
+    /// tokens, so it must never appear in an error or a log.
+    fn complete_oauth(&self, url: String) -> Result<()> {
+        let Some(sender) = self.oauth_callback.lock().unwrap().take() else {
+            bail!("no Gale sync sign-in is waiting for this callback");
+        };
+        sender
+            .send(url)
+            .map_err(|_| eyre!("the Gale sync sign-in this callback belongs to has already ended"))
     }
 }
 
@@ -113,14 +142,15 @@ pub async fn login_with_oauth(app: &AppHandle) -> Result<User> {
 /// refresh token on every grant, so handing the worker a copy of the
 /// desktop's token would break whichever side refreshed second.
 pub async fn oauth_credentials(app: &AppHandle) -> Result<AuthCredentials> {
+    // Register before opening the browser so the callback can never
+    // arrive before — or be routed to — another flow.
+    let callback = app.sync_auth().begin_oauth()?;
     let url = format!("{}/auth/login", *super::API_URL);
     open::that(url).context("failed to open url in browser")?;
 
-    let mut channel = app.sync_auth().callback_channel.subscribe();
-
     tokio::select! {
-        url = channel.recv() => {
-         let url = url?;
+        url = callback => {
+         let url = url.context("the sign-in was abandoned")?;
          let url = Url::parse(&url).context("invalid url")?;
          let query: HashMap<_, _> = url.query_pairs().collect();
 
@@ -169,9 +199,7 @@ pub async fn logout(app: &AppHandle) -> Result<()> {
 }
 
 pub fn handle_callback(url: String, app: &AppHandle) -> Result<()> {
-    app.sync_auth().callback_channel.send(url)?;
-
-    Ok(())
+    app.sync_auth().complete_oauth(url)
 }
 
 #[derive(Debug, Deserialize)]
@@ -344,5 +372,44 @@ mod tests {
             .expect_err("the fake auth server rejects the refresh token");
         assert!(is_refresh_rejected(&error));
         server.await.unwrap();
+    }
+
+    /// The callback URL carries no flow identifier, so one callback
+    /// resolves exactly one flow and a second concurrent sign-in is
+    /// refused rather than sharing the callback.
+    #[tokio::test]
+    async fn an_oauth_callback_resolves_exactly_one_waiting_flow() {
+        let state = State::new(None);
+        let first = state.begin_oauth().unwrap();
+        assert!(
+            state.begin_oauth().is_err(),
+            "a second flow must not wait on the same callback"
+        );
+
+        state
+            .complete_oauth("gale://auth/callback?access_token=a".to_owned())
+            .unwrap();
+        assert_eq!(first.await.unwrap(), "gale://auth/callback?access_token=a");
+
+        // The callback was consumed; nothing is left for a late flow.
+        assert!(
+            state
+                .complete_oauth("gale://auth/callback?x".to_owned())
+                .is_err()
+        );
+    }
+
+    /// A dropped receiver (timed-out or cancelled sign-in) frees the
+    /// slot so the next flow can begin and be resolved normally.
+    #[tokio::test]
+    async fn an_ended_oauth_flow_frees_the_slot() {
+        let state = State::new(None);
+        drop(state.begin_oauth().unwrap());
+
+        let second = state.begin_oauth().unwrap();
+        state
+            .complete_oauth("gale://auth/callback?access_token=b".to_owned())
+            .unwrap();
+        assert_eq!(second.await.unwrap(), "gale://auth/callback?access_token=b");
     }
 }
