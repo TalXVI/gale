@@ -78,7 +78,10 @@
 					<RemoteConnectionSettings {form} />
 
 					<SmallHeading>{m.serverPage_sectionDeployment()}</SmallHeading>
-					<RemoteDeploymentSettings {form} />
+					<RemoteDeploymentSettings
+						{form}
+						onProvisioned={() => sync.loadStatus(false).catch(() => {})}
+					/>
 
 					<SmallHeading>{m.serverPage_sectionHostProvider()}</SmallHeading>
 					<HostProviderSettings {form} />

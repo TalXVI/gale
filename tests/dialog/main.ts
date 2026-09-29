@@ -50,6 +50,7 @@ const worker = {
 	observedRevision: null as string | null,
 	lastError: null as string | null,
 	pollError: null as string | null,
+	syncReauthorizationRequired: false,
 	pendingRevision: null as string | null,
 	nextAttemptAt: null as string | null,
 	lastDeployedRevision: null as string | null,
@@ -241,6 +242,7 @@ Object.assign(window, {
 		worker.pendingRevision = pendingRevision;
 	},
 	setLocalWorkerReauthorization: (required: boolean) => {
+		worker.syncReauthorizationRequired = required;
 		const current = localWorker.worker as Record<string, unknown> | null;
 		localWorker = {
 			...localWorker,
@@ -404,6 +406,13 @@ mockIPC(async (cmd, args) => {
 		case 'get_local_worker_status':
 			return localWorker;
 		case 'provision_local_worker':
+			// Models same-binding credential recovery in the Worker journal.
+			if (
+				worker.syncReauthorizationRequired &&
+				worker.pollError === 'Publication check failed: sync token request failed'
+			)
+				worker.pollError = null;
+			worker.syncReauthorizationRequired = false;
 			localWorker = {
 				...localWorker,
 				service: 'running',

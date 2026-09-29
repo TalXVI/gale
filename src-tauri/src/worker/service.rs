@@ -828,11 +828,11 @@ mod tests {
         );
     }
 
-    /// A same-binding re-install swaps only the credential: the issued
+    /// A same-binding re-install recovers the rejected credential: the issued
     /// sync token lands in the journal, never in secrets.env where it
-    /// would go stale, and the latch plus all operational state survive.
+    /// would go stale. The rejection clears and all operational state survives.
     #[test]
-    fn same_binding_reauthorization_replaces_only_the_credential() {
+    fn same_binding_reauthorization_clears_only_the_credential_rejection() {
         use crate::profile::export::ModRevision;
         use crate::profile::server::settings::RestartPolicy;
         use crate::profile::server::state::{
@@ -853,10 +853,17 @@ mod tests {
         let before = {
             let mut state = journal.state.blocking_lock();
             state.pending = Some(PendingWork::new(Utc::now(), mod_rev('b')));
+            state.pending.as_mut().unwrap().attempts = 3;
+            state.pending.as_mut().unwrap().next_attempt_at =
+                Some(Utc::now() + chrono::Duration::minutes(5));
             state.last_deployed_revision = Some(Utc::now() - chrono::Duration::hours(1));
             state.deployed_mods_revision = Some(mod_rev('a'));
             state.auto_deploy_mods = true;
             state.restart_policy = RestartPolicy::WhenEmpty;
+            state.automation_seeded = true;
+            state.last_error = Some("automatic deployment failed: upload failed".to_owned());
+            state.poll_error =
+                Some("Publication check failed: sync token request failed".to_owned());
             state.last_operation = Some(OperationRecord {
                 id: "op-1".to_owned(),
                 executor: ExecutorKind::Worker,
@@ -903,13 +910,18 @@ mod tests {
         let state = journal.state.blocking_lock();
         assert_eq!(state.refresh_token.as_deref(), Some("fresh"));
         assert!(!state.sync_reauthorization_required);
+        assert!(state.poll_error.is_none());
         let mut after = serde_json::to_value(&*state).unwrap();
         let mut expected = before;
+        expected["pollError"] = serde_json::Value::Null;
         for value in [&mut after, &mut expected] {
             let object = value.as_object_mut().unwrap();
             object.remove("refreshToken");
             object.remove("syncReauthorizationRequired");
         }
-        assert_eq!(after, expected, "only the credential changed");
+        assert_eq!(
+            after, expected,
+            "only the credential and its rejection state changed"
+        );
     }
 }

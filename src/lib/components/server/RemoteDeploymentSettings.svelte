@@ -10,7 +10,8 @@
 	import { m } from '$lib/paraglide/messages';
 	import type { ServerFormState } from './serverForm.svelte';
 
-	let { form }: { form: ServerFormState } = $props();
+	let { form, onProvisioned }: { form: ServerFormState; onProvisioned: () => Promise<void> } =
+		$props();
 	const formId = $props.id();
 
 	const servicePillClass = $derived(
@@ -62,7 +63,7 @@
 					color="primary"
 					icon="mdi:server-plus"
 					loading={form.provisioning}
-					onclick={() => form.provisionWorker()}
+					onclick={() => form.provisionWorker(onProvisioned)}
 					>{m.dedicatedServerDialog_localWorkerProvision()}</Button
 				>
 			</div>
@@ -89,7 +90,7 @@
 							color="primary"
 							icon="mdi:server-plus"
 							loading={form.provisioning}
-							onclick={() => form.provisionWorker()}
+							onclick={() => form.provisionWorker(onProvisioned)}
 							>{m.dedicatedServerDialog_localWorkerFinishSetup()}</Button
 						>
 					</div>
@@ -101,7 +102,7 @@
 							color="primary"
 							icon="mdi:account-reactivate"
 							loading={form.provisioning}
-							onclick={() => form.provisionWorker()}
+							onclick={() => form.provisionWorker(onProvisioned)}
 							>{m.dedicatedServerDialog_localWorkerReauthorizeAction()}</Button
 						>
 					</div>

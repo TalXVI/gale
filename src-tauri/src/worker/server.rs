@@ -1157,8 +1157,48 @@ mod tests {
         assert_eq!(status.restart_policy, super::RestartPolicy::WhenEmpty);
         // The poll failed before any deployment could be attempted.
         assert_eq!(api.archive_hits.load(Ordering::Relaxed), 0);
-        let state = ctx.journal.state.lock().await;
-        assert_eq!(state.pending.as_ref().unwrap().attempts, 0);
+        let before = {
+            let state = ctx.journal.state.lock().await;
+            assert_eq!(state.pending.as_ref().unwrap().attempts, 0);
+            state.clone()
+        };
+
+        // Same-binding setup saves the new sign-in before the restarted
+        // worker can poll. Status must already report the recovery.
+        // The mock recognizes refresh-rotated as its next issued credential.
+        api.refresh_tokens
+            .lock()
+            .await
+            .push("refresh-seed".to_owned());
+        {
+            let mut state = ctx.journal.state.lock().await;
+            state.replace_sync_credential("refresh-rotated".to_owned());
+            ctx.journal.save(&state).unwrap();
+        }
+        let recovered = poll_status(ctx.clone()).await;
+        assert!(!recovered.sync_reauthorization_required);
+        assert!(recovered.poll_error.is_none());
+        let mut expected = before;
+        expected.refresh_token = Some("refresh-rotated".to_owned());
+        expected.sync_reauthorization_required = false;
+        expected.poll_error = None;
+        let journal = Journal::load(dir.path()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&*journal.state.lock().await).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+
+        // A new failure still reaches status normally. A transient token
+        // failure does not re-latch the replaced credential.
+        api.token_status.store(500, Ordering::Relaxed);
+        super::poll_once(&ctx).await;
+        let failed_again = poll_status(ctx.clone()).await;
+        assert_eq!(
+            failed_again.poll_error.as_deref(),
+            Some("Publication check failed: sync token request failed")
+        );
+        assert!(!failed_again.sync_reauthorization_required);
+        assert_eq!(failed_again.last_error, status.last_error);
     }
 
     #[tokio::test]

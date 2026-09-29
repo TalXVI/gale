@@ -405,9 +405,11 @@ test('provisioning the local worker leaves no unsaved bar', async ({ page }) => 
 	expect(provisioned).toBe(true);
 });
 
-test('a rejected worker sign-in offers a reauthorization action', async ({ page }) => {
+test('a rejected worker sign-in refreshes the mounted status immediately after reauthorization', async ({
+	page
+}) => {
 	await page.clock.install();
-	await page.goto('/tests/dialog/?mode=worker');
+	await page.goto('/tests/dialog/?mode=worker&wpending=1&deployed=1');
 	const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
 	await remoteTab.getByLabel('Sync mode').click();
 	await page.getByRole('option', { name: 'Worker on this PC' }).click();
@@ -417,8 +419,20 @@ test('a rejected worker sign-in offers a reauthorization action', async ({ page 
 	// The worker reports that its sync credential was rejected; the
 	// background status tick picks it up.
 	await page.evaluate(() => (window as any).setLocalWorkerReauthorization(true));
+	const pollError = 'Publication check failed: sync token request failed';
+	const deploymentError = 'automatic deployment failed: upload failed';
+	await page.evaluate(
+		([poll, deployment]) => (window as any).setWorkerErrors(poll, deployment),
+		[pollError, deploymentError]
+	);
 	await page.clock.runFor(60_500);
+	await page.clock.pauseAt(await page.evaluate(() => Date.now()));
 	await expect(remoteTab.getByText(/Gale sync sign-in expired or was revoked/)).toBeVisible();
+	await expect(remoteTab.getByText(pollError)).toBeVisible();
+	await expect(remoteTab.getByText(deploymentError)).toBeVisible();
+	const statusCalls = await page.evaluate(
+		() => (window as any).calls.filter((call: any) => call.cmd === 'get_server_sync_status').length
+	);
 	const reauthorize = remoteTab.getByRole('button', { name: 'Sign in again' });
 	await reauthorize.click();
 
@@ -434,6 +448,30 @@ test('a rejected worker sign-in offers a reauthorization action', async ({ page 
 		.toBe(2);
 	await expect(remoteTab.getByText(/Gale sync sign-in expired or was revoked/)).toHaveCount(0);
 	await expect(remoteTab.getByRole('button', { name: 'Sign in again' })).toHaveCount(0);
+	// No clock advance or manual refresh: the mounted status cache must
+	// refetch after provisioning, while unrelated failures stay visible.
+	await expect(remoteTab.getByText(pollError)).toHaveCount(0);
+	await expect(remoteTab.getByText(deploymentError)).toBeVisible();
+	await expect(remoteTab.getByText('Server update pending', { exact: true })).toBeVisible();
+	expect(
+		await page.evaluate(
+			() =>
+				(window as any).calls.filter((call: any) => call.cmd === 'get_server_sync_status').length
+		)
+	).toBeGreaterThan(statusCalls);
+
+	for (const newError of [
+		pollError,
+		'Publication check failed: canonical publication failed validation'
+	]) {
+		await page.evaluate(
+			([poll, deployment]) => (window as any).setWorkerErrors(poll, deployment),
+			[newError, deploymentError]
+		);
+		await page.clock.runFor(60_500);
+		await expect(remoteTab.getByText(newError)).toBeVisible();
+		await expect(remoteTab.getByText(deploymentError)).toBeVisible();
+	}
 });
 
 test('a failed live refresh reports unavailable instead of spinning forever', async ({ page }) => {

@@ -57,7 +57,8 @@ pub struct WorkerJournal {
     pub last_operation: Option<OperationRecord>,
     /// The last deployment failure, reported through the status endpoint.
     pub last_error: Option<String>,
-    /// The current publication-poll failure, cleared by the next successful poll.
+    /// The current publication-poll failure, cleared by a successful poll
+    /// or by setup replacing the sign-in that caused a latched rejection.
     pub poll_error: Option<String>,
 }
 
@@ -183,9 +184,22 @@ impl WorkerJournal {
     }
 
     /// Installs a freshly issued sync credential (same-binding setup).
-    /// Everything else in the journal — pending work, deployed revisions,
-    /// automation settings, operation history — is kept.
+    /// Clears the poll error for a latched credential rejection, including
+    /// the generic token error retained by older workers. Other poll errors
+    /// and all operational state are kept.
     pub fn replace_sync_credential(&mut self, refresh_token: String) {
+        if self.sync_reauthorization_required
+            && self
+                .poll_error
+                .as_deref()
+                .and_then(|error| error.strip_prefix("Publication check failed: "))
+                .is_some_and(|error| {
+                    error == super::sync_client::SYNC_REAUTHORIZATION_REQUIRED
+                        || error == "sync token request failed"
+                })
+        {
+            self.poll_error = None;
+        }
         self.refresh_token = Some(refresh_token);
         self.sync_reauthorization_required = false;
     }
@@ -343,7 +357,7 @@ mod tests {
         assert!(Journal::load(dir.path()).is_err());
     }
 
-    /// A fresh sign-in only swaps the credential and clears the latch;
+    /// A fresh sign-in clears the rejected credential's poll error;
     /// owed work, deployed revisions, automation, and history survive.
     #[tokio::test]
     async fn replace_sync_credential_preserves_operational_state() {
@@ -353,6 +367,9 @@ mod tests {
         let before = {
             let mut state = journal.state.lock().await;
             state.pending = Some(PendingWork::new(revision, mod_rev('b')));
+            state.pending.as_mut().unwrap().attempts = 3;
+            state.pending.as_mut().unwrap().next_attempt_at =
+                Some(revision + chrono::Duration::minutes(5));
             state.last_deployed_revision = Some(revision - chrono::Duration::hours(1));
             state.deployed_mods_revision = Some(mod_rev('a'));
             state.refresh_token = Some("rejected-token".to_owned());
@@ -362,7 +379,10 @@ mod tests {
             state.automation_seeded = true;
             state.last_operation = Some(operation("op-1"));
             state.last_error = Some("automatic deployment failed: upload failed".to_owned());
-            state.poll_error = Some("Publication check failed: rejected".to_owned());
+            state.poll_error = Some(format!(
+                "Publication check failed: {}",
+                crate::worker::sync_client::SYNC_REAUTHORIZATION_REQUIRED
+            ));
             journal.save(&state).unwrap();
             state.clone()
         };
@@ -380,11 +400,48 @@ mod tests {
         let mut expected = before;
         expected.refresh_token = Some("fresh-token".to_owned());
         expected.sync_reauthorization_required = false;
+        expected.poll_error = None;
         assert_eq!(
             serde_json::to_value(&*state).unwrap(),
             serde_json::to_value(&expected).unwrap(),
-            "every field except the credential survived"
+            "only the credential and its rejection state changed"
         );
+    }
+
+    #[test]
+    fn replace_sync_credential_clears_only_latched_authentication_poll_errors() {
+        let rejection = format!(
+            "Publication check failed: {}",
+            crate::worker::sync_client::SYNC_REAUTHORIZATION_REQUIRED
+        );
+        for error in [
+            rejection.as_str(),
+            "Publication check failed: sync token request failed",
+            "Publication check failed: failed to reach the sync service",
+            "Publication check failed: canonical publication failed validation",
+            "Publication check failed: failed to download the publication",
+        ] {
+            for latched in [false, true] {
+                let mut state = WorkerJournal {
+                    refresh_token: Some("rejected-token".to_owned()),
+                    sync_reauthorization_required: latched,
+                    poll_error: Some(error.to_owned()),
+                    ..Default::default()
+                };
+                state.replace_sync_credential("fresh-token".to_owned());
+                let authentication_error = error == rejection
+                    || error == "Publication check failed: sync token request failed";
+                assert_eq!(
+                    state.poll_error.as_deref(),
+                    if latched && authentication_error {
+                        None
+                    } else {
+                        Some(error)
+                    },
+                    "latched={latched}, error={error}"
+                );
+            }
+        }
     }
 
     fn mod_rev(byte: char) -> ModRevision {

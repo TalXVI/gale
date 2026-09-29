@@ -461,7 +461,7 @@ export class ServerFormState {
 	/// provisioning could start. Once the service is installed, the
 	/// backend itself persists hosted-worker mode with the loopback
 	/// address; the page then mirrors that state.
-	async provisionWorker() {
+	async provisionWorker(onProvisioned: () => Promise<void>) {
 		const current = await this.checkedSettings();
 		if (!current) return;
 		current.remote.syncMode = 'local';
@@ -492,6 +492,9 @@ export class ServerFormState {
 			this.#savedJson = this.#liveJson;
 			// Provisioning turned this profile into a hosted-worker remote.
 			void serverSync.reconfigure();
+			// The mounted panel owns its status cache. Reload it from the
+			// installed worker before completing setup.
+			await onProvisioned();
 		} finally {
 			this.provisioning = false;
 		}
