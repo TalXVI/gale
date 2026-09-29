@@ -429,12 +429,12 @@ fn install_inner(staging: &Path, log: &Path) -> Result<()> {
         private.join(local::SECRETS_FILE),
     )
     .context("failed to install worker secrets")?;
-    if staged_secrets.refresh_token.is_some() {
+    if let Some(token) = staged_secrets.refresh_token {
         // Setup obtains a new login. An old rotated token must not override
         // it when the retained journal is loaded on the next start.
         let journal = journal::Journal::load(&config.state_dir)?;
         let mut state = journal.state.blocking_lock();
-        state.refresh_token = staged_secrets.refresh_token;
+        state.replace_sync_credential(token);
         journal.save(&state)?;
     }
     // A staged SSH key accompanies private-key configs. The service

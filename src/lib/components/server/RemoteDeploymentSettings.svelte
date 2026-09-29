@@ -94,6 +94,18 @@
 						>
 					</div>
 				{/if}
+				{#if form.localWorker.worker?.syncReauthorizationRequired}
+					<InfoBox type="error">{m.dedicatedServerDialog_localWorkerReauthorize()}</InfoBox>
+					<div>
+						<Button
+							color="primary"
+							icon="mdi:account-reactivate"
+							loading={form.provisioning}
+							onclick={() => form.provisionWorker()}
+							>{m.dedicatedServerDialog_localWorkerReauthorizeAction()}</Button
+						>
+					</div>
+				{/if}
 				{#if form.localWorker.run?.phase === 'shutdown'}
 					<InfoBox type="info">{m.dedicatedServerDialog_localWorkerShutdown()}</InfoBox>
 				{:else if form.localWorker.service !== 'running' && form.localWorker.run?.phase === 'running'}

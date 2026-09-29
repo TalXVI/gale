@@ -290,6 +290,7 @@ async fn status(
         last_operation: journal.last_operation.clone(),
         last_error: journal.last_error.clone(),
         poll_error: journal.poll_error.clone(),
+        sync_reauthorization_required: journal.sync_reauthorization_required,
         server,
     })
     .into_response()
@@ -1097,6 +1098,60 @@ mod tests {
         let state = journal.state.lock().await;
         assert!(state.poll_error.is_none());
         assert_eq!(state.last_error, failed.last_error);
+    }
+
+    /// A permanently rejected sync credential latches: the poll error
+    /// names the recovery, owed work stays owed, no deployment is
+    /// attempted, and the status endpoint reports that a new sign-in is
+    /// required.
+    #[tokio::test]
+    async fn a_rejected_sync_credential_latches_and_is_reported() {
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().unwrap();
+        let revision = Utc::now();
+        let api = crate::worker::sync_client::tests::MockApi {
+            meta: Some(crate::worker::sync_client::tests::metadata(
+                "valheim", revision,
+            )),
+            ..Default::default()
+        };
+        api.token_status.store(400, Ordering::Relaxed);
+        let server = crate::worker::sync_client::tests::serve(api.clone()).await;
+        let ctx = poll_test_context(dir.path(), server.url.clone());
+        {
+            let mut state = ctx.journal.state.lock().await;
+            state.pending = Some(PendingWork::new(revision, owed_mod()));
+            state.refresh_token = Some("refresh-seed".to_owned());
+            state.last_error = Some("automatic deployment failed: upload failed".to_owned());
+            state.auto_deploy_mods = true;
+            state.restart_policy = super::RestartPolicy::WhenEmpty;
+            ctx.journal.save(&state).unwrap();
+        }
+
+        super::poll_once(&ctx).await;
+        let status = poll_status(ctx.clone()).await;
+        assert!(status.sync_reauthorization_required);
+        assert!(
+            status
+                .poll_error
+                .as_deref()
+                .unwrap()
+                .contains(crate::worker::sync_client::SYNC_REAUTHORIZATION_REQUIRED),
+            "unexpected poll error: {:?}",
+            status.poll_error
+        );
+        assert_eq!(status.pending_revision, Some(revision));
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("automatic deployment failed: upload failed")
+        );
+        assert!(status.auto_deploy_mods);
+        assert_eq!(status.restart_policy, super::RestartPolicy::WhenEmpty);
+        // The poll failed before any deployment could be attempted.
+        assert_eq!(api.archive_hits.load(Ordering::Relaxed), 0);
+        let state = ctx.journal.state.lock().await;
+        assert_eq!(state.pending.as_ref().unwrap().attempts, 0);
     }
 
     #[tokio::test]

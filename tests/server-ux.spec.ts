@@ -405,6 +405,37 @@ test('provisioning the local worker leaves no unsaved bar', async ({ page }) => 
 	expect(provisioned).toBe(true);
 });
 
+test('a rejected worker sign-in offers a reauthorization action', async ({ page }) => {
+	await page.clock.install();
+	await page.goto('/tests/dialog/?mode=worker');
+	const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
+	await remoteTab.getByLabel('Sync mode').click();
+	await page.getByRole('option', { name: 'Worker on this PC' }).click();
+	await remoteTab.getByRole('button', { name: 'Set up worker' }).click();
+	await expect(remoteTab.getByText('running', { exact: true })).toBeVisible();
+
+	// The worker reports that its sync credential was rejected; the
+	// background status tick picks it up.
+	await page.evaluate(() => (window as any).setLocalWorkerReauthorization(true));
+	await page.clock.runFor(60_500);
+	await expect(remoteTab.getByText(/Gale sync sign-in expired or was revoked/)).toBeVisible();
+	const reauthorize = remoteTab.getByRole('button', { name: 'Sign in again' });
+	await reauthorize.click();
+
+	// Signing in again re-runs provisioning, which returns a worker whose
+	// credential is fresh — the banner and action disappear.
+	await expect
+		.poll(() =>
+			page.evaluate(
+				() =>
+					(window as any).calls.filter((call: any) => call.cmd === 'provision_local_worker').length
+			)
+		)
+		.toBe(2);
+	await expect(remoteTab.getByText(/Gale sync sign-in expired or was revoked/)).toHaveCount(0);
+	await expect(remoteTab.getByRole('button', { name: 'Sign in again' })).toHaveCount(0);
+});
+
 test('a failed live refresh reports unavailable instead of spinning forever', async ({ page }) => {
 	await page.goto('/tests/dialog/?status=upToDate&failStatus=1');
 	const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });

@@ -240,6 +240,13 @@ Object.assign(window, {
 	setWorkerPending: (pendingRevision: string | null) => {
 		worker.pendingRevision = pendingRevision;
 	},
+	setLocalWorkerReauthorization: (required: boolean) => {
+		const current = localWorker.worker as Record<string, unknown> | null;
+		localWorker = {
+			...localWorker,
+			worker: current ? { ...current, syncReauthorizationRequired: required } : null
+		};
+	},
 	failWorkerRefresh: (on: boolean) => {
 		workerRefreshFails = on;
 	},
@@ -409,7 +416,7 @@ mockIPC(async (cmd, args) => {
 					phase: 'running',
 					at: '2026-09-25T00:00:00Z'
 				},
-				worker: { ...worker, workerId: 'local-worker' }
+				worker: { ...worker, workerId: 'local-worker', syncReauthorizationRequired: false }
 			};
 			return localWorker;
 		case 'set_dedicated_server_settings':

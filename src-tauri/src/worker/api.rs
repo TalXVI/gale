@@ -83,6 +83,11 @@ pub struct StatusResponse {
     pub last_error: Option<String>,
     /// The current publication-poll failure.
     pub poll_error: Option<String>,
+    /// The sync service rejected the worker's sign-in credential and it
+    /// latches until a new sign-in replaces it. Older workers omit this
+    /// field, hence the serde default.
+    #[serde(default)]
+    pub sync_reauthorization_required: bool,
     /// Live remote state, present only for `?refresh=true` requests.
     pub server: Option<ServerStateSummary>,
 }

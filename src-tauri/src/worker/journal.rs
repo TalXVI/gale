@@ -40,8 +40,14 @@ pub struct WorkerJournal {
     /// deployed without opening a remote session.
     pub deployed_mods_revision: Option<ModRevision>,
     /// The current sync refresh token (rotated on each token grant).
-    /// Seeded from `GALE_WORKER_REFRESH_TOKEN` on first run.
+    /// Seeded from `GALE_WORKER_REFRESH_TOKEN` on first run. When the
+    /// sync service rejects it, this still records the rejected value so
+    /// the same credential is never presented twice.
     pub refresh_token: Option<String>,
+    /// Set when the sync service rejected `refresh_token` (HTTP 400/401).
+    /// Only a new sign-in recovers, so no token requests are made until
+    /// setup replaces the credential or a different seed is supplied.
+    pub sync_reauthorization_required: bool,
     pub auto_deploy_mods: bool,
     pub restart_policy: RestartPolicy,
     /// Whether automation and restart policy were seeded from the config file.
@@ -174,6 +180,14 @@ impl WorkerJournal {
                     .map_or(revision, |prev| prev.max(revision)),
             );
         }
+    }
+
+    /// Installs a freshly issued sync credential (same-binding setup).
+    /// Everything else in the journal — pending work, deployed revisions,
+    /// automation settings, operation history — is kept.
+    pub fn replace_sync_credential(&mut self, refresh_token: String) {
+        self.refresh_token = Some(refresh_token);
+        self.sync_reauthorization_required = false;
     }
 }
 
@@ -326,6 +340,50 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(JOURNAL_FILE), b"{ not json").unwrap();
         assert!(Journal::load(dir.path()).is_err());
+    }
+
+    /// A fresh sign-in only swaps the credential and clears the latch;
+    /// owed work, deployed revisions, automation, and history survive.
+    #[tokio::test]
+    async fn replace_sync_credential_preserves_operational_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::load(dir.path()).unwrap();
+        let revision = Utc::now();
+        let before = {
+            let mut state = journal.state.lock().await;
+            state.pending = Some(PendingWork::new(revision, mod_rev('b')));
+            state.last_deployed_revision = Some(revision - chrono::Duration::hours(1));
+            state.deployed_mods_revision = Some(mod_rev('a'));
+            state.refresh_token = Some("rejected-token".to_owned());
+            state.sync_reauthorization_required = true;
+            state.auto_deploy_mods = true;
+            state.restart_policy = RestartPolicy::WhenEmpty;
+            state.automation_seeded = true;
+            state.last_operation = Some(operation("op-1"));
+            state.last_error = Some("automatic deployment failed: upload failed".to_owned());
+            state.poll_error = Some("Publication check failed: rejected".to_owned());
+            journal.save(&state).unwrap();
+            state.clone()
+        };
+
+        {
+            let mut state = journal.state.lock().await;
+            state.replace_sync_credential("fresh-token".to_owned());
+            journal.save(&state).unwrap();
+        }
+
+        let journal = Journal::load(dir.path()).unwrap();
+        let state = journal.state.lock().await;
+        assert_eq!(state.refresh_token.as_deref(), Some("fresh-token"));
+        assert!(!state.sync_reauthorization_required);
+        let mut expected = before;
+        expected.refresh_token = Some("fresh-token".to_owned());
+        expected.sync_reauthorization_required = false;
+        assert_eq!(
+            serde_json::to_value(&*state).unwrap(),
+            serde_json::to_value(&expected).unwrap(),
+            "every field except the credential survived"
+        );
     }
 
     fn mod_rev(byte: char) -> ModRevision {

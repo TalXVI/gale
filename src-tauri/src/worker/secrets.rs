@@ -152,7 +152,9 @@ impl Secrets {
     }
 
     /// The initial sync refresh token. Once the journal holds a rotated
-    /// token the seed is ignored.
+    /// token the seed is ignored — unless the journal credential was
+    /// rejected, in which case a *different* seed is a new sign-in and
+    /// is tried once.
     #[cfg(feature = "worker")]
     pub fn seed_refresh_token(&self) -> Option<String> {
         self.refresh_token.clone()

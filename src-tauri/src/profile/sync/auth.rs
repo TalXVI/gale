@@ -8,7 +8,7 @@ use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use eyre::{Context, OptionExt, Result, bail, eyre};
 use reqwest::StatusCode;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tauri::{AppHandle, Emitter, Manager, Url};
 use tokio::sync::{Mutex as AsyncMutex, broadcast};
 use tracing::{debug, error, info, warn};
@@ -182,7 +182,7 @@ struct JwtPayload {
     user: User,
 }
 
-fn decode_jwt(token: &str) -> Result<JwtPayload> {
+fn decode_jwt<T: DeserializeOwned>(token: &str) -> Result<T> {
     let payload = token.split('.').nth(1).ok_or_eyre("token is malformed")?;
 
     let bytes = BASE64_URL_SAFE_NO_PAD
@@ -190,6 +190,17 @@ fn decode_jwt(token: &str) -> Result<JwtPayload> {
         .context("failed to decode base64")?;
 
     serde_json::from_slice(&bytes).context("failed to deserialize json")
+}
+
+/// The `exp` claim of a sync access token, as issued by the sync service.
+pub(crate) fn access_token_expiry(access_token: &str) -> Result<DateTime<Utc>> {
+    #[derive(Debug, Deserialize)]
+    struct Expiry {
+        exp: i64,
+    }
+
+    let Expiry { exp } = decode_jwt(access_token).context("failed to decode jwt")?;
+    DateTime::from_timestamp(exp, 0).ok_or_eyre("access token expiry is out of range")
 }
 
 pub fn user_info(app: &AppHandle) -> Option<User> {

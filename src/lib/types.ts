@@ -497,6 +497,9 @@ export type WorkerStatus = {
 	lastError: string | null;
 	/// The current publication-poll failure.
 	pollError: string | null;
+	/// The worker's sync sign-in was rejected and latches until it is
+	/// signed in again. Older workers omit this field.
+	syncReauthorizationRequired?: boolean;
 	server: ServerStateSummary | null;
 };
 
