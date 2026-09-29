@@ -11,10 +11,13 @@
 //!   provider is DatHost.
 //!
 //! A persistent service cannot receive per-user environment variables,
-//! so the Windows service install writes the same keys to a `secrets.env`
-//! file instead (ACL-protected, referenced by the config's `secretsFile`).
-//! An environment variable always wins over the file, so operators can
-//! override a single value without editing the file.
+//! so the Windows service install writes the API token and the remote
+//! and DatHost credentials to a `secrets.env` file instead
+//! (ACL-protected, referenced by the config's `secretsFile`); the sync
+//! credential lives in the journal, since the file's copy would go stale
+//! the first time it rotates. An environment variable always wins over
+//! the file, so operators can override a single value without editing
+//! the file.
 
 #[cfg(feature = "worker")]
 use std::path::Path;

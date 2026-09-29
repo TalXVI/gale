@@ -424,19 +424,7 @@ fn install_inner(staging: &Path, log: &Path) -> Result<()> {
     config
         .save(&installed)
         .context("failed to install worker config")?;
-    std::fs::copy(
-        staging.join(local::SECRETS_FILE),
-        private.join(local::SECRETS_FILE),
-    )
-    .context("failed to install worker secrets")?;
-    if let Some(token) = staged_secrets.refresh_token {
-        // Setup obtains a new login. An old rotated token must not override
-        // it when the retained journal is loaded on the next start.
-        let journal = journal::Journal::load(&config.state_dir)?;
-        let mut state = journal.state.blocking_lock();
-        state.replace_sync_credential(token);
-        journal.save(&state)?;
-    }
+    install_secrets(staged_secrets, &private, &config.state_dir)?;
     // A staged SSH key accompanies private-key configs. The service
     // cannot reach user-profile paths as LocalSystem.
     let staged_key = staging.join(local::SSH_KEY_FILE);
@@ -446,6 +434,24 @@ fn install_inner(staging: &Path, log: &Path) -> Result<()> {
     }
 
     start_installed_worker(&manager, &root, &config.listen, log)
+}
+
+/// The managed worker's sync credential lives only in the journal: the
+/// journal rotates it on every grant, so a copy left in secrets.env would
+/// go stale and be mistaken for a new sign-in after a rejection latch.
+fn install_secrets(mut staged: Secrets, private: &Path, state_dir: &Path) -> Result<()> {
+    let refresh_token = staged.refresh_token.take();
+    std::fs::write(private.join(local::SECRETS_FILE), staged.render()?)
+        .context("failed to install worker secrets")?;
+    if let Some(token) = refresh_token {
+        // Setup obtains a new login. An old rotated token must not override
+        // it when the retained journal is loaded on the next start.
+        let journal = journal::Journal::load(state_dir)?;
+        let mut state = journal.state.blocking_lock();
+        state.replace_sync_credential(token);
+        journal.save(&state)?;
+    }
+    Ok(())
 }
 
 fn start_installed_worker(
@@ -820,5 +826,90 @@ mod tests {
             next.wait(Duration::from_secs(5)).unwrap(),
             "releasing the holder should let the next waiter acquire"
         );
+    }
+
+    /// A same-binding re-install swaps only the credential: the issued
+    /// sync token lands in the journal, never in secrets.env where it
+    /// would go stale, and the latch plus all operational state survive.
+    #[test]
+    fn same_binding_reauthorization_replaces_only_the_credential() {
+        use crate::profile::export::ModRevision;
+        use crate::profile::server::settings::RestartPolicy;
+        use crate::profile::server::state::{
+            ExecutorKind, OperationKind, OperationRecord, OperationStatus, OperationSummary,
+            RestartOutcome,
+        };
+        use crate::worker::journal::{Journal, PendingWork};
+        use chrono::Utc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let private = dir.path().join("private");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let mod_rev = |byte: char| ModRevision::try_from(byte.to_string().repeat(64)).unwrap();
+        let journal = Journal::load(&state_dir).unwrap();
+        let before = {
+            let mut state = journal.state.blocking_lock();
+            state.pending = Some(PendingWork::new(Utc::now(), mod_rev('b')));
+            state.last_deployed_revision = Some(Utc::now() - chrono::Duration::hours(1));
+            state.deployed_mods_revision = Some(mod_rev('a'));
+            state.auto_deploy_mods = true;
+            state.restart_policy = RestartPolicy::WhenEmpty;
+            state.last_operation = Some(OperationRecord {
+                id: "op-1".to_owned(),
+                executor: ExecutorKind::Worker,
+                kind: OperationKind::Automatic,
+                worker_id: Some("test".to_owned()),
+                publication_revision: None,
+                mods_revision: None,
+                status: OperationStatus::Succeeded,
+                summary: OperationSummary::default(),
+                restart: RestartOutcome::NotRequired,
+                error: None,
+                started_at: Utc::now(),
+                finished_at: Utc::now(),
+            });
+            state.refresh_token = Some("rt-9".to_owned());
+            state.sync_reauthorization_required = true;
+            journal.save(&state).unwrap();
+            serde_json::to_value(&*state).unwrap()
+        };
+        drop(journal);
+
+        super::install_secrets(
+            super::Secrets {
+                token: Some("api-token".to_owned()),
+                remote_password: Some("remote-pw".to_owned()),
+                refresh_token: Some("fresh".to_owned()),
+                dat_host_password: Some("dathost-pw".to_owned()),
+            },
+            &private,
+            &state_dir,
+        )
+        .unwrap();
+
+        let installed =
+            super::Secrets::load_file(&private.join(super::local::SECRETS_FILE)).unwrap();
+        assert_eq!(installed.token.as_deref(), Some("api-token"));
+        assert_eq!(installed.remote_password.as_deref(), Some("remote-pw"));
+        assert_eq!(installed.dat_host_password.as_deref(), Some("dathost-pw"));
+        // The sync credential never reaches the file, so a worker built
+        // from it gets no seed that could override the journal.
+        assert_eq!(installed.seed_refresh_token(), None);
+
+        let journal = Journal::load(&state_dir).unwrap();
+        let state = journal.state.blocking_lock();
+        assert_eq!(state.refresh_token.as_deref(), Some("fresh"));
+        assert!(!state.sync_reauthorization_required);
+        let mut after = serde_json::to_value(&*state).unwrap();
+        let mut expected = before;
+        for value in [&mut after, &mut expected] {
+            let object = value.as_object_mut().unwrap();
+            object.remove("refreshToken");
+            object.remove("syncReauthorizationRequired");
+        }
+        assert_eq!(after, expected, "only the credential changed");
     }
 }

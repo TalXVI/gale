@@ -103,8 +103,8 @@ C:\ProgramData\Gale\worker\
   worker.log           service log
   gale-worker.exe      the copy the service actually runs
   private\             ACL'd to SYSTEM + Administrators only
-    secrets.env        API token, remote credential, sync refresh token
-    gale-worker-state.json   durable journal (pending work, rotated tokens)
+    secrets.env        API token and remote credential
+    gale-worker-state.json   durable journal (pending work, sync credential)
     gale-worker.lock   instance lock that blocks a second worker
     ssh.key            staged copy of the SSH key, when key auth is used
 ```
@@ -188,7 +188,7 @@ The managed worker's job queue and rotated credentials live in `%ProgramData%\Ga
 
 1. Stop the old worker first. On the Server page choose **Stop**, wait until the service reports `stopped`, and confirm the last `status.json` report is not `running`. Two workers can keep polling the same server even though the remote lease prevents simultaneous deployments.
 2. **Copy the durable state** to the VPS: `private\gale-worker-state.json` (journal: pending work, retry backoff, rotated refresh token) and `private\secrets.env` (API token and credentials). Copy `gale-worker.json` too as a starting point.
-3. On the VPS, write a new `gale-worker.json` with the same `profileId`, `game`, and remote settings. Point `stateDir` at the copied journal and set `listen` to an address Gale can reach. Load the copied secrets through `secretsFile` or the environment. Use the worker's rotated token from `secrets.env`, not the desktop's sign-in.
+3. On the VPS, write a new `gale-worker.json` with the same `profileId`, `game`, and remote settings. Point `stateDir` at the copied journal and set `listen` to an address Gale can reach. Load the copied secrets through `secretsFile` or the environment, but do not set `GALE_WORKER_REFRESH_TOKEN`: the copied journal already carries the current sync credential, and a seed is only for a first run or a fresh sign-in.
 4. Start the external worker (systemd example above), then switch the profile's sync mode to **Worker on another machine** with the new address and the same bearer token.
 5. **Uninstall the local service** from the Server page (**Uninstall**) once the external worker reports healthy. Uninstall deletes `%ProgramData%\Gale\worker`, so copy the state out first.
 6. Verify that the new worker is bound to this profile and that `pendingRevision` clears after the first poll. Gale warns if the worker belongs to a different profile.
