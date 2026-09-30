@@ -185,6 +185,15 @@ pub struct ServerSyncStatus {
     pub warnings: Vec<String>,
 }
 
+impl ServerSyncStatus {
+    /// Combines the executor's state with independently fetched publication metadata.
+    fn observe_worker(&mut self, worker: StatusResponse) {
+        self.server = worker.server.clone();
+        self.publication_revision = self.publication_revision.max(worker.observed_revision);
+        self.worker = Some(worker);
+    }
+}
+
 // ---------- settings ----------
 
 #[command]
@@ -677,9 +686,7 @@ pub async fn get_server_sync_status(
 
     let refreshed = match resolve_executor(&target, &request.password, &request.worker_token) {
         Ok(Executor::Worker(client)) => client.status(request.refresh).await.map(|worker| {
-            status.server = worker.server.clone();
-            status.publication_revision = worker.observed_revision.or(status.publication_revision);
-            status.worker = Some(worker);
+            status.observe_worker(worker);
         }),
         Ok(Executor::Local(credential)) => {
             open_remote_session(&target.settings, &credential, target.mod_loader)
@@ -1207,6 +1214,42 @@ pub(crate) fn update_settings_for(
 mod tests {
     use super::super::settings::ServerLocation;
     use super::*;
+
+    #[test]
+    fn stale_worker_observation_cannot_mask_canonical_publication() {
+        let old = DateTime::parse_from_rfc3339("2026-09-22T00:00:00Z")
+            .unwrap()
+            .to_utc();
+        let new = old + chrono::Duration::seconds(1);
+        for (canonical, observed, expected) in [
+            (Some(new), Some(old), Some(new)),
+            (Some(old), Some(new), Some(new)),
+            (Some(new), None, Some(new)),
+            (None, Some(new), Some(new)),
+        ] {
+            let mut status = ServerSyncStatus {
+                mode: SyncMode::Worker,
+                server: None,
+                publication_revision: canonical,
+                worker: None,
+                credential_required: false,
+                warnings: Vec::new(),
+            };
+            let worker = serde_json::from_value(serde_json::json!({
+                "workerId": "worker", "profileId": "sync-profile-1", "autoDeployMods": false,
+                "restartPolicy": "manual", "observedRevision": observed, "pendingRevision": null,
+                "nextAttemptAt": null, "lastDeployedRevision": old, "busy": false,
+                "lastOperation": null, "lastError": null, "pollError": null, "server": null,
+            }))
+            .unwrap();
+            status.observe_worker(worker);
+            assert_eq!(
+                status.publication_revision, expected,
+                "keep the newest trustworthy publication"
+            );
+            assert!(status.worker.is_some());
+        }
+    }
 
     /// Remote settings in worker mode bound to a worker address.
     fn worker_settings() -> ProfileServerSettings {

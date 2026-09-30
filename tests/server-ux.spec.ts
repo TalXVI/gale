@@ -1,5 +1,36 @@
 import { test, expect, type Page } from '@playwright/test';
 
+test('a newer canonical publication is pending before the Worker observes it', async ({ page }) => {
+	await page.clock.install();
+	await page.goto('/tests/dialog/?component=navbar&mode=worker&deployed=1');
+	const remote = page.getByRole('tabpanel', { name: 'Remote server' });
+	const dot = page.locator('nav a[href="/server"] [data-badge]');
+	const old = '2026-09-22T00:00:00Z';
+	await page.evaluate((old) => (window as any).setWorkerObservation(old, old), old);
+	await remote.getByRole('button', { name: 'Refresh' }).click();
+	await expect(remote.getByText('Server is up to date')).toBeVisible();
+	await expect(dot).toHaveAttribute('data-badge', 'healthy');
+
+	await page.evaluate(() => (window as any).setPublicationRevision('2026-09-23T00:00:00Z'));
+	await page.clock.runFor(60_500);
+	await expect(remote.getByText('Server update pending', { exact: true })).toBeVisible();
+	await expect(remote.getByText('Server is up to date')).toHaveCount(0);
+	await expect(dot).toHaveAttribute('data-badge', 'pending');
+	await remote.getByRole('button', { name: 'Refresh' }).click();
+	await expect(remote.getByText('Server update pending', { exact: true })).toBeVisible();
+
+	// An older Worker can omit observedRevision; its deployment still bounds freshness.
+	await page.evaluate((old) => (window as any).setWorkerObservation(null, old), old);
+	await remote.getByRole('button', { name: 'Refresh' }).click();
+	await expect(remote.getByText('Server update pending', { exact: true })).toBeVisible();
+	// Equivalent timestamps with different offsets must not create false pending work.
+	await page.evaluate(() =>
+		(window as any).setWorkerObservation('2026-09-23T02:00:00+02:00', '2026-09-22T00:00:00Z')
+	);
+	await remote.getByRole('button', { name: 'Refresh' }).click();
+	await expect(remote.getByText('Server is up to date')).toBeVisible();
+});
+
 const lastSave = (page: Page) =>
 	page.evaluate(
 		() =>

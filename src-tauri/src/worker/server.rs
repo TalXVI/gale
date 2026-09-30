@@ -18,7 +18,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use eyre::{Context, Result, bail, ensure};
 use serde::Deserialize;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -62,6 +62,9 @@ pub struct WorkerContext {
     /// the remote lease's job; this keeps a manual request and an automatic
     /// poll from racing in the same process.
     operation_lock: Mutex<()>,
+    /// Serializes publication probes so a late response cannot replace a newer observation.
+    publication_lock: Mutex<()>,
+    automation_wake: Notify,
     progress: Arc<std::sync::Mutex<Option<SyncProgress>>>,
     token: String,
     cache_dir: std::path::PathBuf,
@@ -92,6 +95,8 @@ impl WorkerContext {
             journal: Arc::new(journal),
             spec,
             operation_lock: Mutex::new(()),
+            publication_lock: Mutex::new(()),
+            automation_wake: Notify::new(),
             progress: Arc::new(std::sync::Mutex::new(None)),
         })
     }
@@ -274,7 +279,14 @@ async fn status(
         None
     };
 
+    // Observation is separate from deployment: a live status request can
+    // discover work without waiting for staging, uploads, or a restart.
+    let publication_checked =
+        query.refresh.unwrap_or(false) && observe_publication(&ctx).await.is_ok();
     let journal = ctx.journal.state.lock().await.clone();
+    if publication_checked && automatic_deploy_due(&journal, Utc::now()) {
+        ctx.automation_wake.notify_one();
+    }
     let pending = journal.pending.as_ref();
 
     Json(StatusResponse {
@@ -579,6 +591,9 @@ async fn configure(
     match ctx.journal.save(&updated) {
         Ok(()) => {
             *state = updated;
+            if automatic_deploy_due(&state, Utc::now()) {
+                ctx.automation_wake.notify_one();
+            }
             StatusCode::NO_CONTENT.into_response()
         }
         Err(err) => error_response(&err),
@@ -597,21 +612,22 @@ async fn configure(
 /// it, and config state never creates work: the server is authoritative
 /// for its config files, so only the mod payload is synchronized.
 async fn poll_loop(ctx: Arc<WorkerContext>, shutdown: CancellationToken) {
-    let interval = Duration::from_secs(ctx.config.poll_interval_secs);
+    let mut interval = tokio::time::interval(Duration::from_secs(ctx.config.poll_interval_secs));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    // Poll once immediately, since a publication pushed while the worker
-    // was down should not wait a full interval, then repeat on the fixed
-    // cadence. Both waits select on the shutdown token so a service stop
-    // is answered promptly rather than after the current interval.
-    loop {
-        tokio::select! {
-            () = shutdown.cancelled() => break,
-            () = poll_once(&ctx) => {}
+    // The first tick is immediate. Refreshes wake only pending execution;
+    // they do not reset the unattended publication-check cadence.
+    let work = async {
+        loop {
+            tokio::select! {
+                _ = interval.tick() => poll_once(&ctx).await,
+                () = ctx.automation_wake.notified() => deploy_pending(&ctx).await,
+            }
         }
-        tokio::select! {
-            () = shutdown.cancelled() => break,
-            () = tokio::time::sleep(interval) => {}
-        }
+    };
+    tokio::select! {
+        () = shutdown.cancelled() => {},
+        () = work => {},
     }
 }
 
@@ -631,6 +647,14 @@ fn retry_delay(attempts: u32) -> Duration {
 /// One poll cycle. Observes the newest publication, then drives pending
 /// work.
 async fn poll_once(ctx: &Arc<WorkerContext>) {
+    if observe_publication(ctx).await.is_ok() {
+        deploy_pending(ctx).await;
+    }
+}
+
+/// Validates and records a canonical publication without doing deployment work.
+async fn observe_publication(ctx: &Arc<WorkerContext>) -> Result<()> {
+    let _guard = ctx.publication_lock.lock().await;
     let last_seen = ctx.journal.state.lock().await.observed_revision();
     let probe = match ctx.sync.poll(&ctx.journal, last_seen).await {
         Ok(probe) => probe,
@@ -643,7 +667,7 @@ async fn poll_once(ctx: &Arc<WorkerContext>) {
             {
                 warn!(%save_err, "failed to record poll error in journal");
             }
-            return;
+            return Err(err);
         }
     };
     let mut state = ctx.journal.state.lock().await;
@@ -652,7 +676,14 @@ async fn poll_once(ctx: &Arc<WorkerContext>) {
         Some(publication) => {
             let revision = publication.revision;
             info!(%revision, "observed new publication");
-            state.observe_publication(revision, &publication.mods_revision);
+            // A deployment may have confirmed a newer publication while
+            // this probe was in flight. Never regress its journal markers.
+            if state
+                .observed_revision()
+                .is_none_or(|observed| revision > observed)
+            {
+                state.observe_publication(revision, &publication.mods_revision);
+            }
             if let Err(err) = ctx.journal.save(&state) {
                 warn!(%err, "failed to persist observed revision");
             }
@@ -663,20 +694,20 @@ async fn poll_once(ctx: &Arc<WorkerContext>) {
             }
         }
     }
-    drop(state);
+    Ok(())
+}
 
+/// Runs only owed mod work, under the same lock as manual operations.
+async fn deploy_pending(ctx: &Arc<WorkerContext>) {
     let due = {
         let state = ctx.journal.state.lock().await;
         automatic_deploy_due(&state, Utc::now())
     };
 
     if due {
-        let Ok(guard) = ctx.operation_lock.try_lock() else {
-            // A manual operation is running, so the pending work
-            // stays in the journal and retries next tick.
-            info!("automatic deploy deferred: another operation is running");
-            return;
-        };
+        // Queue behind manual work rather than losing a refresh wake until
+        // the next periodic check. Status requests never wait on this lock.
+        let guard = ctx.operation_lock.lock().await;
 
         // Re-check under the operation lock. The action check above
         // may be stale. Owed work is always the mod payload, so the
@@ -860,6 +891,10 @@ pub async fn run(
     report_run_state(&ctx.config, WorkerRunPhase::Stopped);
     result
 }
+
+#[cfg(test)]
+#[path = "server_publication_tests.rs"]
+mod publication_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1315,7 +1350,7 @@ mod tests {
         );
     }
 
-    fn worker_config(dir: &std::path::Path, listen: String) -> super::WorkerConfig {
+    pub(super) fn worker_config(dir: &std::path::Path, listen: String) -> super::WorkerConfig {
         super::WorkerConfig {
             worker_id: "w".to_owned(),
             profile_id: "p".to_owned(),
@@ -1327,7 +1362,7 @@ mod tests {
         }
     }
 
-    fn worker_secrets() -> super::Secrets {
+    pub(super) fn worker_secrets() -> super::Secrets {
         super::Secrets {
             token: Some("token".to_owned()),
             ..super::Secrets::default()
@@ -1371,7 +1406,7 @@ mod tests {
         );
     }
 
-    fn free_port() -> u16 {
+    pub(super) fn free_port() -> u16 {
         std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
@@ -1574,7 +1609,7 @@ mod tests {
     use crate::thunderstore::{Backend, PackageIdent};
     const SYNC_PROFILE: &str = "sync-profile-1";
 
-    fn pack_manifest() -> ProfileManifest {
+    pub(super) fn pack_manifest() -> ProfileManifest {
         ProfileManifest {
             name: "Pack".to_owned(),
             mods: vec![R2Mod {
@@ -1592,7 +1627,7 @@ mod tests {
 
     /// A legacy-format publication archive: `export.r2x` manifest plus
     /// config payloads.
-    fn publication_zip(manifest: &ProfileManifest) -> Vec<u8> {
+    pub(super) fn publication_zip(manifest: &ProfileManifest) -> Vec<u8> {
         use std::io::{Cursor, Write};
         use zip::{ZipWriter, write::SimpleFileOptions};
 

@@ -30,6 +30,10 @@ export function remoteDeployState(
 	if (status.publicationRevision == null) return 'neverDeployed';
 	if (status.worker) {
 		if (status.worker.pendingRevision) return 'pending';
+		const observed = status.worker.observedRevision ?? status.worker.lastDeployedRevision;
+		if (observed != null && Date.parse(observed) < Date.parse(status.publicationRevision)) {
+			return 'pending';
+		}
 		return status.worker.lastDeployedRevision ? 'upToDate' : 'neverDeployed';
 	}
 	if (!status.server) return liveChecked ? 'unavailable' : 'checking';

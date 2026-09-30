@@ -58,9 +58,14 @@ const worker = {
 	lastOperation: null,
 	server: null
 };
-if (params.has('deployed')) worker.lastDeployedRevision = '2026-09-21T00:00:00Z';
+if (params.has('deployed')) {
+	worker.lastDeployedRevision = '2026-09-21T00:00:00Z';
+	// The later publication has already been observed with the same mod payload.
+	worker.observedRevision = '2026-09-22T00:00:00Z';
+}
 if (params.has('wpending')) worker.pendingRevision = '2026-09-23T12:00:00Z';
 let workerRefreshFails = false;
+let publicationRevision = '2026-09-22T00:00:00Z';
 let mockAuthExpired = false;
 const profileId = params.get('profile') ?? 'first';
 let activeId = 1;
@@ -240,6 +245,13 @@ Object.assign(window, {
 	},
 	setWorkerPending: (pendingRevision: string | null) => {
 		worker.pendingRevision = pendingRevision;
+	},
+	setPublicationRevision: (revision: string) => {
+		publicationRevision = revision;
+	},
+	setWorkerObservation: (observed: string | null, deployed: string | null) => {
+		worker.observedRevision = observed;
+		worker.lastDeployedRevision = deployed;
 	},
 	setLocalWorkerReauthorization: (required: boolean) => {
 		worker.syncReauthorizationRequired = required;
@@ -498,7 +510,7 @@ mockIPC(async (cmd, args) => {
 				worker: workerMode ? worker : null,
 				// A publication normally exists. `nopub` models a profile
 				// that has never been published.
-				publicationRevision: params.has('nopub') ? null : '2026-09-22T00:00:00Z',
+				publicationRevision: params.has('nopub') ? null : publicationRevision,
 				server: serverState(),
 				credentialRequired: false,
 				warnings: [] as string[]

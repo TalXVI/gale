@@ -51,7 +51,8 @@ pub struct DeployRequest {
 }
 
 /// `GET /v1/status` returns journal state plus, when `refresh` is set, a
-/// live read of the remote deployment state.
+/// live read of the remote deployment state and canonical publication observation.
+/// Automatic deployment is scheduled separately from the status request.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusResponse {

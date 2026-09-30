@@ -408,6 +408,9 @@ pub(crate) mod tests {
         assert_eq!(expiry, DateTime::from_timestamp(4102444800, 0).unwrap());
     }
 
+    type MockPublication = (SyncProfileMetadata, Vec<u8>);
+    type ArchiveGate = (usize, Arc<tokio::sync::Semaphore>);
+
     #[derive(Clone, Default)]
     pub(crate) struct MockApi {
         pub(crate) meta: Option<SyncProfileMetadata>,
@@ -419,6 +422,8 @@ pub(crate) mod tests {
         pub(crate) token_hits: Arc<AtomicUsize>,
         pub(crate) meta_hits: Arc<AtomicUsize>,
         pub(crate) archive_hits: Arc<AtomicUsize>,
+        pub(crate) publication: Arc<std::sync::Mutex<Option<MockPublication>>>,
+        pub(crate) archive_gate: Arc<std::sync::Mutex<Option<ArchiveGate>>>,
         pub(crate) refresh_tokens: Arc<tokio::sync::Mutex<Vec<String>>>,
     }
 
@@ -467,6 +472,9 @@ pub(crate) mod tests {
 
     async fn meta(State(api): State<MockApi>, Path(_id): Path<String>) -> Response {
         api.meta_hits.fetch_add(1, Ordering::Relaxed);
+        if let Some((meta, _)) = &*api.publication.lock().unwrap() {
+            return Json(meta.clone()).into_response();
+        }
         match &api.meta {
             Some(meta) => Json(meta.clone()).into_response(),
             None => HttpStatus::NOT_FOUND.into_response(),
@@ -474,7 +482,16 @@ pub(crate) mod tests {
     }
 
     async fn archive(State(api): State<MockApi>, Path(_id): Path<String>) -> Response {
-        api.archive_hits.fetch_add(1, Ordering::Relaxed);
+        let hit = api.archive_hits.fetch_add(1, Ordering::Relaxed) + 1;
+        let gate = api.archive_gate.lock().unwrap().clone();
+        if let Some((after, gate)) = gate
+            && hit >= after
+        {
+            gate.acquire().await.unwrap().forget();
+        }
+        if let Some((_, archive)) = &*api.publication.lock().unwrap() {
+            return archive.clone().into_response();
+        }
         if api.chunked {
             let chunks: Vec<_> = api
                 .archive
@@ -496,6 +513,22 @@ pub(crate) mod tests {
     impl MockServer {
         pub(crate) fn metadata_requests(&self) -> usize {
             self.api.meta_hits.load(Ordering::Relaxed)
+        }
+
+        pub(crate) fn archive_requests(&self) -> usize {
+            self.api.archive_hits.load(Ordering::Relaxed)
+        }
+
+        pub(crate) fn publish(&self, meta: SyncProfileMetadata, archive: Vec<u8>) {
+            *self.api.publication.lock().unwrap() = Some((meta, archive));
+        }
+
+        /// Holds deployment's archive fetch after observation has fetched it once.
+        pub(crate) fn hold_deployment_archive(&self) -> Arc<tokio::sync::Semaphore> {
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            *self.api.archive_gate.lock().unwrap() =
+                Some((self.archive_requests() + 2, gate.clone()));
+            gate
         }
     }
 
