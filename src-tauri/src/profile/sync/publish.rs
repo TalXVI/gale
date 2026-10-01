@@ -436,7 +436,7 @@ pub(super) async fn publish_profile(
             profile.name.clone(),
             sync.id.clone(),
             published,
-            export::build_manifest(profile, game),
+            export::build_manifest(profile),
             export::collect_config_files(&profile.path, game.mod_loader.mod_config_dirs())?,
         )
     };
@@ -496,7 +496,7 @@ pub(super) async fn create_profile(app: &AppHandle, profile_id: i64) -> Result<S
         (
             profile.path.clone(),
             profile.name.clone(),
-            export::build_manifest(profile, game),
+            export::build_manifest(profile),
             export::collect_config_files(&profile.path, game.mod_loader.mod_config_dirs())?,
         )
     };

@@ -80,6 +80,7 @@ pub struct Profile {
     pub custom_args: String,
     pub server_settings: Option<server::settings::ProfileServerSettings>,
     pub missing: bool,
+    pub excluded_export_files: HashSet<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -610,6 +611,7 @@ impl ModManager {
                 custom_args: saved_profile.custom_args,
                 server_settings: saved_profile.server_settings,
                 missing,
+                excluded_export_files: saved_profile.excluded_export_files.unwrap_or_default(),
             };
 
             manager

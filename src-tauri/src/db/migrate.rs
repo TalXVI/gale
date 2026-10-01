@@ -107,6 +107,7 @@ fn read_manager_data(prefs: &Prefs) -> Result<SaveData> {
                 custom_args: String::new(),
                 ignored_package_updates: None,
                 server_settings: None,
+                excluded_export_files: None,
             });
 
             if data.active_profile_index == index {

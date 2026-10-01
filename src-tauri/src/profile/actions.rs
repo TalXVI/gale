@@ -329,6 +329,7 @@ impl ManagedGame {
             server_settings: None,
             missing: false,
             ignored_package_updates: HashSet::new(),
+            excluded_export_files: HashSet::new(),
         };
 
         let index = self.target_profile_index(&profile.name);

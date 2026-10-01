@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fmt::Display,
     fs::{self, File},
     io::{self, Cursor, Seek, Write},
@@ -8,12 +8,13 @@ use std::{
 };
 
 use base64::{Engine, prelude::BASE64_STANDARD};
-use eyre::{Context, OptionExt, bail, ensure};
+use eyre::{Context, OptionExt, ensure, eyre};
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
+use itertools::Itertools;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
-use tracing::info;
+use tracing::{info, trace};
 use uuid::Uuid;
 use walkdir::WalkDir;
 use zip::{ZipWriter, write::SimpleFileOptions};
@@ -21,7 +22,6 @@ use zip::{ZipWriter, write::SimpleFileOptions};
 use super::{Profile, Result, install::ModInstall};
 use crate::thunderstore::Backend;
 use crate::{
-    game::Game,
     state::ManagerExt,
     thunderstore::{LegacyProfileCreateResponse, PackageIdent, Thunderstore, VersionIdent},
 };
@@ -393,14 +393,68 @@ pub fn manifest_revision(manifest: &ProfileManifest) -> Result<ModRevision> {
 
 pub const PROFILE_DATA_PREFIX: &str = "#r2modman\n";
 
-pub(super) fn export_zip(profile: &Profile, writer: impl Write + Seek, game: Game) -> Result<()> {
-    let manifest = build_manifest(profile, game);
-    let config = collect_config_files(&profile.path, game.mod_loader.mod_config_dirs())?;
+pub async fn export_zip<W>(app: &AppHandle, profile_id: i64, mut writer: W) -> Result<W>
+where
+    W: Write + Seek + Send + 'static,
+{
+    let (manifest, config_paths, profile_path) = {
+        let manager = app.lock_manager();
+        let (_, profile) = manager.profile_by_id(profile_id)?;
 
-    write_archive(&manifest, &config, writer)
+        let (manifest, config_paths) = prepare_export(profile)?;
+
+        (manifest, config_paths, profile.path.clone())
+    };
+
+    tokio::task::spawn_blocking(move || {
+        write_zip(&mut writer, &profile_path, &config_paths, &manifest)?;
+        Ok::<_, eyre::Report>(writer)
+    })
+    .await?
 }
 
-pub(super) fn build_manifest(profile: &Profile, game: Game) -> ProfileManifest {
+fn prepare_export(profile: &Profile) -> Result<(ProfileManifest, Vec<PathBuf>)> {
+    let manifest = build_manifest(profile);
+
+    let config_paths = list_export_files(profile)
+        .filter_ok(|file| {
+            if file.included {
+                true
+            } else {
+                trace!(path = %file.path.display(), "excluding file from export");
+                false
+            }
+        })
+        .map_ok(|file| file.path)
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok((manifest, config_paths))
+}
+
+fn write_zip<W>(
+    writer: &mut W,
+    profile_path: &Path,
+    paths: &[PathBuf],
+    manifest: &ProfileManifest,
+) -> Result<()>
+where
+    W: Write + Seek,
+{
+    let mut zip = ZipWriter::new(writer);
+
+    let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+    zip.start_file("export.r2x", opts)?;
+    serde_yaml::to_writer(&mut zip, &manifest).context("failed to write profile manifest")?;
+
+    write_config(paths.iter(), profile_path, &mut zip, opts)?;
+
+    zip.finish()?;
+
+    Ok(())
+}
+
+pub(super) fn build_manifest(profile: &Profile) -> ProfileManifest {
     let mods = profile
         .thunderstore_mods()
         .map(|(ts_mod, enabled)| {
@@ -423,7 +477,7 @@ pub(super) fn build_manifest(profile: &Profile, game: Game) -> ProfileManifest {
 
     ProfileManifest {
         name: profile.name.clone(),
-        game: Some(game.slug.to_string()),
+        game: Some(profile.game.slug.to_string()),
         mods,
         ignored_version_updates: profile.ignored_version_updates.iter().copied().collect(),
         ignored_package_updates: profile.ignored_package_updates.iter().copied().collect(),
@@ -488,24 +542,36 @@ pub(super) fn write_archive(
     Ok(())
 }
 
-#[derive(Serialize)]
-pub struct ExportCode {
-    code: Uuid,
-    backend: Backend,
+#[derive(Debug, Serialize)]
+pub struct ExportedCode {
+    pub code: Uuid,
+    pub backend: Backend,
 }
 
-async fn export_code(app: &AppHandle) -> Result<ExportCode> {
-    let (backend, base64) = {
-        let mut manager = app.lock_manager();
+#[derive(Debug, thiserror::Error)]
+enum ExportCodeError {
+    #[error("profile export is too large ({size} bytes)")]
+    TooLarge { size: usize },
+    #[error(transparent)]
+    Other(#[from] eyre::Report),
+}
 
-        let game = manager.active_game().game;
-        let profile = manager.active_profile_mut();
+impl From<reqwest_middleware::Error> for ExportCodeError {
+    fn from(value: reqwest_middleware::Error) -> Self {
+        Self::Other(value.into())
+    }
+}
 
-        let mut data = Cursor::new(Vec::new());
-        export_zip(profile, &mut data, game)?;
+impl From<reqwest::Error> for ExportCodeError {
+    fn from(value: reqwest::Error) -> Self {
+        Self::Other(value.into())
+    }
+}
 
-        let mut base64 = String::from(PROFILE_DATA_PREFIX);
-        base64.push_str(&BASE64_STANDARD.encode(data.get_ref()));
+async fn export_code(app: &AppHandle) -> Result<ExportedCode, ExportCodeError> {
+    let (profile_id, backend) = {
+        let manager = app.lock_manager();
+        let profile = manager.active_profile();
 
         let backend = if profile.has_hexium_exclusive_mods(&app.lock_thunderstore()) {
             Backend::Hexium
@@ -513,8 +579,14 @@ async fn export_code(app: &AppHandle) -> Result<ExportCode> {
             Backend::Thunderstore
         };
 
-        (backend, base64)
+        (profile.id, backend)
     };
+
+    let writer = Cursor::new(Vec::new());
+    let data = export_zip(app, profile_id, writer).await?;
+
+    let mut base64 = String::from(PROFILE_DATA_PREFIX);
+    base64.push_str(&BASE64_STANDARD.encode(data.get_ref()));
 
     let len = base64.len();
 
@@ -531,29 +603,74 @@ async fn export_code(app: &AppHandle) -> Result<ExportCode> {
     let response = match response.status() {
         status if status.is_success() => response.json::<LegacyProfileCreateResponse>().await?,
         StatusCode::PAYLOAD_TOO_LARGE => {
-            bail!(
-                "profile config is too large to export: {}, please reduce the size by removing heavy and/or unneeded config files",
-                humansize::format_size(len, humansize::BINARY)
-            );
+            return Err(ExportCodeError::TooLarge { size: len });
         }
-        _ => bail!("upload failed with status: {}", response.status()),
+        _ => {
+            return Err(ExportCodeError::Other(eyre!(
+                "failed to export profile code: {}",
+                response.status()
+            )));
+        }
     };
 
-    Ok(ExportCode {
+    Ok(ExportedCode {
         code: response.key,
         backend,
     })
 }
 
-fn write_config<P, I, W>(files: I, source: &Path, zip: &mut ZipWriter<W>) -> Result<()>
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportFile {
+    pub path: PathBuf,
+    pub size: usize,
+    pub included: bool,
+}
+
+fn refresh_excluded_export_files(profile: &mut Profile) -> Result<()> {
+    let config_files = find_config(&profile.path, profile.game.mod_loader.mod_config_dirs())
+        .collect::<HashSet<_>>();
+
+    profile
+        .excluded_export_files
+        .retain(|path| config_files.contains(path));
+
+    Ok(())
+}
+
+fn list_export_files(profile: &Profile) -> impl Iterator<Item = Result<ExportFile>> {
+    find_config(&profile.path, profile.game.mod_loader.mod_config_dirs()).map(|path| {
+        let full_path = profile.path.join(&path);
+        let size = std::fs::metadata(full_path).map(|meta| meta.len() as usize)?;
+
+        let included = profile.excluded_export_files.get(&path).is_none();
+
+        Ok(ExportFile {
+            path,
+            size,
+            included,
+        })
+    })
+}
+
+fn write_config<P, I, W>(
+    files: I,
+    source: &Path,
+    zip: &mut ZipWriter<W>,
+    opts: SimpleFileOptions,
+) -> Result<()>
 where
     P: AsRef<Path>,
     I: Iterator<Item = P>,
     W: Write + Seek,
 {
     for file in files {
-        let path = file.as_ref().to_string_lossy().replace('\\', "/");
-        zip.start_file(path, SimpleFileOptions::default())?;
+        let file = file.as_ref();
+
+        let path = file.to_string_lossy().replace('\\', "/");
+        zip.start_file(path, opts)?;
+
+        trace!(path = %file.display(), "writing config file to zip");
 
         let mut reader = File::open(source.join(file))?;
 

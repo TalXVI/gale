@@ -596,6 +596,7 @@ mod tests {
             custom_args: String::new(),
             server_settings: None,
             missing: false,
+            excluded_export_files: Default::default(),
         }
     }
 
