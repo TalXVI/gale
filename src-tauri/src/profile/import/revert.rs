@@ -359,6 +359,7 @@ mod tests {
             sync: None,
             custom_args: String::new(),
             missing: false,
+            excluded_export_files: Default::default(),
         }
     }
 

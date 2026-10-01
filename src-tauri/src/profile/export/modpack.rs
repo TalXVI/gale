@@ -155,6 +155,7 @@ impl Profile {
                 .map(|(file, _)| file),
             &self.path,
             &mut zip,
+            SimpleFileOptions::default(),
         )?;
 
         Ok(())

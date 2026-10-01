@@ -269,10 +269,17 @@ export type ModpackInfo = {
 	hexiumExclusive: boolean;
 };
 
-export type ExportCode = {
-	code: string;
-	backend: Backend;
+export type ExportFile = {
+	path: string;
+	size: number;
+	included: boolean;
 };
+
+export type ExportResult<T = {}> =
+	| ({ type: 'success' } & T)
+	| ({ type: 'tooLarge' } & { size: number });
+
+export type ExportCodeResult = ExportResult<{ code: string; backend: Backend }>;
 
 export type Game = {
 	name: string;
