@@ -27,7 +27,7 @@ use crate::{
 };
 
 mod apply;
-pub(super) mod archive;
+pub(crate) mod archive;
 pub mod auth;
 pub mod commands;
 mod publish;
@@ -42,14 +42,23 @@ async fn request(
     method: Method,
     path: impl Display,
     app: &AppHandle,
-) -> reqwest_middleware::RequestBuilder {
+) -> Result<reqwest_middleware::RequestBuilder> {
     let url = format!("{}{path}", *API_URL);
 
+    let token = required_token(&method, auth::access_token(app).await)?;
     let mut req = app.http().request(method, url);
-    if let Some(token) = auth::access_token(app).await {
+    if let Some(token) = token {
         req = req.bearer_auth(token);
     }
-    req
+    Ok(req)
+}
+
+fn required_token(method: &Method, token: Result<Option<String>>) -> Result<Option<String>> {
+    match token? {
+        Some(token) => Ok(Some(token)),
+        None if *method == Method::GET => Ok(None),
+        None => bail!("sign in to sync before modifying a profile"),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,11 +73,11 @@ struct CreateSyncProfileResponse {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncProfileMetadata {
-    id: String,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-    owner: auth::User,
-    manifest: ProfileManifest,
+    pub(crate) id: String,
+    pub(crate) created_at: DateTime<Utc>,
+    pub(crate) updated_at: DateTime<Utc>,
+    pub(crate) owner: auth::User,
+    pub(crate) manifest: ProfileManifest,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -182,6 +191,14 @@ impl From<SyncProfileMetadata> for SyncProfileData {
     }
 }
 
+impl SyncProfileData {
+    /// The sync-service profile id. Dedicated-server synchronization
+    /// fetches the canonical publication for this id.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
 async fn upload_profile_file(
     app: &AppHandle,
     bytes: Vec<u8>,
@@ -190,7 +207,7 @@ async fn upload_profile_file(
 ) -> Result<CreateSyncProfileResponse> {
     let len = bytes.len();
     let res = request(method, endpoint, app)
-        .await
+        .await?
         .body(bytes)
         .send()
         .await?;
@@ -450,6 +467,10 @@ async fn apply_archive(
     let latest = normalized.latest.clone();
 
     let resolved = resolve_target(&target, &manifest.name, app)?;
+
+    if let Some(profile_id) = resolved.profile_id {
+        super::server::ensure_profile_unlocked(app, profile_id)?;
+    }
 
     if clone && resolved.profile_id.is_none() && resolved.dir.is_some() {
         ensure_clone_target(resolved.prior_sync.as_ref(), &metadata.id, &manifest.name)?;
@@ -942,7 +963,7 @@ const MAX_DOWNLOAD_BYTES: usize = 16 * 1024 * 1024;
 
 pub(super) async fn download_profile_bytes(id: &str, app: &AppHandle) -> Result<Vec<u8>> {
     let mut response = request(Method::GET, format!("/profile/{id}"), app)
-        .await
+        .await?
         .send()
         .await?
         .error_for_status()?;
@@ -968,7 +989,7 @@ pub(super) async fn download_profile_bytes(id: &str, app: &AppHandle) -> Result<
 
 async fn delete_profile(id: &str, app: &AppHandle) -> Result<()> {
     request(Method::DELETE, format!("/profile/{id}"), app)
-        .await
+        .await?
         .send()
         .await?
         .error_for_status()?;
@@ -976,9 +997,12 @@ async fn delete_profile(id: &str, app: &AppHandle) -> Result<()> {
     Ok(())
 }
 
-async fn get_profile_meta(id: &str, app: &AppHandle) -> Result<Option<SyncProfileMetadata>> {
+pub(crate) async fn get_profile_meta(
+    id: &str,
+    app: &AppHandle,
+) -> Result<Option<SyncProfileMetadata>> {
     let res = request(Method::GET, format!("/profile/{id}/meta"), app)
-        .await
+        .await?
         .send()
         .await?
         .error_for_status();
@@ -999,9 +1023,45 @@ pub async fn read_profile(id: &str, app: &AppHandle) -> Result<SyncProfileMetada
         .ok_or_eyre("profile not found")
 }
 
+/// The canonical published state of a sync profile, validated and
+/// normalized. This is the exact artifact subscriber clients consume
+/// through `pull_profile` and dedicated servers deploy from.
+pub struct FetchedPublication {
+    /// Remote `updated_at`, identifying this exact publication revision.
+    pub revision: DateTime<Utc>,
+    pub manifest: ProfileManifest,
+    pub mods_revision: ModRevision,
+    pub config: BTreeMap<ConfigPath, archive::ValidatedConfigFile>,
+}
+
+/// Builds a publication from already-fetched metadata and archive bytes.
+/// Shared by the desktop and the standalone worker so both validate and
+/// normalize archives identically.
+pub fn publication_from_archive(
+    metadata: &SyncProfileMetadata,
+    bytes: &[u8],
+) -> Result<FetchedPublication> {
+    let validated = archive::validate(bytes).context("sync archive failed validation")?;
+    let normalized = normalize_archive(&validated)?;
+
+    Ok(FetchedPublication {
+        revision: metadata.updated_at,
+        manifest: normalized.manifest.clone(),
+        mods_revision: normalized.latest.mods_revision.clone(),
+        config: normalized.config.into_owned(),
+    })
+}
+
+/// Fetches the canonical publication for `id` from the sync service.
+pub async fn fetch_publication(id: &str, app: &AppHandle) -> Result<FetchedPublication> {
+    let metadata = read_profile(id, app).await?;
+    let bytes = download_profile_bytes(id, app).await?;
+    publication_from_archive(&metadata, &bytes)
+}
+
 async fn get_owned_profiles(app: &AppHandle) -> Result<Vec<ListedSyncProfile>> {
     let user: FullUserInfo = request(Method::GET, "/user/me", app)
-        .await
+        .await?
         .send()
         .await?
         .error_for_status()?
@@ -1016,6 +1076,19 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+
+    #[test]
+    fn mutating_requests_cannot_continue_without_authentication() {
+        let error = required_token(&Method::PUT, Ok(None)).unwrap_err();
+        assert!(format!("{error:#}").contains("sign in"));
+        let error = required_token(
+            &Method::PUT,
+            Err(eyre!("sync session expired; sign in again")),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("session expired"));
+        assert!(required_token(&Method::GET, Ok(None)).unwrap().is_none());
+    }
     use crate::{
         profile::export::{R2Mod, manifest_revision},
         thunderstore::{Backend, ModId, PackageIdent},
@@ -1662,6 +1735,7 @@ mod tests {
             modpack: None,
             sync: None,
             custom_args: String::new(),
+            server_settings: None,
             missing: false,
             excluded_export_files: Default::default(),
         }

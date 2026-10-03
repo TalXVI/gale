@@ -45,7 +45,8 @@
 	let statusLabel = $derived({
 		new: m.syncPublishDialog_status_new(),
 		modified: m.syncPublishDialog_status_modified(),
-		published: m.syncPublishDialog_status_published()
+		published: m.syncPublishDialog_status_published(),
+		removed: m.syncPublishDialog_status_removed()
 	});
 
 	$effect(() => {
@@ -56,6 +57,10 @@
 
 	const changedPaths = () =>
 		files.filter((file) => file.status !== 'published').map((file) => file.path);
+	const defaultPaths = () =>
+		files
+			.filter((file) => file.status === 'new' || file.status === 'modified')
+			.map((file) => file.path);
 
 	async function loadFiles() {
 		const id = profileId;
@@ -65,7 +70,7 @@
 			// discard the response if the dialog was repinned while loading
 			if (id !== profileId) return;
 			files = loaded;
-			selected = new SvelteSet(changedPaths());
+			selected = new SvelteSet(defaultPaths());
 		} catch {
 			files = [];
 			selected = new SvelteSet();
@@ -74,7 +79,7 @@
 		}
 	}
 
-	function selectChanged() {
+	function selectChanges() {
 		selected = new SvelteSet(changedPaths());
 	}
 
@@ -82,7 +87,17 @@
 		loading = true;
 		try {
 			let publishMode: SyncPublishMode =
-				mode === 'mods' ? { kind: 'mods' } : { kind: mode, files: [...selected] };
+				mode === 'mods'
+					? { kind: 'mods' }
+					: {
+							kind: mode,
+							files: files
+								.filter((file) => file.status !== 'removed' && selected.has(file.path))
+								.map((file) => file.path),
+							removeFiles: files
+								.filter((file) => file.status === 'removed' && selected.has(file.path))
+								.map((file) => file.path)
+						};
 
 			await api.profile.sync.push(publishMode, profileId);
 			pushInfoToast({ message: m.syncPublishDialog_successMessage() });
@@ -115,8 +130,8 @@
 			<h3 class="text-primary-800 dark:text-primary-100 mr-auto font-medium">
 				{m.syncPublishDialog_configHeading()}
 			</h3>
-			<Button color="primary" onclick={selectChanged}>
-				{m.syncPublishDialog_selectChanged()}
+			<Button color="primary" onclick={selectChanges}>
+				{m.syncPublishDialog_selectChanges()}
 			</Button>
 			<Button color="primary" onclick={() => (selected = new SvelteSet())}>
 				{m.syncPublishDialog_clear()}
@@ -148,17 +163,23 @@
 						<span class="text-primary-800 dark:text-primary-100 truncate" title={file.path}>
 							{file.path}
 						</span>
-						<span class="text-primary-500 dark:text-primary-400 shrink-0 text-sm">
-							{shortenFileSize(file.size)}
-						</span>
+						{#if file.size !== null}
+							<span class="text-primary-500 dark:text-primary-400 shrink-0 text-sm">
+								{shortenFileSize(file.size)}
+							</span>
+						{/if}
 						<span
+							title={file.status === 'removed'
+								? m.syncPublishDialog_removedDescription()
+								: undefined}
 							class={[
 								'ml-auto shrink-0 rounded px-2 py-0.5 text-xs font-medium',
 								{
 									new: 'bg-accent-600 text-white',
 									modified: 'text-primary-900 bg-yellow-500',
 									published:
-										'bg-primary-300 text-primary-600 dark:bg-primary-700 dark:text-primary-300'
+										'bg-primary-300 text-primary-600 dark:bg-primary-700 dark:text-primary-300',
+									removed: 'bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-200'
 								}[file.status]
 							]}
 						>

@@ -1,6 +1,6 @@
 use tauri::{AppHandle, command};
 
-use crate::{state::ManagerExt, util::cmd::Result};
+use crate::util::cmd::Result;
 
 use super::{
     ConfigUpdatePolicy, ListedSyncProfile, SyncProfileMetadata,
@@ -64,6 +64,8 @@ pub async fn delete_sync_profile(id: String, app: AppHandle) -> Result<()> {
 
 #[command]
 pub async fn pull_sync_profile(profile_id: i64, app: AppHandle) -> Result<ConfigApplyReport> {
+    crate::profile::server::ensure_profile_unlocked(&app, profile_id)?;
+
     let report = super::pull_profile(false, profile_id, &app).await?;
 
     Ok(report)
@@ -103,6 +105,8 @@ pub async fn apply_sync_config(
     profile_id: i64,
     app: AppHandle,
 ) -> Result<Vec<ConfigPath>> {
+    crate::profile::server::ensure_profile_unlocked(&app, profile_id)?;
+
     let written =
         super::apply_selected_config(files, remember, restore_deleted, profile_id, &app).await?;
 
@@ -137,7 +141,7 @@ pub async fn login(app: AppHandle) -> Result<auth::User> {
 
 #[command]
 pub async fn logout(app: AppHandle) -> Result<()> {
-    app.sync_auth().set_creds(None, app.db())?;
+    auth::logout(&app).await?;
 
     Ok(())
 }

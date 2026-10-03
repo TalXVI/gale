@@ -11,3 +11,6 @@ vite.config.ts.timestamp-*
 .VSCodeCounter
 /src-tauri/gen
 PRS.md
+
+/test-results
+/playwright-report

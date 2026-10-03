@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { Dialog } from 'bits-ui';
+	import { m } from '$lib/paraglide/messages';
 	import { fade } from 'svelte/transition';
 	import Icon from '@iconify/svelte';
 	import { confirm } from '@tauri-apps/plugin-dialog';
@@ -27,13 +28,12 @@
 	}: Props = $props();
 
 	async function close(evt: UIEvent) {
+		evt.preventDefault();
 		if (!canClose) {
-			evt.preventDefault();
 			return;
 		}
 
 		if (confirmClose) {
-			evt.preventDefault();
 			let result = await confirm(confirmClose.message);
 			if (!result) return;
 		}
@@ -64,6 +64,7 @@
 		</Dialog.Overlay>
 		<Dialog.Content
 			interactOutsideBehavior={canClose && confirmClose === null ? 'close' : 'ignore'}
+			onEscapeKeydown={close}
 			class="pointer-events-none"
 		>
 			{#if open}
@@ -87,6 +88,7 @@
 							<button
 								class="text-primary-500 hover:text-primary-700 dark:text-primary-400 dark:hover:bg-primary-700 dark:hover:text-primary-300 hover:bg-primary-200 absolute top-5 right-5 rounded-md p-0.5 text-3xl"
 								onclick={close}
+								aria-label={m.ui_closeDialog()}
 							>
 								<Icon icon="mdi:close" />
 							</button>
