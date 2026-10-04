@@ -15,6 +15,7 @@ import {
 	type ContextItem
 } from './types';
 import { convertFileSrc } from '@tauri-apps/api/core';
+import { compare } from 'semver';
 import games from './state/game.svelte';
 import { m } from './paraglide/messages';
 import * as api from '$lib/api';
@@ -108,19 +109,11 @@ export function timeSince(date: Date | string): string {
 	return m.util_timeSince_interval_null();
 }
 
-export function compareVersions(v1: string, v2: string): number {
-	const v1Parts = v1.split('.').map(Number);
-	const v2Parts = v2.split('.').map(Number);
-
-	for (let i = 0; i < Math.max(v1Parts.length, v2Parts.length); i++) {
-		const part1 = v1Parts[i] ?? 0;
-		const part2 = v2Parts[i] ?? 0;
-
-		if (part1 > part2) return 1;
-		if (part1 < part2) return -1;
+export function compareVersions(v1: string | null, v2: string | null): number {
+	if (v1 === null || v2 === null) {
+		return Number(v1 !== null) - Number(v2 !== null);
 	}
-
-	return 0;
+	return compare(v1, v2);
 }
 
 export function getPreferredBackend({ hexium, thunderstore }: DeduplicatedMod<Mod>): Backend {
@@ -130,7 +123,7 @@ export function getPreferredBackend({ hexium, thunderstore }: DeduplicatedMod<Mo
 	if (hexium?.isDeprecated && !thunderstore?.isDeprecated) return Backend.Thunderstore;
 	if (!hexium?.isDeprecated && thunderstore?.isDeprecated) return Backend.Hexium;
 
-	const versionCmp = compareVersions(thunderstore?.version ?? '', hexium?.version ?? '');
+	const versionCmp = compareVersions(thunderstore?.version ?? null, hexium?.version ?? null);
 	if (versionCmp > 0) return Backend.Thunderstore;
 	if (versionCmp < 0) return Backend.Hexium;
 

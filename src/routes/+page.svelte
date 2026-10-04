@@ -269,7 +269,10 @@
 		{/if}
 
 		{#if unknownMods.length > 0}
-			<UnknownModsBanner mods={unknownMods} uninstallAll={forceUninstall} />
+			<UnknownModsBanner
+				mods={unknownMods}
+				uninstallAll={() => forceUninstall(...unknownMods.map((mod) => mod.uuid))}
+			/>
 		{/if}
 
 		{#if mods.length === 0 && hasRefreshed}
@@ -319,6 +322,8 @@
 
 		<ModDetails
 			mod={selectedMod.data}
+			enabled={selectedMod.enabled}
+			configFile={selectedMod.configFile}
 			contextItems={resolveModContextItems(contextItems, selectedMod, locked)}
 			onclose={() => (selectedMod = null)}
 		>

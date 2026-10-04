@@ -29,6 +29,7 @@
 
 	type Props = {
 		mod: Mod;
+		enabled?: boolean;
 		contextItems?: ContextItem[];
 		onclose: () => void;
 		header?: Snippet;
@@ -39,6 +40,7 @@
 
 	let {
 		mod,
+		enabled,
 		contextItems = [],
 		onclose,
 		header,
@@ -102,7 +104,7 @@
 
 	<div class="-mr-3 grow overflow-x-hidden overflow-y-scroll pr-3 pb-2">
 		<div class="mb-3 flex flex-col gap-4 xl:flex-row xl:items-center">
-			<img src={modIconSrc(mod)} class="max-h-30 max-w-30 rounded-lg" alt="" />
+			<img src={modIconSrc(mod, enabled)} class="max-h-30 max-w-30 rounded-lg" alt="" />
 
 			<div>
 				<svelte:element

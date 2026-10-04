@@ -54,7 +54,11 @@
 	{/if}
 
 	<div class="flex items-center overflow-hidden">
-		<img src={modIconSrc(mod.data)} alt={mod.data.name} class="mr-3 size-12 rounded-md" />
+		<img
+			src={modIconSrc(mod.data, mod.enabled)}
+			alt={mod.data.name}
+			class="mr-3 size-12 rounded-md"
+		/>
 
 		<div class="mr-2 shrink overflow-hidden">
 			<div

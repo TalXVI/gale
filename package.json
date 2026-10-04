@@ -28,6 +28,7 @@
 		"@tailwindcss/vite": "^4.3.0",
 		"@tauri-apps/cli": "^2.11.4",
 		"@types/node": "^25.9.2",
+		"@types/semver": "^7.8.0",
 		"prettier": "^3.8.1",
 		"prettier-plugin-svelte": "^3.4.1",
 		"prettier-plugin-tailwindcss": "^0.7.2",
@@ -58,6 +59,7 @@
 		"js-convert-case": "^4.2.0",
 		"rehype-highlight": "^7.0.2",
 		"rehype-raw": "^7.0.0",
+		"semver": "^7.8.5",
 		"svelte-exmarkdown": "^5.0.2"
 	}
 }
