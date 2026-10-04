@@ -179,6 +179,7 @@ pub async fn oauth_credentials(app: &AppHandle) -> Result<AuthCredentials> {
 /// Forces a token grant with the desktop's stored refresh token. A second
 /// OAuth login may invalidate the earlier chain, so worker provisioning
 /// calls this afterwards to find out whether the desktop session survived.
+#[cfg(windows)]
 pub async fn verify_session(app: &AppHandle) -> Result<()> {
     let _refresh_guard = app.sync_auth().refresh_lock.lock().await;
     let refresh_token = {

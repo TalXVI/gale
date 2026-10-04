@@ -96,6 +96,7 @@ pub(crate) fn sync_target(app: &AppHandle) -> Result<SyncTarget> {
 
 /// The active profile's target acting on `settings` instead of the stored
 /// ones, for setup that must not depend on an earlier save.
+#[cfg(windows)]
 pub(crate) fn sync_target_with(app: &AppHandle, settings: RemoteServerSettings) -> SyncTarget {
     active_target(app, &app.lock_manager(), settings)
 }

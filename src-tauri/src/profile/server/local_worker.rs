@@ -253,7 +253,7 @@ pub async fn provision(
     #[cfg(not(windows))]
     {
         let _ = (app, request);
-        bail!("the managed worker is only supported on Windows")
+        bail!("the managed worker is only supported on Windows");
     }
     #[cfg(windows)]
     {
@@ -457,7 +457,7 @@ pub async fn control(app: &AppHandle, action: ServiceControlAction) -> Result<Lo
     #[cfg(not(windows))]
     {
         let _ = (app, action);
-        bail!("the managed worker is only supported on Windows")
+        bail!("the managed worker is only supported on Windows");
     }
     #[cfg(windows)]
     {
@@ -476,7 +476,7 @@ pub async fn update(app: &AppHandle) -> Result<LocalWorkerStatus> {
     #[cfg(not(windows))]
     {
         let _ = app;
-        bail!("the managed worker is only supported on Windows")
+        bail!("the managed worker is only supported on Windows");
     }
     #[cfg(windows)]
     {
@@ -502,7 +502,7 @@ pub async fn uninstall(app: &AppHandle) -> Result<LocalWorkerStatus> {
     #[cfg(not(windows))]
     {
         let _ = app;
-        bail!("the managed worker is only supported on Windows")
+        bail!("the managed worker is only supported on Windows");
     }
     #[cfg(windows)]
     {
