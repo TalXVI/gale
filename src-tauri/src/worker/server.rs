@@ -1236,7 +1236,11 @@ mod tests {
         );
 
         // Pre-seeded payload cache keeps staging offline.
-        let staged = dir.path().join("cache").join("Author-Mod").join("1.0.0");
+        let staged = crate::profile::install::cache::path(
+            &dir.path().join("cache"),
+            &crate::thunderstore::VersionIdent::from(("Author", "Mod", "1.0.0")),
+            Backend::Thunderstore,
+        );
         std::fs::create_dir_all(&staged).unwrap();
         std::fs::write(staged.join("mod.dll"), b"mod").unwrap();
 
@@ -1549,7 +1553,11 @@ mod tests {
             ..Default::default()
         };
         // Pre-seeded payload cache keeps staging offline.
-        let staged = dir.path().join("cache").join("Author-Mod").join("1.0.0");
+        let staged = crate::profile::install::cache::path(
+            &dir.path().join("cache"),
+            &crate::thunderstore::VersionIdent::from(("Author", "Mod", "1.0.0")),
+            Backend::Thunderstore,
+        );
         std::fs::create_dir_all(&staged).unwrap();
         std::fs::write(staged.join("mod.dll"), b"mod").unwrap();
 
@@ -1964,7 +1972,11 @@ mod tests {
         let ctx = std::sync::Arc::new(
             super::WorkerContext::new(config.clone(), secrets, journal).unwrap(),
         );
-        let staged = dir.path().join("cache").join("Author-Mod").join("1.0.0");
+        let staged = crate::profile::install::cache::path(
+            &dir.path().join("cache"),
+            &crate::thunderstore::VersionIdent::from(("Author", "Mod", "1.0.0")),
+            Backend::Thunderstore,
+        );
         std::fs::create_dir_all(&staged).unwrap();
         std::fs::write(staged.join("mod.dll"), b"mod").unwrap();
 
@@ -2038,7 +2050,11 @@ mod tests {
             let mut state = journal.state.lock().await;
             state.auto_deploy_mods = true;
         }
-        let staged = dir.path().join("cache").join("Author-Mod").join("1.0.0");
+        let staged = crate::profile::install::cache::path(
+            &dir.path().join("cache"),
+            &crate::thunderstore::VersionIdent::from(("Author", "Mod", "1.0.0")),
+            Backend::Thunderstore,
+        );
         std::fs::create_dir_all(&staged).unwrap();
         std::fs::write(staged.join("mod.dll"), b"mod").unwrap();
         let ctx = std::sync::Arc::new(
@@ -2108,7 +2124,11 @@ mod tests {
         }
         // The staged package tree carries a bundled config alongside the
         // payload; the pre-seeded cache keeps staging offline.
-        let staged = dir.path().join("cache").join("Author-Mod").join("1.0.0");
+        let staged = crate::profile::install::cache::path(
+            &dir.path().join("cache"),
+            &crate::thunderstore::VersionIdent::from(("Author", "Mod", "1.0.0")),
+            Backend::Thunderstore,
+        );
         std::fs::create_dir_all(staged.join("BepInEx/config")).unwrap();
         std::fs::write(staged.join("mod.dll"), b"mod").unwrap();
         std::fs::write(

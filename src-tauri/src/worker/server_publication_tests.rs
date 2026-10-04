@@ -15,6 +15,7 @@ use crate::{
         },
         sync::{SyncProfileMetadata, auth::User, publication_from_archive},
     },
+    thunderstore::Backend,
     worker::{
         api::PreviewRequest,
         journal::Journal,
@@ -121,7 +122,11 @@ async fn live_refresh_observes_new_publication_and_wakes_config_free_automation(
         metadata.updated_at = new;
         metadata.manifest = manifest.clone();
         sync.publish(metadata.clone(), publication_zip(&manifest));
-        let staged = dir.path().join("cache/Author-Mod/2.0.0");
+        let staged = crate::profile::install::cache::path(
+            &dir.path().join("cache"),
+            &crate::thunderstore::VersionIdent::from(("Author", "Mod", "2.0.0")),
+            Backend::Thunderstore,
+        );
         std::fs::create_dir_all(staged.join("BepInEx/config")).unwrap();
         std::fs::create_dir_all(staged.join("BepInEx/plugins/Author-Mod")).unwrap();
         std::fs::write(staged.join("BepInEx/plugins/Author-Mod/mod.dll"), b"v2").unwrap();
