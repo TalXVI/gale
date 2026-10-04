@@ -238,8 +238,13 @@ mod tests {
     /// irrelevant.
     #[cfg(windows)]
     fn sleeper() -> super::SharedChild {
-        let child = tokio::process::Command::new("cmd")
-            .args(["/c", "ping", "-n", "60", "127.0.0.1"])
+        let child = tokio::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 60",
+            ])
             .kill_on_drop(true)
             .spawn()
             .unwrap();
@@ -256,9 +261,9 @@ mod tests {
         std::sync::Arc::new(tokio::sync::Mutex::new(child))
     }
 
-    fn runtime_with_child() -> (super::ServerRuntime, u32) {
+    async fn runtime_with_child() -> (super::ServerRuntime, u32) {
         let child = sleeper();
-        let pid = child.blocking_lock().id().unwrap();
+        let pid = child.lock().await.id().unwrap();
         let mut runtime = super::ServerRuntime::default();
         runtime
             .register(
@@ -272,11 +277,11 @@ mod tests {
         (runtime, pid)
     }
 
-    #[test]
-    fn stopping_keeps_the_profile_locked_and_blocks_launch() {
+    #[tokio::test]
+    async fn stopping_keeps_the_profile_locked_and_blocks_launch() {
         // The 8.2 contract: while termination is pending the process may
         // still be alive, so it keeps counting as running.
-        let (mut runtime, pid) = runtime_with_child();
+        let (mut runtime, pid) = runtime_with_child().await;
         assert!(runtime.is_profile_locked(7));
 
         let (stopped_pid, _child) = runtime.begin_stop().unwrap();
@@ -305,12 +310,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn failed_termination_restores_the_running_entry() {
+    #[tokio::test]
+    async fn failed_termination_restores_the_running_entry() {
         // cancel_stop simulates a failed kill: the process is still alive,
         // so the runtime goes back to plain Running. It must never report
         // a live process as stopped.
-        let (mut runtime, pid) = runtime_with_child();
+        let (mut runtime, pid) = runtime_with_child().await;
         runtime.begin_stop().unwrap();
 
         runtime.cancel_stop(pid);
@@ -331,16 +336,16 @@ mod tests {
         assert!(!runtime.is_profile_locked(7));
     }
 
-    #[test]
-    fn stale_watcher_cannot_clear_a_replacement() {
+    #[tokio::test]
+    async fn stale_watcher_cannot_clear_a_replacement() {
         // clear_if_pid is pid-scoped: an old watcher reporting death must
         // not remove a newer registration.
-        let (mut runtime, pid) = runtime_with_child();
+        let (mut runtime, pid) = runtime_with_child().await;
         runtime.begin_stop().unwrap();
         runtime.clear_if_pid(pid);
 
         let child = sleeper();
-        let new_pid = child.blocking_lock().id().unwrap();
+        let new_pid = child.lock().await.id().unwrap();
         runtime
             .register(
                 7,
