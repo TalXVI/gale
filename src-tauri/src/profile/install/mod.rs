@@ -4,7 +4,7 @@
 ///
 /// 1) The mod ZIP is downloaded from Thunderstore and extracted according to the modloader-specific rules.
 ///    This is handled by [`PackageInstaller::extract`], implemented in the respective `installers` submodules.
-/// 2) The extracted files are placed into `<data directory>/cache/<author-name>/<version>`.
+/// 2) The extracted files are placed into `<data directory>/cache/<backend>/<author-name>/<version>`.
 /// 3) The files are copied to the profile folder (at the same relative path). Most files are copied using
 ///    hard links, but ones that are expected to change are properly cloned. This is also implemented in the
 ///    respective `installers` submodules.
@@ -37,10 +37,10 @@ use crate::{
     prefs::Prefs,
     profile::{ProfileMod, ProfileModKind, ThunderstoreMod},
     state::ManagerExt,
-    thunderstore::{BorrowedMod, ModId, Thunderstore, VersionIdent},
+    thunderstore::{BorrowedMod, ModId, Thunderstore, VersionIdent, query::Queryable},
 };
 
-mod cache;
+pub(crate) mod cache;
 pub mod commands;
 pub(crate) mod download;
 mod fs;
@@ -283,7 +283,7 @@ fn total_download_size(
         .missing_deps(borrowed.dependencies(), thunderstore)
         .chain(iter::once(borrowed))
         .filter(|borrowed| {
-            !cache::path(borrowed.ident(), prefs).exists()
+            !cache::path(&prefs.cache_dir(), borrowed.ident(), borrowed.backend()).exists()
                 && !queue.has_mod(borrowed.package.uuid, profile.id)
         })
         .map(|borrowed| borrowed.version.file_size)

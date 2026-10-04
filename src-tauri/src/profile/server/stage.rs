@@ -29,7 +29,7 @@ use crate::{
     game::mod_loader::ModLoader,
     profile::{
         export::{ContentHash, R2Mod},
-        install::{InstallError, download},
+        install::{InstallError, cache, download},
         sync::FetchedPublication,
     },
     thunderstore::{Backend, VersionIdent},
@@ -50,7 +50,7 @@ pub trait PayloadSource: Send + Sync {
 
 /// A payload source backed by a plain directory plus an HTTP client.
 ///
-/// Layout: `<root>/<full_name>/<version>/`, identical to Gale's install
+/// Layout: `<root>/<backend>/<full_name>/<version>/`, identical to Gale's install
 /// cache so Local mode can share `prefs.cache_dir()` directly.
 pub struct CachePayloadSource {
     pub root: PathBuf,
@@ -65,8 +65,10 @@ impl PayloadSource for CachePayloadSource {
         backend: Backend,
     ) -> BoxFuture<'a, Result<PathBuf>> {
         Box::pin(async move {
-            let parent = self.root.join(ident.full_name());
-            let dest = parent.join(ident.version());
+            let dest = cache::path(&self.root, ident, backend);
+            let parent = dest
+                .parent()
+                .expect("cache entries have a package directory");
 
             if is_staged(&dest) {
                 return Ok(dest);
@@ -81,12 +83,12 @@ impl PayloadSource for CachePayloadSource {
                 })
                 .with_context(|| format!("failed to download {ident}"))?;
 
-            std::fs::create_dir_all(&parent).context("failed to create staging directory")?;
+            std::fs::create_dir_all(parent).context("failed to create staging directory")?;
 
             // Extract to a sibling temp dir, then rename into place so an
             // interrupted extraction can't leave a half-populated tree
             // behind.
-            let tmp = tempfile::tempdir_in(&parent)?;
+            let tmp = tempfile::tempdir_in(parent)?;
             self.extract(bytes, ident, tmp.path())?;
             commit_staged(tmp, &dest)?;
             Ok(dest)
@@ -368,6 +370,34 @@ mod tests {
             );
         }
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn staging_uses_the_requested_source_with_warm_caches() {
+        let root = tempfile::tempdir().unwrap();
+        let ident = VersionIdent::from(("Author", "Mod", "1.0.0"));
+        for (namespace, bytes) in [
+            ("", b"legacy".as_slice()),
+            ("thunderstore", b"thunderstore".as_slice()),
+            ("hexium", b"hexium".as_slice()),
+        ] {
+            let dir = root.path().join(namespace).join("Author-Mod/1.0.0");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("Mod.dll"), bytes).unwrap();
+        }
+        let source = super::CachePayloadSource {
+            root: root.path().to_path_buf(),
+            client: reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build(),
+            mod_loader: Box::leak(Box::new(bepinex())),
+        };
+
+        for backend in [Backend::Hexium, Backend::Thunderstore, Backend::Hexium] {
+            let staged = source.stage(&ident, backend).await.unwrap();
+            assert_eq!(
+                std::fs::read(staged.join("Mod.dll")).unwrap(),
+                backend.to_string().as_bytes()
+            );
+        }
     }
 
     #[tokio::test]
