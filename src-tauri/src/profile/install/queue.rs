@@ -18,7 +18,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 use zip::ZipArchive;
 
-use crate::{logger, state::ManagerExt, util::error::IoResultExt};
+use crate::{logger, profile::server, state::ManagerExt, util::error::IoResultExt};
 
 use super::{
     CancelBehavior, HideReason, InstallError, InstallEvent, InstallOptions, InstallResult,
@@ -184,7 +184,15 @@ impl InstallQueueLock<'_> {
             on_complete: tx,
         };
 
-        if mod_count > 0 {
+        if mod_count == 0 {
+            info!(options = ?batch.options, "no mods to install, completing batch immediately");
+            // complete the task immediately since there are no mods to install
+            batch.complete(Ok(()), app);
+        } else if let Err(err) = server::ensure_profile_unlocked(app, profile_id) {
+            // fail before downloading anything; the install itself checks
+            // again under the manager lock right before writing
+            batch.complete(Err(InstallError::Error(err)), app);
+        } else {
             info!(len = mod_count, options = ?batch.options, "pushing batch to install queue");
             self.state.pending.push_back(batch);
             self.queue.notify_push.notify_waiters();
@@ -196,10 +204,6 @@ impl InstallQueueLock<'_> {
                 },
                 app,
             );
-        } else {
-            info!(options = ?batch.options, "no mods to install, completing batch immediately");
-            // complete the task immediately since there are no mods to install
-            batch.complete(Ok(()), app);
         }
 
         async move {
@@ -445,6 +449,8 @@ fn try_cache_install(batch: &InstallBatch, index: usize, app: &AppHandle) -> Res
     let mut manager = app.lock_manager();
 
     let (game, profile) = manager.profile_by_id_mut(batch.profile_id)?;
+    server::ensure_profile_unlocked(app, batch.profile_id)?;
+
     if let Some(callback) = &batch.options.before_install {
         callback(install, profile)?;
     }
@@ -523,6 +529,7 @@ fn install_from_download(
 
     let mut manager = app.lock_manager();
     let (_, profile) = manager.profile_by_id_mut(batch.profile_id)?;
+    server::ensure_profile_unlocked(app, batch.profile_id)?;
 
     if let Some(callback) = &batch.options.before_install {
         callback(install, profile)?;

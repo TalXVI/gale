@@ -5,7 +5,7 @@ use tauri::{AppHandle, command};
 
 use super::{AnyFileKind, frontend};
 use crate::{
-    profile::{ModManager, Profile},
+    profile::{ModManager, Profile, server},
     state::ManagerExt,
     util::cmd::Result,
 };
@@ -21,6 +21,18 @@ fn active_profile_guarded<'m>(
     if profile.id != profile_id {
         return Err(eyre!("active profile changed while the config editor was open").into());
     }
+    Ok(profile)
+}
+
+/// [`active_profile_guarded`] for commands that write to the profile's
+/// files, which a running dedicated server keeps locked.
+fn writable_profile_guarded<'m>(
+    manager: &'m mut ModManager,
+    profile_id: i64,
+    app: &AppHandle,
+) -> Result<&'m mut Profile> {
+    let profile = active_profile_guarded(manager, profile_id)?;
+    server::ensure_profile_unlocked(app, profile.id)?;
     Ok(profile)
 }
 
@@ -45,7 +57,7 @@ pub fn set_config_entry(
 ) -> Result<()> {
     let mut manager = app.lock_manager();
 
-    let profile = active_profile_guarded(&mut manager, profile_id)?;
+    let profile = writable_profile_guarded(&mut manager, profile_id, &app)?;
     let file = profile.config_cache.find_file(file)?;
 
     match &mut file.kind {
@@ -68,7 +80,7 @@ pub fn reset_config_entry(
 ) -> Result<frontend::Value> {
     let mut manager = app.lock_manager();
 
-    let profile = active_profile_guarded(&mut manager, profile_id)?;
+    let profile = writable_profile_guarded(&mut manager, profile_id, &app)?;
     let file = profile.config_cache.find_file(file)?;
 
     let value = match &mut file.kind {
@@ -84,7 +96,7 @@ pub fn reset_config_entry(
 pub fn reset_config_file(file: &Path, profile_id: i64, app: AppHandle) -> Result<()> {
     let mut manager = app.lock_manager();
 
-    let profile = active_profile_guarded(&mut manager, profile_id)?;
+    let profile = writable_profile_guarded(&mut manager, profile_id, &app)?;
     let file = profile.config_cache.find_file(file)?;
 
     match &mut file.kind {
@@ -112,7 +124,7 @@ pub fn open_config_file(file: &Path, profile_id: i64, app: AppHandle) -> Result<
 pub fn delete_config_file(file: &Path, profile_id: i64, app: AppHandle) -> Result<()> {
     let mut manager = app.lock_manager();
 
-    let profile = active_profile_guarded(&mut manager, profile_id)?;
+    let profile = writable_profile_guarded(&mut manager, profile_id, &app)?;
 
     let Some(index) = profile
         .config_cache
