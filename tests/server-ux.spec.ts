@@ -517,7 +517,8 @@ test('a failed worker setup leaves the saved settings untouched', async ({ page 
 test('a rejected worker sign-in refreshes the mounted status immediately after reauthorization', async ({
 	page
 }) => {
-	await page.clock.install();
+	await page.clock.install({ time: new Date('2026-01-01T00:00:00Z') });
+	await page.clock.pauseAt(new Date('2026-01-01T00:01:00Z'));
 	await page.goto('/tests/dialog/?mode=worker&wpending=1&deployed=1');
 	const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
 	await remoteTab.getByLabel('Sync mode').click();
@@ -535,7 +536,6 @@ test('a rejected worker sign-in refreshes the mounted status immediately after r
 		[pollError, deploymentError]
 	);
 	await page.clock.runFor(60_500);
-	await page.clock.pauseAt(await page.evaluate(() => Date.now()));
 	await expect(remoteTab.getByText(/Gale sync sign-in expired or was revoked/)).toBeVisible();
 	await expect(remoteTab.getByText(pollError)).toBeVisible();
 	await expect(remoteTab.getByText(deploymentError)).toBeVisible();
