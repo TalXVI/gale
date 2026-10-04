@@ -111,8 +111,11 @@ impl InstallQueue {
         allow_multiple: bool,
         app: &AppHandle,
     ) -> Result<impl Future<Output = InstallResult<()>>> {
-        self.lock()
-            .push_with_deps(mods, profile_id, options, allow_multiple, app)
+        // Resolve before taking the queue lock: the manager is always locked
+        // before the queue, so taking it while holding the queue could
+        // deadlock against a command that holds the manager.
+        let mods = resolve_with_deps(mods, profile_id, allow_multiple, app)?;
+        Ok(self.lock().push_batch(mods, profile_id, options, app))
     }
 }
 
@@ -208,48 +211,6 @@ impl InstallQueueLock<'_> {
         }
     }
 
-    fn push_with_deps(
-        &mut self,
-        mods: Vec<ModInstall>,
-        profile_id: i64,
-        options: InstallOptions,
-        allow_multiple: bool,
-        app: &AppHandle,
-    ) -> Result<impl Future<Output = InstallResult<()>> + use<>> {
-        let mods = {
-            let manager = app.lock_manager();
-            let thunderstore = app.lock_thunderstore();
-            let (_, profile) = manager.profile_by_id(profile_id)?;
-
-            if !allow_multiple && mods.len() == 1 && profile.has_mod(mods[0].uuid()) {
-                bail!("mod is already installed");
-            }
-
-            // find the missing dependencies of each mod and flatten them into one vec
-            let mods = mods
-                .into_iter()
-                .map(|install| {
-                    let borrowed = install.id.borrow(&thunderstore)?;
-
-                    Ok(iter::once(install).chain(
-                        profile
-                            .missing_deps(borrowed.dependencies(), &thunderstore)
-                            .map(ModInstall::from),
-                    ))
-                })
-                .flatten_ok()
-                .collect::<Result<Vec<_>>>()
-                .context("failed to resolve dependencies")?;
-
-            mods.into_iter()
-                .unique_by(super::ModInstall::uuid) // remove duplicate dependencies
-                .rev() // install dependencies first
-                .collect_vec()
-        };
-
-        Ok(self.push_batch(mods, profile_id, options, app))
-    }
-
     fn pop_next(&mut self) -> Option<InstallBatch> {
         let next = self.state.pending.pop_front();
         self.state.processing = next.as_ref().map(|batch| {
@@ -265,6 +226,45 @@ impl InstallQueueLock<'_> {
 
         next
     }
+}
+
+/// Adds the missing dependencies of `mods`, ordered so dependencies install
+/// first.
+fn resolve_with_deps(
+    mods: Vec<ModInstall>,
+    profile_id: i64,
+    allow_multiple: bool,
+    app: &AppHandle,
+) -> Result<Vec<ModInstall>> {
+    let manager = app.lock_manager();
+    let thunderstore = app.lock_thunderstore();
+    let (_, profile) = manager.profile_by_id(profile_id)?;
+
+    if !allow_multiple && mods.len() == 1 && profile.has_mod(mods[0].uuid()) {
+        bail!("mod is already installed");
+    }
+
+    // find the missing dependencies of each mod and flatten them into one vec
+    let mods = mods
+        .into_iter()
+        .map(|install| {
+            let borrowed = install.id.borrow(&thunderstore)?;
+
+            Ok(iter::once(install).chain(
+                profile
+                    .missing_deps(borrowed.dependencies(), &thunderstore)
+                    .map(ModInstall::from),
+            ))
+        })
+        .flatten_ok()
+        .collect::<Result<Vec<_>>>()
+        .context("failed to resolve dependencies")?;
+
+    Ok(mods
+        .into_iter()
+        .unique_by(super::ModInstall::uuid) // remove duplicate dependencies
+        .rev() // install dependencies first
+        .collect_vec())
 }
 
 pub struct InstallBatch {
