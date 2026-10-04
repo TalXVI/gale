@@ -26,7 +26,7 @@ pub(crate) const MAX_STATE_BYTES: u64 = 4 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OwnedFile {
-    pub hash: String,
+    pub hash: ContentHash,
     pub size: u64,
 }
 
@@ -360,7 +360,7 @@ mod tests {
         state.files.insert(
             deploy("BepInEx/config/evil.cfg"),
             OwnedFile {
-                hash: "x".to_owned(),
+                hash: hash_of("x"),
                 size: 1,
             },
         );
@@ -383,7 +383,7 @@ mod tests {
         state.files.insert(
             deploy("BepInEx/plugins/Mod/translations/en.json"),
             OwnedFile {
-                hash: "x".to_owned(),
+                hash: hash_of("x"),
                 size: 1,
             },
         );

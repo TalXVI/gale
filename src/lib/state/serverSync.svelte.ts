@@ -43,7 +43,9 @@ export function remoteDeployState(
 	if (lastOperation?.modsRevision == null || lastOperation.publicationRevision == null) {
 		return 'deployed';
 	}
-	if (lastOperation.publicationRevision < status.publicationRevision) return 'pending';
+	if (Date.parse(lastOperation.publicationRevision) < Date.parse(status.publicationRevision)) {
+		return 'pending';
+	}
 	return lastOperation.status === 'succeeded' ? 'upToDate' : 'deployed';
 }
 
@@ -102,7 +104,12 @@ export class ServerSync {
 		try {
 			const settings = await api.profile.server.getSettings({ quiet: true });
 			if (generation !== this.#generation || key !== this.#key) return;
-			if (settings?.remote.syncMode !== 'worker' || settings.remote.host.trim() === '') {
+			const remote = settings?.remote;
+			if (
+				remote == null ||
+				remote.executor.mode === 'local' ||
+				remote.transport.host.trim() === ''
+			) {
 				this.status = null;
 				return;
 			}
@@ -144,7 +151,7 @@ export class ServerSync {
 	}
 
 	#isWorkerObservation(status: ServerSyncStatus) {
-		return status.mode === 'worker' && status.worker != null;
+		return status.mode !== 'local' && status.worker != null;
 	}
 
 	/// The remote tab feeds the statuses it actually applied here so the

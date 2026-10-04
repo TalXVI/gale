@@ -11,43 +11,41 @@
 //! same `publication_from_archive` path the desktop uses, so a
 //! "canonical publication" is the identical artifact on both sides.
 
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use eyre::{Context, OptionExt, Result, bail, ensure};
+use eyre::{Context, OptionExt, Result, ensure};
 use reqwest::StatusCode;
-use serde::{Deserialize, Serialize};
 
-use crate::profile::sync::{self, FetchedPublication, SyncProfileMetadata};
+use crate::profile::sync::{
+    self, FetchedPublication, SyncProfileMetadata,
+    auth::{GrantTokenRequest, TokenResponse},
+};
 use crate::worker::{config::WorkerConfig, journal::Journal, secrets};
-
-static DEFAULT_API_URL: &str = "https://gale.kesomannen.com/api";
-
-/// Same bound as the desktop's `download_profile_bytes`.
-const MAX_DOWNLOAD_BYTES: usize = 16 * 1024 * 1024;
 
 /// Bounds how long a hung grant can hold the refresh lock — and delay
 /// shutdown, which waits on it through `settle`.
 const GRANT_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct GrantTokenRequest {
-    refresh_token: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TokenResponse {
-    access_token: String,
-    refresh_token: String,
-}
-
 /// Surfaced as the poll error when the sync service rejects the worker's
 /// refresh token; the text tells the operator how to sign the worker in
 /// again.
 pub const SYNC_REAUTHORIZATION_REQUIRED: &str = "Gale sync rejected the Worker's sign-in (it expired or was revoked). Sign the Worker in again: run 'Set up worker' for a Worker hosted on this PC, or give a manually run Worker a new GALE_WORKER_REFRESH_TOKEN and restart it.";
+
+/// The error a poll fails with while the sync service rejects the
+/// worker's sign-in. Typed so the journal can classify the poll error
+/// without matching its text.
+#[derive(Debug)]
+pub struct SyncReauthorizationRequired;
+
+impl std::fmt::Display for SyncReauthorizationRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(SYNC_REAUTHORIZATION_REQUIRED)
+    }
+}
+
+impl std::error::Error for SyncReauthorizationRequired {}
 
 /// Surfaced as the poll error when a rotated credential could not be
 /// persisted; the text tells the operator what a restart would lose.
@@ -93,15 +91,12 @@ impl SyncClient {
         }
     }
 
+    /// The configured sync service, or the desktop's.
     fn api_url(&self) -> &str {
-        static ENV_URL: LazyLock<Option<String>> =
-            LazyLock::new(|| std::env::var("GALE_SYNC_URL").ok());
-
         self.config
             .sync_url
             .as_deref()
-            .or(ENV_URL.as_deref())
-            .unwrap_or(DEFAULT_API_URL)
+            .unwrap_or(sync::API_URL.as_ref())
     }
 
     /// Ensures a usable access token exists, reusing the cached one while
@@ -177,18 +172,9 @@ impl SyncClient {
             .send()
             .await
             .context("failed to reach the sync service")?;
-
-        if response.status() == StatusCode::NOT_FOUND {
+        let Some(metadata) = sync::read_profile_meta(response).await? else {
             return Ok(None);
-        }
-        let response = response
-            .error_for_status()
-            .context("failed to fetch sync profile metadata")?;
-
-        let metadata: SyncProfileMetadata = response
-            .json()
-            .await
-            .context("sync profile metadata was malformed")?;
+        };
 
         let game = metadata.manifest.game.as_deref().unwrap_or_default();
         ensure!(
@@ -211,25 +197,7 @@ impl SyncClient {
             .context("failed to reach the sync service")?
             .error_for_status()
             .context("failed to download the publication")?;
-
-        if let Some(len) = response.content_length() {
-            ensure!(
-                len <= MAX_DOWNLOAD_BYTES as u64,
-                "sync archive exceeds the download size limit"
-            );
-        }
-
-        let mut bytes = Vec::new();
-        let mut response = response;
-        while let Some(chunk) = response.chunk().await? {
-            ensure!(
-                bytes.len() + chunk.len() <= MAX_DOWNLOAD_BYTES,
-                "sync archive exceeds the download size limit"
-            );
-            bytes.extend_from_slice(&chunk);
-        }
-
-        Ok(bytes)
+        sync::read_archive(response).await
     }
 
     /// Polls for the canonical publication. When `since` is `Some`, the
@@ -279,7 +247,7 @@ async fn grant(
             // a newly supplied sign-in worth one attempt.
             match seed.as_deref() {
                 Some(seed) if Some(seed) != state.refresh_token.as_deref() => seed.to_owned(),
-                _ => bail!("{SYNC_REAUTHORIZATION_REQUIRED}"),
+                _ => return Err(SyncReauthorizationRequired.into()),
             }
         } else {
             state
@@ -315,7 +283,7 @@ async fn grant(
         state.sync_reauthorization_required = true;
         journal.save(&state)?;
         slot.access = None;
-        bail!("{SYNC_REAUTHORIZATION_REQUIRED}");
+        return Err(SyncReauthorizationRequired.into());
     }
 
     let tokens: TokenResponse = response
@@ -400,13 +368,6 @@ pub(crate) mod tests {
 
     /// The access token every `MockApi` grant issues, expiring in 2100.
     static ACCESS_JWT: LazyLock<String> = LazyLock::new(|| jwt_with_expiry(4102444800));
-
-    #[test]
-    fn the_mock_access_token_carries_a_real_expiry() {
-        let expiry = crate::profile::sync::auth::access_token_expiry(&ACCESS_JWT)
-            .expect("the mock token must decode");
-        assert_eq!(expiry, DateTime::from_timestamp(4102444800, 0).unwrap());
-    }
 
     type MockPublication = (SyncProfileMetadata, Vec<u8>);
     type ArchiveGate = (usize, Arc<tokio::sync::Semaphore>);
@@ -873,7 +834,7 @@ pub(crate) mod tests {
         for chunked in [false, true] {
             // A valid ZIP with a large archive comment/prefix padding: ZIP readers allow
             // prepended data. Rejection must be the transport bound, not ZIP parsing.
-            let mut archive = vec![0; MAX_DOWNLOAD_BYTES + 1];
+            let mut archive = vec![0; sync::MAX_DOWNLOAD_BYTES + 1];
             archive.extend(archive_zip(&manifest("valheim")));
             zip::ZipArchive::new(std::io::Cursor::new(&archive)).unwrap();
             let api = MockApi {

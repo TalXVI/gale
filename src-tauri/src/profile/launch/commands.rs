@@ -9,10 +9,6 @@ use crate::{
 
 #[command]
 pub async fn launch_game(app: AppHandle, vanilla: bool, args: Option<String>) -> Result<()> {
-    if !vanilla {
-        server::ensure_active_profile_unlocked(&app)?;
-    }
-
     if app.lock_prefs().pull_before_launch {
         let profile_id = app.lock_manager().active_profile().id;
         sync::pull_profile(false, profile_id, &app).await?;
@@ -20,6 +16,11 @@ pub async fn launch_game(app: AppHandle, vanilla: bool, args: Option<String>) ->
 
     let prefs = app.lock_prefs();
     let manager = app.lock_manager();
+
+    // A vanilla launch leaves the profile's files alone.
+    if !vanilla {
+        server::ensure_profile_unlocked(&app, manager.active_profile().id)?;
+    }
 
     manager
         .active_game()

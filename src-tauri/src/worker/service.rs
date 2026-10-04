@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use eyre::{Context, Result, bail, ensure};
+use sha1::{Digest, Sha1};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
 use windows_service::service::{
@@ -40,6 +41,7 @@ use super::api::WorkerRunPhase;
 use super::config::WorkerConfig;
 use super::journal;
 use super::local::{self, TRANSITION_TIMEOUT, await_listen_ready, stop_and_wait, wait_for_state};
+use super::named_mutex::NamedMutex;
 use super::secrets::Secrets;
 use super::server;
 
@@ -299,60 +301,23 @@ fn provision_fail(log: &Path, err: &eyre::Report) -> eyre::Report {
     eyre::eyre!("{err:#}")
 }
 
-/// A handle to a named mutex. Dropping it releases ownership (a no-op when
-/// the wait never succeeded) and closes the handle.
-struct NamedLock(windows::Win32::Foundation::HANDLE);
-
-impl NamedLock {
-    fn open(name: &str) -> Result<Self> {
-        use windows::Win32::System::Threading::CreateMutexW;
-        use windows::core::{HSTRING, PCWSTR};
-
-        let name = HSTRING::from(name);
-        let handle = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }
-            .context("failed to open the worker update lock")?;
-        Ok(Self(handle))
-    }
-
-    /// Waits up to `timeout` for ownership; `false` means it timed out.
-    fn wait(&self, timeout: Duration) -> Result<bool> {
-        use windows::Win32::Foundation::{WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT};
-        use windows::Win32::System::Threading::WaitForSingleObject;
-
-        let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
-        let status = unsafe { WaitForSingleObject(self.0, millis) };
-        if status == WAIT_OBJECT_0 || status == WAIT_ABANDONED {
-            Ok(true)
-        } else if status == WAIT_TIMEOUT {
-            Ok(false)
-        } else {
-            Err(windows::core::Error::from_thread())
-                .context("failed to acquire the worker update lock")
-        }
-    }
-}
-
-impl Drop for NamedLock {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = windows::Win32::System::Threading::ReleaseMutex(self.0);
-            let _ = windows::Win32::Foundation::CloseHandle(self.0);
-        }
-    }
-}
-
 /// The desktop reads the provisioning log, not the elevated process's
 /// stderr, so a lock failure has to be written there before it returns.
-fn lock_service_change(log: &Path) -> Result<NamedLock> {
+fn lock_service_change(log: &Path) -> Result<NamedMutex> {
     let acquire = || {
-        let lock = NamedLock::open(UPDATE_MUTEX)?;
-        if !lock.wait(Duration::ZERO)? {
+        let lock =
+            NamedMutex::open(UPDATE_MUTEX).context("failed to open the worker update lock")?;
+        let wait = |timeout| {
+            lock.wait(timeout)
+                .context("failed to acquire the worker update lock")
+        };
+        if !wait(Duration::ZERO)? {
             provision_log(
                 log,
                 "waiting for another Worker install, update, or uninstall to finish",
             );
             ensure!(
-                lock.wait(UPDATE_LOCK_TIMEOUT)?,
+                wait(UPDATE_LOCK_TIMEOUT)?,
                 "another Worker install, update, or uninstall is still running. Wait for it to finish and try again"
             );
         }
@@ -408,7 +373,8 @@ fn install_inner(staging: &Path, log: &Path) -> Result<()> {
         .is_some_and(|old| {
             old.profile_id != config.profile_id
                 || old.game != config.game
-                || old.remote.describe_target() != config.remote.describe_target()
+                || old.remote.transport.describe_target()
+                    != config.remote.transport.describe_target()
         });
 
     let manager = open_manager_for_create()?;
@@ -425,8 +391,8 @@ fn install_inner(staging: &Path, log: &Path) -> Result<()> {
         .save(&installed)
         .context("failed to install worker config")?;
     install_secrets(staged_secrets, &private, &config.state_dir)?;
-    // A staged SSH key accompanies private-key configs. The service
-    // cannot reach user-profile paths as LocalSystem.
+    // A staged SSH key accompanies private-key configs. The service's
+    // virtual account cannot read user-profile paths.
     let staged_key = staging.join(local::SSH_KEY_FILE);
     if staged_key.is_file() {
         std::fs::copy(&staged_key, private.join(local::SSH_KEY_FILE))
@@ -612,9 +578,13 @@ fn create_service(
             root.join(local::LOG_FILE).into_os_string(),
         ],
         dependencies: vec![],
-        // LocalSystem: the service must reach its ProgramData state and
-        // read the staged SSH key without a logged-in session.
-        account_name: None,
+        // The service's own virtual account. It holds no rights beyond the
+        // worker directory, so a compromised worker cannot take over the
+        // machine the way it could as LocalSystem.
+        account_name: Some(OsString::from(format!(
+            r"NT SERVICE\{}",
+            local::SERVICE_NAME
+        ))),
         account_password: None,
     };
     let service = manager
@@ -704,23 +674,52 @@ fn grant_user_control() -> Result<()> {
     Ok(())
 }
 
+/// The SID of the service's virtual account, `NT SERVICE\<name>`, derived
+/// the way Windows derives service SIDs: `S-1-5-80` followed by the SHA-1
+/// of the upper-cased UTF-16 service name, read as five little-endian
+/// 32-bit values. Granting by SID works before the service exists.
+fn service_sid(name: &str) -> String {
+    let utf16: Vec<u8> = name
+        .to_uppercase()
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let hash = Sha1::digest(&utf16);
+    let parts = hash
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| u32::from_le_bytes(*chunk).to_string());
+
+    std::iter::once("S-1-5-80".to_owned())
+        .chain(parts)
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
 /// Locks down the worker directory. Well-known SIDs (`*S-1-...`) are used
 /// instead of group names because icacls localizes names on non-English
 /// Windows.
 fn apply_directory_acls(root: &Path, private: &Path) -> Result<()> {
-    // Root: SYSTEM + Administrators full control, all users read. Gale
-    // reads status.json and worker.log unelevated.
+    let service = format!("*{}:(OI)(CI)M", service_sid(local::SERVICE_NAME));
+    // Root: SYSTEM + Administrators full control, all users read, and the
+    // service writes its status and log. Gale reads status.json and
+    // worker.log unelevated.
     icacls(
         root,
         &[
             "*S-1-5-18:(OI)(CI)F",
             "*S-1-5-32-544:(OI)(CI)F",
             "*S-1-5-32-545:(OI)(CI)RX",
+            &service,
         ],
     )?;
-    // Private: SYSTEM + Administrators only, secrets.env and the journal
-    // carry the worker's bearer token and sync refresh token.
-    icacls(private, &["*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"])
+    // Private: SYSTEM + Administrators + the service only. secrets.env and
+    // the journal carry the worker's bearer token and sync refresh token.
+    icacls(
+        private,
+        &["*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", &service],
+    )
 }
 
 fn icacls(path: &Path, grants: &[&str]) -> Result<()> {
@@ -747,7 +746,21 @@ fn icacls(path: &Path, grants: &[&str]) -> Result<()> {
 mod tests {
     use std::time::Duration;
 
-    use super::{ServiceArgs, await_listen_ready};
+    use super::{ServiceArgs, await_listen_ready, service_sid};
+
+    #[test]
+    fn service_sid_matches_the_sid_windows_assigns() {
+        // Windows' own values: TrustedInstaller's documented SID, and
+        // `sc showsid GaleWorker`, which works without the service.
+        assert_eq!(
+            service_sid("TrustedInstaller"),
+            "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+        );
+        assert_eq!(
+            service_sid("GaleWorker"),
+            "S-1-5-80-2769169290-2553713292-796222524-4265435681-1965319269"
+        );
+    }
 
     #[test]
     fn initialization_failure_reports_stopped_with_nonzero_exit() {
@@ -800,7 +813,7 @@ mod tests {
     #[test]
     fn update_lock_is_exclusive_until_the_holder_releases() {
         let name = r"Local\GaleWorkerUpdateTest";
-        let held = super::NamedLock::open(name).unwrap();
+        let held = super::NamedMutex::open(name).unwrap();
         assert!(
             held.wait(Duration::from_secs(5)).unwrap(),
             "the free lock should be acquired immediately"
@@ -810,7 +823,7 @@ mod tests {
         // blocking, so the contender has to be a different thread.
         // The handle is not `Send`, so the contender opens its own.
         let acquired = std::thread::spawn(move || {
-            let contender = super::NamedLock::open(name).unwrap();
+            let contender = super::NamedMutex::open(name).unwrap();
             contender.wait(Duration::from_millis(200)).unwrap()
         })
         .join()
@@ -821,7 +834,7 @@ mod tests {
         );
 
         drop(held);
-        let next = super::NamedLock::open(name).unwrap();
+        let next = super::NamedMutex::open(name).unwrap();
         assert!(
             next.wait(Duration::from_secs(5)).unwrap(),
             "releasing the holder should let the next waiter acquire"

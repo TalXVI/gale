@@ -6,4 +6,7 @@ fn main() -> eyre::Result<()> {
 }
 
 #[cfg(not(windows))]
-fn main() {}
+fn main() {
+    eprintln!("gale-worker-tray only runs on Windows");
+    std::process::exit(1);
+}

@@ -8,7 +8,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use eyre::{Context, OptionExt, Result, bail, ensure, eyre};
+use eyre::{Context, OptionExt, Result, bail, ensure};
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
@@ -33,10 +33,11 @@ pub mod commands;
 mod publish;
 pub mod socket;
 
-static API_URL: LazyLock<Cow<'static, str>> = LazyLock::new(|| match env::var("GALE_SYNC_URL") {
-    Ok(var) => var.into(),
-    Err(_) => "https://gale.kesomannen.com/api".into(),
-});
+pub(crate) static API_URL: LazyLock<Cow<'static, str>> =
+    LazyLock::new(|| match env::var("GALE_SYNC_URL") {
+        Ok(var) => var.into(),
+        Err(_) => "https://gale.kesomannen.com/api".into(),
+    });
 
 async fn request(
     method: Method,
@@ -53,10 +54,18 @@ async fn request(
     Ok(req)
 }
 
+/// Reads go out anonymously when there is no usable session, since public
+/// profiles don't need one. Changes need a signed-in user.
 fn required_token(method: &Method, token: Result<Option<String>>) -> Result<Option<String>> {
+    if *method == Method::GET {
+        return Ok(token.unwrap_or_else(|err| {
+            warn!("continuing without a sync session: {err:#}");
+            None
+        }));
+    }
+
     match token? {
         Some(token) => Ok(Some(token)),
-        None if *method == Method::GET => Ok(None),
         None => bail!("sign in to sync before modifying a profile"),
     }
 }
@@ -468,6 +477,8 @@ async fn apply_archive(
 
     let resolved = resolve_target(&target, &manifest.name, app)?;
 
+    // fail before any work; the import and the commit below check again
+    // under the manager lock right before they write
     if let Some(profile_id) = resolved.profile_id {
         super::server::ensure_profile_unlocked(app, profile_id)?;
     }
@@ -578,6 +589,7 @@ async fn apply_archive(
         );
 
         let mut manager = app.lock_manager();
+        super::server::ensure_profile_unlocked(app, target_id)?;
         let (_, profile) = manager.profile_by_id_mut(target_id)?;
 
         let current_sync_id = profile.sync.as_ref().map(|sync| sync.id.clone());
@@ -931,6 +943,7 @@ async fn apply_selected_config(
     let normalized = normalize_archive(&validated)?;
 
     let mut manager = app.lock_manager();
+    super::server::ensure_profile_unlocked(app, profile_id)?;
     let (_, profile) = manager.profile_by_id_mut(profile_id)?;
     let profile_dir = profile.path.clone();
     let sync = sync_apply_target(&mut profile.sync, &sync_id)?;
@@ -959,15 +972,20 @@ async fn apply_selected_config(
 
 /// Sync archives are a manifest plus text config files; anything larger is
 /// malformed or hostile.
-const MAX_DOWNLOAD_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_DOWNLOAD_BYTES: usize = 16 * 1024 * 1024;
 
 pub(super) async fn download_profile_bytes(id: &str, app: &AppHandle) -> Result<Vec<u8>> {
-    let mut response = request(Method::GET, format!("/profile/{id}"), app)
+    let response = request(Method::GET, format!("/profile/{id}"), app)
         .await?
         .send()
         .await?
         .error_for_status()?;
+    read_archive(response).await
+}
 
+/// Reads a profile archive download, refusing a body past
+/// [`MAX_DOWNLOAD_BYTES`]. The standalone worker reads archives here too.
+pub(crate) async fn read_archive(mut response: reqwest::Response) -> Result<Vec<u8>> {
     if let Some(len) = response.content_length() {
         ensure!(
             len <= MAX_DOWNLOAD_BYTES as u64,
@@ -1001,20 +1019,28 @@ pub(crate) async fn get_profile_meta(
     id: &str,
     app: &AppHandle,
 ) -> Result<Option<SyncProfileMetadata>> {
-    let res = request(Method::GET, format!("/profile/{id}/meta"), app)
+    let response = request(Method::GET, format!("/profile/{id}/meta"), app)
         .await?
         .send()
-        .await?
-        .error_for_status();
+        .await?;
+    read_profile_meta(response).await
+}
 
-    match res {
-        Ok(res) => {
-            let res = res.json().await?;
-            Ok(Some(res))
-        }
-        Err(err) if err.status() == Some(StatusCode::NOT_FOUND) => Ok(None),
-        Err(err) => Err(eyre!(err)),
+/// Reads a profile metadata response: `None` when the profile does not
+/// exist. The standalone worker reads metadata here too.
+pub(crate) async fn read_profile_meta(
+    response: reqwest::Response,
+) -> Result<Option<SyncProfileMetadata>> {
+    if response.status() == StatusCode::NOT_FOUND {
+        return Ok(None);
     }
+    let metadata = response
+        .error_for_status()
+        .context("failed to fetch sync profile metadata")?
+        .json()
+        .await
+        .context("sync profile metadata was malformed")?;
+    Ok(Some(metadata))
 }
 
 pub async fn read_profile(id: &str, app: &AppHandle) -> Result<SyncProfileMetadata> {
@@ -1075,6 +1101,8 @@ async fn get_owned_profiles(app: &AppHandle) -> Result<Vec<ListedSyncProfile>> {
 mod tests {
     use std::path::Path;
 
+    use eyre::eyre;
+
     use super::*;
 
     #[test]
@@ -1088,6 +1116,14 @@ mod tests {
         .unwrap_err();
         assert!(format!("{error:#}").contains("session expired"));
         assert!(required_token(&Method::GET, Ok(None)).unwrap().is_none());
+        // Reads such as the pull before a launch work signed out, so a
+        // failed refresh must not block them.
+        let refresh_failed = Err(eyre!("sync session expired; sign in again"));
+        assert!(
+            required_token(&Method::GET, refresh_failed)
+                .unwrap()
+                .is_none()
+        );
     }
     use crate::{
         profile::export::{R2Mod, manifest_revision},

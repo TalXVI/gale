@@ -10,15 +10,20 @@ use std::time::Duration;
 
 use axum::{
     Json, Router,
-    extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    extract::{
+        Query, Request, State,
+        rejection::{JsonRejection, QueryRejection},
+    },
+    http::{StatusCode, header::AUTHORIZATION},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
-use eyre::{Context, Result, bail, ensure};
+use eyre::{Context, Result, ensure};
+use reqwest_middleware::ClientBuilder;
 use serde::Deserialize;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, MutexGuard, Notify};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -36,18 +41,20 @@ use crate::{
     game,
     profile::{
         server::{
-            engine::{self, OperationMeta, Session},
+            dedicated,
+            engine::{self, OperationMeta},
             host,
-            plan::{self, DeploySelection},
+            lease::LeaseBusy,
+            plan::{DeploySelection, InvalidSelection, StalePlan},
             progress::{ProgressReporter, ProgressStatus, SyncOperation, SyncProgress},
-            remote::{ConnectionAttempt, RemoteConnection, RemoteOps},
+            service::{Connector, DeployService, PinAdvice},
             settings::RestartPolicy,
             spec::DeploymentSpec,
-            stage,
             state::OperationKind,
         },
         sync::FetchedPublication,
     },
+    state,
 };
 
 /// Everything a request handler or the poll loop needs.
@@ -56,8 +63,9 @@ pub struct WorkerContext {
     secrets: Secrets,
     journal: Arc<Journal>,
     sync: SyncClient,
-    mod_loader: &'static game::mod_loader::ModLoader<'static>,
-    spec: DeploymentSpec,
+    /// The deployment service desktop Local mode runs too, bound to this
+    /// worker's profile and remote.
+    service: DeployService,
     /// Serializes operations inside this process. Cross-executor safety is
     /// the remote lease's job; this keeps a manual request and an automatic
     /// poll from racing in the same process.
@@ -67,18 +75,14 @@ pub struct WorkerContext {
     automation_wake: Notify,
     progress: Arc<std::sync::Mutex<Option<SyncProgress>>>,
     token: String,
-    cache_dir: std::path::PathBuf,
 }
 
 impl WorkerContext {
     fn new(config: WorkerConfig, secrets: Secrets, journal: Journal) -> Result<Self> {
-        // The bundled list is deliberate: a release build's cached
-        // games.json can predate this fork's dedicated-server metadata
-        // and would wrongly reject a supported game.
-        let game = game::bundled_from_slug(&config.game)
+        let game = game::from_slug(&config.game)
             .ok_or_else(|| eyre::eyre!("unknown game slug '{}'", config.game))?;
         ensure!(
-            game.dedicated_server.is_some(),
+            dedicated::for_game(game).is_some(),
             "game '{}' has no dedicated-server support",
             config.game
         );
@@ -86,38 +90,32 @@ impl WorkerContext {
             .context("this game's mod loader has no deployment spec")?;
 
         Ok(Self {
-            cache_dir: config.state_dir.join("cache"),
+            service: DeployService {
+                connector: Connector {
+                    settings: config.remote.transport.clone(),
+                    password: secrets.remote_password(),
+                    pin_advice: PinAdvice {
+                        host_key: "pin it as trustedHostKey in the worker config",
+                        certificate: "pin it as trustedCertificate in the worker config",
+                    },
+                },
+                spec,
+                profile_id: config.profile_id.clone(),
+                game: config.game.clone(),
+                mod_loader: &game.mod_loader,
+                cache_dir: config.state_dir.join("cache"),
+                http: ClientBuilder::new(state::base_http_client()?).build(),
+            },
             token: secrets.token()?,
             sync: SyncClient::new(config.clone(), secrets.seed_refresh_token()),
-            mod_loader: &game.mod_loader,
             config,
             secrets,
             journal: Arc::new(journal),
-            spec,
             operation_lock: Mutex::new(()),
             publication_lock: Mutex::new(()),
             automation_wake: Notify::new(),
             progress: Arc::new(std::sync::Mutex::new(None)),
         })
-    }
-
-    /// Opens an authenticated remote session. Runs inside `spawn_blocking`.
-    fn connect(&self) -> Result<Box<dyn RemoteOps>> {
-        let password = self.secrets.remote_password();
-        match RemoteConnection::connect(&self.config.remote, &password)? {
-            ConnectionAttempt::Connected(connection) => Ok(connection),
-            ConnectionAttempt::HostKeyUntrusted { fingerprint } => bail!(
-                "SFTP host key is not trusted ({fingerprint}); pin it as trustedHostKey in the worker config"
-            ),
-            ConnectionAttempt::CertificateUntrusted { fingerprint } => bail!(
-                "FTPS certificate is not trusted ({fingerprint}); pin it as trustedCertificate in the worker config"
-            ),
-        }
-    }
-
-    fn open_session(&self) -> Result<Session> {
-        let ops = self.connect()?;
-        engine::open_session(ops, &self.spec, self.config.remote.server_directory()?)
     }
 
     fn meta(&self, kind: OperationKind) -> OperationMeta {
@@ -152,15 +150,12 @@ impl WorkerContext {
         }
     }
 
-    /// The context the plan hash binds an approval to. The identity comes
-    /// from the config the worker was started with, never from request
-    /// parameters.
-    fn plan_context(&self, restart_policy: RestartPolicy) -> plan::PlanContext {
-        plan::PlanContext {
-            profile_id: self.config.profile_id.clone(),
-            game: self.config.game.clone(),
-            target: self.config.remote.describe_target(),
-            restart_policy,
+    /// The restart policy an operation applies: the requested one, or the
+    /// journal's current one, which wins over the config file after setup.
+    async fn restart_policy(&self, requested: Option<RestartPolicy>) -> RestartPolicy {
+        match requested {
+            Some(policy) => policy,
+            None => self.journal.state.lock().await.restart_policy,
         }
     }
 
@@ -171,69 +166,135 @@ impl WorkerContext {
         )
     }
 
-    /// Fetches the latest publication and stages its mod payload when selected.
-    async fn publication_with_progress(
-        &self,
-        include_mods: bool,
-        progress: &mut ProgressReporter,
-    ) -> Result<(FetchedPublication, plan::DesiredDeployment)> {
-        let publication = self
-            .sync
+    /// The latest canonical publication.
+    async fn publication(&self) -> Result<FetchedPublication> {
+        self.sync
             .poll(&self.journal, None)
             .await?
-            .ok_or_else(|| eyre::eyre!("profile has no published revision yet"))?;
-        let desired = stage::stage_fetched(
-            &publication,
-            self.cache_dir.clone(),
-            self.mod_loader,
-            &self.spec,
-            include_mods,
-            progress,
-        )
-        .await?;
-
-        Ok((publication, desired))
+            .ok_or_else(|| eyre::eyre!("profile has no published revision yet"))
     }
 }
 
-// ---------- auth ----------
+// ---------- HTTP plumbing ----------
 
-fn authorized(ctx: &WorkerContext, headers: &HeaderMap) -> bool {
-    headers
-        .get(axum::http::header::AUTHORIZATION)
+/// A failed request: the error's message, under the status that tells
+/// the caller what to do about it.
+struct ApiError {
+    status: StatusCode,
+    message: String,
+}
+
+type ApiResult<T> = std::result::Result<T, ApiError>;
+
+impl ApiError {
+    fn unauthorized() -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: "missing or invalid bearer token".to_owned(),
+        }
+    }
+
+    fn busy() -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: "a deployment is already running (this worker)".to_owned(),
+        }
+    }
+}
+
+impl From<eyre::Report> for ApiError {
+    fn from(error: eyre::Report) -> Self {
+        let status = if error
+            .chain()
+            .any(|cause| cause.is::<LeaseBusy>() || cause.is::<StalePlan>())
+        {
+            // Another executor holds the server, or it changed since the
+            // preview: the caller must wait or preview again.
+            StatusCode::CONFLICT
+        } else if error.chain().any(|cause| cause.is::<InvalidSelection>()) {
+            StatusCode::UNPROCESSABLE_ENTITY
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        Self {
+            status,
+            message: format!("{error:#}"),
+        }
+    }
+}
+
+/// A malformed body still answers with the API's error shape.
+impl From<JsonRejection> for ApiError {
+    fn from(rejection: JsonRejection) -> Self {
+        Self {
+            status: rejection.status(),
+            message: rejection.body_text(),
+        }
+    }
+}
+
+impl From<QueryRejection> for ApiError {
+    fn from(rejection: QueryRejection) -> Self {
+        Self {
+            status: rejection.status(),
+            message: rejection.body_text(),
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (
+            self.status,
+            Json(ErrorResponse {
+                error: self.message,
+            }),
+        )
+            .into_response()
+    }
+}
+
+/// Admits only callers presenting the worker's bearer token, before any
+/// handler reads the request.
+async fn require_bearer(
+    State(ctx): State<Arc<WorkerContext>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let authorized = request
+        .headers()
+        .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|token| token == ctx.token)
+        // blake3 hashes compare in constant time, so the response time
+        // reveals nothing about how much of a guessed token was right.
+        .is_some_and(|token| blake3::hash(token.as_bytes()) == blake3::hash(ctx.token.as_bytes()));
+    if !authorized {
+        return ApiError::unauthorized().into_response();
+    }
+    next.run(request).await
 }
 
-fn unauthorized() -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(ErrorResponse {
-            error: "missing or invalid bearer token".to_owned(),
-        }),
-    )
-        .into_response()
+/// Claims this worker's operation lock, or answers busy when another
+/// operation holds it.
+fn begin_operation(ctx: &WorkerContext) -> ApiResult<MutexGuard<'_, ()>> {
+    ctx.operation_lock.try_lock().map_err(|_| ApiError::busy())
 }
 
-fn error_response(error: &eyre::Report) -> Response {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(ErrorResponse {
-            error: format!("{error:#}"),
-        }),
-    )
-        .into_response()
-}
-
-fn busy_response(owner: &str) -> Response {
-    (
-        StatusCode::CONFLICT,
-        Json(ErrorResponse {
-            error: format!("a deployment is already running ({owner})"),
-        }),
-    )
-        .into_response()
+/// The worker API. Every route but the health probe requires the bearer
+/// token.
+fn router(ctx: Arc<WorkerContext>) -> Router {
+    Router::new()
+        .route("/v1/status", get(status))
+        .route("/v1/progress", get(operation_progress))
+        .route("/v1/preview", post(preview))
+        .route("/v1/deploy", post(deploy))
+        .route("/v1/policy", post(set_policy))
+        .route("/v1/restart-ack", post(acknowledge_external_restart))
+        .route("/v1/config", post(configure))
+        .route_layer(middleware::from_fn_with_state(ctx.clone(), require_bearer))
+        .route("/v1/health", get(|| async { StatusCode::NO_CONTENT }))
+        .with_state(ctx)
 }
 
 // ---------- handlers ----------
@@ -245,36 +306,22 @@ struct StatusQuery {
 
 async fn status(
     State(ctx): State<Arc<WorkerContext>>,
-    headers: HeaderMap,
-    Query(query): Query<StatusQuery>,
-) -> Response {
-    if !authorized(&ctx, &headers) {
-        return unauthorized();
-    }
-
+    query: Result<Query<StatusQuery>, QueryRejection>,
+) -> ApiResult<Json<StatusResponse>> {
+    let Query(query) = query?;
     let server = if query.refresh.unwrap_or(false) {
-        let ctx2 = ctx.clone();
-        match tokio::task::spawn_blocking(move || ctx2.open_session()).await {
-            Ok(Ok(session)) => {
-                // A fresh remote read settles pending mod work that
-                // another executor already deployed, and keeps the
-                // mirror fresh for classifying future observations.
-                {
-                    let mut state = ctx.journal.state.lock().await;
-                    state.observe_remote_mods(&session.state.mods_revision);
-                    if let Err(err) = ctx.journal.save(&state) {
-                        warn!(%err, "failed to persist remote state observation");
-                    }
-                }
-                Some(session.into())
-            }
-            Ok(Err(err)) => {
-                return error_response(&err);
-            }
-            Err(err) => {
-                return error_response(&eyre::eyre!(err));
+        let session = ctx.service.read_session().await?;
+        // A fresh remote read settles pending mod work that another
+        // executor already deployed, and keeps the mirror fresh for
+        // classifying future observations.
+        {
+            let mut state = ctx.journal.state.lock().await;
+            state.observe_remote_mods(&session.state.mods_revision);
+            if let Err(err) = ctx.journal.save(&state) {
+                warn!(%err, "failed to persist remote state observation");
             }
         }
+        Some(session.into())
     } else {
         None
     };
@@ -289,7 +336,7 @@ async fn status(
     }
     let pending = journal.pending.as_ref();
 
-    Json(StatusResponse {
+    Ok(Json(StatusResponse {
         worker_id: ctx.config.worker_id.clone(),
         profile_id: ctx.config.profile_id.clone(),
         auto_deploy_mods: journal.auto_deploy_mods,
@@ -304,48 +351,35 @@ async fn status(
         poll_error: journal.poll_error.clone(),
         sync_reauthorization_required: journal.sync_reauthorization_required,
         server,
-    })
-    .into_response()
+    }))
 }
 
 /// The latest snapshot is bounded to one operation and lives only in this
 /// process. Polling it never waits for the remote operation lock.
-async fn operation_progress(State(ctx): State<Arc<WorkerContext>>, headers: HeaderMap) -> Response {
-    if !authorized(&ctx, &headers) {
-        return unauthorized();
-    }
-    Json(ctx.progress.lock().ok().and_then(|slot| slot.clone())).into_response()
+async fn operation_progress(State(ctx): State<Arc<WorkerContext>>) -> Json<Option<SyncProgress>> {
+    Json(ctx.progress.lock().ok().and_then(|slot| slot.clone()))
 }
 
 async fn preview(
     State(ctx): State<Arc<WorkerContext>>,
-    headers: HeaderMap,
-    Json(request): Json<PreviewRequest>,
-) -> Response {
-    if !authorized(&ctx, &headers) {
-        return unauthorized();
-    }
-
+    request: Result<Json<PreviewRequest>, JsonRejection>,
+) -> ApiResult<Json<engine::Preview>> {
+    let Json(request) = request?;
     // Keep a manual preview from overlapping a deployment in this worker.
-    let Ok(guard) = ctx.operation_lock.try_lock() else {
-        return busy_response("this worker");
-    };
+    let _operation = begin_operation(&ctx)?;
 
     let selection = request.selection;
     let mut progress = ctx.reporter(request.run_id, SyncOperation::Preview, &selection);
-    let response = preview_inner(&ctx, selection, request.restart_policy, &mut progress).await;
-    match response {
+    match preview_inner(&ctx, selection, request.restart_policy, &mut progress).await {
         Ok(preview) => {
             progress.succeeded();
             ctx.clear_progress();
-            drop(guard);
-            Json(preview).into_response()
+            Ok(Json(preview))
         }
         Err(error) => {
             progress.failed();
             ctx.fail_progress();
-            drop(guard);
-            error_response(&error)
+            Err(error.into())
         }
     }
 }
@@ -356,47 +390,30 @@ async fn preview_inner(
     restart_policy: Option<RestartPolicy>,
     progress: &mut ProgressReporter,
 ) -> Result<engine::Preview> {
-    let (publication, desired) = ctx
-        .publication_with_progress(selection.include_mods, progress)
-        .await?;
-
+    let publication = ctx.publication().await?;
     // The plan hash binds the restart policy the deploy will use.
-    let policy = match restart_policy {
-        Some(policy) => policy,
-        None => ctx.journal.state.lock().await.restart_policy,
-    };
-
-    let worker = Arc::clone(ctx);
-    engine::preview(
-        move || worker.connect(),
-        ctx.spec.clone(),
-        ctx.config.remote.server_directory()?,
-        publication,
-        desired,
-        selection,
-        ctx.plan_context(policy),
-        ctx.meta(OperationKind::Manual),
-        progress,
-    )
-    .await
+    let policy = ctx.restart_policy(restart_policy).await;
+    ctx.service
+        .preview(
+            publication,
+            selection,
+            policy,
+            ctx.meta(OperationKind::Manual),
+            progress,
+        )
+        .await
 }
 
 async fn deploy(
     State(ctx): State<Arc<WorkerContext>>,
-    headers: HeaderMap,
-    Json(request): Json<DeployRequest>,
-) -> Response {
-    if !authorized(&ctx, &headers) {
-        return unauthorized();
-    }
-
+    request: Result<Json<DeployRequest>, JsonRejection>,
+) -> ApiResult<Json<DeployResponse>> {
+    let Json(request) = request?;
     // Serializes against an in-flight automatic deployment. The remote
     // lease is the real cross-process lock.
-    let Ok(guard) = ctx.operation_lock.try_lock() else {
-        return busy_response("this worker");
-    };
+    let _operation = begin_operation(&ctx)?;
 
-    let response = match run_deployment(
+    let response = run_deployment(
         &ctx,
         request.selection,
         Some(request.plan_hash),
@@ -405,13 +422,8 @@ async fn deploy(
         OperationKind::Manual,
         Some(request.run_id),
     )
-    .await
-    {
-        Ok(response) => Json(response).into_response(),
-        Err(err) => error_response(&err),
-    };
-    drop(guard);
-    response
+    .await?;
+    Ok(Json(response))
 }
 
 /// Shared deployment path for manual API requests and the automatic poll
@@ -432,31 +444,21 @@ async fn run_deployment(
         .unwrap_or_else(|| meta.id.clone());
     let mut progress = ctx.reporter(run_id, SyncOperation::Deploy, &selection);
     let result = async {
-        // The journal's current policy wins over the config file after setup.
-        let policy = match restart_policy {
-            Some(policy) => policy,
-            None => ctx.journal.state.lock().await.restart_policy,
-        };
-        let (publication, desired) = ctx
-            .publication_with_progress(selection.include_mods, &mut progress)
+        let policy = ctx.restart_policy(restart_policy).await;
+        let publication = ctx.publication().await?;
+        let response = ctx
+            .service
+            .deploy(
+                publication,
+                selection,
+                plan_hash,
+                force,
+                policy,
+                ctx.host().as_ref(),
+                meta,
+                &mut progress,
+            )
             .await?;
-        let worker = Arc::clone(ctx);
-        let response = engine::deploy(
-            move || worker.connect(),
-            ctx.spec.clone(),
-            ctx.config.remote.server_directory()?,
-            publication,
-            desired,
-            selection,
-            ctx.plan_context(policy),
-            meta,
-            plan_hash,
-            force,
-            ctx.host().as_ref(),
-            policy,
-            &mut progress,
-        )
-        .await?;
 
         let mut state = ctx.journal.state.lock().await;
         // Config-only pushes do not discharge owed mod work.
@@ -486,97 +488,53 @@ async fn run_deployment(
 
 async fn set_policy(
     State(ctx): State<Arc<WorkerContext>>,
-    headers: HeaderMap,
-    Json(request): Json<PolicyRequest>,
-) -> Response {
-    if !authorized(&ctx, &headers) {
-        return unauthorized();
-    }
-
-    let Ok(guard) = ctx.operation_lock.try_lock() else {
-        return busy_response("this worker");
-    };
+    request: Result<Json<PolicyRequest>, JsonRejection>,
+) -> ApiResult<StatusCode> {
+    let Json(request) = request?;
+    let _operation = begin_operation(&ctx)?;
 
     // The worker resolves the policy pin from the canonical publication,
     // so the client cannot supply an arbitrary one.
-    let pinned_at = match ctx.sync.poll(&ctx.journal, None).await {
-        Ok(Some(publication)) => publication
-            .config
-            .get(&request.path)
-            .map(|file| file.hash.clone()),
-        Ok(None) => return error_response(&eyre::eyre!("profile has no published revision yet")),
-        Err(err) => {
-            drop(guard);
-            return error_response(&err);
-        }
-    };
+    let pinned_at = ctx
+        .publication()
+        .await?
+        .config
+        .get(&request.path)
+        .map(|file| file.hash.clone());
 
-    let worker = Arc::clone(&ctx);
-    let meta = ctx.meta(OperationKind::Manual);
-    let result = tokio::task::spawn_blocking(move || {
-        let mut session = worker.open_session()?;
-        engine::set_config_policy(
-            &mut session,
-            &request.path,
+    ctx.service
+        .set_config_policy(
+            request.path,
             request.policy,
-            pinned_at.as_ref(),
-            &meta,
+            pinned_at,
+            ctx.meta(OperationKind::Manual),
         )
-    })
-    .await;
-
-    drop(guard);
-
-    match result {
-        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
-        Ok(Err(err)) => error_response(&err),
-        Err(err) => error_response(&eyre::eyre!(err)),
-    }
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn acknowledge_external_restart(
     State(ctx): State<Arc<WorkerContext>>,
-    headers: HeaderMap,
-) -> Response {
-    if !authorized(&ctx, &headers) {
-        return unauthorized();
-    }
-    let Ok(guard) = ctx.operation_lock.try_lock() else {
-        return busy_response("this worker");
-    };
+) -> ApiResult<StatusCode> {
+    let _operation = begin_operation(&ctx)?;
 
-    let worker = Arc::clone(&ctx);
-    let meta = ctx.meta(OperationKind::Manual);
-    let result = tokio::task::spawn_blocking(move || {
-        let mut session = worker.open_session()?;
-        engine::acknowledge_external_restart(&mut session, &meta)
-    })
-    .await;
-    drop(guard);
-
-    match result {
-        Ok(Ok(state)) => {
-            if let Some(record) = state.last_operation
-                && let Err(error) = ctx.journal.record_operation(record).await
-            {
-                warn!(%error, "failed to journal external restart acknowledgment");
-            }
-            StatusCode::NO_CONTENT.into_response()
-        }
-        Ok(Err(error)) => error_response(&error),
-        Err(error) => error_response(&eyre::eyre!(error)),
+    let state = ctx
+        .service
+        .acknowledge_external_restart(ctx.meta(OperationKind::Manual))
+        .await?;
+    if let Some(record) = state.last_operation
+        && let Err(error) = ctx.journal.record_operation(record).await
+    {
+        warn!(%error, "failed to journal external restart acknowledgment");
     }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn configure(
     State(ctx): State<Arc<WorkerContext>>,
-    headers: HeaderMap,
-    Json(request): Json<ConfigureRequest>,
-) -> Response {
-    if !authorized(&ctx, &headers) {
-        return unauthorized();
-    }
-
+    request: Result<Json<ConfigureRequest>, JsonRejection>,
+) -> ApiResult<StatusCode> {
+    let Json(request) = request?;
     let mut state = ctx.journal.state.lock().await;
     let mut updated = state.clone();
     updated.auto_deploy_mods = request.auto_deploy_mods;
@@ -588,16 +546,12 @@ async fn configure(
     {
         work.next_attempt_at = None;
     }
-    match ctx.journal.save(&updated) {
-        Ok(()) => {
-            *state = updated;
-            if automatic_deploy_due(&state, Utc::now()) {
-                ctx.automation_wake.notify_one();
-            }
-            StatusCode::NO_CONTENT.into_response()
-        }
-        Err(err) => error_response(&err),
+    ctx.journal.save(&updated)?;
+    *state = updated;
+    if automatic_deploy_due(&state, Utc::now()) {
+        ctx.automation_wake.notify_one();
     }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ---------- poll loop ----------
@@ -660,18 +614,14 @@ async fn observe_publication(ctx: &Arc<WorkerContext>) -> Result<()> {
         Ok(probe) => probe,
         Err(err) => {
             warn!(error = %format_args!("{err:#}"), "publication poll failed");
-            if let Err(save_err) = ctx
-                .journal
-                .record_poll_error(Some(format!("Publication check failed: {err}")))
-                .await
-            {
+            if let Err(save_err) = ctx.journal.record_poll_error(Some(&err)).await {
                 warn!(%save_err, "failed to record poll error in journal");
             }
             return Err(err);
         }
     };
     let mut state = ctx.journal.state.lock().await;
-    let recovered = state.poll_error.take().is_some();
+    let recovered = state.clear_poll_error();
     match probe {
         Some(publication) => {
             let revision = publication.revision;
@@ -722,10 +672,7 @@ async fn deploy_pending(ctx: &Arc<WorkerContext>) {
         }
         let selection = DeploySelection {
             include_mods: true,
-            include_configs: false,
-            apply_configs: Vec::new(),
-            restore_configs: Vec::new(),
-            decline_configs: Vec::new(),
+            configs: None,
         };
 
         let result = run_deployment(
@@ -843,8 +790,8 @@ pub async fn run(
             // The config file seeds automation on first run; after
             // that the journal is the source of truth so /v1/config
             // changes persist across restarts.
-            state.auto_deploy_mods = config.remote.worker.auto_deploy_mods;
-            state.restart_policy = config.remote.restart_policy;
+            state.auto_deploy_mods = config.remote.automation.auto_deploy_mods;
+            state.restart_policy = config.remote.automation.restart_policy;
             state.automation_seeded = true;
         }
         journal.save(&state)?;
@@ -852,16 +799,7 @@ pub async fn run(
 
     let ctx = Arc::new(WorkerContext::new(config, secrets, journal)?);
 
-    let app = Router::new()
-        .route("/v1/status", get(status))
-        .route("/v1/progress", get(operation_progress))
-        .route("/v1/preview", post(preview))
-        .route("/v1/deploy", post(deploy))
-        .route("/v1/policy", post(set_policy))
-        .route("/v1/restart-ack", post(acknowledge_external_restart))
-        .route("/v1/config", post(configure))
-        .route("/v1/health", get(|| async { StatusCode::NO_CONTENT }))
-        .with_state(ctx.clone());
+    let app = router(ctx.clone());
 
     let listener = tokio::net::TcpListener::bind(&ctx.config.listen)
         .await
@@ -900,13 +838,14 @@ mod publication_tests;
 mod tests {
     use std::sync::Arc;
 
-    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use axum::{http::StatusCode, response::IntoResponse};
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
 
     use super::{WorkerContext, automatic_deploy_due, operation_progress, retry_delay};
     use crate::profile::server::{
         plan::DeploySelection,
         progress::{ProgressStatus, SyncOperation, SyncPhase, SyncProgress},
+        settings::TransportSettings,
     };
     use crate::worker::journal::{PendingWork, WorkerJournal};
     use crate::worker::{config::WorkerConfig, journal::Journal, secrets::Secrets};
@@ -922,9 +861,17 @@ mod tests {
         crate::profile::export::ModRevision::try_from("a".repeat(64)).unwrap()
     }
 
+    /// Serves `ctx` through the worker's router; returns the API base URL.
+    async fn serve_api(ctx: Arc<WorkerContext>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, super::router(ctx)).await });
+        format!("http://{address}/v1")
+    }
+
     #[tokio::test]
     async fn progress_endpoint_requires_bearer_and_exposes_only_the_latest_run() {
-        use axum::extract::State;
+        use axum::{extract::State, response::IntoResponse};
 
         let directory = tempfile::tempdir().unwrap();
         let config = WorkerConfig {
@@ -948,23 +895,40 @@ mod tests {
             )
         };
         let ctx = make_context();
-        let unauthorized = operation_progress(State(ctx.clone()), HeaderMap::new()).await;
+        let api = serve_api(ctx.clone()).await;
+        let http = reqwest::Client::new();
+        let unauthorized = http.get(format!("{api}/progress")).send().await.unwrap();
         assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        for wrong in [
+            "Bearer private-toke",
+            "Bearer private-tokens",
+            "private-token",
+        ] {
+            let response = http
+                .get(format!("{api}/progress"))
+                .header(axum::http::header::AUTHORIZATION, wrong)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{wrong}");
+        }
 
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            HeaderValue::from_static("Bearer private-token"),
-        );
-        let read = |ctx: Arc<WorkerContext>, headers: HeaderMap| async move {
-            let response = operation_progress(State(ctx), headers).await;
+        let response = http
+            .get(format!("{api}/progress"))
+            .bearer_auth("private-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let read = |ctx: Arc<WorkerContext>| async move {
+            let response = operation_progress(State(ctx)).await.into_response();
             assert_eq!(response.status(), StatusCode::OK);
             let body = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
                 .unwrap();
             serde_json::from_slice::<Option<SyncProgress>>(&body).unwrap()
         };
-        assert!(read(ctx.clone(), headers.clone()).await.is_none());
+        assert!(read(ctx.clone()).await.is_none());
 
         let mut first = ctx.reporter(
             "first".to_owned(),
@@ -972,10 +936,7 @@ mod tests {
             &DeploySelection::default(),
         );
         first.phase(SyncPhase::Connecting);
-        assert_eq!(
-            read(ctx.clone(), headers.clone()).await.unwrap().run_id,
-            "first"
-        );
+        assert_eq!(read(ctx.clone()).await.unwrap().run_id, "first");
         let mut second = ctx.reporter(
             "second".to_owned(),
             SyncOperation::Deploy,
@@ -983,12 +944,12 @@ mod tests {
         );
         second.phase(SyncPhase::Connecting);
         ctx.fail_progress();
-        let snapshot = read(ctx.clone(), headers.clone()).await.unwrap();
+        let snapshot = read(ctx.clone()).await.unwrap();
         assert_eq!(snapshot.run_id, "second");
         assert_eq!(snapshot.status, ProgressStatus::Failed);
         ctx.clear_progress();
-        assert!(read(ctx, headers.clone()).await.is_none());
-        assert!(read(make_context(), headers).await.is_none());
+        assert!(read(ctx).await.is_none());
+        assert!(read(make_context()).await.is_none());
     }
 
     #[test]
@@ -1071,17 +1032,12 @@ mod tests {
     }
 
     async fn poll_status(ctx: Arc<WorkerContext>) -> crate::worker::api::StatusResponse {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            HeaderValue::from_static("Bearer token"),
-        );
         let response = super::status(
             axum::extract::State(ctx),
-            headers,
-            axum::extract::Query(super::StatusQuery { refresh: None }),
+            Ok(axum::extract::Query(super::StatusQuery { refresh: None })),
         )
-        .await;
+        .await
+        .into_response();
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -1217,6 +1173,7 @@ mod tests {
         expected.refresh_token = Some("refresh-rotated".to_owned());
         expected.sync_reauthorization_required = false;
         expected.poll_error = None;
+        expected.poll_error_kind = None;
         let journal = Journal::load(dir.path()).unwrap();
         assert_eq!(
             serde_json::to_value(&*journal.state.lock().await).unwrap(),
@@ -1246,12 +1203,15 @@ mod tests {
         config.profile_id = SYNC_PROFILE.to_owned();
         config.sync_url = Some(sync_api.url.clone());
         config.remote = RemoteServerSettings {
-            protocol: RemoteProtocol::Ftp,
-            host: "127.0.0.1".to_owned(),
-            port: ftp.addr.port(),
-            username: "u".to_owned(),
-            server_directory: "/".to_owned(),
-            ..RemoteServerSettings::default()
+            transport: TransportSettings {
+                protocol: RemoteProtocol::Ftp,
+                host: "127.0.0.1".to_owned(),
+                port: ftp.addr.port(),
+                username: "u".to_owned(),
+                server_directory: "/".to_owned(),
+                ..Default::default()
+            },
+            ..Default::default()
         };
         let journal = Journal::load(dir.path()).unwrap();
         {
@@ -1282,8 +1242,7 @@ mod tests {
 
         let selection = DeploySelection {
             include_mods: true,
-            include_configs: false,
-            ..Default::default()
+            configs: None,
         };
         super::run_deployment(
             &ctx,
@@ -1383,20 +1342,15 @@ mod tests {
             )
             .unwrap(),
         );
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            "Bearer token".parse().unwrap(),
-        );
         let response = super::configure(
             axum::extract::State(ctx.clone()),
-            headers,
-            axum::Json(crate::worker::api::ConfigureRequest {
+            Ok(axum::Json(crate::worker::api::ConfigureRequest {
                 auto_deploy_mods: true,
                 restart_policy: crate::profile::server::settings::RestartPolicy::Immediate,
-            }),
+            })),
         )
-        .await;
+        .await
+        .into_response();
         assert!(!response.status().is_success());
         let state = ctx.journal.state.lock().await;
         assert!(!state.auto_deploy_mods);
@@ -1422,7 +1376,7 @@ mod tests {
     #[tokio::test]
     async fn status_refresh_flag_round_trips_through_the_http_route() {
         use crate::profile::server::{
-            settings::{RemoteProtocol, RemoteServerSettings},
+            settings::{RemoteProtocol, RemoteServerSettings, TransportSettings},
             worker_client::WorkerClient,
         };
 
@@ -1432,12 +1386,15 @@ mod tests {
 
         let mut config = worker_config(dir.path(), format!("127.0.0.1:{api_port}"));
         config.remote = RemoteServerSettings {
-            protocol: RemoteProtocol::Ftp,
-            host: "127.0.0.1".to_owned(),
-            port: ftp.addr.port(),
-            username: "u".to_owned(),
-            server_directory: "/".to_owned(),
-            ..RemoteServerSettings::default()
+            transport: TransportSettings {
+                protocol: RemoteProtocol::Ftp,
+                host: "127.0.0.1".to_owned(),
+                port: ftp.addr.port(),
+                username: "u".to_owned(),
+                server_directory: "/".to_owned(),
+                ..Default::default()
+            },
+            ..Default::default()
         };
         // The poll loop is not under test; keep it off the network.
         config.sync_url = Some("http://127.0.0.1:1/".to_owned());
@@ -1457,8 +1414,9 @@ mod tests {
         ready_rx.await.expect("the worker never became ready");
 
         let mut settings = RemoteServerSettings::default();
-        settings.worker.address = format!("http://127.0.0.1:{api_port}");
-        let client = WorkerClient::new(&settings, "token".to_owned()).unwrap();
+        settings.executor.worker_address = format!("http://127.0.0.1:{api_port}");
+        let client =
+            WorkerClient::new(&settings.executor.worker_address, "token".to_owned()).unwrap();
 
         // Without refresh the handler returns journal state only. No
         // remote session is opened.
@@ -1474,7 +1432,8 @@ mod tests {
         assert!(server.lease.is_none());
 
         // The endpoint still requires the bearer token.
-        let unauthenticated = WorkerClient::new(&settings, "wrong".to_owned()).unwrap();
+        let unauthenticated =
+            WorkerClient::new(&settings.executor.worker_address, "wrong".to_owned()).unwrap();
         let err = unauthenticated.status(false).await.unwrap_err();
         assert!(
             err.to_string().contains("bearer token"),
@@ -1497,6 +1456,174 @@ mod tests {
                 "{query} must be rejected"
             );
         }
+
+        shutdown.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    /// Every API route but the health probe answers an unauthenticated
+    /// caller with 401 before it reads the request, so a caller without
+    /// the token learns nothing about request shapes.
+    #[tokio::test]
+    async fn every_route_but_health_rejects_an_unauthenticated_caller_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let api_port = free_port();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(super::run(
+            worker_config(dir.path(), format!("127.0.0.1:{api_port}")),
+            worker_secrets(),
+            shutdown.clone(),
+            Some(ready_tx),
+        ));
+        ready_rx.await.expect("the worker never became ready");
+
+        let http = reqwest::Client::new();
+        let base = format!("http://127.0.0.1:{api_port}/v1");
+        let routes = [
+            (reqwest::Method::GET, "status?refresh=bogus"),
+            (reqwest::Method::GET, "progress"),
+            (reqwest::Method::POST, "preview"),
+            (reqwest::Method::POST, "deploy"),
+            (reqwest::Method::POST, "policy"),
+            (reqwest::Method::POST, "restart-ack"),
+            (reqwest::Method::POST, "config"),
+        ];
+        for (method, route) in routes {
+            for token in [None, Some("wrong")] {
+                let mut request = http
+                    .request(method.clone(), format!("{base}/{route}"))
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body("{ not json");
+                if let Some(token) = token {
+                    request = request.bearer_auth(token);
+                }
+                let response = request.send().await.unwrap();
+                assert_eq!(
+                    response.status(),
+                    reqwest::StatusCode::UNAUTHORIZED,
+                    "{method} {route} with {token:?}"
+                );
+                let body: crate::worker::api::ErrorResponse = response.json().await.unwrap();
+                assert_eq!(body.error, "missing or invalid bearer token");
+            }
+        }
+
+        let health = http.get(format!("{base}/health")).send().await.unwrap();
+        assert_eq!(health.status(), reqwest::StatusCode::NO_CONTENT);
+
+        shutdown.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    /// A failed deploy answers with the status that tells the caller what
+    /// to do next: 409 when the server moved on or another executor holds
+    /// it, 422 when the request itself cannot be satisfied. The message
+    /// stays the engine's own.
+    #[tokio::test]
+    async fn deploy_failures_answer_with_the_status_the_caller_must_act_on() {
+        use crate::profile::server::{
+            lease::{LEASE_TTL, LeaseRecord},
+            settings::TransportSettings,
+            state::ExecutorKind,
+        };
+        use crate::worker::api::ErrorResponse;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sync_api = spawn_sync_api(pack_manifest(), Utc::now()).await;
+        let ftp = FakeFtp::valheim_host(FtpOptions::default());
+        let api_port = free_port();
+        let mut config = worker_config(dir.path(), format!("127.0.0.1:{api_port}"));
+        config.profile_id = SYNC_PROFILE.to_owned();
+        config.sync_url = Some(sync_api.url.clone());
+        config.poll_interval_secs = 300;
+        config.remote = RemoteServerSettings {
+            transport: TransportSettings {
+                protocol: RemoteProtocol::Ftp,
+                host: "127.0.0.1".to_owned(),
+                port: ftp.addr.port(),
+                username: "u".to_owned(),
+                server_directory: "/".to_owned(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // Pre-seeded payload cache keeps staging offline.
+        let staged = dir.path().join("cache").join("Author-Mod").join("1.0.0");
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(staged.join("mod.dll"), b"mod").unwrap();
+
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(super::run(
+            config,
+            Secrets {
+                remote_password: Some("pw".to_owned()),
+                refresh_token: Some("refresh-seed".to_owned()),
+                ..worker_secrets()
+            },
+            shutdown.clone(),
+            Some(ready_tx),
+        ));
+        ready_rx.await.expect("the worker never became ready");
+
+        let http = reqwest::Client::new();
+        // The selection goes in the wire shape, so a request no typed
+        // selection could produce can be sent too.
+        let deploy = |selection: serde_json::Value| {
+            let request = http
+                .post(format!("http://127.0.0.1:{api_port}/v1/deploy"))
+                .bearer_auth("token")
+                .json(&serde_json::json!({
+                    "runId": "run",
+                    "selection": selection,
+                    "planHash": "approved-elsewhere",
+                    "restartPolicy": null,
+                    "force": false,
+                }));
+            async move {
+                let response = request.send().await.unwrap();
+                let status = response.status();
+                (
+                    status,
+                    response.json::<ErrorResponse>().await.unwrap().error,
+                )
+            }
+        };
+        let mods_only = || serde_json::json!({ "includeMods": true, "includeConfigs": false });
+
+        let (status, error) = deploy(mods_only()).await;
+        assert_eq!(status, reqwest::StatusCode::CONFLICT, "{error}");
+        assert!(error.contains("please preview again"), "{error}");
+
+        let (status, error) = deploy(serde_json::json!({
+            "includeMods": true,
+            "includeConfigs": false,
+            "applyConfigs": ["BepInEx/config/mod.cfg"],
+        }))
+        .await;
+        assert_eq!(status, reqwest::StatusCode::UNPROCESSABLE_ENTITY, "{error}");
+        assert!(
+            error.contains("config selections require the config phase"),
+            "{error}"
+        );
+
+        ftp.seed_dir("/BepInEx/config/.gale-deploy.lock");
+        let record = LeaseRecord {
+            owner: "local:other".to_owned(),
+            executor: ExecutorKind::Local,
+            operation_id: "op-other".to_owned(),
+            acquired_at: Utc::now(),
+            heartbeat_at: Utc::now(),
+            ttl_secs: LEASE_TTL.as_secs(),
+        };
+        ftp.seed_file(
+            "/BepInEx/config/.gale-deploy.lock/lease.json",
+            &serde_json::to_vec(&record).unwrap(),
+        );
+        let (status, error) = deploy(mods_only()).await;
+        assert_eq!(status, reqwest::StatusCode::CONFLICT, "{error}");
+        assert!(error.contains("already in progress"), "{error}");
 
         shutdown.cancel();
         task.await.unwrap().unwrap();
@@ -1696,8 +1823,9 @@ mod tests {
             ..worker_secrets()
         };
         let mut settings = RemoteServerSettings::default();
-        settings.worker.address = format!("http://{}", config.listen);
-        let client = WorkerClient::new(&settings, "token".to_owned()).unwrap();
+        settings.executor.worker_address = format!("http://{}", config.listen);
+        let client =
+            WorkerClient::new(&settings.executor.worker_address, "token".to_owned()).unwrap();
 
         let shutdown = tokio_util::sync::CancellationToken::new();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -1747,12 +1875,15 @@ mod tests {
         config.profile_id = SYNC_PROFILE.to_owned();
         config.sync_url = Some(sync_api.url.clone());
         config.remote = RemoteServerSettings {
-            protocol: RemoteProtocol::Ftp,
-            host: "127.0.0.1".to_owned(),
-            port: ftp.addr.port(),
-            username: "u".to_owned(),
-            server_directory: "/".to_owned(),
-            ..RemoteServerSettings::default()
+            transport: TransportSettings {
+                protocol: RemoteProtocol::Ftp,
+                host: "127.0.0.1".to_owned(),
+                port: ftp.addr.port(),
+                username: "u".to_owned(),
+                server_directory: "/".to_owned(),
+                ..Default::default()
+            },
+            ..Default::default()
         };
         let secrets = super::Secrets {
             remote_password: Some("pw".to_owned()),
@@ -1836,20 +1967,15 @@ mod tests {
         std::fs::create_dir_all(&staged).unwrap();
         std::fs::write(staged.join("mod.dll"), b"mod").unwrap();
 
-        let mut headers = super::HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            "Bearer token".parse().unwrap(),
-        );
         let response = super::configure(
             super::State(ctx.clone()),
-            headers,
-            super::Json(super::ConfigureRequest {
+            Ok(super::Json(super::ConfigureRequest {
                 auto_deploy_mods: true,
                 restart_policy: super::RestartPolicy::Manual,
-            }),
+            })),
         )
-        .await;
+        .await
+        .into_response();
         assert_eq!(response.status(), super::StatusCode::NO_CONTENT);
         {
             let state = ctx.journal.state.lock().await;
@@ -1896,12 +2022,15 @@ mod tests {
         config.profile_id = SYNC_PROFILE.to_owned();
         config.sync_url = Some(sync_api.url.clone());
         config.remote = RemoteServerSettings {
-            protocol: RemoteProtocol::Ftp,
-            host: "127.0.0.1".to_owned(),
-            port: ftp.addr.port(),
-            username: "u".to_owned(),
-            server_directory: "/".to_owned(),
-            ..RemoteServerSettings::default()
+            transport: TransportSettings {
+                protocol: RemoteProtocol::Ftp,
+                host: "127.0.0.1".to_owned(),
+                port: ftp.addr.port(),
+                username: "u".to_owned(),
+                server_directory: "/".to_owned(),
+                ..Default::default()
+            },
+            ..Default::default()
         };
         let journal = crate::worker::journal::Journal::load(dir.path()).unwrap();
         {
@@ -1961,12 +2090,15 @@ mod tests {
         config.profile_id = SYNC_PROFILE.to_owned();
         config.sync_url = Some(sync_api.url.clone());
         config.remote = RemoteServerSettings {
-            protocol: RemoteProtocol::Ftp,
-            host: "127.0.0.1".to_owned(),
-            port: ftp.addr.port(),
-            username: "u".to_owned(),
-            server_directory: "/".to_owned(),
-            ..RemoteServerSettings::default()
+            transport: TransportSettings {
+                protocol: RemoteProtocol::Ftp,
+                host: "127.0.0.1".to_owned(),
+                port: ftp.addr.port(),
+                username: "u".to_owned(),
+                server_directory: "/".to_owned(),
+                ..Default::default()
+            },
+            ..Default::default()
         };
         let journal = crate::worker::journal::Journal::load(dir.path()).unwrap();
         {
@@ -2022,7 +2154,7 @@ mod tests {
     #[tokio::test]
     async fn configure_updates_the_journal_and_survives_restarts() {
         use crate::profile::server::{
-            settings::{RemoteProtocol, RemoteServerSettings, RestartPolicy},
+            settings::{RemoteProtocol, RemoteServerSettings, RestartPolicy, TransportSettings},
             worker_client::WorkerClient,
         };
         use crate::worker::journal::Journal;
@@ -2033,19 +2165,23 @@ mod tests {
 
         let mut config = worker_config(dir.path(), format!("127.0.0.1:{api_port}"));
         config.remote = RemoteServerSettings {
-            protocol: RemoteProtocol::Ftp,
-            host: "127.0.0.1".to_owned(),
-            port: ftp.addr.port(),
-            username: "u".to_owned(),
-            server_directory: "/".to_owned(),
-            ..RemoteServerSettings::default()
+            transport: TransportSettings {
+                protocol: RemoteProtocol::Ftp,
+                host: "127.0.0.1".to_owned(),
+                port: ftp.addr.port(),
+                username: "u".to_owned(),
+                server_directory: "/".to_owned(),
+                ..Default::default()
+            },
+            ..Default::default()
         };
-        config.remote.worker.auto_deploy_mods = true;
+        config.remote.automation.auto_deploy_mods = true;
         config.sync_url = Some("http://127.0.0.1:1/".to_owned());
 
         let mut settings = RemoteServerSettings::default();
-        settings.worker.address = format!("http://127.0.0.1:{api_port}");
-        let client = WorkerClient::new(&settings, "token".to_owned()).unwrap();
+        settings.executor.worker_address = format!("http://127.0.0.1:{api_port}");
+        let client =
+            WorkerClient::new(&settings.executor.worker_address, "token".to_owned()).unwrap();
 
         // Managed installation writes a journal with a refresh token before
         // the worker starts. That unseeded journal must still take its
@@ -2089,7 +2225,7 @@ mod tests {
 
         // A restart with a config claiming automation is on keeps the
         // journal's values. It is authoritative once seeded.
-        config.remote.worker.auto_deploy_mods = true;
+        config.remote.automation.auto_deploy_mods = true;
         let shutdown = tokio_util::sync::CancellationToken::new();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(super::run(
@@ -2120,8 +2256,8 @@ mod tests {
 
         // The config now disagrees with both saved values. The journal
         // remains authoritative for automation and restart policy.
-        config.remote.worker.auto_deploy_mods = false;
-        config.remote.restart_policy = RestartPolicy::Immediate;
+        config.remote.automation.auto_deploy_mods = false;
+        config.remote.automation.restart_policy = RestartPolicy::Immediate;
         let shutdown = tokio_util::sync::CancellationToken::new();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(super::run(

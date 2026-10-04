@@ -89,7 +89,7 @@ impl ProgressReporter {
         if selection.include_mods {
             phases.extend([SyncPhase::ScanningPayload, SyncPhase::VerifyingPayload]);
         }
-        if selection.include_configs {
+        if selection.configs.is_some() {
             phases.push(SyncPhase::CheckingConfigs);
         }
         phases.push(SyncPhase::BuildingPlan);
@@ -99,7 +99,7 @@ impl ProgressReporter {
                 if selection.include_mods {
                     phases.extend([SyncPhase::RemovingFiles, SyncPhase::UploadingPayload]);
                 }
-                if selection.include_configs {
+                if selection.configs.is_some() {
                     phases.push(SyncPhase::WritingConfigs);
                 }
                 phases.extend([
@@ -231,7 +231,7 @@ mod tests {
             "run".to_owned(),
             SyncOperation::Deploy,
             &DeploySelection {
-                include_configs: true,
+                configs: Some(Default::default()),
                 ..Default::default()
             },
             |_| {},

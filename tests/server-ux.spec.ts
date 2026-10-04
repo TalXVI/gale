@@ -68,7 +68,7 @@ test('Worker settings expose one mod automation toggle with accurate help', asyn
 
 	await automation.check();
 	await page.getByRole('button', { name: 'Save settings' }).click();
-	const worker = (await lastSave(page)).settings.remote.worker;
+	const worker = (await lastSave(page)).settings.remote.automation;
 	expect(worker.autoDeployMods).toBe(true);
 	expect(worker).not.toHaveProperty('autoSync');
 	expect(worker).not.toHaveProperty('autoMods');
@@ -108,6 +108,60 @@ test('local settings save includes the password and its remember choice', async 
 	});
 });
 
+test('an unverifiable certificate is pinned only after its fingerprint is accepted', async ({
+	page
+}) => {
+	const fingerprint = 'AB:CD:EF:01:23:45:67:89';
+	await page.goto(`/tests/dialog/?certificate=${encodeURIComponent(fingerprint)}`);
+	const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
+	await remoteTab.getByLabel('Protocol').click();
+	await page.getByRole('option', { name: 'FTPS (TLS required)' }).click();
+	await remoteTab.getByLabel('Password', { exact: true }).fill('test-remote-password');
+
+	const pinsSent = () =>
+		page.evaluate(() =>
+			(window as any).calls
+				.filter((call: any) => call.cmd === 'test_remote_server_connection')
+				.map((call: any) => call.args.request.settings.transport.trustedCertificate)
+		);
+	const dialogs = () =>
+		page.evaluate(() =>
+			(window as any).calls
+				.filter((call: any) => call.cmd === 'plugin:dialog|message')
+				.map((call: any) => call.args)
+		);
+	const testConnection = async () => {
+		await remoteTab.getByRole('button', { name: 'Test connection' }).click();
+		await expect(remoteTab.getByRole('button', { name: 'Test connection' })).toBeEnabled();
+	};
+
+	await page.evaluate(() => (window as any).answerDialogs('Cancel'));
+	await testConnection();
+	const [prompt] = await dialogs();
+	expect(prompt.title).toBe('Certificate cannot be verified');
+	expect(prompt.message).toContain(fingerprint);
+	expect(prompt.message).toContain('example.test');
+	expect(await pinsSent()).toEqual([null]);
+
+	await page.evaluate(() => (window as any).answerDialogs('Ok'));
+	await testConnection();
+	// The declined attempt pinned nothing; the accepted one retries with the pin.
+	expect(await pinsSent()).toEqual([null, null, fingerprint]);
+	expect((await dialogs()).at(-1)).toMatchObject({
+		title: 'Connection successful',
+		message:
+			'Connected to example.test with encryption. Certificate verification is bypassed for this host.'
+	});
+
+	await page.getByRole('button', { name: 'Save settings' }).click();
+	await expect
+		.poll(async () => (await lastSave(page))?.settings.remote.transport)
+		.toMatchObject({
+			protocol: 'ftps',
+			trustedCertificate: fingerprint
+		});
+});
+
 test('connection tests run against unsaved input and Discard restores the loaded values', async ({
 	page
 }) => {
@@ -133,7 +187,7 @@ test('connection tests run against unsaved input and Discard restores the loaded
 			(window as any).calls.find((call: any) => call.cmd === 'test_remote_server_connection').args
 				.request
 	);
-	expect(connectionTest.settings.host).toBe('example.test');
+	expect(connectionTest.settings.transport.host).toBe('example.test');
 	expect(connectionTest.password).toBe('test-remote-password');
 	const workerTest = await page.evaluate(
 		() =>
@@ -436,6 +490,30 @@ test('provisioning the local worker leaves no unsaved bar', async ({ page }) => 
 	expect(provisioned).toBe(true);
 });
 
+test('a failed worker setup leaves the saved settings untouched', async ({ page }) => {
+	await page.goto('/tests/dialog/?mode=worker');
+	const remoteTab = page.getByRole('tabpanel', { name: 'Remote server' });
+	await remoteTab.getByLabel('Sync mode').click();
+	await page.getByRole('option', { name: 'Worker on this PC' }).click();
+	await page.evaluate(() => (window as any).fail('provision_local_worker'));
+	await remoteTab.getByRole('button', { name: 'Set up worker' }).click();
+	await expect
+		.poll(() =>
+			page.evaluate(() =>
+				(window as any).calls.some((call: any) => call.cmd === 'provision_local_worker')
+			)
+		)
+		.toBe(true);
+
+	// Reload what the profile has saved by switching away and back.
+	await page.evaluate(() => (window as any).switchProfile(2));
+	await page.evaluate(() => (window as any).switchProfile(1));
+	await expect(remoteTab.getByLabel('Sync mode')).toHaveText('Worker on another machine');
+	await expect(page.getByPlaceholder('https://worker.example.com')).toHaveValue(
+		'https://worker.example.test'
+	);
+});
+
 test('a rejected worker sign-in refreshes the mounted status immediately after reauthorization', async ({
 	page
 }) => {
@@ -560,4 +638,24 @@ test('a delayed settings response cannot replace the newly selected profile', as
 		await new Promise((resolve) => setTimeout(resolve, 0));
 	});
 	await expect(address).toHaveValue('https://worker2.example.test');
+});
+
+test('local-mode freshness compares publication times, not their text', async ({ page }) => {
+	await page.goto('/tests/dialog/?status=upToDate');
+	const remote = page.getByRole('tabpanel', { name: 'Remote server' });
+	await expect(remote.getByText('Server is up to date')).toBeVisible();
+	const refresh = async (revision: string) => {
+		const before = await statusCallCount(page);
+		await page.evaluate((revision) => (window as any).setPublicationRevision(revision), revision);
+		await remote.getByRole('button', { name: 'Refresh' }).click();
+		await expect.poll(() => statusCallCount(page)).toBeGreaterThan(before);
+	};
+
+	// The deployed publication, written with an offset instead of Z.
+	await refresh('2026-09-22T02:00:00+02:00');
+	await expect(remote.getByText('Server is up to date')).toBeVisible();
+
+	// Half a second newer than the deployed publication.
+	await refresh('2026-09-22T00:00:00.500Z');
+	await expect(remote.getByText('Server update available. Preview the changes.')).toBeVisible();
 });

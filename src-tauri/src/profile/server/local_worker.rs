@@ -14,9 +14,12 @@ use eyre::{Result, bail};
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 
-use crate::worker::{
-    ManagedServiceState, ServiceControlAction,
-    api::{StatusResponse, WorkerRunReport},
+use crate::{
+    profile::server::settings_store::SaveServerSettingsRequest,
+    worker::{
+        ManagedServiceState, ServiceControlAction,
+        api::{StatusResponse, WorkerRunReport},
+    },
 };
 
 #[cfg(windows)]
@@ -30,14 +33,10 @@ use uuid::Uuid;
 use crate::{
     profile::{
         server::{
-            commands::{
-                persist_credential, remote_credential, sync_id_for, sync_target,
-                update_settings_for, worker_client,
-            },
+            executor::{remote_credential, sync_id_for, sync_target_with, worker_client},
             secrets::{ServerSecret, ServerSecrets},
-            settings::{
-                HostProvider, RemoteAuthentication, RemoteServerSettings, SyncMode, WorkerSettings,
-            },
+            settings::{HostProvider, RemoteAuthentication, SyncMode},
+            settings_store::{persist_credential, persist_settings, update_settings_for},
         },
         sync::auth,
     },
@@ -185,12 +184,10 @@ pub async fn status(app: &AppHandle) -> Result<LocalWorkerStatus> {
                 if token.is_empty() {
                     worker_error = Some("this profile has no stored worker token".to_owned());
                 } else {
-                    let mut settings = RemoteServerSettings::default();
-                    settings.worker.address = address
-                        .as_ref()
-                        .expect("owned implies an installed address")
-                        .clone();
-                    match worker_client(&secrets, &settings, &token) {
+                    let address = address
+                        .as_deref()
+                        .expect("owned implies an installed address");
+                    match worker_client(&secrets, address, &token) {
                         Ok(client) => match client.status(false).await {
                             Ok(live) => worker = Some(live),
                             Err(err) => worker_error = Some(format!("{err:#}")),
@@ -230,9 +227,8 @@ fn profile_bound_to(app: &AppHandle, profile_id: i64, address: &str) -> bool {
             .ok()
             .and_then(|(_, profile)| profile.server_settings.as_ref())
             .is_some_and(|settings| {
-                settings.remote.sync_mode == SyncMode::Worker
-                    && settings.remote.worker.hosted
-                    && settings.remote.worker.address == address
+                settings.remote.executor.mode == SyncMode::HostedWorker
+                    && settings.remote.executor.worker_address == address
             })
     };
     let token = ServerSecrets::for_profile(profile_id)
@@ -245,31 +241,32 @@ fn profile_bound_to(app: &AppHandle, profile_id: i64, address: &str) -> bool {
 
 /// Provisions and installs the managed worker for the active profile:
 /// an independent sync credential, staged config + secrets, one elevated
-/// install step, then the profile's worker settings point at the loopback
-/// address.
+/// install step, then the profile's settings are saved pointing at the
+/// loopback address.
+///
+/// Everything is derived from `request`, not from stored settings, and
+/// nothing is persisted before the service runs.
 pub async fn provision(
     app: &AppHandle,
-    password: &str,
-    dat_host_password: &str,
+    request: SaveServerSettingsRequest,
 ) -> Result<LocalWorkerStatus> {
     #[cfg(not(windows))]
     {
-        let _ = (app, password, dat_host_password);
+        let _ = (app, request);
         bail!("the managed worker is only supported on Windows")
     }
     #[cfg(windows)]
     {
-        provision_windows(app, password, dat_host_password).await
+        provision_windows(app, request).await
     }
 }
 
 #[cfg(windows)]
 async fn provision_windows(
     app: &AppHandle,
-    password: &str,
-    dat_host_password: &str,
+    request: SaveServerSettingsRequest,
 ) -> Result<LocalWorkerStatus> {
-    let target = sync_target(app)?;
+    let target = sync_target_with(app, request.settings.remote.clone());
     let sync_id = target
         .sync_id
         .clone()
@@ -292,28 +289,34 @@ async fn provision_windows(
     );
     Staging::sweep_stale();
 
-    // The embedded remote settings describe the transport; the worker
-    // block inside them is meaningless to the worker itself, so the copy
-    // it runs with is normalized to Local to keep validation honest.
+    // The worker's copy of the remote settings: it validates only the
+    // transport and host control, never the profile's executor choice.
     let mut worker_remote = target.settings.clone();
-    worker_remote.sync_mode = SyncMode::Local;
     ensure!(
-        worker_remote.authentication != RemoteAuthentication::Agent,
+        worker_remote.transport.authentication != RemoteAuthentication::Agent,
         "SSH agent authentication cannot run unattended in a service; use a password or a private key"
     );
 
     let port = pick_port(installed_port())?;
     let listen = format!("127.0.0.1:{port}");
+
+    // What the profile is saved as once the service runs. Validated now so
+    // nothing after the install can reject it.
+    let mut settings = request.settings.clone();
+    settings.remote.executor.mode = SyncMode::HostedWorker;
+    settings.remote.executor.worker_address = format!("http://{listen}");
+    settings.validate()?;
+
     let root = local::root_dir();
     let private = local::private_dir();
 
-    // A key under %USERPROFILE% is unreachable to the LocalSystem
-    // service, so the staged payload carries a copy and the worker's
+    // A key under %USERPROFILE% is unreachable to the service's virtual
+    // account, so the staged payload carries a copy and the worker's
     // config points at the installed path in the locked-down dir.
-    let key_source = if worker_remote.authentication == RemoteAuthentication::PrivateKey {
-        let source = PathBuf::from(&worker_remote.private_key_path);
+    let key_source = if worker_remote.transport.authentication == RemoteAuthentication::PrivateKey {
+        let source = PathBuf::from(&worker_remote.transport.private_key_path);
         ensure!(source.is_file(), "SSH private key file does not exist");
-        worker_remote.private_key_path = private
+        worker_remote.transport.private_key_path = private
             .join(local::SSH_KEY_FILE)
             .to_string_lossy()
             .into_owned();
@@ -321,11 +324,18 @@ async fn provision_windows(
     } else {
         None
     };
-    worker_remote.validate()?;
+    // What the worker itself validates when it loads its config.
+    worker_remote.transport.validate()?;
+    worker_remote.host_control.validate()?;
 
     let secrets = ServerSecrets::for_profile(target.profile_id)?;
-    let remote_password = remote_credential(&secrets, &target.settings, password)?;
-    let dat_host_password = secrets.resolve(ServerSecret::DatHostPassword, dat_host_password)?;
+    let remote_password = remote_credential(
+        &secrets,
+        &target.settings.transport,
+        &request.remote_password,
+    )?;
+    let dat_host_password =
+        secrets.resolve(ServerSecret::DatHostPassword, &request.dat_host_password)?;
     if target.settings.host_control.provider == HostProvider::DatHost {
         ensure!(
             !dat_host_password.is_empty(),
@@ -405,15 +415,11 @@ async fn provision_windows(
     drop(staging);
 
     // The service is installed and running. Point the profile at it.
-    let mut remote = target.settings.clone();
-    remote.sync_mode = SyncMode::Worker;
-    remote.worker.address = format!("http://{listen}");
-    remote.worker.hosted = true;
     // Persisting the desktop half of the binding can still fail, leaving
     // a running worker whose profile can't reach it. Status reports it
     // as `incomplete`. Retrying setup reinstalls and relinks the worker,
     // preserving its pending work for the same profile and server.
-    update_settings_for(app, target.profile_id, |settings| settings.remote = remote).context(
+    persist_settings(app, target.profile_id, &secrets, settings, &request).context(
         "the worker is installed and running, but saving its settings failed. Run 'Set up worker' again to finish setup",
     )?;
     persist_credential(&secrets, Some(ServerSecret::WorkerToken), &token, true).context(
@@ -428,8 +434,8 @@ async fn provision_windows(
     // page and future provisioning see the same truth.
     if let Some(live) = worker_status.worker.as_ref() {
         update_settings_for(app, target.profile_id, |settings| {
-            settings.remote.worker.auto_deploy_mods = live.auto_deploy_mods;
-            settings.remote.restart_policy = live.restart_policy;
+            settings.remote.automation.auto_deploy_mods = live.auto_deploy_mods;
+            settings.remote.automation.restart_policy = live.restart_policy;
         })
         .context("failed to mirror the worker's automation settings")?;
     }
@@ -528,13 +534,12 @@ pub async fn uninstall(app: &AppHandle) -> Result<LocalWorkerStatus> {
             .1
             .server_settings
             .as_ref()
-            .is_some_and(|settings| {
-                settings.remote.sync_mode == SyncMode::Worker && settings.remote.worker.hosted
-            });
+            .is_some_and(|settings| settings.remote.executor.mode == SyncMode::HostedWorker);
         if hosted {
             update_settings_for(app, profile_id, |settings| {
-                settings.remote.sync_mode = SyncMode::Local;
-                settings.remote.worker = WorkerSettings::default();
+                settings.remote.executor = Default::default();
+                // As before the split: automation belonged to the worker.
+                settings.remote.automation.auto_deploy_mods = false;
             })?;
             let secrets = ServerSecrets::for_profile(profile_id)?;
             persist_credential(&secrets, Some(ServerSecret::WorkerToken), "", false)?;

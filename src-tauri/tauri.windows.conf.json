@@ -1,5 +1,6 @@
 {
 	"build": {
+		"beforeDevCommand": "pnpm run build:worker && pnpm run dev",
 		"features": ["worker"]
 	},
 	"bundle": {

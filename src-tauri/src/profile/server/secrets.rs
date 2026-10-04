@@ -1,7 +1,7 @@
 use eyre::{Context, Result};
 use keyring::Entry;
 
-use super::settings::RemoteServerSettings;
+use super::settings::TransportSettings;
 
 const SERVICE: &str = "com.kesomannen.gale.dedicated-server";
 
@@ -15,22 +15,37 @@ pub enum ServerSecret {
     WorkerToken,
 }
 
+// `ServerSecrets` indexes its entries by discriminant, so `ALL` must list
+// every secret in declaration order.
+const _: () = {
+    let mut index = 0;
+    while index < ServerSecret::ALL.len() {
+        assert!(ServerSecret::ALL[index] as usize == index);
+        index += 1;
+    }
+};
+
 /// Access to a profile's server credentials in the OS credential store.
 /// The keyring entries are initialized once per server operation and reused
 /// for every credential it touches.
 pub struct ServerSecrets {
-    game_password: Entry,
-    sftp_password: Entry,
-    ftp_password: Entry,
-    ssh_key_passphrase: Entry,
-    dat_host_password: Entry,
-    worker_token: Entry,
+    /// One entry per secret, indexed by `ServerSecret`.
+    entries: Vec<Entry>,
 }
 
 impl ServerSecret {
+    const ALL: [Self; 6] = [
+        Self::GamePassword,
+        Self::SftpPassword,
+        Self::FtpPassword,
+        Self::SshKeyPassphrase,
+        Self::DatHostPassword,
+        Self::WorkerToken,
+    ];
+
     /// The credential a remote connection requires, if any. SSH agent
     /// authentication needs no stored credential.
-    pub fn required_by(settings: &RemoteServerSettings) -> Option<Self> {
+    pub fn required_by(settings: &TransportSettings) -> Option<Self> {
         use super::settings::{RemoteAuthentication, RemoteProtocol};
 
         match (settings.protocol, settings.authentication) {
@@ -62,25 +77,15 @@ impl ServerSecret {
 
 impl ServerSecrets {
     pub fn for_profile(profile_id: i64) -> Result<Self> {
-        Ok(Self {
-            game_password: ServerSecret::GamePassword.entry(profile_id)?,
-            sftp_password: ServerSecret::SftpPassword.entry(profile_id)?,
-            ftp_password: ServerSecret::FtpPassword.entry(profile_id)?,
-            ssh_key_passphrase: ServerSecret::SshKeyPassphrase.entry(profile_id)?,
-            dat_host_password: ServerSecret::DatHostPassword.entry(profile_id)?,
-            worker_token: ServerSecret::WorkerToken.entry(profile_id)?,
-        })
+        let entries = ServerSecret::ALL
+            .iter()
+            .map(|secret| secret.entry(profile_id))
+            .collect::<Result<_>>()?;
+        Ok(Self { entries })
     }
 
     fn entry(&self, secret: ServerSecret) -> &Entry {
-        match secret {
-            ServerSecret::GamePassword => &self.game_password,
-            ServerSecret::SftpPassword => &self.sftp_password,
-            ServerSecret::FtpPassword => &self.ftp_password,
-            ServerSecret::SshKeyPassphrase => &self.ssh_key_passphrase,
-            ServerSecret::DatHostPassword => &self.dat_host_password,
-            ServerSecret::WorkerToken => &self.worker_token,
-        }
+        &self.entries[secret as usize]
     }
 
     /// Returns `provided` when given, otherwise the stored credential.
@@ -132,21 +137,18 @@ impl ServerSecrets {
 pub(crate) fn in_memory_secrets() -> ServerSecrets {
     use keyring::mock::MockCredential;
 
-    let entry = || Entry::new_with_credential(Box::new(MockCredential::default()));
     ServerSecrets {
-        game_password: entry(),
-        sftp_password: entry(),
-        ftp_password: entry(),
-        ssh_key_passphrase: entry(),
-        dat_host_password: entry(),
-        worker_token: entry(),
+        entries: ServerSecret::ALL
+            .iter()
+            .map(|_| Entry::new_with_credential(Box::new(MockCredential::default())))
+            .collect(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profile::server::commands::persist_credential;
+    use crate::profile::server::settings_store::persist_credential;
     use keyring::mock::MockCredential;
 
     #[test]
@@ -193,7 +195,7 @@ mod tests {
             .set(ServerSecret::GamePassword, "saved-password")
             .unwrap();
         secrets
-            .game_password
+            .entry(ServerSecret::GamePassword)
             .get_credential()
             .downcast_ref::<MockCredential>()
             .unwrap()

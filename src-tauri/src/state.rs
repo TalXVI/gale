@@ -91,14 +91,20 @@ pub fn setup(app: &AppHandle) -> Result<()> {
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn create_http_client() -> Result<reqwest_middleware::ClientWithMiddleware> {
-    let base = reqwest::Client::builder()
+/// Gale's HTTP client without the response cache, for processes that have no
+/// app cache directory of their own, such as the worker.
+pub(crate) fn base_http_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
         .user_agent(concat!("Kesomannen-Gale/", env!("CARGO_PKG_VERSION")))
         // without these, a stalled connection would hang the request (and thus the
         // install queue) indefinitely, instead of failing so that we can retry it
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
-        .build()?;
+        .build()
+}
+
+fn create_http_client() -> Result<reqwest_middleware::ClientWithMiddleware> {
+    let base = base_http_client()?;
 
     let http = reqwest_middleware::ClientBuilder::new(base)
         .with(create_http_cache())

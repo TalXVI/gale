@@ -48,10 +48,10 @@
 		<SecretField
 			id={`${formId}-dat-host-password`}
 			label={m.dedicatedServerDialog_datHostPassword()}
-			bind:value={form.datHostPassword}
+			bind:value={form.credentials.datHostPassword.value}
 			saved={form.savedCredentials?.datHostPassword ?? false}
 			rememberLabel={m.dedicatedServerDialog_rememberPassword()}
-			bind:remember={form.rememberDatHostPassword}
+			bind:remember={form.credentials.datHostPassword.remember}
 		/>
 	{/if}
 </div>

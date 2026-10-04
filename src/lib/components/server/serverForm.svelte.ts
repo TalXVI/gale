@@ -1,10 +1,12 @@
 import * as api from '$lib/api';
+import type { ServerCredentials } from '$lib/api/profile/server';
 import type {
 	LocalWorkerStatus,
 	ProfileServerSettings,
 	RemoteServerSettings,
 	RemoteProtocol,
 	SavedServerCredentials,
+	TransportSettings,
 	WorkerStatus
 } from '$lib/types';
 import games from '$lib/state/game.svelte';
@@ -17,8 +19,6 @@ export const DEFAULT_SFTP_PORT = '22';
 export const DEFAULT_FTP_PORT = '21';
 const FALLBACK_SERVER_PORT = 2456;
 const MAX_PORT = 65535;
-
-export type SyncChoice = 'local' | 'hostedWorker' | 'worker';
 
 /// Initial settings built from the active game, for profiles that have
 /// never configured a dedicated server.
@@ -33,22 +33,45 @@ export function defaultSettings(): ProfileServerSettings {
 		crossplay: false,
 		extraArgs: '',
 		remote: {
-			protocol: 'sftp',
-			host: '',
-			port: Number(DEFAULT_SFTP_PORT),
-			username: '',
-			serverDirectory: '/',
-			authentication: 'password',
-			privateKeyPath: '',
-			trustedHostKey: null,
-			trustedCertificate: null,
-			syncMode: 'local',
-			worker: { address: '', hosted: false, autoDeployMods: false },
+			transport: {
+				protocol: 'sftp',
+				host: '',
+				port: Number(DEFAULT_SFTP_PORT),
+				username: '',
+				serverDirectory: '/',
+				authentication: 'password',
+				privateKeyPath: '',
+				trustedHostKey: null,
+				trustedCertificate: null
+			},
+			executor: { mode: 'local', workerAddress: '' },
 			hostControl: { provider: 'none', datHostServerId: '', datHostUsername: '' },
-			restartPolicy: 'manual'
+			automation: { autoDeployMods: false, restartPolicy: 'manual' }
 		}
 	};
 }
+
+/// Empty typed credentials, each remembered by default.
+function emptyCredentials(): ServerCredentials {
+	const input = () => ({ value: '', remember: true });
+	return {
+		gamePassword: input(),
+		remotePassword: input(),
+		workerToken: input(),
+		datHostPassword: input()
+	};
+}
+
+/// What the unsaved-changes check compares: everything a save persists
+/// except typed secret values. The tab binding (`location`) is just the
+/// last-viewed tab, so it is normalized out; the remember choices stay in
+/// because toggling them controls whether secrets persist.
+type FormBaseline = {
+	form: ProfileServerSettings;
+	port: string;
+	remotePort: string;
+	remember: Record<keyof ServerCredentials, boolean>;
+};
 
 export function parsePort(value: string, label: string) {
 	const parsed = Number(value);
@@ -65,18 +88,9 @@ export class ServerFormState {
 	form = $state<ProfileServerSettings>(defaultSettings());
 	port = $state('');
 	remotePort = $state(DEFAULT_SFTP_PORT);
-	/// The UI-level sync choice: 'hostedWorker' maps to syncMode 'worker'
-	/// with `hosted: true`.
-	syncChoice = $state<SyncChoice>('local');
 	localWorker = $state<LocalWorkerStatus | null>(null);
-	gamePassword = $state('');
-	remotePassword = $state('');
-	workerToken = $state('');
-	datHostPassword = $state('');
-	rememberGamePassword = $state(true);
-	rememberRemotePassword = $state(true);
-	rememberWorkerToken = $state(true);
-	rememberDatHostPassword = $state(true);
+	/// Typed credentials and their remember choices.
+	credentials = $state<ServerCredentials>(emptyCredentials());
 	savedCredentials = $state<SavedServerCredentials | null>(null);
 	hasSavedSettings = $state(false);
 	loadingSettings = $state(false);
@@ -95,51 +109,39 @@ export class ServerFormState {
 			this.workerBusy
 	);
 
-	#savedJson = $state('');
+	/// The last loaded or saved values; `null` until the first load.
+	#baseline = $state.raw<FormBaseline | null>(null);
+	#baselineJson = $derived(this.#baseline && JSON.stringify(this.#baseline));
 	#loadSeq = 0;
-	/// The tab binding (`location`) is just the last-viewed tab now, so it
-	/// is normalized out of the comparison; the remember checkboxes stay
-	/// in because toggling them controls whether secrets persist.
-	#liveJson = $derived(
-		JSON.stringify({
+	#live = $derived.by(
+		(): FormBaseline => ({
 			form: { ...this.form, location: 'local' },
 			port: this.port,
 			remotePort: this.remotePort,
-			syncChoice: this.syncChoice,
-			rememberGamePassword: this.rememberGamePassword,
-			rememberRemotePassword: this.rememberRemotePassword,
-			rememberWorkerToken: this.rememberWorkerToken,
-			rememberDatHostPassword: this.rememberDatHostPassword
+			remember: {
+				gamePassword: this.credentials.gamePassword.remember,
+				remotePassword: this.credentials.remotePassword.remember,
+				workerToken: this.credentials.workerToken.remember,
+				datHostPassword: this.credentials.datHostPassword.remember
+			}
 		})
 	);
-	secretsDirty = $derived(
-		this.gamePassword !== '' ||
-			this.remotePassword !== '' ||
-			this.workerToken !== '' ||
-			this.datHostPassword !== ''
-	);
+	secretsDirty = $derived(Object.values(this.credentials).some((input) => input.value !== ''));
 	/// Transport-relevant form drift. A typed secret does not count, so
 	/// the user can still preview and deploy with an unsaved credential.
-	settingsChanged = $derived(this.#savedJson !== '' && this.#liveJson !== this.#savedJson);
-	dirty = $derived(
-		this.#savedJson !== '' && (this.#liveJson !== this.#savedJson || this.secretsDirty)
+	settingsChanged = $derived(
+		this.#baselineJson !== null && JSON.stringify(this.#live) !== this.#baselineJson
 	);
+	dirty = $derived(this.settingsChanged || (this.#baseline !== null && this.secretsDirty));
 
 	/// The saved settings decide whether the remote panels mount at all.
 	/// Unsaved edits never enable or disable the status/deploy panel.
 	remoteConfigured = $derived.by(() => {
-		if (!this.hasSavedSettings || !this.#savedJson) return false;
-		const saved = JSON.parse(this.#savedJson) as {
-			form: ProfileServerSettings;
-			syncChoice: SyncChoice;
-		};
+		const saved = this.#baseline;
+		if (!this.hasSavedSettings || !saved) return false;
 		const remote = saved.form.remote;
-		if (remote.host.trim() === '') return false;
-		return (
-			saved.syncChoice === 'local' ||
-			saved.syncChoice === 'hostedWorker' ||
-			remote.worker.address.trim() !== ''
-		);
+		if (remote.transport.host.trim() === '') return false;
+		return remote.executor.mode !== 'worker' || remote.executor.workerAddress.trim() !== '';
 	});
 
 	/// Whether the remote password/passphrase field should show the
@@ -147,7 +149,7 @@ export class ServerFormState {
 	remoteCredentialSaved = $derived.by(() => {
 		const saved = this.savedCredentials;
 		if (!saved) return false;
-		const remote = this.form.remote;
+		const remote = this.form.remote.transport;
 		if (remote.protocol === 'sftp') {
 			if (remote.authentication === 'agent') return false;
 			return remote.authentication === 'password' ? saved.sftpPassword : saved.sshKeyPassphrase;
@@ -170,40 +172,37 @@ export class ServerFormState {
 			this.port = String(
 				this.form.port || games.active?.dedicatedServer?.defaultPort || FALLBACK_SERVER_PORT
 			);
+			const transport = this.form.remote.transport;
 			this.remotePort = String(
-				this.form.remote.port ||
-					(this.form.remote.protocol === 'sftp' ? DEFAULT_SFTP_PORT : DEFAULT_FTP_PORT)
+				transport.port || (transport.protocol === 'sftp' ? DEFAULT_SFTP_PORT : DEFAULT_FTP_PORT)
 			);
-			this.syncChoice =
-				this.form.remote.syncMode === 'worker'
-					? this.form.remote.worker.hosted
-						? 'hostedWorker'
-						: 'worker'
-					: 'local';
 			this.localWorker = localWorker;
-			if (localWorker?.ownership === 'incomplete' && this.syncChoice === 'local') {
-				this.syncChoice = 'hostedWorker';
+			const executor = this.form.remote.executor;
+			if (localWorker?.ownership === 'incomplete' && executor.mode === 'local') {
+				executor.mode = 'hostedWorker';
 			}
 			// The worker's journal holds the automation state. For the managed
 			// worker, its live report wins over the stored
 			// copy, which only seeds new installs.
-			const liveWorker = this.syncChoice === 'hostedWorker' ? this.localWorker?.worker : null;
-			this.form.remote.worker.autoDeployMods =
-				liveWorker?.autoDeployMods ?? this.form.remote.worker.autoDeployMods;
-			this.form.remote.restartPolicy = liveWorker?.restartPolicy ?? this.form.remote.restartPolicy;
+			const liveWorker = executor.mode === 'hostedWorker' ? this.localWorker?.worker : null;
+			const automation = this.form.remote.automation;
+			automation.autoDeployMods = liveWorker?.autoDeployMods ?? automation.autoDeployMods;
+			automation.restartPolicy = liveWorker?.restartPolicy ?? automation.restartPolicy;
 			this.savedCredentials = credentials;
 			this.clearSecrets();
-			this.#savedJson = this.#liveJson;
+			this.#commitBaseline();
 		} finally {
 			if (seq === this.#loadSeq) this.loadingSettings = false;
 		}
 	}
 
 	clearSecrets() {
-		this.gamePassword = '';
-		this.remotePassword = '';
-		this.workerToken = '';
-		this.datHostPassword = '';
+		for (const input of Object.values(this.credentials)) input.value = '';
+	}
+
+	/// Makes what the page shows now the saved state.
+	#commitBaseline() {
+		this.#baseline = $state.snapshot(this.#live);
 	}
 
 	async refreshSavedCredentials() {
@@ -224,8 +223,9 @@ export class ServerFormState {
 			// still reads 'local' because linking it is the step that
 			// failed. Show the hosted-worker section so Finish setup is
 			// one click away.
-			if (status?.ownership === 'incomplete' && this.syncChoice === 'local') {
-				this.syncChoice = 'hostedWorker';
+			const executor = this.form.remote.executor;
+			if (status?.ownership === 'incomplete' && executor.mode === 'local') {
+				executor.mode = 'hostedWorker';
 			}
 		} catch {
 			// A background refresh keeps the last known service state.
@@ -235,42 +235,46 @@ export class ServerFormState {
 	}
 
 	remoteSettings(): RemoteServerSettings {
+		const transport: TransportSettings = this.form.remote.transport;
 		return {
 			...this.form.remote,
-			host: this.form.remote.host.trim(),
-			port: parsePort(
-				this.remotePort,
-				this.form.remote.protocol === 'sftp'
-					? m.dedicatedServerDialog_sshPort()
-					: m.dedicatedServerDialog_ftpPort()
-			),
-			username: this.form.remote.username.trim(),
-			serverDirectory: this.form.remote.serverDirectory.trim(),
-			privateKeyPath: this.form.remote.privateKeyPath.trim(),
-			syncMode: this.syncChoice === 'local' ? 'local' : 'worker',
-			worker: {
-				...this.form.remote.worker,
-				address: this.form.remote.worker.address.trim(),
-				hosted: this.syncChoice === 'hostedWorker'
+			transport: {
+				...transport,
+				host: transport.host.trim(),
+				port: parsePort(
+					this.remotePort,
+					transport.protocol === 'sftp'
+						? m.dedicatedServerDialog_sshPort()
+						: m.dedicatedServerDialog_ftpPort()
+				),
+				username: transport.username.trim(),
+				serverDirectory: transport.serverDirectory.trim(),
+				privateKeyPath: transport.privateKeyPath.trim()
+			},
+			executor: {
+				...this.form.remote.executor,
+				workerAddress: this.form.remote.executor.workerAddress.trim()
 			},
 			hostControl: {
 				...this.form.remote.hostControl,
 				datHostServerId: this.form.remote.hostControl.datHostServerId.trim(),
 				datHostUsername: this.form.remote.hostControl.datHostUsername.trim()
-			}
+			},
+			automation: { ...this.form.remote.automation }
 		};
 	}
 
 	changeRemoteProtocol(value: RemoteProtocol) {
+		const transport = this.form.remote.transport;
 		if (
-			(this.form.remote.protocol === 'sftp' && this.remotePort === DEFAULT_SFTP_PORT) ||
-			(this.form.remote.protocol !== 'sftp' && this.remotePort === DEFAULT_FTP_PORT)
+			(transport.protocol === 'sftp' && this.remotePort === DEFAULT_SFTP_PORT) ||
+			(transport.protocol !== 'sftp' && this.remotePort === DEFAULT_FTP_PORT)
 		) {
 			this.remotePort = value === 'sftp' ? DEFAULT_SFTP_PORT : DEFAULT_FTP_PORT;
 		}
-		this.form.remote.protocol = value;
-		this.form.remote.trustedHostKey = null;
-		this.form.remote.trustedCertificate = null;
+		transport.protocol = value;
+		transport.trustedHostKey = null;
+		transport.trustedCertificate = null;
 	}
 
 	async choosePrivateKey() {
@@ -279,7 +283,7 @@ export class ServerFormState {
 			directory: false,
 			multiple: false
 		});
-		if (typeof selected === 'string') this.form.remote.privateKeyPath = selected;
+		if (typeof selected === 'string') this.form.remote.transport.privateKeyPath = selected;
 	}
 
 	settings(): ProfileServerSettings {
@@ -307,19 +311,22 @@ export class ServerFormState {
 			title: m.dedicatedServerDialog_trustTitle(),
 			kind: 'warning'
 		});
-		if (accepted) this.form.remote.trustedHostKey = fingerprint;
+		if (accepted) this.form.remote.transport.trustedHostKey = fingerprint;
 		return accepted;
 	}
 
 	async trustInvalidCertificate(fingerprint: string) {
 		const accepted = await confirm(
-			m.dedicatedServerDialog_certificateMessage({ host: this.form.remote.host.trim() }),
+			m.dedicatedServerDialog_certificateMessage({
+				host: this.form.remote.transport.host.trim(),
+				fingerprint
+			}),
 			{
 				title: m.dedicatedServerDialog_certificateTitle(),
 				kind: 'warning'
 			}
 		);
-		if (accepted) this.form.remote.trustedCertificate = fingerprint;
+		if (accepted) this.form.remote.transport.trustedCertificate = fingerprint;
 		return accepted;
 	}
 
@@ -328,27 +335,26 @@ export class ServerFormState {
 		if (!current) return;
 		this.testing = true;
 		try {
-			let result = await api.profile.server.testRemoteConnection(
-				current.remote,
-				this.remotePassword
-			);
+			const password = this.credentials.remotePassword.value;
+			let result = await api.profile.server.testRemoteConnection(current.remote, password);
 			if (result.status === 'hostKeyUntrusted') {
 				if (!(await this.trustHost(result.fingerprint))) return;
-				current.remote.trustedHostKey = this.form.remote.trustedHostKey;
-				result = await api.profile.server.testRemoteConnection(current.remote, this.remotePassword);
+				current.remote.transport.trustedHostKey = this.form.remote.transport.trustedHostKey;
+				result = await api.profile.server.testRemoteConnection(current.remote, password);
 			}
 			if (result.status === 'certificateUntrusted') {
 				if (!(await this.trustInvalidCertificate(result.fingerprint))) return;
-				current.remote.trustedCertificate = this.form.remote.trustedCertificate;
-				result = await api.profile.server.testRemoteConnection(current.remote, this.remotePassword);
+				current.remote.transport.trustedCertificate = this.form.remote.transport.trustedCertificate;
+				result = await api.profile.server.testRemoteConnection(current.remote, password);
 			}
 			if (result.status !== 'connected') return;
+			const { host, protocol, trustedCertificate } = this.form.remote.transport;
 			await message(
 				!result.encrypted
-					? m.dedicatedServerDialog_connectionPlain({ host: this.form.remote.host })
-					: this.form.remote.protocol !== 'sftp' && this.form.remote.trustedCertificate
-						? m.dedicatedServerDialog_connectionEncrypted({ host: this.form.remote.host })
-						: m.dedicatedServerDialog_connectionSecure({ host: this.form.remote.host }),
+					? m.dedicatedServerDialog_connectionPlain({ host })
+					: protocol !== 'sftp' && trustedCertificate
+						? m.dedicatedServerDialog_connectionEncrypted({ host })
+						: m.dedicatedServerDialog_connectionSecure({ host }),
 				{
 					title: m.dedicatedServerDialog_connectionTitle(),
 					kind: 'info'
@@ -366,7 +372,7 @@ export class ServerFormState {
 		try {
 			const status = await api.profile.server.testWorkerConnection(
 				current.remote,
-				this.workerToken
+				this.credentials.workerToken.value
 			);
 			await message(
 				m.dedicatedServerDialog_workerConnected({
@@ -387,12 +393,7 @@ export class ServerFormState {
 		if (!current) return;
 		this.saving = true;
 		try {
-			await api.profile.server.setSettings(current, {
-				gamePassword: { value: this.gamePassword, remember: this.rememberGamePassword },
-				remotePassword: { value: this.remotePassword, remember: this.rememberRemotePassword },
-				workerToken: { value: this.workerToken, remember: this.rememberWorkerToken },
-				datHostPassword: { value: this.datHostPassword, remember: this.rememberDatHostPassword }
-			});
+			await api.profile.server.setSettings(current, $state.snapshot(this.credentials));
 			// Automation may have changed. Re-read the worker's own
 			// state so the pending banner reflects what it will actually do.
 			await this.refreshLocalWorker();
@@ -400,7 +401,7 @@ export class ServerFormState {
 			this.hasSavedSettings = true;
 			this.clearSecrets();
 			await this.refreshSavedCredentials();
-			this.#savedJson = this.#liveJson;
+			this.#commitBaseline();
 			// The navbar poll targets remote+worker setups; a save may have
 			// just created or removed one.
 			void serverSync.reconfigure();
@@ -420,76 +421,55 @@ export class ServerFormState {
 	/// The current tab survives. It is not a saved value anymore.
 	discard() {
 		this.clearSecrets();
-		if (!this.#savedJson) return;
-		const saved = JSON.parse(this.#savedJson) as {
-			form: ProfileServerSettings;
-			port: string;
-			remotePort: string;
-			syncChoice: SyncChoice;
-			rememberGamePassword: boolean;
-			rememberRemotePassword: boolean;
-			rememberWorkerToken: boolean;
-			rememberDatHostPassword: boolean;
-		};
-		this.form = { ...saved.form, location: this.form.location };
+		const saved = this.#baseline;
+		if (!saved) return;
+		// A copy, so later edits never reach the baseline.
+		this.form = { ...structuredClone(saved.form), location: this.form.location };
 		this.port = saved.port;
 		this.remotePort = saved.remotePort;
-		this.syncChoice = saved.syncChoice;
-		this.rememberGamePassword = saved.rememberGamePassword;
-		this.rememberRemotePassword = saved.rememberRemotePassword;
-		this.rememberWorkerToken = saved.rememberWorkerToken;
-		this.rememberDatHostPassword = saved.rememberDatHostPassword;
+		for (const key of Object.keys(saved.remember) as (keyof ServerCredentials)[]) {
+			this.credentials[key].remember = saved.remember[key];
+		}
 	}
 
 	/// Reverts the automation controls to the managed worker's live report
 	/// or the last values saved for this profile.
 	reconcileAutomation() {
-		const liveWorker = this.syncChoice === 'hostedWorker' ? this.localWorker?.worker : null;
-		const saved = JSON.parse(this.#savedJson) as { form: ProfileServerSettings };
-		this.form.remote.worker.autoDeployMods =
-			liveWorker?.autoDeployMods ?? saved.form.remote.worker.autoDeployMods;
-		this.form.remote.restartPolicy = liveWorker?.restartPolicy ?? saved.form.remote.restartPolicy;
+		const liveWorker =
+			this.form.remote.executor.mode === 'hostedWorker' ? this.localWorker?.worker : null;
+		const saved = (this.#baseline?.form.remote ?? this.form.remote).automation;
+		this.form.remote.automation = {
+			autoDeployMods: liveWorker?.autoDeployMods ?? saved.autoDeployMods,
+			restartPolicy: liveWorker?.restartPolicy ?? saved.restartPolicy
+		};
 	}
 
-	/// Saves the current transport settings first. Provisioning derives
-	/// the worker's config from the *saved* settings, so unsaved edits
-	/// would otherwise leave worker and desktop pointing at different
-	/// remotes.
-	///
-	/// The save uses `local` sync mode on purpose: a fresh profile has no
-	/// worker address yet, so `worker` mode would fail validation before
-	/// provisioning could start. Once the service is installed, the
-	/// backend itself persists hosted-worker mode with the loopback
-	/// address; the page then mirrors that state.
+	/// Sets the worker up from the page as it stands, saved or not. Once
+	/// the service is installed, the backend saves these settings in
+	/// hosted-worker mode with the loopback address; the page then mirrors
+	/// that state. A failed setup saves nothing.
 	async provisionWorker(onProvisioned: () => Promise<void>) {
 		const current = await this.checkedSettings();
 		if (!current) return;
-		current.remote.syncMode = 'local';
-		current.remote.worker.hosted = false;
 		this.provisioning = true;
 		try {
-			await api.profile.server.setSettings(current, {
-				gamePassword: { value: this.gamePassword, remember: this.rememberGamePassword },
-				remotePassword: { value: this.remotePassword, remember: this.rememberRemotePassword },
-				workerToken: { value: this.workerToken, remember: this.rememberWorkerToken },
-				datHostPassword: { value: this.datHostPassword, remember: this.rememberDatHostPassword }
-			});
 			this.localWorker = await api.profile.server.provisionLocalWorker(
-				this.remotePassword,
-				this.datHostPassword
+				current,
+				$state.snapshot(this.credentials)
 			);
-			if (this.localWorker.address) this.form.remote.worker.address = this.localWorker.address;
-			this.syncChoice = 'hostedWorker';
+			const executor = this.form.remote.executor;
+			if (this.localWorker.address) executor.workerAddress = this.localWorker.address;
+			executor.mode = 'hostedWorker';
 			// A reprovisioned worker keeps its journal. Adopt whatever
 			// automation setting it actually runs.
 			this.reconcileAutomation();
-			// Provisioning persisted the remote settings itself (hosted
-			// worker mode plus the loopback address), so the saved baseline
-			// moves to what the page now shows.
+			// Provisioning saved the page's settings (in hosted-worker mode
+			// with the loopback address), so the saved baseline moves to
+			// what the page now shows.
 			this.hasSavedSettings = true;
 			this.clearSecrets();
 			await this.refreshSavedCredentials();
-			this.#savedJson = this.#liveJson;
+			this.#commitBaseline();
 			// Provisioning turned this profile into a hosted-worker remote.
 			void serverSync.reconfigure();
 			// The mounted panel owns its status cache. Reload it from the
@@ -527,15 +507,18 @@ export class ServerFormState {
 		this.workerBusy = true;
 		try {
 			this.localWorker = await api.profile.server.uninstallLocalWorker();
-			this.syncChoice = 'local';
-			this.form.remote.worker.address = '';
+			this.form.remote.executor = { mode: 'local', workerAddress: '' };
 			// The backend reverted the profile to Local sync. Patch the
 			// saved baseline the same way so other unsaved edits stay dirty.
-			if (this.#savedJson) {
-				const saved = JSON.parse(this.#savedJson);
-				saved.syncChoice = 'local';
-				saved.form.remote.worker.address = '';
-				this.#savedJson = JSON.stringify(saved);
+			const saved = this.#baseline;
+			if (saved) {
+				this.#baseline = {
+					...saved,
+					form: {
+						...saved.form,
+						remote: { ...saved.form.remote, executor: { mode: 'local', workerAddress: '' } }
+					}
+				};
 			}
 			void serverSync.reconfigure();
 		} finally {
@@ -573,7 +556,8 @@ export class ServerFormState {
 		if (!current) return;
 		this.launching = true;
 		try {
-			await api.profile.server.launch(current, this.gamePassword, this.rememberGamePassword);
+			const { value, remember } = this.credentials.gamePassword;
+			await api.profile.server.launch(current, value, remember);
 			pushInfoToast({ message: m.toolBar_launchServer_started() });
 		} finally {
 			this.launching = false;

@@ -21,6 +21,7 @@ required-features = ["worker"]
 [[bin]]
 name = "gale-worker-tray"
 path = "src/bin/gale_worker_tray.rs"
+required-features = ["worker"]
 
 [build-dependencies]
 chrono = "0.4"
@@ -89,6 +90,7 @@ new-vdf-parser = "0.1.0"
 tracing-log = "0.2.0"
 shell-words = "1.1.1"
 ssh2 = "0.9.6"
+sha2 = "0.10"
 suppaftp = { version = "11", features = ["rustls-aws-lc-rs"] }
 webpki-roots = "1"
 winsplit = "0.1.0"
@@ -123,6 +125,7 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 windows-service = "0.8"
+sha1 = "0.10"
 winreg = "0.52"
 tray-icon = "0.23"
 

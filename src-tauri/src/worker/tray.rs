@@ -1,6 +1,6 @@
 //! Per-user Windows notification-area companion for the managed Worker.
 //!
-//! The SCM service runs as LocalSystem in Session 0 and never owns UI.
+//! The SCM service runs in Session 0 and never owns UI.
 //! Gale copies this helper to a versioned directory under LocalAppData,
 //! registers that copy in HKCU Run, and passes the bundled Worker path as
 //! the update candidate. Running outside Gale's install directory keeps
@@ -16,12 +16,9 @@ use eyre::{Context, Result, bail, ensure};
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem as NativeMenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use uuid::Uuid;
-use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, WAIT_OBJECT_0,
-};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{
-    CreateEventW, CreateMutexW, EVENT_MODIFY_STATE, OpenEventW, ReleaseMutex, SetEvent,
-    WaitForSingleObject,
+    CreateEventW, EVENT_MODIFY_STATE, OpenEventW, SetEvent, WaitForSingleObject,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, MB_ICONERROR, MB_OK, MSG, MessageBoxW, PM_REMOVE, PeekMessageW,
@@ -31,7 +28,7 @@ use windows::core::{HSTRING, PCWSTR};
 use winreg::RegKey;
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
 
-use super::{ManagedServiceState, ServiceControlAction, local};
+use super::{ManagedServiceState, ServiceControlAction, local, named_mutex::NamedMutex};
 
 const TOOLTIP: &str = "Gale Worker";
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -83,28 +80,9 @@ impl UpdatePlan {
     }
 }
 
-struct NamedMutex(HANDLE);
-
-impl NamedMutex {
-    fn acquire(name: &str) -> Result<Option<Self>> {
-        let name = HSTRING::from(name);
-        let handle = unsafe { CreateMutexW(None, true, PCWSTR(name.as_ptr())) }
-            .context("failed to create the companion instance guard")?;
-        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-            unsafe { CloseHandle(handle) }?;
-            return Ok(None);
-        }
-        Ok(Some(Self(handle)))
-    }
-}
-
-impl Drop for NamedMutex {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = ReleaseMutex(self.0);
-            let _ = CloseHandle(self.0);
-        }
-    }
+/// The single-instance guard: `None` while another companion runs.
+fn instance_guard() -> Result<Option<NamedMutex>> {
+    NamedMutex::acquire(INSTANCE_MUTEX).context("failed to create the companion instance guard")
 }
 
 struct ShutdownEvent(HANDLE);
@@ -270,7 +248,7 @@ pub fn uninstall_for_current_user() -> Result<()> {
 
 fn wait_for_companion_exit() -> Result<()> {
     for _ in 0..50 {
-        if NamedMutex::acquire(INSTANCE_MUTEX)?.is_some() {
+        if instance_guard()?.is_some() {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -384,7 +362,7 @@ fn begin_action(
 }
 
 fn run(worker_candidate: PathBuf) -> Result<()> {
-    let Some(_instance) = NamedMutex::acquire(INSTANCE_MUTEX)? else {
+    let Some(_instance) = instance_guard()? else {
         return Ok(());
     };
     let shutdown = ShutdownEvent::create()?;

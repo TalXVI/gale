@@ -5,20 +5,17 @@
 //! never need to say which profile or server they target.
 
 use eyre::{Context, Result, bail, ensure};
+use futures_util::future::BoxFuture;
 use reqwest::StatusCode;
 
 use super::{
-    plan::DeploySelection,
+    executor::{ExecutorStatus, SyncExecutor},
     progress::SyncProgress,
-    settings::{RemoteServerSettings, RestartPolicy},
+    settings::RestartPolicy,
 };
-use crate::{
-    profile::export::ConfigPath,
-    profile::sync::ConfigUpdatePolicy,
-    worker::api::{
-        self, ConfigureRequest, DeployRequest, DeployResponse, ErrorResponse, PolicyRequest,
-        PreviewRequest, PreviewResponse, StatusResponse,
-    },
+use crate::worker::api::{
+    self, ConfigureRequest, DeployRequest, DeployResponse, ErrorResponse, PolicyRequest,
+    PreviewRequest, PreviewResponse, StatusResponse,
 };
 
 pub struct WorkerClient {
@@ -28,8 +25,8 @@ pub struct WorkerClient {
 }
 
 impl WorkerClient {
-    pub fn new(settings: &RemoteServerSettings, token: String) -> Result<Self> {
-        let base = settings.worker.address.trim().trim_end_matches('/');
+    pub fn new(address: &str, token: String) -> Result<Self> {
+        let base = address.trim().trim_end_matches('/');
         let url = reqwest::Url::parse(base)
             .context("worker address must be an http:// or https:// URL")?;
         ensure!(
@@ -101,77 +98,6 @@ impl WorkerClient {
         self.send(self.http.get(url)).await
     }
 
-    pub async fn progress(&self) -> Result<Option<SyncProgress>> {
-        self.send(
-            self.http
-                .get(format!("{}{}/progress", self.base, api::API_BASE)),
-        )
-        .await
-    }
-
-    pub async fn preview(
-        &self,
-        selection: &DeploySelection,
-        restart_policy: Option<RestartPolicy>,
-        run_id: &str,
-    ) -> Result<PreviewResponse> {
-        self.send(
-            self.http
-                .post(format!("{}{}/preview", self.base, api::API_BASE))
-                .json(&PreviewRequest {
-                    run_id: run_id.to_owned(),
-                    selection: selection.clone(),
-                    restart_policy,
-                }),
-        )
-        .await
-    }
-
-    pub async fn deploy(
-        &self,
-        selection: &DeploySelection,
-        plan_hash: &str,
-        restart_policy: Option<RestartPolicy>,
-        force: bool,
-        run_id: &str,
-    ) -> Result<DeployResponse> {
-        self.send(
-            self.http
-                .post(format!("{}{}/deploy", self.base, api::API_BASE))
-                .json(&DeployRequest {
-                    run_id: run_id.to_owned(),
-                    selection: selection.clone(),
-                    plan_hash: plan_hash.to_owned(),
-                    restart_policy,
-                    force,
-                }),
-        )
-        .await
-    }
-
-    /// Sets a persistent per-file config update policy on the remote
-    /// deployment state, through the worker. The worker derives the
-    /// publication pin itself, so clients never supply it.
-    pub async fn set_policy(&self, path: &ConfigPath, policy: ConfigUpdatePolicy) -> Result<()> {
-        self.send(
-            self.http
-                .post(format!("{}{}/policy", self.base, api::API_BASE))
-                .json(&PolicyRequest {
-                    path: path.clone(),
-                    policy,
-                }),
-        )
-        .await
-    }
-
-    pub async fn acknowledge_external_restart(&self) -> Result<()> {
-        self.send(
-            self.http
-                .post(format!("{}{}/restart-ack", self.base, api::API_BASE)),
-        )
-        .await
-    }
-
     /// Updates automatic mod deployment and restart policy. Manual Deploy
     /// Now requests are unaffected.
     pub async fn configure(
@@ -188,6 +114,61 @@ impl WorkerClient {
                 }),
         )
         .await
+    }
+}
+
+impl SyncExecutor for WorkerClient {
+    fn read_status(&self, refresh: bool) -> BoxFuture<'_, Result<Option<ExecutorStatus>>> {
+        Box::pin(async move { Ok(Some(ExecutorStatus::Worker(self.status(refresh).await?))) })
+    }
+
+    fn progress(&self) -> BoxFuture<'_, Result<Option<SyncProgress>>> {
+        Box::pin(
+            self.send(
+                self.http
+                    .get(format!("{}{}/progress", self.base, api::API_BASE)),
+            ),
+        )
+    }
+
+    fn preview(&self, request: PreviewRequest) -> BoxFuture<'_, Result<PreviewResponse>> {
+        Box::pin(
+            self.send(
+                self.http
+                    .post(format!("{}{}/preview", self.base, api::API_BASE))
+                    .json(&request),
+            ),
+        )
+    }
+
+    fn deploy(&self, request: DeployRequest) -> BoxFuture<'_, Result<DeployResponse>> {
+        Box::pin(
+            self.send(
+                self.http
+                    .post(format!("{}{}/deploy", self.base, api::API_BASE))
+                    .json(&request),
+            ),
+        )
+    }
+
+    /// The worker derives the publication pin itself.
+    fn set_policy(&self, request: PolicyRequest) -> BoxFuture<'_, Result<()>> {
+        Box::pin(
+            self.send(
+                self.http
+                    .post(format!("{}{}/policy", self.base, api::API_BASE))
+                    .json(&request),
+            ),
+        )
+    }
+
+    fn acknowledge_external_restart(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(
+            self.send(
+                self.http
+                    .post(format!("{}{}/restart-ack", self.base, api::API_BASE)),
+            ),
+        )
     }
 }
 
@@ -210,13 +191,7 @@ fn is_loopback_host(host: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::profile::server::{settings::RemoteServerSettings, worker_client::WorkerClient};
-
-    fn settings(address: &str) -> RemoteServerSettings {
-        let mut settings = RemoteServerSettings::default();
-        settings.worker.address = address.to_owned();
-        settings
-    }
+    use crate::profile::server::worker_client::WorkerClient;
 
     #[test]
     fn rejects_non_loopback_plaintext_http() {
@@ -228,7 +203,7 @@ mod tests {
             "http://10.0.0.5",
             "http://[fd00::1]:8472",
         ] {
-            let err = match WorkerClient::new(&settings(address), "token".to_owned()) {
+            let err = match WorkerClient::new(address, "token".to_owned()) {
                 Err(err) => err,
                 Ok(_) => panic!("{address} must be rejected"),
             };
@@ -248,7 +223,7 @@ mod tests {
             "https://worker.example.com",
             "https://192.168.1.10:8473",
         ] {
-            WorkerClient::new(&settings(address), "token".to_owned())
+            WorkerClient::new(address, "token".to_owned())
                 .unwrap_or_else(|err| panic!("{address} rejected: {err}"));
         }
     }
@@ -260,7 +235,7 @@ mod tests {
             ("http://user:pass@127.0.0.1:8472", "token"),
             ("http://127.0.0.1:8472", ""),
         ] {
-            assert!(WorkerClient::new(&settings(address), token.to_owned()).is_err());
+            assert!(WorkerClient::new(address, token.to_owned()).is_err());
         }
     }
 }

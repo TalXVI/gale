@@ -36,8 +36,19 @@ pub enum SyncMode {
     /// Gale on this device connects to the server and deploys directly.
     #[default]
     Local,
-    /// An independently running gale-worker performs the deployment.
+    /// The Gale-managed gale-worker service on this machine (installed
+    /// under ProgramData) performs the deployment. Provisioning selects
+    /// it; uninstall returns to `Local`.
+    HostedWorker,
+    /// An independently hosted gale-worker performs the deployment.
     Worker,
+}
+
+impl SyncMode {
+    /// Whether a worker, rather than this process, executes deployments.
+    pub fn uses_worker(self) -> bool {
+        matches!(self, Self::HostedWorker | Self::Worker)
+    }
 }
 
 /// What may happen to the game server process after files are deployed.
@@ -55,7 +66,8 @@ pub enum RestartPolicy {
 }
 
 /// Client-local defaults for manual deployments from the Sync dialog.
-/// The worker's unattended restart policy remains `remote.restart_policy`.
+/// The worker's unattended restart policy remains
+/// `remote.automation.restart_policy`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct SyncDialogPreferences {
@@ -73,19 +85,25 @@ pub enum HostProvider {
     DatHost,
 }
 
-/// Connection details for the worker that executes deployments remotely.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Who executes deployments.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "camelCase")]
-pub struct WorkerSettings {
+pub struct ExecutorSettings {
+    pub mode: SyncMode,
     /// Base URL of the worker's HTTP API, e.g. `http://192.168.1.10:8472`.
-    pub address: String,
-    /// Whether `address` points at the Gale-managed Windows service on
-    /// this machine (`gale-worker` installed under ProgramData) rather
-    /// than an independently hosted worker. Provisioning sets it;
-    /// uninstall clears it.
-    pub hosted: bool,
+    /// Kept while `mode` is `Local` so switching back restores it.
+    pub worker_address: String,
+}
+
+/// What a worker does without being asked.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AutomationSettings {
     /// Whether owed mod payloads may deploy without a manual request.
     pub auto_deploy_mods: bool,
+    /// What may happen to the server process after a deployment that
+    /// does not choose a policy itself.
+    pub restart_policy: RestartPolicy,
 }
 
 /// Hosting-provider configuration used for restart/presence operations.
@@ -147,9 +165,10 @@ pub struct LocalServerSettings {
     pub extra_args: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// How Gale reaches a remote server's files.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "camelCase")]
-pub struct RemoteServerSettings {
+pub struct TransportSettings {
     pub protocol: RemoteProtocol,
     pub host: String,
     pub port: u16,
@@ -167,14 +186,63 @@ pub struct RemoteServerSettings {
     /// hostname-wide trust this only accepts the exact certificate seen at
     /// trust time, so subsequent arbitrary certificates are rejected.
     pub trusted_certificate: Option<String>,
-    /// Which executor performs remote synchronization.
-    pub sync_mode: SyncMode,
-    /// Worker connection and automation settings (`syncMode == "worker"`).
-    pub worker: WorkerSettings,
+}
+
+/// Settings for deploying a profile to a remote server.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(from = "RemoteSettingsRepr", rename_all = "camelCase")]
+pub struct RemoteServerSettings {
+    pub transport: TransportSettings,
+    pub executor: ExecutorSettings,
     /// Hosting provider used for restarts and player-presence checks.
     pub host_control: HostSettings,
-    /// What may happen to the server process after deployment.
-    pub restart_policy: RestartPolicy,
+    pub automation: AutomationSettings,
+}
+
+/// Every shape `RemoteServerSettings` has been stored in. Settings saved
+/// before the fields were grouped are flat, and describe the hosted
+/// worker as `syncMode: "worker"` plus `worker.hosted`.
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct RemoteSettingsRepr {
+    transport: Option<TransportSettings>,
+    executor: Option<ExecutorSettings>,
+    host_control: HostSettings,
+    automation: Option<AutomationSettings>,
+    #[serde(flatten)]
+    flat_transport: TransportSettings,
+    sync_mode: SyncMode,
+    worker: FlatWorkerSettings,
+    restart_policy: RestartPolicy,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct FlatWorkerSettings {
+    address: String,
+    hosted: bool,
+    auto_deploy_mods: bool,
+}
+
+impl From<RemoteSettingsRepr> for RemoteServerSettings {
+    fn from(repr: RemoteSettingsRepr) -> Self {
+        let mode = match repr.sync_mode {
+            SyncMode::Worker if repr.worker.hosted => SyncMode::HostedWorker,
+            mode => mode,
+        };
+        Self {
+            transport: repr.transport.unwrap_or(repr.flat_transport),
+            executor: repr.executor.unwrap_or(ExecutorSettings {
+                mode,
+                worker_address: repr.worker.address,
+            }),
+            host_control: repr.host_control,
+            automation: repr.automation.unwrap_or(AutomationSettings {
+                auto_deploy_mods: repr.worker.auto_deploy_mods,
+                restart_policy: repr.restart_policy,
+            }),
+        }
+    }
 }
 
 impl ProfileServerSettings {
@@ -209,16 +277,10 @@ impl LocalServerSettings {
     }
 }
 
-impl RemoteServerSettings {
+impl TransportSettings {
     /// The checks a file-transfer connection needs: reachable host,
     /// credentials to authenticate with, and a valid remote directory.
-    ///
-    /// Worker and host-provider fields are deliberately excluded. They
-    /// configure who executes deployments and what happens afterwards,
-    /// so requiring them here would block testing the FTP/SFTP settings
-    /// before a worker is provisioned or while an external worker is
-    /// still being configured.
-    pub fn validate_connection(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         ensure!(!self.host.trim().is_empty(), "remote host cannot be empty");
         ensure!(self.port != 0, "remote port cannot be 0");
         ensure!(
@@ -234,36 +296,6 @@ impl RemoteServerSettings {
             ensure!(
                 !self.private_key_path.trim().is_empty(),
                 "SSH private key file is required"
-            );
-        }
-
-        Ok(())
-    }
-
-    /// Full validation for operations that act on the whole
-    /// configuration: saving settings, deploying, or testing the worker.
-    /// Worker mode requires a bound worker address here; connection-only
-    /// operations use [`Self::validate_connection`] instead.
-    pub fn validate(&self) -> Result<()> {
-        self.validate_connection()?;
-
-        if self.sync_mode == SyncMode::Worker {
-            let address = self.worker.address.trim();
-            ensure!(!address.is_empty(), "worker address cannot be empty");
-            ensure!(
-                address.starts_with("http://") || address.starts_with("https://"),
-                "worker address must be an http:// or https:// URL"
-            );
-        }
-
-        if self.host_control.provider == HostProvider::DatHost {
-            ensure!(
-                !self.host_control.dat_host_server_id.trim().is_empty(),
-                "DatHost server id is required"
-            );
-            ensure!(
-                !self.host_control.dat_host_username.trim().is_empty(),
-                "DatHost account email is required"
             );
         }
 
@@ -294,11 +326,59 @@ impl RemoteServerSettings {
     }
 }
 
+impl ExecutorSettings {
+    /// A worker mode needs the address of the worker to reach.
+    pub fn validate(&self) -> Result<()> {
+        if self.mode.uses_worker() {
+            let address = self.worker_address.trim();
+            ensure!(!address.is_empty(), "worker address cannot be empty");
+            ensure!(
+                address.starts_with("http://") || address.starts_with("https://"),
+                "worker address must be an http:// or https:// URL"
+            );
+        }
+
+        Ok(())
+    }
+}
+
+impl HostSettings {
+    /// Validates the hosting-provider settings that restarts and presence
+    /// checks use.
+    pub fn validate(&self) -> Result<()> {
+        if self.provider == HostProvider::DatHost {
+            ensure!(
+                !self.dat_host_server_id.trim().is_empty(),
+                "DatHost server id is required"
+            );
+            ensure!(
+                !self.dat_host_username.trim().is_empty(),
+                "DatHost account email is required"
+            );
+        }
+
+        Ok(())
+    }
+}
+
+impl RemoteServerSettings {
+    /// Full validation for operations that act on the whole
+    /// configuration: saving settings, deploying, or testing the worker.
+    /// Connection-only operations validate [`Self::transport`] alone, so
+    /// file transfer can be tested before a worker is provisioned.
+    pub fn validate(&self) -> Result<()> {
+        self.transport.validate()?;
+        self.executor.validate()?;
+        self.host_control.validate()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        LocalServerSettings, ProfileServerSettings, RemoteAuthentication, RemoteProtocol,
-        RemoteServerSettings, ServerLocation, SyncMode, WorkerSettings,
+        AutomationSettings, ExecutorSettings, LocalServerSettings, ProfileServerSettings,
+        RemoteAuthentication, RemoteProtocol, RemoteServerSettings, RestartPolicy, ServerLocation,
+        SyncMode, TransportSettings,
     };
 
     /// The fresh-profile provisioning sequence relies on this contract:
@@ -310,19 +390,20 @@ mod tests {
     #[test]
     fn worker_mode_requires_an_address_but_local_does_not() {
         let transport = RemoteServerSettings {
-            host: "h".into(),
-            port: 22,
-            username: "u".into(),
-            server_directory: "/srv/valheim".into(),
+            transport: TransportSettings {
+                host: "h".into(),
+                port: 22,
+                username: "u".into(),
+                server_directory: "/srv/valheim".into(),
+                ..Default::default()
+            },
             ..Default::default()
         };
 
         let unprovisioned = RemoteServerSettings {
-            sync_mode: SyncMode::Worker,
-            worker: WorkerSettings {
-                hosted: true,
-                address: String::new(),
-                ..Default::default()
+            executor: ExecutorSettings {
+                mode: SyncMode::HostedWorker,
+                worker_address: String::new(),
             },
             ..transport.clone()
         };
@@ -330,15 +411,14 @@ mod tests {
 
         let mut saved_first = transport.clone();
         assert!(saved_first.validate().is_ok());
-        saved_first.worker.auto_deploy_mods = true;
+        saved_first.automation.auto_deploy_mods = true;
         assert!(saved_first.validate().is_ok());
 
         // An already-configured external worker is untouched.
         let external = RemoteServerSettings {
-            sync_mode: SyncMode::Worker,
-            worker: WorkerSettings {
-                address: "http://127.0.0.1:8472".into(),
-                ..Default::default()
+            executor: ExecutorSettings {
+                mode: SyncMode::Worker,
+                worker_address: "http://127.0.0.1:8472".into(),
             },
             ..transport
         };
@@ -352,25 +432,30 @@ mod tests {
     #[test]
     fn connection_validation_ignores_worker_configuration() {
         let unprovisioned_hosted = RemoteServerSettings {
-            host: "ftp.example.com".into(),
-            port: 21,
-            username: "u".into(),
-            server_directory: "/".into(),
-            sync_mode: SyncMode::Worker,
-            worker: WorkerSettings {
-                hosted: true,
+            transport: TransportSettings {
+                host: "ftp.example.com".into(),
+                port: 21,
+                username: "u".into(),
+                server_directory: "/".into(),
+                ..Default::default()
+            },
+            executor: ExecutorSettings {
+                mode: SyncMode::HostedWorker,
                 ..Default::default()
             },
             ..Default::default()
         };
-        assert!(unprovisioned_hosted.validate_connection().is_ok());
+        assert!(unprovisioned_hosted.transport.validate().is_ok());
         assert!(unprovisioned_hosted.validate().is_err());
 
         let unconfigured_external = RemoteServerSettings {
-            worker: WorkerSettings::default(),
+            executor: ExecutorSettings {
+                mode: SyncMode::Worker,
+                ..Default::default()
+            },
             ..unprovisioned_hosted.clone()
         };
-        assert!(unconfigured_external.validate_connection().is_ok());
+        assert!(unconfigured_external.transport.validate().is_ok());
         assert!(unconfigured_external.validate().is_err());
     }
 
@@ -378,40 +463,48 @@ mod tests {
     /// itself needs; bad credentials or connection settings still fail.
     #[test]
     fn connection_validation_still_checks_the_transport() {
-        let base = RemoteServerSettings {
+        let base = TransportSettings {
             host: "ftp.example.com".into(),
             port: 21,
             username: "u".into(),
             server_directory: "/".into(),
-            sync_mode: SyncMode::Worker,
+            ..Default::default()
+        };
+        let with = |transport| RemoteServerSettings {
+            transport,
+            executor: ExecutorSettings {
+                mode: SyncMode::Worker,
+                ..Default::default()
+            },
             ..Default::default()
         };
 
         for broken in [
-            RemoteServerSettings {
+            TransportSettings {
                 host: "  ".into(),
                 ..base.clone()
             },
-            RemoteServerSettings {
+            TransportSettings {
                 port: 0,
                 ..base.clone()
             },
-            RemoteServerSettings {
+            TransportSettings {
                 username: String::new(),
                 ..base.clone()
             },
-            RemoteServerSettings {
+            TransportSettings {
                 server_directory: "/srv/../escape".into(),
                 ..base.clone()
             },
-            RemoteServerSettings {
+            TransportSettings {
                 protocol: RemoteProtocol::Sftp,
                 authentication: RemoteAuthentication::PrivateKey,
                 private_key_path: String::new(),
                 ..base.clone()
             },
         ] {
-            assert!(broken.validate_connection().is_err());
+            let broken = with(broken);
+            assert!(broken.transport.validate().is_err());
             assert!(broken.validate().is_err());
         }
     }
@@ -440,7 +533,7 @@ mod tests {
         assert_eq!(settings.location, ServerLocation::Remote);
         assert_eq!(settings.local.server_name, "My Server");
         assert_eq!(settings.local.port, 2456);
-        assert_eq!(settings.remote.host, "example.com");
+        assert_eq!(settings.remote.transport.host, "example.com");
         assert_eq!(settings.sync_dialog, Default::default());
     }
 
@@ -450,15 +543,18 @@ mod tests {
     #[test]
     fn ftps_round_trips_as_a_distinct_protocol() {
         let settings = RemoteServerSettings {
-            protocol: RemoteProtocol::Ftps,
+            transport: TransportSettings {
+                protocol: RemoteProtocol::Ftps,
+                ..Default::default()
+            },
             ..Default::default()
         };
 
         let value = serde_json::to_value(&settings).unwrap();
-        assert_eq!(value["protocol"], "ftps");
+        assert_eq!(value["transport"]["protocol"], "ftps");
 
         let parsed: RemoteServerSettings = serde_json::from_value(value).unwrap();
-        assert_eq!(parsed.protocol, RemoteProtocol::Ftps);
+        assert_eq!(parsed.transport.protocol, RemoteProtocol::Ftps);
     }
 
     #[test]
@@ -468,7 +564,64 @@ mod tests {
 
         assert_eq!(settings.location, ServerLocation::Remote);
         assert_eq!(settings.local.port, 0);
-        assert_eq!(settings.remote.protocol, RemoteProtocol::Sftp);
+        assert_eq!(settings.remote.transport.protocol, RemoteProtocol::Sftp);
+    }
+
+    /// Settings saved before the fields were grouped stay readable, and
+    /// the hosted worker they described as `syncMode: "worker"` plus
+    /// `worker.hosted` keeps pointing at the managed service rather than
+    /// turning into an external worker.
+    #[test]
+    fn settings_saved_in_the_flat_shape_keep_their_executor_and_automation() {
+        let flat = |hosted| {
+            serde_json::json!({
+                "protocol": "ftp",
+                "host": "example.com",
+                "port": 21,
+                "username": "u",
+                "serverDirectory": "/srv",
+                "syncMode": "worker",
+                "worker": {
+                    "address": "http://127.0.0.1:8472",
+                    "hosted": hosted,
+                    "autoDeployMods": true
+                },
+                "hostControl": { "provider": "datHost", "datHostServerId": "s" },
+                "restartPolicy": "whenEmpty"
+            })
+        };
+
+        for (hosted, mode) in [(true, SyncMode::HostedWorker), (false, SyncMode::Worker)] {
+            let settings: RemoteServerSettings = serde_json::from_value(flat(hosted)).unwrap();
+
+            assert_eq!(settings.transport.protocol, RemoteProtocol::Ftp);
+            assert_eq!(settings.transport.host, "example.com");
+            assert_eq!(settings.transport.server_directory, "/srv");
+            assert_eq!(
+                settings.executor,
+                ExecutorSettings {
+                    mode,
+                    worker_address: "http://127.0.0.1:8472".into(),
+                }
+            );
+            assert_eq!(
+                settings.automation,
+                AutomationSettings {
+                    auto_deploy_mods: true,
+                    restart_policy: RestartPolicy::WhenEmpty,
+                }
+            );
+            assert_eq!(settings.host_control.dat_host_server_id, "s");
+
+            // Saved again, the settings take the grouped shape and read
+            // back unchanged.
+            let saved = serde_json::to_value(&settings).unwrap();
+            assert!(saved.get("syncMode").is_none() && saved.get("worker").is_none());
+            let reread: RemoteServerSettings = serde_json::from_value(saved).unwrap();
+            assert_eq!(reread.transport, settings.transport);
+            assert_eq!(reread.executor, settings.executor);
+            assert_eq!(reread.automation, settings.automation);
+        }
     }
 
     #[test]

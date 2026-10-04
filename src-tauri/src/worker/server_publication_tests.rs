@@ -6,15 +6,17 @@ use super::tests::{free_port, pack_manifest, publication_zip, worker_config, wor
 use crate::{
     profile::{
         server::{
+            executor::SyncExecutor,
             plan::DeploySelection,
             remote::fake_ftp::{FakeFtp, Options},
-            settings::{RemoteProtocol, RemoteServerSettings, RestartPolicy},
+            settings::{RemoteProtocol, RemoteServerSettings, RestartPolicy, TransportSettings},
             state::{OperationKind, ServerDeploymentState, VERSION},
             worker_client::WorkerClient,
         },
         sync::{SyncProfileMetadata, auth::User, publication_from_archive},
     },
     worker::{
+        api::PreviewRequest,
         journal::Journal,
         secrets::Secrets,
         sync_client::tests::{MockApi, serve},
@@ -76,16 +78,20 @@ async fn live_refresh_observes_new_publication_and_wakes_config_free_automation(
         config.poll_interval_secs = 300;
         config.sync_url = Some(sync.url.clone());
         config.remote = RemoteServerSettings {
-            protocol: RemoteProtocol::Ftp,
-            host: "127.0.0.1".to_owned(),
-            port: ftp.addr.port(),
-            username: "u".to_owned(),
-            server_directory: "/".to_owned(),
+            transport: TransportSettings {
+                protocol: RemoteProtocol::Ftp,
+                host: "127.0.0.1".to_owned(),
+                port: ftp.addr.port(),
+                username: "u".to_owned(),
+                server_directory: "/".to_owned(),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut settings = config.remote.clone();
-        settings.worker.address = format!("http://{}", config.listen);
-        let client = WorkerClient::new(&settings, "token".to_owned()).unwrap();
+        settings.executor.worker_address = format!("http://{}", config.listen);
+        let client =
+            WorkerClient::new(&settings.executor.worker_address, "token".to_owned()).unwrap();
         let stop = tokio_util::sync::CancellationToken::new();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(super::run(
@@ -177,7 +183,11 @@ async fn live_refresh_observes_new_publication_and_wakes_config_free_automation(
         assert!(busy.busy);
         assert_eq!(busy.pending_revision, Some(new));
         let error = client
-            .preview(&DeploySelection::default(), None, "manual-race")
+            .preview(PreviewRequest {
+                selection: DeploySelection::default(),
+                restart_policy: None,
+                run_id: "manual-race".to_owned(),
+            })
             .await
             .unwrap_err();
         assert!(error.to_string().contains("already running"));

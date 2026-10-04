@@ -17,27 +17,30 @@ let settings: unknown = params.has('unset')
 			crossplay: false,
 			extraArgs: '',
 			remote: {
-				protocol: 'sftp',
-				host: 'example.test',
-				port: 22,
-				username: 'test-user',
-				serverDirectory: '/srv/server',
-				authentication: 'password',
-				privateKeyPath: '',
-				trustedHostKey: null,
-				trustedCertificate: null,
-				syncMode: workerMode ? 'worker' : 'local',
-				worker: {
-					address: workerMode ? 'https://worker.example.test' : '',
-					hosted: false,
-					autoDeployMods: false
+				transport: {
+					protocol: 'sftp',
+					host: 'example.test',
+					port: 22,
+					username: 'test-user',
+					serverDirectory: '/srv/server',
+					authentication: 'password',
+					privateKeyPath: '',
+					trustedHostKey: null,
+					trustedCertificate: null
+				},
+				executor: {
+					mode: workerMode ? 'worker' : 'local',
+					workerAddress: workerMode ? 'https://worker.example.test' : ''
 				},
 				hostControl: { provider: 'none', datHostServerId: '', datHostUsername: '' },
-				restartPolicy: 'manual'
+				automation: { autoDeployMods: false, restartPolicy: 'manual' }
 			}
 		};
 let serverRunning = params.has('running');
-const cancelStop = params.has('cancelStop');
+let dialogAnswer = params.has('cancelStop') ? 'Cancel' : 'Ok';
+// `?certificate=<fingerprint>` makes the remote present a certificate that
+// only connects once that fingerprint is pinned.
+const presentedCertificate = params.get('certificate');
 const manyConfigs = params.has('many');
 const plannedUnchanged = Number(params.get('unchanged') ?? '0');
 const plannedUnmanaged = Number(params.get('unmanaged') ?? '0');
@@ -233,6 +236,9 @@ Object.assign(window, {
 	fail: (cmd: string) => {
 		failing.add(cmd);
 	},
+	answerDialogs: (answer: 'Ok' | 'Cancel') => {
+		dialogAnswer = answer;
+	},
 	unfail: (cmd: string) => {
 		failing.delete(cmd);
 	},
@@ -383,11 +389,9 @@ mockIPC(async (cmd, args) => {
 					...s,
 					remote: {
 						...s.remote,
-						syncMode: params.has('worker2') ? 'worker' : 'local',
-						worker: {
-							...s.remote.worker,
-							address: params.has('worker2') ? 'https://worker2.example.test' : ''
-						}
+						executor: params.has('worker2')
+							? { mode: 'worker', workerAddress: 'https://worker2.example.test' }
+							: { mode: 'local', workerAddress: '' }
 					}
 				};
 			}
@@ -417,7 +421,17 @@ mockIPC(async (cmd, args) => {
 			return;
 		case 'get_local_worker_status':
 			return localWorker;
-		case 'provision_local_worker':
+		case 'provision_local_worker': {
+			// Setup saves the submitted settings once the service runs,
+			// pointed at the hosted worker's loopback address.
+			const submitted = structuredClone((args as any).request.settings);
+			settings = {
+				...submitted,
+				remote: {
+					...submitted.remote,
+					executor: { mode: 'hostedWorker', workerAddress: 'http://127.0.0.1:8472' }
+				}
+			};
 			// Models same-binding credential recovery in the Worker journal.
 			if (
 				worker.syncReauthorizationRequired &&
@@ -440,10 +454,16 @@ mockIPC(async (cmd, args) => {
 				worker: { ...worker, workerId: 'local-worker', syncReauthorizationRequired: false }
 			};
 			return localWorker;
+		}
 		case 'set_dedicated_server_settings':
 			settings = structuredClone((args as any).request.settings);
 			return;
 		case 'test_remote_server_connection':
+			if (
+				presentedCertificate &&
+				(args as any).request.settings.transport.trustedCertificate !== presentedCertificate
+			)
+				return { status: 'certificateUntrusted', fingerprint: presentedCertificate };
 			return { status: 'connected', encrypted: true };
 		case 'test_worker_connection':
 			return { workerId: 'test-worker', autoDeployMods: false };
@@ -464,7 +484,7 @@ mockIPC(async (cmd, args) => {
 		case 'plugin:dialog|message':
 			if (params.get('component') === 'regression' && (args as any).buttons === 'OkCancel')
 				return params.has('confirmClose') ? 'Ok' : 'Cancel';
-			return cancelStop ? 'Cancel' : 'Ok';
+			return dialogAnswer;
 		case 'plugin:store|load':
 			return;
 		case 'plugin:store|entries':

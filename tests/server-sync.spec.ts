@@ -529,7 +529,7 @@ test('re-previewing config decisions stays config-only while mods are pending', 
 	await expect(page.getByText('Update pending')).toBeVisible();
 });
 
-test('a mods preview and re-preview stay mods-only; deploying them discharges pending mods', async ({
+test('a mods preview and re-preview stay mods-only; deploying them re-reads the live status', async ({
 	page
 }) => {
 	await page.goto('/tests/dialog/?mode=worker&wpending=1');
@@ -553,13 +553,22 @@ test('a mods preview and re-preview stay mods-only; deploying them discharges pe
 		remoteTab.getByRole('button', { name: 'Preview config changes', exact: true })
 	).toBeVisible();
 
+	const liveReads = () =>
+		page.evaluate(
+			() =>
+				(window as any).calls.filter(
+					(call: any) => call.cmd === 'get_server_sync_status' && call.args.request.refresh
+				).length
+		);
+	const readsBefore = await liveReads();
 	await remoteTab.getByRole('button', { name: 'Deploy', exact: true }).click();
 	await expect(page.getByText('Mod deployment finished.')).toBeVisible();
 	expect(await lastSelection(page, 'deploy_server_sync')).toEqual(modsOnlySelection);
 
-	// The mock discharges the pending revision only on a mods deploy,
-	// so the banner clears here while test A keeps it.
-	await remoteTab.getByRole('button', { name: 'Refresh', exact: true }).click();
+	// Whether the pending work settled is the worker's call, so the page
+	// re-reads the live status on its own (interval ticks never do) and
+	// shows what came back instead of assuming the outcome.
+	await expect.poll(liveReads).toBeGreaterThan(readsBefore);
 	await expect(page.getByText('Update pending')).toHaveCount(0);
 });
 

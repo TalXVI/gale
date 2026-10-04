@@ -38,6 +38,9 @@ pub(crate) mod config;
 /// Shared layout constants for the managed Windows service.
 #[cfg(windows)]
 pub(crate) mod local;
+/// Named mutexes the tray companion and the service installer share.
+#[cfg(windows)]
+pub(crate) mod named_mutex;
 /// Used by the worker at runtime and by the desktop's provisioning on
 /// Windows; dead code elsewhere.
 #[cfg(any(windows, feature = "worker"))]

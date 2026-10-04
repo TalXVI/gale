@@ -52,7 +52,11 @@
 		{/if}
 		{#if sync.preview.busy}
 			<InfoBox type="warning" class="mt-3">
-				{m.serverSync_leaseHeld({ owner: sync.preview.busy.record.owner })}
+				{#if sync.preview.busy.record}
+					{m.serverSync_leaseHeld({ owner: sync.preview.busy.record.owner })}
+				{:else}
+					{m.serverSync_leaseHeldUnknown()}
+				{/if}
 			</InfoBox>
 		{/if}
 		{#each sync.preview.warnings as warning}

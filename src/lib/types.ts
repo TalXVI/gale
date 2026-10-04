@@ -289,25 +289,13 @@ export type DedicatedServerInfo = {
 export type ServerLocation = 'local' | 'remote';
 export type RemoteAuthentication = 'password' | 'privateKey' | 'agent';
 export type RemoteProtocol = 'sftp' | 'ftp' | 'ftps';
-export type SyncMode = 'local' | 'worker';
+/// Who executes deployments: Gale itself, the Gale-managed worker service
+/// on this machine, or an independently hosted worker.
+export type SyncMode = 'local' | 'hostedWorker' | 'worker';
 export type RestartPolicy = 'manual' | 'immediate' | 'whenEmpty';
 export type HostProvider = 'none' | 'datHost';
 
-export type WorkerSettings = {
-	address: string;
-	/// True when `address` points at the Gale-managed Windows service on
-	/// this machine rather than an independently hosted worker.
-	hosted: boolean;
-	autoDeployMods: boolean;
-};
-
-export type HostSettings = {
-	provider: HostProvider;
-	datHostServerId: string;
-	datHostUsername: string;
-};
-
-export type RemoteServerSettings = {
+export type TransportSettings = {
 	protocol: RemoteProtocol;
 	host: string;
 	port: number;
@@ -317,10 +305,29 @@ export type RemoteServerSettings = {
 	privateKeyPath: string;
 	trustedHostKey: string | null;
 	trustedCertificate: string | null;
-	syncMode: SyncMode;
-	worker: WorkerSettings;
-	hostControl: HostSettings;
+};
+
+export type ExecutorSettings = {
+	mode: SyncMode;
+	workerAddress: string;
+};
+
+export type AutomationSettings = {
+	autoDeployMods: boolean;
 	restartPolicy: RestartPolicy;
+};
+
+export type HostSettings = {
+	provider: HostProvider;
+	datHostServerId: string;
+	datHostUsername: string;
+};
+
+export type RemoteServerSettings = {
+	transport: TransportSettings;
+	executor: ExecutorSettings;
+	hostControl: HostSettings;
+	automation: AutomationSettings;
 };
 
 export type ProfileServerSettings = {
@@ -444,9 +451,10 @@ export type LeaseRecord = {
 
 /// A preview that found another live executor holding the deployment
 /// lease. `stale` marks a lease whose heartbeat expired, the only case
-/// where a forced takeover is offered.
+/// where a forced takeover is offered. `record` is null when the host
+/// hides the lease record and only a holder marker proves the claim.
 export type LeaseBusy = {
-	record: LeaseRecord;
+	record: LeaseRecord | null;
 	stale: boolean;
 };
 

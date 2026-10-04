@@ -36,31 +36,30 @@ export const setSyncDialogPreferences = (preferences: SyncDialogPreferences) =>
 /// and whether it should stay stored across saves.
 export type CredentialInput = { value: string; remember: boolean };
 
+export type ServerCredentials = {
+	gamePassword: CredentialInput;
+	remotePassword: CredentialInput;
+	workerToken: CredentialInput;
+	datHostPassword: CredentialInput;
+};
+
+const settingsRequest = (settings: ProfileServerSettings, credentials: ServerCredentials) => ({
+	settings,
+	remotePassword: credentials.remotePassword.value,
+	rememberRemotePassword: credentials.remotePassword.remember,
+	workerToken: credentials.workerToken.value,
+	rememberWorkerToken: credentials.workerToken.remember,
+	datHostPassword: credentials.datHostPassword.value,
+	rememberDatHostPassword: credentials.datHostPassword.remember,
+	gamePassword: credentials.gamePassword.value,
+	rememberGamePassword: credentials.gamePassword.remember
+});
+
 /// Persists settings and credentials together. An empty value leaves a
 /// stored credential untouched; each `remember` flag controls only its
 /// own credential. Setting it to `false` clears that credential.
-export const setSettings = (
-	settings: ProfileServerSettings,
-	credentials: {
-		gamePassword: CredentialInput;
-		remotePassword: CredentialInput;
-		workerToken: CredentialInput;
-		datHostPassword: CredentialInput;
-	}
-) =>
-	invoke('set_dedicated_server_settings', {
-		request: {
-			settings,
-			remotePassword: credentials.remotePassword.value,
-			rememberRemotePassword: credentials.remotePassword.remember,
-			workerToken: credentials.workerToken.value,
-			rememberWorkerToken: credentials.workerToken.remember,
-			datHostPassword: credentials.datHostPassword.value,
-			rememberDatHostPassword: credentials.datHostPassword.remember,
-			gamePassword: credentials.gamePassword.value,
-			rememberGamePassword: credentials.gamePassword.remember
-		}
-	});
+export const setSettings = (settings: ProfileServerSettings, credentials: ServerCredentials) =>
+	invoke('set_dedicated_server_settings', { request: settingsRequest(settings, credentials) });
 
 /// Saves `settings` and launches with them. `rememberPassword` controls
 /// whether the provided (or stored) password stays in the credential store.
@@ -112,34 +111,27 @@ export const getSyncProgress = (workerToken = '') =>
 		request: { workerToken }
 	});
 
+/// Typed credentials that override the stored ones for one request.
+export type CredentialOverrides = { password: string; workerToken: string };
+
 /// The restart policy is bound into the plan hash. A preview only stays
 /// deployable while the selected policy is unchanged.
-export const previewSync = (
-	selection: DeploySelection,
-	restartPolicy: RestartPolicy | null,
-	password: string,
-	workerToken: string,
-	runId: string
-) =>
-	invoke<ServerSyncPreview>('preview_server_sync', {
-		request: { selection, restartPolicy, password, workerToken, runId }
-	});
+export type PreviewSyncRequest = CredentialOverrides & {
+	selection: DeploySelection;
+	restartPolicy: RestartPolicy | null;
+	runId: string;
+};
+
+export const previewSync = (request: PreviewSyncRequest) =>
+	invoke<ServerSyncPreview>('preview_server_sync', { request });
 
 /// `force` takes over a *stale* foreign lease after the old executor is
 /// confirmed stopped, the recovery path the preview's busy state shows.
 /// Live leases always win.
-export const deploySync = (
-	selection: DeploySelection,
-	planHash: string,
-	restartPolicy: RestartPolicy | null,
-	force: boolean,
-	password: string,
-	workerToken: string,
-	runId: string
-) =>
-	invoke<ServerSyncResult>('deploy_server_sync', {
-		request: { selection, planHash, restartPolicy, force, password, workerToken, runId }
-	});
+export type DeploySyncRequest = PreviewSyncRequest & { planHash: string; force: boolean };
+
+export const deploySync = (request: DeploySyncRequest) =>
+	invoke<ServerSyncResult>('deploy_server_sync', { request });
 
 /// The backend derives the publication pin itself, so callers never
 /// supply it and a policy can't be anchored to the wrong revision.
@@ -177,10 +169,15 @@ export const getLocalWorkerStatus = (options?: { quiet?: boolean }) =>
 
 /// Provisions and installs the managed worker: a second Gale sign-in
 /// gives the worker its own credentials, then one UAC-elevated step
-/// registers and starts the Windows service.
-export const provisionLocalWorker = (password = '', datHostPassword = '') =>
+/// registers and starts the Windows service. The worker is set up from
+/// `settings`, which are saved, with the credentials, only once the
+/// service runs; a failed setup leaves the saved settings untouched.
+export const provisionLocalWorker = (
+	settings: ProfileServerSettings,
+	credentials: ServerCredentials
+) =>
 	invoke<LocalWorkerStatus>('provision_local_worker', {
-		request: { password, datHostPassword }
+		request: settingsRequest(settings, credentials)
 	});
 
 export const controlLocalWorker = (action: LocalWorkerAction) =>

@@ -1,0 +1,10 @@
+{
+	"valheim": {
+		"platforms": {
+			"steam": {
+				"id": 896660
+			}
+		},
+		"defaultPort": 2456
+	}
+}

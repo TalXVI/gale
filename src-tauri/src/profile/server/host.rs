@@ -87,14 +87,10 @@ struct DatHostMetrics {
 
 impl DatHostControl {
     fn new(server_id: String, username: String, password: String) -> Self {
-        let base = std::env::var("GALE_DATHOST_API")
-            .unwrap_or_else(|_| DATHOST_API.to_owned())
-            .trim_end_matches('/')
-            .to_owned();
-
         Self {
-            client: reqwest::Client::new(),
-            base,
+            // Timeouts keep a stalled API from hanging the restart phase.
+            client: crate::state::base_http_client().unwrap_or_default(),
+            base: DATHOST_API.to_owned(),
             server_id,
             username,
             password,
@@ -369,8 +365,9 @@ mod tests {
             };
             let mut progress =
                 ProgressReporter::silent(SyncOperation::Deploy, &DeploySelection::default());
-            let outcome =
-                apply_restart_policy_reporting(&host, policy, required, &mut progress).await;
+            let outcome = apply_restart_policy_reporting(&host, policy, required, &mut progress)
+                .await
+                .outcome;
             task.abort();
             assert_eq!(outcome, expected, "policy {policy:?}, players {players:?}");
             assert_eq!(*api.calls.lock().unwrap(), calls);

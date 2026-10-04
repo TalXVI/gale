@@ -11,42 +11,42 @@
 //! Both execution modes share the wire shapes in `worker::api`, so the
 //! frontend handles Local and Worker results identically.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use eyre::{Context, OptionExt, bail, ensure};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, command};
+use tauri::{AppHandle, command};
 use tokio::sync::Mutex;
 
+use super::settings_store::SaveServerSettingsRequest;
 use crate::{
-    game::mod_loader::ModLoader,
     profile::{
-        export::ConfigPath,
         server::{
             args,
-            engine::{self, OperationMeta},
-            host, local, local_worker,
-            plan::{self, DeploySelection},
-            progress::{ProgressReporter, SyncOperation, SyncProgress},
-            remote::{self, ConnectionAttempt, ConnectionTestResult, RemoteConnection, RemoteOps},
+            executor::{
+                CredentialOverrides, ExecutorStatus, executor, remote_credential, sync_id_for,
+                sync_target, worker_client,
+            },
+            local, local_worker,
+            progress::SyncProgress,
+            remote::{self, ConnectionTestResult},
             runtime::{self, ServerStatus, SharedChild},
             secrets::{ServerSecret, ServerSecrets},
             settings::{
-                ProfileServerSettings, RemoteServerSettings, RestartPolicy, SyncDialogPreferences,
-                SyncMode,
+                AutomationSettings, ProfileServerSettings, RemoteServerSettings, RestartPolicy,
+                SyncDialogPreferences, SyncMode,
             },
-            spec::DeploymentSpec,
-            stage,
-            state::OperationKind,
-            worker_client::WorkerClient,
+            settings_store::{persist_settings, update_settings_for},
         },
-        sync::{self, ConfigUpdatePolicy, FetchedPublication},
+        sync,
     },
     state::ManagerExt,
     util::cmd::Result,
-    worker::api::{DeployResponse, PreviewResponse, ServerStateSummary, StatusResponse},
+    worker::api::{
+        DeployRequest, DeployResponse, PolicyRequest, PreviewRequest, PreviewResponse,
+        ServerStateSummary, StatusResponse,
+    },
 };
 
 #[derive(Debug, Deserialize)]
@@ -60,79 +60,30 @@ pub struct LaunchDedicatedServerRequest {
     pub remember_password: bool,
 }
 
-/// Settings + optional credentials, saved together from the settings
-/// page. Empty credential fields leave stored credentials untouched;
-/// each `remember*` flag controls only its own credential, `false`
-/// clears that one and nothing else.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SaveServerSettingsRequest {
-    pub settings: ProfileServerSettings,
-    #[serde(default)]
-    pub game_password: String,
-    #[serde(default)]
-    pub remember_game_password: bool,
-    #[serde(default)]
-    pub remote_password: String,
-    #[serde(default)]
-    pub remember_remote_password: bool,
-    #[serde(default)]
-    pub worker_token: String,
-    #[serde(default)]
-    pub remember_worker_token: bool,
-    #[serde(default)]
-    pub dat_host_password: String,
-    #[serde(default)]
-    pub remember_dat_host_password: bool,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteServerRequest {
     pub settings: RemoteServerSettings,
-    #[serde(default)]
-    pub password: String,
-    #[serde(default)]
-    pub worker_token: String,
+    #[serde(flatten)]
+    pub credentials: CredentialOverrides,
 }
 
-/// Routine remote requests use stored settings; the credential fields only
+/// Routine remote requests use stored settings; the credentials only
 /// override what's in the keyring.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ServerSyncRequest {
-    pub run_id: String,
-    pub selection: DeploySelection,
-    /// The restart policy the deploy will use. Preview binds it into the
-    /// plan hash so changing it afterwards invalidates the approval.
-    /// `None` uses the stored policy.
-    #[serde(default)]
-    pub restart_policy: Option<RestartPolicy>,
-    #[serde(default)]
-    pub password: String,
-    #[serde(default)]
-    pub worker_token: String,
+    #[serde(flatten)]
+    pub operation: PreviewRequest,
+    #[serde(flatten)]
+    pub credentials: CredentialOverrides,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ServerSyncDeployRequest {
-    pub run_id: String,
-    pub selection: DeploySelection,
-    /// The hash of the approved preview; deployment is rejected when the
-    /// recomputed plan differs.
-    pub plan_hash: String,
-    /// Overrides the stored restart policy for this operation.
-    #[serde(default)]
-    pub restart_policy: Option<RestartPolicy>,
-    /// Take over a stale foreign lease, the recovery path after the old
-    /// executor is confirmed stopped. Live leases always win.
-    #[serde(default)]
-    pub force: bool,
-    #[serde(default)]
-    pub password: String,
-    #[serde(default)]
-    pub worker_token: String,
+    #[serde(flatten)]
+    pub operation: DeployRequest,
+    #[serde(flatten)]
+    pub credentials: CredentialOverrides,
 }
 
 #[derive(Debug, Deserialize)]
@@ -142,21 +93,16 @@ pub struct ServerSyncStatusRequest {
     /// refresh its view (Worker). `false` returns cheap cached state.
     #[serde(default)]
     pub refresh: bool,
-    #[serde(default)]
-    pub password: String,
-    #[serde(default)]
-    pub worker_token: String,
+    #[serde(flatten)]
+    pub credentials: CredentialOverrides,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SetConfigPolicyRequest {
-    pub path: ConfigPath,
-    pub policy: ConfigUpdatePolicy,
-    #[serde(default)]
-    pub password: String,
-    #[serde(default)]
-    pub worker_token: String,
+    #[serde(flatten)]
+    pub operation: PolicyRequest,
+    #[serde(flatten)]
+    pub credentials: CredentialOverrides,
 }
 
 #[derive(Debug, Deserialize)]
@@ -267,13 +213,7 @@ pub async fn set_dedicated_server_settings(
     let secrets = ServerSecrets::for_profile(profile_id)?;
 
     let mut settings = request.settings.clone();
-    // A settings dialog opened earlier must not overwrite newer Sync-dialog
-    // defaults. That dedicated command owns this client-local field.
-    settings.sync_dialog = stored
-        .as_ref()
-        .map(|settings| settings.sync_dialog.clone())
-        .unwrap_or_default();
-    if settings.remote.sync_mode == SyncMode::Worker
+    if settings.remote.executor.mode.uses_worker()
         && worker_config_differs(stored.as_ref(), &settings)
     {
         // The running worker is authoritative for automation. The
@@ -288,65 +228,12 @@ pub async fn set_dedicated_server_settings(
             &request.worker_token,
         )
         .await?;
-        settings.remote.worker.auto_deploy_mods = confirmed.auto_deploy_mods;
-        settings.remote.restart_policy = confirmed.restart_policy;
+        settings.remote.automation.auto_deploy_mods = confirmed.auto_deploy_mods;
+        settings.remote.automation.restart_policy = confirmed.restart_policy;
     }
 
-    persist_credential(
-        &secrets,
-        Some(ServerSecret::GamePassword),
-        &request.game_password,
-        request.remember_game_password,
-    )?;
+    persist_settings(&app, profile_id, &secrets, settings, &request)?;
 
-    let remote = settings.remote.clone();
-    update_settings_for(&app, profile_id, |stored| *stored = settings)?;
-    persist_remote_credentials(&secrets, &remote, &request)?;
-
-    Ok(())
-}
-
-/// Persists each remote credential independently: a provided value is
-/// stored per its own `remember` flag, an empty one leaves the stored
-/// value alone unless `remember` is off, which clears just that
-/// credential and nothing else.
-fn persist_remote_credentials(
-    secrets: &ServerSecrets,
-    remote: &RemoteServerSettings,
-    request: &SaveServerSettingsRequest,
-) -> eyre::Result<()> {
-    persist_credential(
-        secrets,
-        ServerSecret::required_by(remote),
-        &request.remote_password,
-        request.remember_remote_password,
-    )?;
-    persist_credential(
-        secrets,
-        Some(ServerSecret::WorkerToken),
-        &request.worker_token,
-        request.remember_worker_token,
-    )?;
-    persist_credential(
-        secrets,
-        Some(ServerSecret::DatHostPassword),
-        &request.dat_host_password,
-        request.remember_dat_host_password,
-    )
-}
-
-pub(crate) fn persist_credential(
-    secrets: &ServerSecrets,
-    secret: Option<ServerSecret>,
-    value: &str,
-    remember: bool,
-) -> eyre::Result<()> {
-    let Some(secret) = secret else {
-        return Ok(());
-    };
-    if !value.is_empty() || !remember {
-        secrets.persist(secret, value, remember)?;
-    }
     Ok(())
 }
 
@@ -361,10 +248,9 @@ fn worker_config_differs(
     let Some(stored) = stored else {
         return true;
     };
-    stored.remote.sync_mode != SyncMode::Worker
-        || stored.remote.worker.address.trim() != new.remote.worker.address.trim()
-        || stored.remote.worker.auto_deploy_mods != new.remote.worker.auto_deploy_mods
-        || stored.remote.restart_policy != new.remote.restart_policy
+    !stored.remote.executor.mode.uses_worker()
+        || stored.remote.executor.worker_address.trim() != new.remote.executor.worker_address.trim()
+        || stored.remote.automation != new.remote.automation
 }
 
 /// Pushes the automation configuration in `remote` to the worker it
@@ -378,7 +264,7 @@ async fn configure_running_worker(
     expected_profile: Option<&str>,
     worker_token: &str,
 ) -> eyre::Result<StatusResponse> {
-    let client = worker_client(secrets, remote, worker_token)?;
+    let client = worker_client(secrets, &remote.executor.worker_address, worker_token)?;
     let status = client
         .status(false)
         .await
@@ -400,7 +286,10 @@ async fn configure_running_worker(
         );
     }
     client
-        .configure(remote.worker.auto_deploy_mods, remote.restart_policy)
+        .configure(
+            remote.automation.auto_deploy_mods,
+            remote.automation.restart_policy,
+        )
         .await
         .context("the worker did not accept the automation update")?;
     client
@@ -453,6 +342,17 @@ pub async fn launch_dedicated_server(
             .games
             .get(&game)
             .ok_or_eyre("the profile's game is not installed")?;
+
+        // Installs write under the manager lock held here and refuse a
+        // locked profile, so one that has not started yet fails cleanly. A
+        // batch already underway must finish first: refusing it midway
+        // would roll back files the server is about to load.
+        if app.install_queue().lock().has_any_for_profile(profile_id) {
+            return Err(eyre::eyre!(
+                "please wait for mod installations to finish before starting the server"
+            )
+            .into());
+        }
 
         // Keep the runtime locked from the final check through registration
         // so concurrent launches cannot leave an untracked process running.
@@ -543,13 +443,17 @@ pub async fn test_remote_server_connection(
     // Only the file transfer is exercised, so worker and host-provider
     // fields must not gate it: a worker may not be provisioned or fully
     // configured yet.
-    request.settings.validate_connection()?;
+    request.settings.transport.validate()?;
 
     let secrets = ServerSecrets::for_profile(profile_id)?;
-    let credential = remote_credential(&secrets, &request.settings, &request.password)?;
+    let credential = remote_credential(
+        &secrets,
+        &request.settings.transport,
+        &request.credentials.password,
+    )?;
 
     let result = tokio::task::spawn_blocking(move || {
-        remote::test_connection(&request.settings, &credential)
+        remote::test_connection(&request.settings.transport, &credential)
     })
     .await
     .map_err(|err| eyre::eyre!("remote connection worker failed: {err}"))??;
@@ -569,7 +473,11 @@ pub async fn test_worker_connection(
     let secrets = ServerSecrets::for_profile(profile_id)?;
     // Capture the profile identity before awaiting the connection test.
     let sync_id = sync_id_for(&app, profile_id);
-    let client = worker_client(&secrets, &request.settings, &request.worker_token)?;
+    let client = worker_client(
+        &secrets,
+        &request.settings.executor.worker_address,
+        &request.credentials.worker_token,
+    )?;
     let status = client.status(false).await?;
 
     // The worker is bound to one profile; a mismatch means the address
@@ -591,17 +499,6 @@ pub async fn test_worker_connection(
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct LocalWorkerProvisionRequest {
-    /// Remote transport credential override when the keyring lacks one.
-    #[serde(default)]
-    pub password: String,
-    /// DatHost account password override when the keyring lacks one.
-    #[serde(default)]
-    pub dat_host_password: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct LocalWorkerControlRequest {
     pub action: crate::worker::ServiceControlAction,
 }
@@ -615,12 +512,16 @@ pub async fn get_local_worker_status(app: AppHandle) -> Result<local_worker::Loc
 /// Provisions and installs the managed worker: a second OAuth login gives
 /// it an independent credential chain, then one elevated step registers
 /// and starts the Windows service.
+///
+/// The request carries the page's settings and credentials, saved or not.
+/// They are stored only once the service runs, so a failed setup leaves
+/// the profile's saved settings as they were.
 #[command]
 pub async fn provision_local_worker(
-    request: LocalWorkerProvisionRequest,
+    request: SaveServerSettingsRequest,
     app: AppHandle,
 ) -> Result<local_worker::LocalWorkerStatus> {
-    Ok(local_worker::provision(&app, &request.password, &request.dat_host_password).await?)
+    Ok(local_worker::provision(&app, request).await?)
 }
 
 #[command]
@@ -672,7 +573,7 @@ pub async fn get_server_sync_status(
     };
 
     let mut status = ServerSyncStatus {
-        mode: target.settings.sync_mode,
+        mode: target.settings.executor.mode,
         server: None,
         publication_revision,
         worker: None,
@@ -680,32 +581,35 @@ pub async fn get_server_sync_status(
         warnings,
     };
 
-    if !request.refresh && target.settings.sync_mode == SyncMode::Local {
+    if !request.refresh && !target.settings.executor.mode.uses_worker() {
         return Ok(status);
     }
 
-    let refreshed = match resolve_executor(&target, &request.password, &request.worker_token) {
-        Ok(Executor::Worker(client)) => client.status(request.refresh).await.map(|worker| {
-            status.observe_worker(worker);
-        }),
-        Ok(Executor::Local(credential)) => {
-            open_remote_session(&target.settings, &credential, target.mod_loader)
-                .await
-                .map(|mut session| {
-                    status.warnings.append(&mut session.warnings);
-                    status.server = Some(session.into());
-                })
+    let (profile_id, settings) = (target.profile_id, target.settings.clone());
+    let refreshed = async {
+        let executor = executor(&app, target, &request.credentials)?;
+        match executor.read_status(request.refresh).await? {
+            Some(ExecutorStatus::Worker(worker)) => status.observe_worker(worker),
+            Some(ExecutorStatus::Session {
+                server,
+                mut warnings,
+            }) => {
+                status.warnings.append(&mut warnings);
+                status.server = Some(server);
+            }
+            None => {}
         }
-        Err(err) => Err(err),
-    };
+        eyre::Ok(())
+    }
+    .await;
     if let Err(err) = refreshed {
-        status.credential_required = ServerSecrets::for_profile(target.profile_id)
+        status.credential_required = ServerSecrets::for_profile(profile_id)
             .map(|secrets| {
                 credential_missing(
                     &secrets,
-                    &target.settings,
-                    &request.password,
-                    &request.worker_token,
+                    &settings,
+                    &request.credentials.password,
+                    &request.credentials.worker_token,
                 )
             })
             .unwrap_or(false);
@@ -726,13 +630,13 @@ fn credential_missing(
     password: &str,
     worker_token: &str,
 ) -> bool {
-    let (secret, provided) = match settings.sync_mode {
-        SyncMode::Local => match ServerSecret::required_by(settings) {
+    let (secret, provided) = match settings.executor.mode {
+        SyncMode::Local => match ServerSecret::required_by(&settings.transport) {
             Some(secret) => (secret, password),
             // SSH agent auth has no storable credential.
             None => return false,
         },
-        SyncMode::Worker => (ServerSecret::WorkerToken, worker_token),
+        SyncMode::HostedWorker | SyncMode::Worker => (ServerSecret::WorkerToken, worker_token),
     };
     provided.is_empty()
         && secrets
@@ -747,22 +651,8 @@ pub async fn preview_server_sync(
     app: AppHandle,
 ) -> Result<PreviewResponse> {
     ensure_no_pending_installs(&app)?;
-    let target = sync_target(&app)?;
-
-    match resolve_executor(&target, &request.password, &request.worker_token)? {
-        Executor::Worker(client) => Ok(client
-            .preview(&request.selection, request.restart_policy, &request.run_id)
-            .await?),
-        Executor::Local(credential) => Ok(local_preview(
-            &app,
-            &target,
-            &request.selection,
-            request.restart_policy,
-            &credential,
-            request.run_id,
-        )
-        .await?),
-    }
+    let executor = executor(&app, sync_target(&app)?, &request.credentials)?;
+    Ok(executor.preview(request.operation).await?)
 }
 
 #[command]
@@ -771,20 +661,8 @@ pub async fn deploy_server_sync(
     app: AppHandle,
 ) -> Result<DeployResponse> {
     ensure_no_pending_installs(&app)?;
-    let target = sync_target(&app)?;
-
-    match resolve_executor(&target, &request.password, &request.worker_token)? {
-        Executor::Worker(client) => Ok(client
-            .deploy(
-                &request.selection,
-                &request.plan_hash,
-                request.restart_policy,
-                request.force,
-                &request.run_id,
-            )
-            .await?),
-        Executor::Local(credential) => Ok(local_deploy(&app, &target, request, &credential).await?),
-    }
+    let executor = executor(&app, sync_target(&app)?, &request.credentials)?;
+    Ok(executor.deploy(request.operation).await?)
 }
 
 /// A cheap authenticated read of the worker's single bounded progress
@@ -794,13 +672,8 @@ pub async fn get_server_sync_progress(
     request: ServerSyncStatusRequest,
     app: AppHandle,
 ) -> Result<Option<SyncProgress>> {
-    let target = sync_target(&app)?;
-    let Executor::Worker(client) =
-        resolve_executor(&target, &request.password, &request.worker_token)?
-    else {
-        return Ok(None);
-    };
-    Ok(client.progress().await?)
+    let executor = executor(&app, sync_target(&app)?, &request.credentials)?;
+    Ok(executor.progress().await?)
 }
 
 #[command]
@@ -808,42 +681,8 @@ pub async fn set_server_config_policy(
     request: SetConfigPolicyRequest,
     app: AppHandle,
 ) -> Result<()> {
-    let target = sync_target(&app)?;
-
-    match resolve_executor(&target, &request.password, &request.worker_token)? {
-        Executor::Worker(client) => {
-            client.set_policy(&request.path, request.policy).await?;
-        }
-        Executor::Local(credential) => {
-            // The policy pin comes from the canonical publication on the
-            // trusted side, because a client-supplied value could pin the
-            // policy at the wrong revision.
-            let pinned_at = match &target.sync_id {
-                Some(id) => sync::fetch_publication(id, &app)
-                    .await
-                    .context("failed to fetch the canonical publication for the policy pin")?
-                    .config
-                    .get(&request.path)
-                    .map(|file| file.hash.clone()),
-                None => None,
-            };
-            tokio::task::spawn_blocking(move || {
-                let mut session =
-                    open_session_blocking(&target.settings, &credential, target.mod_loader)?;
-                engine::set_config_policy(
-                    &mut session,
-                    &request.path,
-                    request.policy,
-                    pinned_at.as_ref(),
-                    &target.meta(),
-                )
-            })
-            .await
-            .map_err(|err| eyre::eyre!("policy update failed: {err}"))??;
-        }
-    }
-
-    Ok(())
+    let executor = executor(&app, sync_target(&app)?, &request.credentials)?;
+    Ok(executor.set_policy(request.operation).await?)
 }
 
 /// Explicitly records that the user verified a restart outside Gale.
@@ -853,20 +692,8 @@ pub async fn acknowledge_external_server_restart(
     request: ServerSyncStatusRequest,
     app: AppHandle,
 ) -> Result<()> {
-    let target = sync_target(&app)?;
-    match resolve_executor(&target, &request.password, &request.worker_token)? {
-        Executor::Worker(client) => client.acknowledge_external_restart().await?,
-        Executor::Local(credential) => {
-            tokio::task::spawn_blocking(move || {
-                let mut session =
-                    open_session_blocking(&target.settings, &credential, target.mod_loader)?;
-                engine::acknowledge_external_restart(&mut session, &target.meta()).map(|_| ())
-            })
-            .await
-            .map_err(|err| eyre::eyre!("restart acknowledgment failed: {err}"))??;
-        }
-    }
-    Ok(())
+    let executor = executor(&app, sync_target(&app)?, &request.credentials)?;
+    Ok(executor.acknowledge_external_restart().await?)
 }
 
 /// Updates the worker's automation toggles and mirrors the state it
@@ -878,7 +705,7 @@ pub async fn configure_worker(
     app: AppHandle,
 ) -> Result<StatusResponse> {
     let target = sync_target(&app)?;
-    if target.settings.sync_mode != SyncMode::Worker {
+    if !target.settings.executor.mode.uses_worker() {
         return Err(
             eyre::eyre!("automatic mod deployment is only available in Worker mode").into(),
         );
@@ -886,8 +713,10 @@ pub async fn configure_worker(
 
     let secrets = ServerSecrets::for_profile(target.profile_id)?;
     let mut remote = target.settings.clone();
-    remote.worker.auto_deploy_mods = request.auto_deploy_mods;
-    remote.restart_policy = request.restart_policy;
+    remote.automation = AutomationSettings {
+        auto_deploy_mods: request.auto_deploy_mods,
+        restart_policy: request.restart_policy,
+    };
     let confirmed = configure_running_worker(
         &secrets,
         &remote,
@@ -897,289 +726,11 @@ pub async fn configure_worker(
     .await?;
 
     update_settings_for(&app, target.profile_id, |settings| {
-        settings.remote.worker.auto_deploy_mods = confirmed.auto_deploy_mods;
-        settings.remote.restart_policy = confirmed.restart_policy;
+        settings.remote.automation.auto_deploy_mods = confirmed.auto_deploy_mods;
+        settings.remote.automation.restart_policy = confirmed.restart_policy;
     })?;
 
     Ok(confirmed)
-}
-
-// ---------- Local-mode orchestration ----------
-
-/// The pinned profile/server context for one operation, captured before
-/// any await so an active-profile switch cannot redirect it.
-pub(crate) struct SyncTarget {
-    pub(crate) profile_id: i64,
-    /// The profile's game slug, captured so plan approvals stay bound to
-    /// the originating game across an active-profile switch.
-    pub(crate) game: String,
-    pub(crate) sync_id: Option<String>,
-    pub(crate) mod_loader: &'static ModLoader<'static>,
-    pub(crate) settings: RemoteServerSettings,
-    pub(crate) cache_dir: PathBuf,
-}
-
-impl SyncTarget {
-    fn meta(&self) -> OperationMeta {
-        OperationMeta::local(&self.profile_id.to_string(), OperationKind::Manual)
-    }
-
-    /// Emits progress to the page, which matches the run id before showing it.
-    fn reporter(
-        &self,
-        app: &AppHandle,
-        run_id: String,
-        operation: SyncOperation,
-        selection: &DeploySelection,
-    ) -> ProgressReporter {
-        let app = app.clone();
-        ProgressReporter::new(run_id, operation, selection, move |snapshot| {
-            let _ = app.emit("server_sync_operation_progress", snapshot);
-        })
-    }
-}
-
-pub(crate) fn sync_target(app: &AppHandle) -> eyre::Result<SyncTarget> {
-    let manager = app.lock_manager();
-    let profile = manager.active_profile();
-    let settings = profile
-        .server_settings
-        .as_ref()
-        .map(|settings| settings.remote.clone())
-        .ok_or_eyre("the dedicated server has not been configured yet")?;
-
-    Ok(SyncTarget {
-        profile_id: profile.id,
-        game: manager.active_game().game.slug.to_string(),
-        sync_id: profile.sync.as_ref().map(|sync| sync.id().to_owned()),
-        mod_loader: manager.active_mod_loader(),
-        settings,
-        cache_dir: app.lock_prefs().cache_dir(),
-    })
-}
-
-/// The sync id of a specific profile, looked up by id rather than through
-/// the active profile, so an active-profile switch cannot redirect it.
-pub(crate) fn sync_id_for(app: &AppHandle, profile_id: i64) -> Option<String> {
-    app.lock_manager()
-        .profile_by_id(profile_id)
-        .ok()
-        .and_then(|(_, profile)| profile.sync.as_ref().map(|sync| sync.id().to_owned()))
-}
-
-enum Executor {
-    Local(String),
-    Worker(WorkerClient),
-}
-
-fn resolve_executor(
-    target: &SyncTarget,
-    password: &str,
-    worker_token: &str,
-) -> eyre::Result<Executor> {
-    match target.settings.sync_mode {
-        SyncMode::Local => Ok(Executor::Local(remote_credential(
-            &ServerSecrets::for_profile(target.profile_id)?,
-            &target.settings,
-            password,
-        )?)),
-        SyncMode::Worker => Ok(Executor::Worker(worker_client(
-            &ServerSecrets::for_profile(target.profile_id)?,
-            &target.settings,
-            worker_token,
-        )?)),
-    }
-}
-
-pub(crate) fn worker_client(
-    secrets: &ServerSecrets,
-    settings: &RemoteServerSettings,
-    provided: &str,
-) -> eyre::Result<WorkerClient> {
-    let token = secrets.resolve(ServerSecret::WorkerToken, provided)?;
-    WorkerClient::new(settings, token)
-}
-
-pub(crate) fn remote_credential(
-    secrets: &ServerSecrets,
-    settings: &RemoteServerSettings,
-    provided: &str,
-) -> eyre::Result<String> {
-    match ServerSecret::required_by(settings) {
-        Some(secret) => secrets.resolve(secret, provided),
-        None => Ok(String::new()),
-    }
-}
-
-/// Connects to the remote server, failing on untrusted keys rather than
-/// silently sending credentials.
-fn connect_remote(
-    settings: &RemoteServerSettings,
-    password: &str,
-) -> eyre::Result<Box<dyn RemoteOps>> {
-    match RemoteConnection::connect(settings, password)? {
-        ConnectionAttempt::Connected(connection) => Ok(connection),
-        ConnectionAttempt::HostKeyUntrusted { fingerprint } => bail!(
-            "SFTP host key is not trusted ({fingerprint}); trust it from the server settings first"
-        ),
-        ConnectionAttempt::CertificateUntrusted { fingerprint } => bail!(
-            "FTPS certificate is not trusted ({fingerprint}); pin it from the server settings first"
-        ),
-    }
-}
-
-fn open_session_blocking(
-    settings: &RemoteServerSettings,
-    password: &str,
-    mod_loader: &'static ModLoader<'static>,
-) -> eyre::Result<engine::Session> {
-    let spec = DeploymentSpec::for_loader(mod_loader)?;
-    engine::open_session(
-        connect_remote(settings, password)?,
-        &spec,
-        settings.server_directory()?,
-    )
-}
-
-async fn open_remote_session(
-    settings: &RemoteServerSettings,
-    password: &str,
-    mod_loader: &'static ModLoader<'static>,
-) -> eyre::Result<engine::Session> {
-    let (settings, password) = (settings.clone(), password.to_owned());
-    tokio::task::spawn_blocking(move || open_session_blocking(&settings, &password, mod_loader))
-        .await
-        .map_err(|err| eyre::eyre!("remote session worker failed: {err}"))?
-}
-
-/// Fetches the canonical publication and stages its payload, the same two
-/// steps the worker performs, so both executors see identical content.
-async fn fetch_and_stage(
-    app: &AppHandle,
-    target: &SyncTarget,
-    spec: &DeploymentSpec,
-    include_mods: bool,
-    progress: &mut ProgressReporter,
-) -> eyre::Result<(FetchedPublication, plan::DesiredDeployment)> {
-    let sync_id = target
-        .sync_id
-        .clone()
-        .ok_or_eyre("this profile is not published; publish it before syncing the server")?;
-
-    let publication = sync::fetch_publication(&sync_id, app)
-        .await
-        .context("failed to fetch the canonical publication")?;
-    let desired = stage::stage_fetched(
-        &publication,
-        target.cache_dir.clone(),
-        target.mod_loader,
-        spec,
-        include_mods,
-        progress,
-    )
-    .await
-    .context("failed to stage the published mod set")?;
-
-    Ok((publication, desired))
-}
-
-/// The context the plan hash binds an approval to: the profile, game,
-/// remote identity, and the restart policy the operation will apply.
-fn plan_context(target: &SyncTarget, restart_policy: Option<RestartPolicy>) -> plan::PlanContext {
-    plan::PlanContext {
-        profile_id: target.profile_id.to_string(),
-        game: target.game.clone(),
-        target: target.settings.describe_target(),
-        restart_policy: restart_policy.unwrap_or(target.settings.restart_policy),
-    }
-}
-
-async fn local_preview(
-    app: &AppHandle,
-    target: &SyncTarget,
-    selection: &DeploySelection,
-    restart_policy: Option<RestartPolicy>,
-    credential: &str,
-    run_id: String,
-) -> eyre::Result<PreviewResponse> {
-    let mut progress = target.reporter(app, run_id, SyncOperation::Preview, selection);
-    let result = async {
-        let spec = DeploymentSpec::for_loader(target.mod_loader)?;
-        let (publication, desired) =
-            fetch_and_stage(app, target, &spec, selection.include_mods, &mut progress).await?;
-        let (settings, password) = (target.settings.clone(), credential.to_owned());
-        engine::preview(
-            move || connect_remote(&settings, &password),
-            spec,
-            target.settings.server_directory()?,
-            publication,
-            desired,
-            selection.clone(),
-            plan_context(target, restart_policy),
-            target.meta(),
-            &mut progress,
-        )
-        .await
-    }
-    .await;
-    if result.is_err() {
-        progress.failed();
-    } else {
-        progress.succeeded();
-    }
-    result
-}
-
-async fn local_deploy(
-    app: &AppHandle,
-    target: &SyncTarget,
-    request: ServerSyncDeployRequest,
-    credential: &str,
-) -> eyre::Result<DeployResponse> {
-    let mut progress = target.reporter(
-        app,
-        request.run_id.clone(),
-        SyncOperation::Deploy,
-        &request.selection,
-    );
-    let result = async {
-        let spec = DeploymentSpec::for_loader(target.mod_loader)?;
-        let (publication, desired) = fetch_and_stage(
-            app,
-            target,
-            &spec,
-            request.selection.include_mods,
-            &mut progress,
-        )
-        .await?;
-        let secrets = ServerSecrets::for_profile(target.profile_id)?;
-        let dat_host_password = secrets.get(ServerSecret::DatHostPassword)?;
-        let host = host::from_settings(&target.settings.host_control, dat_host_password.as_deref());
-        let (settings, password) = (target.settings.clone(), credential.to_owned());
-        engine::deploy(
-            move || connect_remote(&settings, &password),
-            spec,
-            target.settings.server_directory()?,
-            publication,
-            desired,
-            request.selection,
-            plan_context(target, request.restart_policy),
-            target.meta(),
-            Some(request.plan_hash),
-            request.force,
-            host.as_ref(),
-            request
-                .restart_policy
-                .unwrap_or(target.settings.restart_policy),
-            &mut progress,
-        )
-        .await
-    }
-    .await;
-    if result.is_err() {
-        progress.failed();
-    }
-    result
 }
 
 // ---------- misc ----------
@@ -1195,19 +746,6 @@ fn ensure_no_pending_installs(app: &AppHandle) -> eyre::Result<()> {
 
 fn active_profile_id(app: &AppHandle) -> i64 {
     app.lock_manager().active_profile().id
-}
-
-/// Updates the settings of a profile captured before any asynchronous
-/// work, so an active-profile switch cannot redirect the write.
-pub(crate) fn update_settings_for(
-    app: &AppHandle,
-    profile_id: i64,
-    update: impl FnOnce(&mut ProfileServerSettings),
-) -> eyre::Result<()> {
-    let mut manager = app.lock_manager();
-    let (_, profile) = manager.profile_by_id_mut(profile_id)?;
-    update(profile.server_settings.get_or_insert_default());
-    profile.save(app, true)
 }
 
 #[cfg(test)]
@@ -1257,8 +795,8 @@ mod tests {
             location: ServerLocation::Remote,
             ..ProfileServerSettings::default()
         };
-        settings.remote.sync_mode = SyncMode::Worker;
-        settings.remote.worker.address = "http://127.0.0.1:8472".to_owned();
+        settings.remote.executor.mode = SyncMode::Worker;
+        settings.remote.executor.worker_address = "http://127.0.0.1:8472".to_owned();
         settings
     }
 
@@ -1272,23 +810,23 @@ mod tests {
 
         // Toggling automation differs.
         let mut new = stored.clone();
-        new.remote.worker.auto_deploy_mods = true;
+        new.remote.automation.auto_deploy_mods = true;
         assert!(worker_config_differs(Some(&stored), &new));
 
         // The restart policy is worker-run configuration too.
         let mut new = stored.clone();
-        new.remote.restart_policy = RestartPolicy::Immediate;
+        new.remote.automation.restart_policy = RestartPolicy::Immediate;
         assert!(worker_config_differs(Some(&stored), &new));
 
         // Retargeting the worker address pushes the flags to the new
         // worker.
         let mut new = stored.clone();
-        new.remote.worker.address = "http://127.0.0.1:9999".to_owned();
+        new.remote.executor.worker_address = "http://127.0.0.1:9999".to_owned();
         assert!(worker_config_differs(Some(&stored), &new));
 
         // Unrelated fields never trigger a worker call.
         let mut new = stored.clone();
-        new.remote.host = "example.com".to_owned();
+        new.remote.transport.host = "example.com".to_owned();
         new.local.server_name = "Other".to_owned();
         new.sync_dialog.restart_policy = RestartPolicy::WhenEmpty;
         assert!(!worker_config_differs(Some(&stored), &new));
@@ -1296,7 +834,7 @@ mod tests {
         // A stored binding that never pointed at a worker differs, as
         // does having no stored settings at all.
         let mut local = stored.clone();
-        local.remote.sync_mode = SyncMode::Local;
+        local.remote.executor.mode = SyncMode::Local;
         assert!(worker_config_differs(Some(&local), &stored));
         assert!(worker_config_differs(None, &stored));
     }
@@ -1317,12 +855,12 @@ mod tests {
         assert!(!credential_missing(&secrets, &remote, "", ""));
 
         // Agent auth needs no credential at all.
-        remote.authentication = super::super::settings::RemoteAuthentication::Agent;
+        remote.transport.authentication = super::super::settings::RemoteAuthentication::Agent;
         secrets.remove(ServerSecret::SftpPassword).unwrap();
         assert!(!credential_missing(&secrets, &remote, "", ""));
 
         // Worker mode keys off the worker token instead.
-        remote.sync_mode = SyncMode::Worker;
+        remote.executor.mode = SyncMode::Worker;
         assert!(credential_missing(&secrets, &remote, "typed", ""));
         assert!(!credential_missing(&secrets, &remote, "", "token"));
         secrets
@@ -1331,149 +869,71 @@ mod tests {
         assert!(!credential_missing(&secrets, &remote, "", ""));
     }
 
-    /// Every credential stored, in the order the assertion tuples use.
-    fn fully_stocked_secrets() -> ServerSecrets {
-        use super::super::secrets::in_memory_secrets;
+    /// The page sends each routine request as one flat object, the shape
+    /// `src/lib/api/profile/server.ts` builds. Typed credentials must reach
+    /// the executor rather than silently fall back to the stored ones.
+    #[test]
+    fn sync_requests_accept_the_flat_payloads_the_page_sends() {
+        use crate::profile::{
+            export::ConfigPath, server::plan::ConfigDecision, sync::ConfigUpdatePolicy,
+        };
 
-        let secrets = in_memory_secrets();
-        for secret in [
-            ServerSecret::GamePassword,
-            ServerSecret::SftpPassword,
-            ServerSecret::FtpPassword,
-            ServerSecret::SshKeyPassphrase,
-            ServerSecret::DatHostPassword,
-            ServerSecret::WorkerToken,
-        ] {
-            secrets.set(secret, "stored").unwrap();
-        }
-        secrets
-    }
-
-    /// Presence of every secret, in `fully_stocked_secrets` order.
-    fn stored(secrets: &ServerSecrets) -> [bool; 6] {
-        [
-            secrets.has(ServerSecret::GamePassword).unwrap(),
-            secrets.has(ServerSecret::SftpPassword).unwrap(),
-            secrets.has(ServerSecret::FtpPassword).unwrap(),
-            secrets.has(ServerSecret::SshKeyPassphrase).unwrap(),
-            secrets.has(ServerSecret::DatHostPassword).unwrap(),
-            secrets.has(ServerSecret::WorkerToken).unwrap(),
-        ]
-    }
-
-    fn save_request(remote: RemoteServerSettings) -> SaveServerSettingsRequest {
-        SaveServerSettingsRequest {
-            settings: ProfileServerSettings {
-                remote,
-                ..ProfileServerSettings::default()
+        let config = ConfigPath::try_from("BepInEx/config/a.cfg".to_owned()).unwrap();
+        let deploy: ServerSyncDeployRequest = serde_json::from_value(serde_json::json!({
+            "selection": {
+                "includeMods": false, "includeConfigs": true,
+                "applyConfigs": [config.as_str()], "restoreConfigs": [], "declineConfigs": [],
             },
-            game_password: String::new(),
-            remember_game_password: true,
-            remote_password: String::new(),
-            remember_remote_password: true,
-            worker_token: String::new(),
-            remember_worker_token: true,
-            dat_host_password: String::new(),
-            remember_dat_host_password: true,
-        }
-    }
-
-    const ALL: [bool; 6] = [true; 6];
-    const SFTP: usize = 1;
-    const FTP: usize = 2;
-    const KEY: usize = 3;
-    const DATHOST: usize = 4;
-    const TOKEN: usize = 5;
-
-    /// Only the flag's own credential is dropped. Index `cleared` is the
-    /// one slot that flips to false.
-    fn assert_only_cleared(cleared: usize, stored: [bool; 6]) {
-        let mut expected = ALL;
-        expected[cleared] = false;
-        assert_eq!(stored, expected, "only slot {cleared} should be cleared");
-    }
-
-    #[test]
-    fn forgetting_one_remote_credential_leaves_all_others() {
-        use super::super::settings::{RemoteAuthentication, RemoteProtocol};
-
-        // SFTP password auth clears only the SFTP password.
-        let secrets = fully_stocked_secrets();
-        let mut request = save_request(RemoteServerSettings::default());
-        request.remember_remote_password = false;
-        persist_remote_credentials(&secrets, &request.settings.remote, &request).unwrap();
-        assert_only_cleared(SFTP, stored(&secrets));
-
-        // Private-key auth clears only the key passphrase.
-        let secrets = fully_stocked_secrets();
-        let remote = RemoteServerSettings {
-            authentication: RemoteAuthentication::PrivateKey,
-            ..Default::default()
-        };
-        let mut request = save_request(remote);
-        request.remember_remote_password = false;
-        persist_remote_credentials(&secrets, &request.settings.remote, &request).unwrap();
-        assert_only_cleared(KEY, stored(&secrets));
-
-        // FTP/FTPS clears only the FTP password.
-        for protocol in [RemoteProtocol::Ftp, RemoteProtocol::Ftps] {
-            let secrets = fully_stocked_secrets();
-            let remote = RemoteServerSettings {
-                protocol,
-                ..Default::default()
-            };
-            let mut request = save_request(remote);
-            request.remember_remote_password = false;
-            persist_remote_credentials(&secrets, &request.settings.remote, &request).unwrap();
-            assert_only_cleared(FTP, stored(&secrets));
-        }
-
-        // Agent auth has no transport credential: nothing is cleared.
-        let secrets = fully_stocked_secrets();
-        let remote = RemoteServerSettings {
-            authentication: RemoteAuthentication::Agent,
-            ..Default::default()
-        };
-        let mut request = save_request(remote);
-        request.remember_remote_password = false;
-        persist_remote_credentials(&secrets, &request.settings.remote, &request).unwrap();
-        assert_eq!(stored(&secrets), ALL);
-
-        // Worker token and DatHost password are independent flags.
-        let secrets = fully_stocked_secrets();
-        let mut request = save_request(RemoteServerSettings::default());
-        request.remember_worker_token = false;
-        persist_remote_credentials(&secrets, &request.settings.remote, &request).unwrap();
-        assert_only_cleared(TOKEN, stored(&secrets));
-
-        let secrets = fully_stocked_secrets();
-        let mut request = save_request(RemoteServerSettings::default());
-        request.remember_dat_host_password = false;
-        persist_remote_credentials(&secrets, &request.settings.remote, &request).unwrap();
-        assert_only_cleared(DATHOST, stored(&secrets));
-    }
-
-    #[test]
-    fn remembered_credentials_stay_untouched_or_replace_only_themselves() {
-        // All remember flags on with empty values: nothing changes.
-        let secrets = fully_stocked_secrets();
-        let request = save_request(RemoteServerSettings::default());
-        persist_remote_credentials(&secrets, &request.settings.remote, &request).unwrap();
-        assert_eq!(stored(&secrets), ALL);
-
-        // A typed value replaces only its own secret.
-        let secrets = fully_stocked_secrets();
-        let mut request = save_request(RemoteServerSettings::default());
-        request.remote_password = "new-remote-password".to_owned();
-        persist_remote_credentials(&secrets, &request.settings.remote, &request).unwrap();
-        assert_eq!(stored(&secrets), ALL);
+            "planHash": "approved-hash", "restartPolicy": null, "force": true,
+            "password": "typed-password", "workerToken": "typed-token", "runId": "run-1",
+        }))
+        .unwrap();
+        assert_eq!(deploy.operation.plan_hash, "approved-hash");
         assert_eq!(
-            secrets.get(ServerSecret::SftpPassword).unwrap().as_deref(),
-            Some("new-remote-password")
+            deploy.operation.selection.configs,
+            Some([(config.clone(), ConfigDecision::Apply)].into())
         );
+        assert_eq!(deploy.operation.restart_policy, None);
+        assert!(deploy.operation.force);
+        assert_eq!(deploy.operation.run_id, "run-1");
+        assert_eq!(deploy.credentials.password, "typed-password");
+        assert_eq!(deploy.credentials.worker_token, "typed-token");
+
+        let preview: ServerSyncRequest = serde_json::from_value(serde_json::json!({
+            "selection": { "includeMods": true, "includeConfigs": false },
+            "restartPolicy": "whenEmpty", "password": "", "workerToken": "typed-token",
+            "runId": "run-2",
+        }))
+        .unwrap();
         assert_eq!(
-            secrets.get(ServerSecret::WorkerToken).unwrap().as_deref(),
-            Some("stored")
+            preview.operation.restart_policy,
+            Some(RestartPolicy::WhenEmpty)
         );
+        assert!(preview.operation.selection.include_mods);
+        assert_eq!(preview.operation.run_id, "run-2");
+        assert_eq!(preview.credentials.worker_token, "typed-token");
+
+        let policy: SetConfigPolicyRequest = serde_json::from_value(serde_json::json!({
+            "path": config.as_str(), "policy": "alwaysKeep",
+            "password": "typed-password", "workerToken": "",
+        }))
+        .unwrap();
+        assert_eq!(policy.operation.path, config);
+        assert_eq!(policy.operation.policy, ConfigUpdatePolicy::AlwaysKeep);
+        assert_eq!(policy.credentials.password, "typed-password");
+
+        // The progress poll sends only the token; everything else defaults.
+        let progress: ServerSyncStatusRequest =
+            serde_json::from_value(serde_json::json!({ "workerToken": "typed-token" })).unwrap();
+        assert!(!progress.refresh);
+        assert_eq!(progress.credentials.password, "");
+        assert_eq!(progress.credentials.worker_token, "typed-token");
+
+        let test: RemoteServerRequest = serde_json::from_value(serde_json::json!({
+            "settings": RemoteServerSettings::default(),
+            "password": "typed-password", "workerToken": "",
+        }))
+        .unwrap();
+        assert_eq!(test.credentials.password, "typed-password");
     }
 }

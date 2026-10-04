@@ -14,20 +14,21 @@
 //!   "profileId": "sync-profile-uuid",
 //!   "game": "valheim",
 //!   "remote": {
-//!     "protocol": "sftp",
-//!     "host": "example.dathost.net",
-//!     "port": 8822,
-//!     "username": "user",
-//!     "serverDirectory": "/",
-//!     "authentication": "password",
-//!     "trustedHostKey": "SHA256:...",
+//!     "transport": {
+//!       "protocol": "sftp",
+//!       "host": "example.dathost.net",
+//!       "port": 8822,
+//!       "username": "user",
+//!       "serverDirectory": "/",
+//!       "authentication": "password",
+//!       "trustedHostKey": "SHA256:..."
+//!     },
 //!     "hostControl": {
 //!       "provider": "datHost",
 //!       "datHostServerId": "...",
 //!       "datHostUsername": "email@example.com"
 //!     },
-//!     "worker": { "autoDeployMods": true },
-//!     "restartPolicy": "whenEmpty"
+//!     "automation": { "autoDeployMods": true, "restartPolicy": "whenEmpty" }
 //!   },
 //!   "pollIntervalSecs": 300,
 //!   "stateDir": "."
@@ -68,7 +69,7 @@ pub struct WorkerConfig {
     pub game: String,
     /// Sync API base URL; defaults to Gale's production service.
     pub sync_url: Option<String>,
-    /// Remote server transport settings (host/port/auth/pins).
+    /// The remote server: its transport, host control, and automation.
     pub remote: RemoteServerSettings,
     /// How often the worker checks for new publications.
     pub poll_interval_secs: u64,
@@ -131,7 +132,10 @@ impl WorkerConfig {
             self.poll_interval_secs >= MIN_POLL_SECS,
             "pollIntervalSecs must be at least {MIN_POLL_SECS}"
         );
-        self.remote.validate()?;
+        // The worker is the executor, so the profile's choice of executor
+        // does not apply to it.
+        self.remote.transport.validate()?;
+        self.remote.host_control.validate()?;
         Ok(())
     }
 
@@ -188,5 +192,20 @@ mod tests {
         let mut value = valid_json();
         value["pollIntervalSecs"] = serde_json::json!(MIN_POLL_SECS - 1);
         assert!(load(value).is_err());
+    }
+
+    /// The worker is the executor: the profile's executor choice it was
+    /// provisioned from does not bind it, but the host control it restarts
+    /// the server through still has to be usable.
+    #[test]
+    fn ignores_the_profiles_executor_choice_but_checks_host_control() {
+        let mut value = valid_json();
+        value["remote"]["syncMode"] = serde_json::json!("worker");
+        value["remote"]["worker"] = serde_json::json!({ "address": "" });
+        load(value.clone()).unwrap();
+
+        value["remote"]["hostControl"] = serde_json::json!({ "provider": "datHost" });
+        let error = load(value).unwrap_err().to_string();
+        assert!(error.contains("DatHost server id is required"), "{error}");
     }
 }

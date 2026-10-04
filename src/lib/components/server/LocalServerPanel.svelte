@@ -68,12 +68,12 @@
 		<SecretField
 			id={`${formId}-field-3`}
 			label={m.dedicatedServerDialog_password()}
-			bind:value={form.gamePassword}
+			bind:value={form.credentials.gamePassword.value}
 			saved={form.savedCredentials?.gamePassword ?? false}
 			rememberLabel={m.dedicatedServerDialog_rememberPassword()}
-			bind:remember={form.rememberGamePassword}
+			bind:remember={form.credentials.gamePassword.remember}
 		/>
-		{#if !form.rememberGamePassword}
+		{#if !form.credentials.gamePassword.remember}
 			<p id={`${formId}-password-help`} class="text-primary-500 mt-1 text-sm">
 				{m.dedicatedServerDialog_sessionPassword()}
 			</p>

@@ -44,11 +44,8 @@
 	let launchOptions = $state<LaunchOption[]>([]);
 
 	const mode = new PersistedState<Mode>('launchMode', 'modded');
+	// Persisted values from older builds may name modes that no longer exist.
 	const currentMode: Mode = $derived(mode.current === 'vanilla' ? 'vanilla' : 'modded');
-
-	$effect(() => {
-		if (mode.current !== currentMode) mode.current = currentMode;
-	});
 
 	const activeGameName = $derived(games.active?.name ?? m.unknown());
 

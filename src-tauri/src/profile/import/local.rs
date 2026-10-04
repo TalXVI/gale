@@ -70,6 +70,7 @@ pub async fn import_local_mod(
 
     let prefs = app.lock_prefs();
     let mut manager = app.lock_manager();
+    crate::profile::server::ensure_profile_unlocked(app, manager.active_profile().id)?;
 
     let mod_loader = manager.active_mod_loader();
     let profile = manager.active_profile_mut();

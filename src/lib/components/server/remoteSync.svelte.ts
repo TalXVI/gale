@@ -21,9 +21,10 @@ type Decision = 'apply' | 'restore' | 'decline';
 /// Which payload a preview or deploy targets.
 type PreviewScope = 'mods' | 'configs';
 
-/// The status/preview/deploy state for the remote tab. Credentials come
-/// from the connection fields on the same page. Typed but unsaved values
-/// are passed so the user can preview before saving.
+/// The status/preview/deploy state for the remote tab of one profile; a
+/// profile switch replaces the instance. Credentials come from the
+/// connection fields on the same page. Typed but unsaved values are passed
+/// so the user can preview before saving.
 export class RemoteSync {
 	#form: ServerFormState;
 
@@ -105,11 +106,15 @@ export class RemoteSync {
 	}
 
 	get password() {
-		return this.#form.remotePassword;
+		return this.#form.credentials.remotePassword.value;
 	}
 
 	get workerToken() {
-		return this.#form.workerToken;
+		return this.#form.credentials.workerToken.value;
+	}
+
+	get #overrides() {
+		return { password: this.password, workerToken: this.workerToken };
 	}
 
 	/// Called when the remote tab becomes visible. Returns the teardown.
@@ -278,29 +283,6 @@ export class RemoteSync {
 		}
 	}
 
-	/// Drops status, preview, and results for the previous profile so a
-	/// profile switch never leaks its state.
-	/// The panel's own mount() is not re-run, so preferences reload here.
-	reset() {
-		this.#statusSeq++;
-		this.stopProgressTimers();
-		this.status = null;
-		this.preview = null;
-		this.result = null;
-		this.decisions = {};
-		this.policyOverrides = {};
-		this.progress = null;
-		this.activeRun = null;
-		this.failedOperation = null;
-		this.approvedInput = '';
-		this.reviewOnly = false;
-		this.restartPolicy = 'manual';
-		this.lastRefreshAt = null;
-		this.liveChecked = false;
-		this.loadingStatus = false;
-		void this.loadPreferences();
-	}
-
 	async loadPreferences() {
 		this.loadingPreferences = true;
 		try {
@@ -331,7 +313,8 @@ export class RemoteSync {
 	}
 
 	isWorker() {
-		return this.status?.mode === 'worker';
+		const mode = this.status?.mode;
+		return mode != null && mode !== 'local';
 	}
 
 	selection(scope: PreviewScope = this.previewScope): DeploySelection {
@@ -391,13 +374,12 @@ export class RemoteSync {
 			const policy = this.restartPolicy;
 			// The restart policy is bound into the plan hash, so the approval
 			// is only valid while this selection stands.
-			const operation = api.profile.server.previewSync(
-				selected,
-				policy,
-				this.password,
-				this.workerToken,
-				runId
-			);
+			const operation = api.profile.server.previewSync({
+				selection: selected,
+				restartPolicy: policy,
+				runId,
+				...this.#overrides
+			});
 			if (this.isWorker()) void this.pollWorkerProgress(runId);
 			const nextPreview = await operation;
 			if (!this.completeOperation(runId)) return;
@@ -481,15 +463,14 @@ export class RemoteSync {
 		const runId = this.beginOperation('deploy');
 		this.deploying = true;
 		try {
-			const operation = api.profile.server.deploySync(
-				this.selection(),
-				this.preview.plan.hash,
-				this.restartPolicy,
+			const operation = api.profile.server.deploySync({
+				selection: this.selection(),
+				planHash: this.preview.plan.hash,
+				restartPolicy: this.restartPolicy,
 				force,
-				this.password,
-				this.workerToken,
-				runId
-			);
+				runId,
+				...this.#overrides
+			});
 			if (this.isWorker()) void this.pollWorkerProgress(runId);
 			const nextResult = await operation;
 			if (!this.completeOperation(runId)) return;

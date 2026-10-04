@@ -39,7 +39,7 @@
 
 	const pendingText = $derived.by(() => {
 		const hosted =
-			form.syncChoice === 'hostedWorker' && form.localWorker?.worker?.pendingRevision
+			form.form.remote.executor.mode === 'hostedWorker' && form.localWorker?.worker?.pendingRevision
 				? form.localWorker.worker
 				: null;
 		const worker = hosted ?? sync.status?.worker;
@@ -49,8 +49,8 @@
 
 	const executorLabel = $derived.by(() => {
 		if (!sync.isWorker()) return m.serverSync_viaDirect();
-		if (form.syncChoice === 'hostedWorker') return m.serverSync_viaWorkerLocal();
-		const address = form.form.remote.worker.address;
+		if (form.form.remote.executor.mode === 'hostedWorker') return m.serverSync_viaWorkerLocal();
+		const address = form.form.remote.executor.workerAddress;
 		try {
 			return m.serverSync_viaWorker({ host: new URL(address).host || address });
 		} catch {
@@ -76,7 +76,7 @@
 			if (document.visibilityState === 'visible' && !sync.busy) {
 				void sync.loadStatus(false, { silent: true });
 			}
-			if (worker && form.syncChoice === 'hostedWorker')
+			if (worker && form.form.remote.executor.mode === 'hostedWorker')
 				void form.refreshLocalWorker({ background: true });
 		}, 60_000);
 		return () => clearInterval(interval);

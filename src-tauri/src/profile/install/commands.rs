@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 use super::{InstallOptions, ModInstall};
 use crate::{
-    profile::{install::InstallResultExt, server},
+    profile::install::InstallResultExt,
     state::ManagerExt,
     thunderstore::ModId,
     util::{self, cmd::Result},
@@ -11,8 +11,6 @@ use crate::{
 
 #[command]
 pub async fn install_mod(id: ModId, app: AppHandle) -> Result<()> {
-    server::ensure_active_profile_unlocked(&app)?;
-
     let profile_id = app.lock_manager().active_profile().id;
     let install = ModInstall::try_from_id(id, &app.lock_thunderstore())?;
 

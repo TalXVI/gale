@@ -26,65 +26,151 @@ use crate::profile::{
 
 /// Which scope a deployment covers.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(try_from = "SelectionRequest", into = "SelectionRequest")]
 pub struct DeploySelection {
     /// Synchronize the published mod payload (mods phase).
     pub include_mods: bool,
-    /// Evaluate published configs (config phase). Independent of the file
-    /// lists so Mods+Configs with zero selected files stays valid.
-    pub include_configs: bool,
-    /// Published config files to apply explicitly.
-    #[serde(default)]
-    pub apply_configs: Vec<ConfigPath>,
-    /// Selected configs whose remote file was deleted after Gale deployed
-    /// it. Recreating them needs this explicit authorization.
-    #[serde(default)]
-    pub restore_configs: Vec<ConfigPath>,
-    /// Published config revisions to decline.
-    #[serde(default)]
-    pub decline_configs: Vec<ConfigPath>,
+    /// The config phase's decisions, or `None` to skip the phase. Empty
+    /// decisions still evaluate published configs, so Mods+Configs with
+    /// zero selected files stays valid. A published config without a
+    /// decision stays as it is on the server.
+    pub configs: Option<BTreeMap<ConfigPath, ConfigDecision>>,
+}
+
+/// What the caller decided for one published config file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConfigDecision {
+    /// Write the published revision.
+    Apply,
+    /// Write the published revision, recreating a remote file deleted
+    /// after Gale deployed it. Recreating needs this explicit
+    /// authorization.
+    Restore,
+    /// Decline the published revision.
+    Decline,
 }
 
 impl DeploySelection {
+    /// The decision for `path`, if the caller made one.
+    fn decision(&self, path: &ConfigPath) -> Option<ConfigDecision> {
+        self.configs.as_ref()?.get(path).copied()
+    }
+
+    /// Paths the selection writes when the plan allows it.
+    pub fn written_configs(&self) -> impl Iterator<Item = &ConfigPath> {
+        self.configs
+            .iter()
+            .flatten()
+            .filter(|(_, decision)| **decision != ConfigDecision::Decline)
+            .map(|(path, _)| path)
+    }
+
+    /// Rejects decisions for files the publication does not offer as
+    /// server configs.
     fn validate(
         &self,
         published: &BTreeMap<ConfigPath, ValidatedConfigFile>,
         spec: &DeploymentSpec,
     ) -> Result<()> {
-        // Reject config decisions in a mods-only selection. Silently
-        // dropping them would hide the caller's intent.
-        ensure!(
-            self.include_configs
-                || (self.apply_configs.is_empty()
-                    && self.restore_configs.is_empty()
-                    && self.decline_configs.is_empty()),
-            "config selections require the config phase"
-        );
-        let mut seen = BTreeSet::new();
-        for path in &self.apply_configs {
-            ensure!(seen.insert(path), "duplicate selected config path: {path}");
+        for (path, decision) in self.configs.iter().flatten() {
+            let role = match decision {
+                ConfigDecision::Apply | ConfigDecision::Restore => "selected",
+                ConfigDecision::Decline => "declined",
+            };
             ensure!(
                 published.contains_key(path) && spec.is_managed_config(path),
-                "selected config file is not a supported published server config: {path}"
-            );
-        }
-        for path in &self.restore_configs {
-            ensure!(
-                seen.contains(path),
-                "restore entry was not selected: {path}"
-            );
-        }
-        for path in &self.decline_configs {
-            ensure!(
-                !seen.contains(path),
-                "config file is both applied and declined: {path}"
-            );
-            ensure!(
-                published.contains_key(path) && spec.is_managed_config(path),
-                "declined config file is not a supported published server config: {path}"
+                "{role} config file is not a supported published server config: {path}"
             );
         }
         Ok(())
+    }
+}
+
+/// The selection's wire shape, which the page and the worker API send.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SelectionRequest {
+    include_mods: bool,
+    include_configs: bool,
+    /// Published config files to apply explicitly.
+    #[serde(default)]
+    apply_configs: Vec<ConfigPath>,
+    /// Applied configs that may recreate a remotely deleted file.
+    #[serde(default)]
+    restore_configs: Vec<ConfigPath>,
+    /// Published config revisions to decline.
+    #[serde(default)]
+    decline_configs: Vec<ConfigPath>,
+}
+
+impl TryFrom<SelectionRequest> for DeploySelection {
+    type Error = String;
+
+    fn try_from(request: SelectionRequest) -> std::result::Result<Self, Self::Error> {
+        if !request.include_configs {
+            // Silently dropping config decisions in a mods-only selection
+            // would hide the caller's intent.
+            if request.apply_configs.is_empty()
+                && request.restore_configs.is_empty()
+                && request.decline_configs.is_empty()
+            {
+                return Ok(Self {
+                    include_mods: request.include_mods,
+                    configs: None,
+                });
+            }
+            return Err("config selections require the config phase".to_owned());
+        }
+
+        let mut configs = BTreeMap::new();
+        for path in request.apply_configs {
+            if configs.contains_key(&path) {
+                return Err(format!("duplicate selected config path: {path}"));
+            }
+            configs.insert(path, ConfigDecision::Apply);
+        }
+        for path in request.restore_configs {
+            match configs.get_mut(&path) {
+                Some(decision) => *decision = ConfigDecision::Restore,
+                None => return Err(format!("restore entry was not selected: {path}")),
+            }
+        }
+        for path in request.decline_configs {
+            if configs
+                .get(&path)
+                .is_some_and(|decision| *decision != ConfigDecision::Decline)
+            {
+                return Err(format!("config file is both applied and declined: {path}"));
+            }
+            configs.insert(path, ConfigDecision::Decline);
+        }
+        Ok(Self {
+            include_mods: request.include_mods,
+            configs: Some(configs),
+        })
+    }
+}
+
+impl From<DeploySelection> for SelectionRequest {
+    fn from(selection: DeploySelection) -> Self {
+        let mut request = Self {
+            include_mods: selection.include_mods,
+            include_configs: selection.configs.is_some(),
+            apply_configs: Vec::new(),
+            restore_configs: Vec::new(),
+            decline_configs: Vec::new(),
+        };
+        for (path, decision) in selection.configs.into_iter().flatten() {
+            match decision {
+                ConfigDecision::Apply => request.apply_configs.push(path),
+                ConfigDecision::Restore => {
+                    request.apply_configs.push(path.clone());
+                    request.restore_configs.push(path);
+                }
+                ConfigDecision::Decline => request.decline_configs.push(path),
+            }
+        }
+        request
     }
 }
 
@@ -93,8 +179,7 @@ impl DeploySelection {
 pub struct StagedFile {
     /// Where the bytes come from during upload.
     pub source: FileSource,
-    /// blake3 hex of the content.
-    pub hash: String,
+    pub hash: ContentHash,
     pub size: u64,
 }
 
@@ -250,7 +335,9 @@ pub fn build_plan(
     context: &PlanContext,
     spec: &DeploymentSpec,
 ) -> Result<DeploymentPlan> {
-    selection.validate(&publication.config, spec)?;
+    selection
+        .validate(&publication.config, spec)
+        .map_err(InvalidSelection)?;
 
     let state = &snapshot.state;
     let mut uploads: Vec<PlanUpload> = Vec::new();
@@ -312,6 +399,21 @@ pub fn build_plan(
         // Payload dirs left with no surviving remote files after removals
         // can go, deepest first. The payload roots themselves are kept so a
         // restricted host's expected layout survives an empty deployment.
+        let removed: BTreeSet<&DeployPathBuf> = removals.iter().collect();
+        let mut occupied = BTreeSet::new();
+        for file in snapshot.payload_files.keys() {
+            if removed.contains(file) {
+                continue;
+            }
+            let mut parent = file.parent();
+            while let Some(dir) = parent {
+                parent = dir.parent();
+                if !occupied.insert(dir) {
+                    // Its ancestors were marked by an earlier file.
+                    break;
+                }
+            }
+        }
         directory_removals = snapshot
             .payload_dirs
             .iter()
@@ -321,18 +423,13 @@ pub fn build_plan(
                     .iter()
                     .any(|root| root.is_ancestor_of(dir))
             })
-            .filter(|dir| {
-                snapshot
-                    .payload_files
-                    .keys()
-                    .all(|file| !dir.is_ancestor_of(file) || removals.contains(file))
-            })
+            .filter(|dir| !occupied.contains(*dir))
             .cloned()
             .collect();
     }
 
     // ---- Config phase: selective application of published config files.
-    let configs_phase = selection.include_configs;
+    let configs_phase = selection.configs.is_some();
     let mut config_entries = Vec::new();
     if configs_phase {
         for (path, file) in &publication.config {
@@ -342,14 +439,11 @@ pub fn build_plan(
             let published = file.hash.clone();
             let remote = snapshot.config_remote.get(path).cloned().flatten();
             let record = state.config.get(path);
-            let selected = selection.apply_configs.contains(path);
             let action = decide_config(
                 &published,
                 remote.as_ref(),
                 record,
-                selected,
-                selection.restore_configs.contains(path),
-                selection.decline_configs.contains(path),
+                selection.decision(path),
             );
 
             if let ConfigAction::Write = action {
@@ -408,7 +502,7 @@ fn remote_intact(
     snapshot
         .payload_hashes
         .get(path)
-        .is_some_and(|remote| remote.as_str() == staged.hash)
+        .is_some_and(|remote| *remote == staged.hash)
 }
 
 /// The server-side config decision. It mirrors the client's `decide` and
@@ -419,9 +513,7 @@ fn decide_config(
     published: &ContentHash,
     remote: Option<&ContentHash>,
     record: Option<&crate::profile::sync::AppliedFile>,
-    selected: bool,
-    restore: bool,
-    declined: bool,
+    decision: Option<ConfigDecision>,
 ) -> ConfigAction {
     const DELETED: ConfigAction = ConfigAction::Pending {
         reason: PendingConfigReason::DeletedLocally,
@@ -431,7 +523,7 @@ fn decide_config(
         return ConfigAction::MarkApplied;
     }
 
-    if declined {
+    if decision == Some(ConfigDecision::Decline) {
         return ConfigAction::Decline;
     }
 
@@ -442,8 +534,8 @@ fn decide_config(
     let deleted =
         remote.is_none() && record.is_some_and(|r| r.applied.is_some() || r.written.is_some());
 
-    if selected {
-        return if deleted && !restore {
+    if let Some(decision) = decision {
+        return if deleted && decision != ConfigDecision::Restore {
             DELETED
         } else {
             ConfigAction::Write
@@ -538,10 +630,17 @@ fn plan_hash(
     blake3::hash(&bytes).to_hex().to_string()
 }
 
-/// Error raised when an approved plan no longer matches the computed one.
-pub fn stale_plan_error() -> eyre::Report {
-    eyre::eyre!("the server state changed since the preview was approved; please preview again")
-}
+/// An approved plan no longer matches the one computed now: the server
+/// changed in between, so the caller must preview again.
+#[derive(Debug, thiserror::Error)]
+#[error("the server state changed since the preview was approved; please preview again")]
+pub struct StalePlan;
+
+/// A selection the publication cannot satisfy. The request is wrong, not
+/// the server.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct InvalidSelection(eyre::Report);
 
 #[cfg(test)]
 mod tests {
@@ -581,7 +680,7 @@ mod tests {
     fn staged(bytes: &[u8]) -> StagedFile {
         StagedFile {
             source: FileSource::Bytes(bytes.to_vec()),
-            hash: blake3::hash(bytes).to_hex().to_string(),
+            hash: ContentHash::from_hash(blake3::hash(bytes)),
             size: bytes.len() as u64,
         }
     }
@@ -641,11 +740,17 @@ mod tests {
     fn selection(mods: bool, configs: bool) -> DeploySelection {
         DeploySelection {
             include_mods: mods,
-            include_configs: configs,
-            apply_configs: Vec::new(),
-            restore_configs: Vec::new(),
-            decline_configs: Vec::new(),
+            configs: configs.then(BTreeMap::new),
         }
+    }
+
+    /// Records `decision` for `path` in a selection's config phase.
+    fn decide(selection: &mut DeploySelection, path: ConfigPath, decision: ConfigDecision) {
+        selection
+            .configs
+            .as_mut()
+            .expect("the config phase is selected")
+            .insert(path, decision);
     }
 
     fn context() -> PlanContext {
@@ -675,27 +780,71 @@ mod tests {
             .collect()
     }
 
+    /// The error a selection sent in the wire shape is rejected with.
+    fn wire_error(value: serde_json::Value) -> String {
+        serde_json::from_value::<DeploySelection>(value)
+            .unwrap_err()
+            .to_string()
+    }
+
     #[test]
     fn mods_only_selection_rejects_config_decisions() {
         // A mods-only selection carrying config decisions is incoherent:
         // silently ignoring them would hide caller intent, so validation
         // fails loudly instead.
-        let fixture = fixture();
-        let mut selected = selection(true, false);
-        selected
-            .apply_configs
-            .push(config_path("BepInEx/config/mod.cfg"));
+        let error = wire_error(serde_json::json!({
+            "includeMods": true,
+            "includeConfigs": false,
+            "applyConfigs": ["BepInEx/config/mod.cfg"],
+        }));
         assert!(
-            build_plan(
-                &fixture.publication(),
-                &payload(b"dll-bytes"),
-                &empty_snapshot(),
-                &selected,
-                &context(),
-                &spec(),
-            )
-            .is_err()
+            error.contains("config selections require the config phase"),
+            "{error}"
         );
+    }
+
+    /// Every decision survives the wire shape the page and the worker API
+    /// carry, so a worker sees exactly the selection the desktop sent.
+    #[test]
+    fn every_config_decision_round_trips_through_the_wire_shape() {
+        let mut sel = selection(true, true);
+        decide(
+            &mut sel,
+            config_path("BepInEx/config/a.cfg"),
+            ConfigDecision::Apply,
+        );
+        decide(
+            &mut sel,
+            config_path("BepInEx/config/b.cfg"),
+            ConfigDecision::Restore,
+        );
+        decide(
+            &mut sel,
+            config_path("BepInEx/config/c.cfg"),
+            ConfigDecision::Decline,
+        );
+
+        let wire = serde_json::to_value(&sel).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "includeMods": true,
+                "includeConfigs": true,
+                "applyConfigs": ["BepInEx/config/a.cfg", "BepInEx/config/b.cfg"],
+                "restoreConfigs": ["BepInEx/config/b.cfg"],
+                "declineConfigs": ["BepInEx/config/c.cfg"],
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<DeploySelection>(wire).unwrap(),
+            sel
+        );
+
+        let mods_only: DeploySelection = serde_json::from_value(
+            serde_json::json!({ "includeMods": true, "includeConfigs": false }),
+        )
+        .unwrap();
+        assert_eq!(mods_only, selection(true, false));
     }
 
     #[test]
@@ -707,7 +856,7 @@ mod tests {
         snapshot.state.files.insert(
             deploy("BepInEx/plugins/Old/Old.dll"),
             crate::profile::server::state::OwnedFile {
-                hash: "x".into(),
+                hash: hash_of(b"x"),
                 size: 1,
             },
         );
@@ -732,8 +881,11 @@ mod tests {
     fn selection_rejects_unpublished_apply() {
         let fixture = fixture();
         let mut sel = selection(false, true);
-        sel.apply_configs
-            .push(config_path("BepInEx/config/ghost.cfg"));
+        decide(
+            &mut sel,
+            config_path("BepInEx/config/ghost.cfg"),
+            ConfigDecision::Apply,
+        );
 
         assert!(
             build_plan(
@@ -750,47 +902,23 @@ mod tests {
 
     #[test]
     fn selection_rejects_apply_and_decline_together() {
-        let mut fixture = fixture();
-        let path = config_path("BepInEx/config/mod.cfg");
-        fixture.config.insert(path.clone(), config_file(b"x"));
-
-        let mut sel = selection(false, true);
-        sel.apply_configs.push(path.clone());
-        sel.decline_configs.push(path);
-
-        assert!(
-            build_plan(
-                &fixture.publication(),
-                &DesiredDeployment::default(),
-                &empty_snapshot(),
-                &sel,
-                &context(),
-                &spec(),
-            )
-            .is_err()
-        );
+        let error = wire_error(serde_json::json!({
+            "includeMods": false,
+            "includeConfigs": true,
+            "applyConfigs": ["BepInEx/config/mod.cfg"],
+            "declineConfigs": ["BepInEx/config/mod.cfg"],
+        }));
+        assert!(error.contains("both applied and declined"), "{error}");
     }
 
     #[test]
     fn selection_rejects_restore_without_apply() {
-        let mut fixture = fixture();
-        let path = config_path("BepInEx/config/mod.cfg");
-        fixture.config.insert(path.clone(), config_file(b"x"));
-
-        let mut sel = selection(false, true);
-        sel.restore_configs.push(path);
-
-        assert!(
-            build_plan(
-                &fixture.publication(),
-                &DesiredDeployment::default(),
-                &empty_snapshot(),
-                &sel,
-                &context(),
-                &spec(),
-            )
-            .is_err()
-        );
+        let error = wire_error(serde_json::json!({
+            "includeMods": false,
+            "includeConfigs": true,
+            "restoreConfigs": ["BepInEx/config/mod.cfg"],
+        }));
+        assert!(error.contains("restore entry was not selected"), "{error}");
     }
 
     #[test]
@@ -857,7 +985,7 @@ mod tests {
 
         // Applying the selection turns the same snapshot into a write.
         let mut apply = selection(false, true);
-        apply.apply_configs.push(path.clone());
+        decide(&mut apply, path.clone(), ConfigDecision::Apply);
         let plan = build_plan(
             &fixture.publication(),
             &DesiredDeployment::default(),
@@ -872,7 +1000,7 @@ mod tests {
 
         // Declining keeps the remote file untouched.
         let mut decline = selection(false, true);
-        decline.decline_configs.push(path);
+        decide(&mut decline, path, ConfigDecision::Decline);
         let plan = build_plan(
             &fixture.publication(),
             &DesiredDeployment::default(),
@@ -916,7 +1044,7 @@ mod tests {
         assert!(plan.removals.is_empty());
 
         let mut select_old_config = selection(false, true);
-        select_old_config.apply_configs.push(path);
+        decide(&mut select_old_config, path, ConfigDecision::Apply);
         assert!(
             build_plan(
                 &fixture.publication(),
@@ -971,7 +1099,7 @@ mod tests {
 
         // Selected without restore still stays pending.
         let mut apply_only = selection(false, true);
-        apply_only.apply_configs.push(path.clone());
+        decide(&mut apply_only, path.clone(), ConfigDecision::Apply);
         let plan = build_plan(
             &fixture.publication(),
             &DesiredDeployment::default(),
@@ -990,7 +1118,7 @@ mod tests {
 
         // Apply + restore authorization finally writes.
         let mut restore = apply_only;
-        restore.restore_configs.push(path);
+        decide(&mut restore, path, ConfigDecision::Restore);
         let plan = build_plan(
             &fixture.publication(),
             &DesiredDeployment::default(),
@@ -1080,7 +1208,7 @@ mod tests {
 
         for path in [translation, loader] {
             let mut selected = selection(false, true);
-            selected.apply_configs.push(path);
+            decide(&mut selected, path, ConfigDecision::Apply);
             assert!(
                 build_plan(
                     &fixture.publication(),
@@ -1218,17 +1346,75 @@ mod tests {
     }
 
     #[test]
-    fn restart_is_required_for_any_write_or_removal() {
+    fn only_directories_emptied_by_removals_are_removed() {
+        let owned = |path: &str| {
+            (
+                deploy(path),
+                crate::profile::server::state::OwnedFile {
+                    hash: ContentHash::from_hash(blake3::hash(path.as_bytes())),
+                    size: 1,
+                },
+            )
+        };
+        let mut snapshot = empty_snapshot();
+        snapshot.state.files = [
+            owned("BepInEx/plugins/Old/Old.dll"),
+            owned("BepInEx/plugins/Old/sub/Data.bin"),
+            owned("BepInEx/plugins/Mixed/Owned.dll"),
+        ]
+        .into_iter()
+        .collect();
+        snapshot.payload_files = snapshot
+            .state
+            .files
+            .keys()
+            .cloned()
+            .chain([deploy("BepInEx/plugins/Mixed/Manual.dll")])
+            .map(|path| (path, 1))
+            .collect();
+        snapshot.payload_dirs = [
+            "BepInEx/plugins",
+            "BepInEx/plugins/Empty",
+            "BepInEx/plugins/Mixed",
+            "BepInEx/plugins/Old",
+            "BepInEx/plugins/Old/sub",
+        ]
+        .into_iter()
+        .map(deploy)
+        .collect();
+
+        let plan = build_plan(
+            &fixture().publication(),
+            &payload(b"dll"),
+            &snapshot,
+            &selection(true, false),
+            &context(),
+            &spec(),
+        )
+        .unwrap();
+
+        // Deepest first. `Mixed` still holds a manually installed mod, and
+        // the payload root itself always stays.
+        assert_eq!(
+            plan.directory_removals,
+            vec![
+                deploy("BepInEx/plugins/Old/sub"),
+                deploy("BepInEx/plugins/Old"),
+                deploy("BepInEx/plugins/Empty"),
+            ]
+        );
+    }
+
+    #[test]
+    fn applied_configs_and_payload_are_uploaded_but_declined_configs_are_not() {
         let mut fixture = fixture();
         let path = config_path("BepInEx/config/mod.cfg");
         fixture
             .config
             .insert(path.clone(), config_file(b"published"));
 
-        // A config-only write still changes server content: the running
-        // game only picks it up after a restart.
         let mut apply = selection(false, true);
-        apply.apply_configs.push(path.clone());
+        decide(&mut apply, path.clone(), ConfigDecision::Apply);
         let plan = build_plan(
             &fixture.publication(),
             &DesiredDeployment::default(),
@@ -1240,9 +1426,8 @@ mod tests {
         .unwrap();
         assert!(!plan.uploads.is_empty());
 
-        // But a declined/unselected config writes nothing, so no restart.
         let mut decline = selection(false, true);
-        decline.decline_configs.push(path);
+        decide(&mut decline, path, ConfigDecision::Decline);
         let plan = build_plan(
             &fixture.publication(),
             &DesiredDeployment::default(),
@@ -1254,7 +1439,6 @@ mod tests {
         .unwrap();
         assert!(plan.uploads.is_empty() && plan.removals.is_empty());
 
-        // Payload upload: restart required.
         let plan = build_plan(
             &fixture.publication(),
             &payload(b"dll"),

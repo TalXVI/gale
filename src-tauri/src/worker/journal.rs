@@ -60,6 +60,19 @@ pub struct WorkerJournal {
     /// The current publication-poll failure, cleared by a successful poll
     /// or by setup replacing the sign-in that caused a latched rejection.
     pub poll_error: Option<String>,
+    /// What caused `poll_error`. Absent in journals written before it was
+    /// recorded, which are classified by their text instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll_error_kind: Option<PollErrorKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PollErrorKind {
+    /// The sync service rejected the worker's sign-in; only a new
+    /// sign-in recovers.
+    SyncReauthorizationRequired,
+    Other,
 }
 
 /// A publication whose mod payload still needs to reach the server.
@@ -188,20 +201,33 @@ impl WorkerJournal {
     /// the generic token error retained by older workers. Other poll errors
     /// and all operational state are kept.
     pub fn replace_sync_credential(&mut self, refresh_token: String) {
-        if self.sync_reauthorization_required
-            && self
+        if self.sync_reauthorization_required && self.poll_error_is_sync_rejection() {
+            self.clear_poll_error();
+        }
+        self.refresh_token = Some(refresh_token);
+        self.sync_reauthorization_required = false;
+    }
+
+    /// Clears the poll error, returning whether there was one.
+    pub fn clear_poll_error(&mut self) -> bool {
+        self.poll_error_kind = None;
+        self.poll_error.take().is_some()
+    }
+
+    fn poll_error_is_sync_rejection(&self) -> bool {
+        match self.poll_error_kind {
+            Some(kind) => kind == PollErrorKind::SyncReauthorizationRequired,
+            // Written before the kind was recorded: the rejection text, or
+            // the generic token error older workers reported it as.
+            None => self
                 .poll_error
                 .as_deref()
                 .and_then(|error| error.strip_prefix("Publication check failed: "))
                 .is_some_and(|error| {
                     error == super::sync_client::SYNC_REAUTHORIZATION_REQUIRED
                         || error == "sync token request failed"
-                })
-        {
-            self.poll_error = None;
+                }),
         }
-        self.refresh_token = Some(refresh_token);
-        self.sync_reauthorization_required = false;
     }
 }
 
@@ -270,9 +296,19 @@ impl Journal {
     }
 
     /// Records a publication-poll error for status reporting.
-    pub async fn record_poll_error(&self, error: Option<String>) -> Result<()> {
+    pub async fn record_poll_error(&self, error: Option<&eyre::Report>) -> Result<()> {
         let mut state = self.state.lock().await;
-        state.poll_error = error;
+        state.poll_error = error.map(|err| format!("Publication check failed: {err}"));
+        state.poll_error_kind = error.map(|err| {
+            if err
+                .downcast_ref::<super::sync_client::SyncReauthorizationRequired>()
+                .is_some()
+            {
+                PollErrorKind::SyncReauthorizationRequired
+            } else {
+                PollErrorKind::Other
+            }
+        });
         self.save(&state)
     }
 }
@@ -325,9 +361,7 @@ mod tests {
             journal.save(&state).unwrap();
         }
         journal
-            .record_poll_error(Some(
-                "Publication check failed: sync token request failed".to_owned(),
-            ))
+            .record_poll_error(Some(&eyre::eyre!("sync token request failed")))
             .await
             .unwrap();
 
@@ -406,6 +440,28 @@ mod tests {
             serde_json::to_value(&expected).unwrap(),
             "only the credential and its rejection state changed"
         );
+    }
+
+    /// A recorded poll error keeps what caused it, so a new sign-in
+    /// clears a sign-in rejection however its message reads, and never
+    /// clears an unrelated error that happens to read like one.
+    #[tokio::test]
+    async fn replace_sync_credential_classifies_recorded_poll_errors_by_cause() {
+        let rejection = eyre::Report::new(crate::worker::sync_client::SyncReauthorizationRequired)
+            .wrap_err("failed to fetch the publication");
+        let lookalike = eyre::eyre!("sync token request failed");
+
+        for (error, clears) in [(rejection, true), (lookalike, false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let journal = Journal::load(dir.path()).unwrap();
+            journal.record_poll_error(Some(&error)).await.unwrap();
+
+            let journal = Journal::load(dir.path()).unwrap();
+            let mut state = journal.state.lock().await;
+            state.sync_reauthorization_required = true;
+            state.replace_sync_credential("fresh-token".to_owned());
+            assert_eq!(state.poll_error.is_none(), clears, "{error:#}");
+        }
     }
 
     #[test]

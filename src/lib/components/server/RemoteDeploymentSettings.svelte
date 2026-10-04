@@ -30,7 +30,7 @@
 			id={`${formId}-sync-mode`}
 			type="single"
 			triggerClass="mt-1 w-full"
-			bind:value={form.syncChoice}
+			bind:value={form.form.remote.executor.mode}
 			items={[
 				{ value: 'local', label: m.dedicatedServerDialog_syncModeLocal() },
 				...(form.localWorker?.supported
@@ -45,15 +45,15 @@
 			]}
 		/>
 		<p class="text-primary-500 mt-1 text-sm">
-			{form.syncChoice === 'worker'
+			{form.form.remote.executor.mode === 'worker'
 				? m.dedicatedServerDialog_syncModeWorkerInfo()
-				: form.syncChoice === 'hostedWorker'
+				: form.form.remote.executor.mode === 'hostedWorker'
 					? m.dedicatedServerDialog_syncModeHostedWorkerInfo()
 					: m.dedicatedServerDialog_syncModeLocalInfo()}
 		</p>
 	</div>
 
-	{#if form.syncChoice === 'hostedWorker'}
+	{#if form.form.remote.executor.mode === 'hostedWorker'}
 		{#if form.localWorker?.ownership === 'foreign'}
 			<InfoBox type="warning">{m.dedicatedServerDialog_localWorkerForeign()}</InfoBox>
 		{:else if form.localWorker === null || form.localWorker.service === 'notInstalled'}
@@ -170,23 +170,23 @@
 				</div>
 			</div>
 		{/if}
-	{:else if form.syncChoice === 'worker'}
+	{:else if form.form.remote.executor.mode === 'worker'}
 		<div>
 			<Label for={`${formId}-worker-address`}>{m.dedicatedServerDialog_workerAddress()}</Label
 			><InputField
 				id={`${formId}-worker-address`}
 				class="mt-1 w-full"
-				bind:value={form.form.remote.worker.address}
+				bind:value={form.form.remote.executor.workerAddress}
 				placeholder="https://worker.example.com"
 			/>
 		</div>
 		<SecretField
 			id={`${formId}-worker-token`}
 			label={m.dedicatedServerDialog_workerToken()}
-			bind:value={form.workerToken}
+			bind:value={form.credentials.workerToken.value}
 			saved={form.savedCredentials?.workerToken ?? false}
 			rememberLabel={m.serverPage_rememberToken()}
-			bind:remember={form.rememberWorkerToken}
+			bind:remember={form.credentials.workerToken.remember}
 		/>
 		<div>
 			<Button
@@ -197,13 +197,13 @@
 			>
 		</div>
 	{/if}
-	{#if form.syncChoice !== 'local'}
+	{#if form.form.remote.executor.mode !== 'local'}
 		<div class="flex items-center">
 			<Label inline for={`${formId}-auto-deploy-mods`}
 				>{m.dedicatedServerDialog_workerAutoDeployMods()}</Label
 			><Info>{m.dedicatedServerDialog_workerAutoDeployModsInfo()}</Info><Checkbox
 				id={`${formId}-auto-deploy-mods`}
-				bind:checked={form.form.remote.worker.autoDeployMods}
+				bind:checked={form.form.remote.automation.autoDeployMods}
 			/>
 		</div>
 		<div>
@@ -214,7 +214,7 @@
 				id={`${formId}-auto-restart`}
 				type="single"
 				triggerClass="mt-1 w-full"
-				bind:value={form.form.remote.restartPolicy}
+				bind:value={form.form.remote.automation.restartPolicy}
 				items={[
 					{ value: 'manual', label: m.dedicatedServerDialog_restartManual() },
 					{ value: 'immediate', label: m.dedicatedServerDialog_restartImmediate() },

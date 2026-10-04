@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use eyre::{Context, OptionExt, Result};
 use tracing::info;
 
-use super::{args, settings::LocalServerSettings};
+use super::{args, dedicated, settings::LocalServerSettings};
 use crate::{
     game::{Game, platform::Platform},
     prefs::Prefs,
@@ -95,10 +95,7 @@ pub fn launch(
 }
 
 pub fn locate_server_dir(game: &ManagedGame, prefs: &Prefs) -> Result<(PathBuf, Platform)> {
-    let dedicated = game
-        .game
-        .dedicated_server
-        .as_ref()
+    let dedicated = dedicated::for_game(game.game)
         .ok_or_eyre("this game does not define a dedicated server")?;
 
     let preferred_platform = prefs

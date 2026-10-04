@@ -239,11 +239,12 @@ pub fn user_info(app: &AppHandle) -> Option<User> {
         .map(|state| state.user.clone())
 }
 
+/// The `POST /auth/token` answer. Every grant rotates the refresh token.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct TokenResponse {
-    access_token: String,
-    refresh_token: String,
+pub(crate) struct TokenResponse {
+    pub(crate) access_token: String,
+    pub(crate) refresh_token: String,
 }
 
 pub async fn access_token(app: &AppHandle) -> Result<Option<String>> {
@@ -308,8 +309,8 @@ async fn refresh_desktop_token(refresh_token: String, app: &AppHandle) -> Result
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct GrantTokenRequest {
-    refresh_token: String,
+pub(crate) struct GrantTokenRequest {
+    pub(crate) refresh_token: String,
 }
 
 async fn request_token(refresh_token: String, app: &AppHandle) -> Result<String> {

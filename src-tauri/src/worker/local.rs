@@ -37,8 +37,8 @@ pub const PORT_RANGE: RangeInclusive<u16> = DEFAULT_PORT..=8496;
 pub const CONFIG_FILE: &str = "gale-worker.json";
 pub const SECRETS_FILE: &str = "secrets.env";
 pub const STATUS_FILE: &str = "status.json";
-/// A staged copy of the user's SSH private key. The service runs as
-/// LocalSystem and cannot read keys under `%USERPROFILE%`.
+/// A staged copy of the user's SSH private key. The service runs as its
+/// own virtual account and cannot read keys under `%USERPROFILE%`.
 pub const SSH_KEY_FILE: &str = "ssh.key";
 #[cfg(feature = "worker")]
 pub const LOG_FILE: &str = "worker.log";
@@ -71,11 +71,42 @@ pub fn worker_update_available(candidate: &Path) -> bool {
     binaries_differ(candidate, &root_dir().join(WORKER_EXE))
 }
 
+/// Whether the two files' bytes differ. An unreadable file never counts as
+/// a difference. Both are polled, so sizes are compared first and contents
+/// are streamed, stopping at the first difference.
 pub fn binaries_differ(candidate: &Path, installed: &Path) -> bool {
-    match (std::fs::read(candidate), std::fs::read(installed)) {
-        (Ok(candidate), Ok(installed)) => candidate != installed,
-        _ => false,
+    files_differ(candidate, installed).unwrap_or(false)
+}
+
+fn files_differ(a: &Path, b: &Path) -> std::io::Result<bool> {
+    let (mut a, mut b) = (std::fs::File::open(a)?, std::fs::File::open(b)?);
+    if a.metadata()?.len() != b.metadata()?.len() {
+        return Ok(true);
     }
+
+    let (mut chunk_a, mut chunk_b) = (vec![0; 64 * 1024], vec![0; 64 * 1024]);
+    loop {
+        let read = read_chunk(&mut a, &mut chunk_a)?;
+        let read_b = read_chunk(&mut b, &mut chunk_b)?;
+        if chunk_a[..read] != chunk_b[..read_b] {
+            return Ok(true);
+        }
+        if read == 0 {
+            return Ok(false);
+        }
+    }
+}
+
+/// Fills `buf` unless the file ends first, and returns how much was read.
+fn read_chunk(file: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match std::io::Read::read(file, &mut buf[filled..])? {
+            0 => break,
+            read => filled += read,
+        }
+    }
+    Ok(filled)
 }
 
 pub(crate) fn service_manager() -> Result<ServiceManager> {
@@ -285,6 +316,32 @@ mod tests {
         let mut operations = FakeOperations::default();
         perform_control(&mut operations, ServiceControlAction::Restart).unwrap();
         assert_eq!(operations.0, ["stop_and_wait", "start_and_wait"]);
+    }
+
+    #[test]
+    fn binaries_differ_by_size_or_content_but_not_when_unreadable() {
+        let root = tempfile::tempdir().unwrap();
+        let write = |name: &str, bytes: &[u8]| {
+            let path = root.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+        // Larger than one comparison chunk, differing only at the end.
+        let mut tail = vec![7u8; 200_000];
+        let installed = write("installed.exe", &tail);
+        tail[199_999] = 8;
+        let changed_tail = write("changed-tail.exe", &tail);
+        tail.push(8);
+        let longer = write("longer.exe", &tail);
+        let same = write("same.exe", &vec![7u8; 200_000]);
+
+        assert!(binaries_differ(&changed_tail, &installed));
+        assert!(binaries_differ(&longer, &installed));
+        assert!(!binaries_differ(&same, &installed));
+        assert!(!binaries_differ(
+            &root.path().join("missing.exe"),
+            &installed
+        ));
     }
 
     #[test]

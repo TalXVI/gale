@@ -14,6 +14,7 @@ use std::{
 
 use eyre::{Context, Result};
 use futures_util::future::BoxFuture;
+use reqwest_middleware::ClientWithMiddleware;
 use tracing::info;
 use walkdir::WalkDir;
 use zip::ZipArchive;
@@ -26,7 +27,11 @@ use super::{
 };
 use crate::{
     game::mod_loader::ModLoader,
-    profile::{export::R2Mod, sync::FetchedPublication},
+    profile::{
+        export::{ContentHash, R2Mod},
+        install::{InstallError, download},
+        sync::FetchedPublication,
+    },
     thunderstore::{Backend, VersionIdent},
     util,
 };
@@ -43,13 +48,13 @@ pub trait PayloadSource: Send + Sync {
     ) -> BoxFuture<'a, Result<PathBuf>>;
 }
 
-/// A payload source backed by a plain directory plus a reqwest client.
+/// A payload source backed by a plain directory plus an HTTP client.
 ///
 /// Layout: `<root>/<full_name>/<version>/`, identical to Gale's install
 /// cache so Local mode can share `prefs.cache_dir()` directly.
 pub struct CachePayloadSource {
     pub root: PathBuf,
-    pub client: reqwest::Client,
+    pub client: ClientWithMiddleware,
     pub mod_loader: &'static ModLoader<'static>,
 }
 
@@ -68,16 +73,13 @@ impl PayloadSource for CachePayloadSource {
             }
 
             let url = backend.download_url(ident);
-            let bytes = self
-                .client
-                .get(&url)
-                .send()
+            let bytes = download::fetch(&self.client, &url, 0, &|_| {}, &|| Ok(()))
                 .await
-                .and_then(|res| res.error_for_status())
-                .with_context(|| format!("failed to download {ident}"))?
-                .bytes()
-                .await
-                .with_context(|| format!("failed to read {ident} download"))?;
+                .map_err(|err| match err {
+                    InstallError::Error(err) => err,
+                    InstallError::Cancelled => eyre::eyre!("the download was cancelled"),
+                })
+                .with_context(|| format!("failed to download {ident}"))?;
 
             std::fs::create_dir_all(&parent).context("failed to create staging directory")?;
 
@@ -105,12 +107,12 @@ fn commit_staged(tmp: tempfile::TempDir, dest: &Path) -> Result<()> {
 }
 
 impl CachePayloadSource {
-    fn extract(&self, bytes: bytes::Bytes, ident: &VersionIdent, dest: &Path) -> Result<()> {
-        let archive = ZipArchive::new(Cursor::new(bytes.to_vec()))
+    fn extract(&self, bytes: Vec<u8>, ident: &VersionIdent, dest: &Path) -> Result<()> {
+        let archive = ZipArchive::new(Cursor::new(bytes))
             .with_context(|| format!("{ident} download is not a valid zip"))?;
         let mut installer = self.mod_loader.installer_for(ident.full_name());
         installer
-            .extract(archive, ident.name(), dest.to_path_buf())
+            .extract(archive, ident.full_name(), dest.to_path_buf())
             .with_context(|| format!("failed to extract {ident} for server deployment"))
     }
 }
@@ -126,6 +128,7 @@ fn is_staged(dir: &Path) -> bool {
 pub async fn stage_fetched(
     publication: &FetchedPublication,
     cache_dir: PathBuf,
+    client: ClientWithMiddleware,
     mod_loader: &'static ModLoader<'static>,
     spec: &DeploymentSpec,
     include_mods: bool,
@@ -136,7 +139,7 @@ pub async fn stage_fetched(
     }
     let source = CachePayloadSource {
         root: cache_dir,
-        client: reqwest::Client::new(),
+        client,
         mod_loader,
     };
     let mut staging_total = None;
@@ -235,10 +238,9 @@ fn staged_file(path: &Path, relative: &DeployPathBuf) -> Result<StagedFile> {
     let metadata = path
         .metadata()
         .with_context(|| format!("failed to read staged file {}", path.display()))?;
-    let hash = util::fs::checksum(path)
-        .with_context(|| format!("failed to hash {relative}"))?
-        .to_hex()
-        .to_string();
+    let hash = ContentHash::from_hash(
+        util::fs::checksum(path).with_context(|| format!("failed to hash {relative}"))?,
+    );
 
     Ok(StagedFile {
         source: FileSource::Path(path.to_path_buf()),
@@ -308,15 +310,46 @@ mod tests {
         }
     }
 
-    fn spec() -> DeploymentSpec {
-        DeploymentSpec::for_loader(&ModLoader {
+    fn bepinex() -> ModLoader<'static> {
+        ModLoader {
             package_name: None,
             file_target: None,
             kind: ModLoaderKind::BepInEx {
                 extra_subdirs: Vec::new(),
             },
-        })
-        .unwrap()
+        }
+    }
+
+    fn spec() -> DeploymentSpec {
+        DeploymentSpec::for_loader(&bepinex()).unwrap()
+    }
+
+    #[test]
+    fn extracted_packages_use_the_install_cache_layout() {
+        // Local mode stages into Gale's install cache, and a later install
+        // of the same version reuses whatever is there. BepInEx installs
+        // keep each mod's plugins in a folder named after the full package
+        // name, so staging must lay the package out the same way.
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file("plugins/Mod.dll", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut zip, b"dll").unwrap();
+        let archive = zip.finish().unwrap().into_inner();
+
+        let source = super::CachePayloadSource {
+            root: std::path::PathBuf::new(),
+            client: reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build(),
+            mod_loader: Box::leak(Box::new(bepinex())),
+        };
+        let ident = VersionIdent::from(("Author", "Mod", "1.0.0"));
+        let dest = tempfile::tempdir().unwrap();
+
+        source.extract(archive, &ident, dest.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read(dest.path().join("BepInEx/plugins/Author-Mod/Mod.dll")).unwrap(),
+            b"dll"
+        );
     }
 
     #[test]

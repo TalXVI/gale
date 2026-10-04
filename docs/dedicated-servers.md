@@ -1,6 +1,6 @@
 # Dedicated servers
 
-Gale can launch a dedicated server on this computer or deploy a published profile to a remote server. Open the **Dedicated server** page from the navigation bar. It appears only for games with a `dedicatedServer` entry in `src-tauri/games.json`.
+Gale can launch a dedicated server on this computer or deploy a published profile to a remote server. Open the **Dedicated server** page from the navigation bar. It appears only for games listed in `src-tauri/src/profile/server/dedicated_servers.json`.
 
 ## Local server
 
@@ -88,7 +88,7 @@ Choose **Worker on this PC** as the sync mode and select **Set up worker**. Gale
 
 If service installation succeeds but saving the profile settings fails, the page reports _setup incomplete_. Run **Set up worker** again to sign in, reinstall the worker, and finish linking the profile. Gale keeps pending work and automation settings when the profile and remote server have not changed.
 
-The service runs as LocalSystem. It starts with Windows before sign-in, restarts after a crash, and resumes queued deployments from its journal. It reports `Running` only after its API starts serving. An initialization failure reports `Stopped` with a failure exit so Windows can restart it. Start, Stop, and Restart use the service's control permissions. Update and Uninstall request UAC elevation.
+The service runs as its own virtual account, `NT SERVICE\GaleWorker`, without administrator rights. It starts with Windows before sign-in, restarts after a crash, and resumes queued deployments from its journal. It reports `Running` only after its API starts serving. An initialization failure reports `Stopped` with a failure exit so Windows can restart it. Start, Stop, and Restart use the service's control permissions. Update and Uninstall request UAC elevation.
 
 The notification-area icon belongs to a per-user helper separate from the Session 0 service. Gale copies the helper to a directory named for its content under `%LocalAppData%\Gale\worker-tray`, registers that copy in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, and starts it after setup. The helper checks the service state. It shows the Gale icon and `Gale Worker` tooltip while the service is `Running`, then hides the icon when the service stops. A session-local mutex prevents duplicate icons.
 
@@ -112,7 +112,7 @@ C:\ProgramData\Gale\worker\
 Notes and limitations:
 
 - Windows only. On Linux/macOS the page does not offer this option; use **Worker on another machine**.
-- SSH **agent** authentication cannot run unattended in a service; use a password or a private key. A private key under `%USERPROFILE%` is copied into `private\` at setup, since LocalSystem cannot read your profile directory.
+- SSH **agent** authentication cannot run unattended in a service; use a password or a private key. A private key under `%USERPROFILE%` is copied into `private\` at setup, since the service account cannot read your profile directory.
 - One managed worker per machine. The `GaleWorker` service name and state-directory lock reject duplicates. The worker stays bound to its setup profile. Other profiles cannot start, stop, update, or uninstall it. To move it, sign in to the owning profile and uninstall first.
 - Gale updates ship a newer `gale-worker.exe` beside the app, but the service keeps running its installed copy so updates never fight a locked executable. The page shows **Update worker** when the bundled copy is newer; updating keeps credentials and pending work.
 - The tray process runs only from its LocalAppData copy and embeds Gale's existing icon. It therefore holds neither the installed service binary nor Gale's bundled Worker/tray files open. Its **Update** command passes the current bundled `gale-worker.exe` to the same elevated `service reinstall` path as the Server page; the tray helper can never become the service update source.
@@ -131,10 +131,9 @@ Notes and limitations:
      "profileId": "the sync profile id",
      "game": "valheim",
      "remote": {
-       "protocol": "sftp", "host": "...", "username": "...",
+       "transport": { "protocol": "sftp", "host": "...", "username": "..." },
        "hostControl": { "provider": "datHost", "datHostServerId": "...", "datHostUsername": "..." },
-       "worker": { "autoDeployMods": true },
-       "restartPolicy": "whenEmpty"
+       "automation": { "autoDeployMods": true, "restartPolicy": "whenEmpty" }
      },
      "pollIntervalSecs": 300,
      "stateDir": "/var/lib/gale-worker"
@@ -225,18 +224,26 @@ The same protections apply in both modes: host-managed BepInEx installations are
 The backend lives in `src-tauri/src/profile/server`:
 
 - `plan.rs`: the pure planner. It is the only place sync semantics are decided, shared by previews and deploys in both modes.
-- `engine.rs`: session, snapshot, lease-gated execution, restart, and state persistence shared by Local and Worker.
+- `engine/`: session, snapshot, lease-gated execution, restart, and state persistence shared by Local and Worker. Its integration tests live in `engine/tests/`.
+- `service.rs`: the deployment service both executors run (connecting, staging, plan binding, every remote operation).
+- `executor.rs`: dispatches routine sync operations to Local mode (the service, in-process) or Worker mode (the worker's HTTP API).
 - `lease.rs`: the remote deployment lease (claim/heartbeat/ownership-verified release/stale takeover).
 - `state.rs`: `.gale-server-state.json`, holding ownership records, config policies, the last operation, and the restart flag.
 - `spec.rs`: managed scope, loader-specific ownership, excluded paths, removal authority.
-- `remote.rs`: SFTP/FTP/FTPS operations; FTPS certificate pinning and verification.
+- `remote/`: SFTP (`sftp.rs`) and FTP/FTPS (`ftp.rs`) operations, FTPS certificate pinning and verification (`ftps_verifier.rs`), and the in-memory and fake-FTP test servers.
 - `stage.rs`: publication → staged payloads; configs-only operations never touch mod sources.
-- `commands.rs`: Tauri commands, executor dispatch (Local vs Worker), credentials, progress events.
+- `commands.rs`: Tauri commands and progress events.
+- `settings.rs` / `settings_store.rs`: the per-profile server settings, and saving them together with their credentials.
+- `secrets.rs`: the profile's credentials in the OS credential store.
+- `host.rs`: hosting-provider restart and status control (DatHost), separate from file transfer.
+- `dedicated.rs` / `dedicated_servers.json`: which games ship a dedicated server, kept out of `games.json` because that list is refreshed from upstream.
 - `local_worker.rs`: desktop orchestration for the managed Windows worker, including provisioning, elevated install and uninstall, service control, and the ProgramData layout.
 - `runtime.rs`: the local server process and its profile lock, including the stopping state.
 - `worker_client.rs`: desktop client for the worker API (loopback-only plaintext rule).
-- `src-tauri/src/worker/`: the HTTP API (`server.rs`), journal (`journal.rs`), config (`config.rs`), secrets loader (`secrets.rs`), sync client (`sync_client.rs`), shared API types (`api.rs`), managed-service paths (`local.rs`), and Windows service code (`service.rs`). Pending journal work always means a mod payload is owed.
+- `src-tauri/src/worker/`: the HTTP API (`server.rs`), journal (`journal.rs`), config (`config.rs`), secrets loader (`secrets.rs`), sync client (`sync_client.rs`), shared API types (`api.rs`), managed-service paths (`local.rs`), Windows service code (`service.rs`), the tray companion (`tray.rs`), and the named mutexes its processes coordinate through (`named_mutex.rs`). Pending journal work always means a mod payload is owed.
+
+Worker API failures use the status to tell the caller what to do: `400` for a malformed request, `401` for a missing or wrong bearer token, `409` when the deployment must wait or be previewed again (a deployment is already running, another executor holds the lease, or the plan is stale), `422` for an invalid selection, and `500` for anything else. The body carries the error message.
 
 Frontend bindings are in `src/lib/api/profile/server.ts`, the page is `src/lib/components/server/ServerPage.svelte`, and user-facing text lives in `messages/en.json` via Paraglide.
 
-When adding another supported game, define its dedicated-server platforms and default port in `src-tauri/games.json`.
+When adding another supported game, define its dedicated-server platforms and default port in `src-tauri/src/profile/server/dedicated_servers.json`, keyed by the game's slug.

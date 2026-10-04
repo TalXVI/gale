@@ -10,22 +10,27 @@
 	import RemoteDeploymentSettings from './RemoteDeploymentSettings.svelte';
 	import HostProviderSettings from './HostProviderSettings.svelte';
 	import type { ServerFormState } from './serverForm.svelte';
-	import type { RemoteSync } from './remoteSync.svelte';
+	import { RemoteSync } from './remoteSync.svelte';
 	import { Tabs } from 'bits-ui';
 	import profiles from '$lib/state/profile.svelte';
 	import { m } from '$lib/paraglide/messages';
 
-	let { form, sync }: { form: ServerFormState; sync: RemoteSync } = $props();
+	let { form }: { form: ServerFormState } = $props();
+
+	// Each profile gets its own sync state, so a switch can never leak
+	// the previous profile's status, preview, or results.
+	const sync = $derived.by(() => {
+		void profiles.activeId;
+		return new RemoteSync(form);
+	});
 
 	// The active profile owns the settings. Switching profiles discards
-	// any unsaved edits, drops the old profile's sync state, and reloads
-	// credentials from scratch.
+	// any unsaved edits and reloads credentials from scratch.
 	let loadedProfile: number | null | undefined = undefined;
 	$effect(() => {
 		const id = profiles.activeId;
 		if (id === loadedProfile) return;
 		loadedProfile = id;
-		sync.reset();
 		// The status panel remounts once loading finishes and issues the
 		// live refresh itself; a still-mounted panel is covered here.
 		void form.load().then(() => {
@@ -59,8 +64,10 @@
 
 				<Tabs.Content value="remote">
 					{#if form.remoteConfigured}
-						<RemoteStatusPanel {form} {sync} />
-						<RemoteDeployPanel {form} {sync} />
+						{#key sync}
+							<RemoteStatusPanel {form} {sync} />
+							<RemoteDeployPanel {form} {sync} />
+						{/key}
 					{:else}
 						<div
 							class="border-primary-300 dark:border-primary-600 bg-primary-50 dark:bg-primary-900 mt-4 rounded-lg border p-3 text-sm"

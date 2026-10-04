@@ -128,26 +128,32 @@ pub enum Ownership {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LeaseBusy {
-    pub record: LeaseRecord,
+    /// The blocking lease's record, or `None` when the host hides it and
+    /// only a holder marker proves that a claim exists.
+    pub record: Option<LeaseRecord>,
     /// Whether the blocking lease's heartbeat has expired. The caller can
-    /// offer `force` takeover only when it has.
+    /// offer `force` takeover only when it has. A missing record never
+    /// counts as stale: expiry cannot be judged without its heartbeat.
     pub stale: bool,
 }
 
 impl std::fmt::Display for LeaseBusy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.stale {
-            write!(
+        match &self.record {
+            Some(record) if self.stale => write!(
                 f,
                 "a stale deployment lease is held by {} (since {}); stop that executor or take it over",
-                self.record.owner, self.record.acquired_at
-            )
-        } else {
-            write!(
+                record.owner, record.acquired_at
+            ),
+            Some(record) => write!(
                 f,
                 "a deployment is already in progress (held by {} since {})",
-                self.record.owner, self.record.acquired_at
-            )
+                record.owner, record.acquired_at
+            ),
+            None => write!(
+                f,
+                "a deployment is already in progress (held by another executor whose lease record cannot be read)"
+            ),
         }
     }
 }
@@ -305,7 +311,7 @@ pub fn acquire(
             false => match read_lease(ops, &lease_file)? {
                 Some(record) if !is_stale(&record) => {
                     return Err(LeaseBusy {
-                        record,
+                        record: Some(record),
                         stale: false,
                     }
                     .into());
@@ -319,7 +325,7 @@ pub fn acquire(
                 }
                 Some(record) => {
                     return Err(LeaseBusy {
-                        record,
+                        record: Some(record),
                         stale: true,
                     }
                     .into());
@@ -337,7 +343,7 @@ pub fn acquire(
                         // without the record. Force is only authorized for
                         // a confirmed stale lease, never an unknown one.
                         return Err(LeaseBusy {
-                            record: marker_record(&markers[0]),
+                            record: None,
                             stale: false,
                         }
                         .into());
@@ -532,23 +538,6 @@ fn find_markers(ops: &mut dyn RemoteOps, lease_dir: &RemotePath) -> Result<Vec<R
         .collect())
 }
 
-/// A placeholder record for a claim whose marker is visible but whose
-/// record is unreadable, so the busy path can still report it honestly.
-fn marker_record(marker: &RemotePath) -> LeaseRecord {
-    LeaseRecord {
-        owner: "another executor (its lease record is unreadable)".to_owned(),
-        executor: ExecutorKind::Worker,
-        operation_id: marker
-            .file_name()
-            .and_then(|name| name.strip_prefix(HOLDER_PREFIX))
-            .unwrap_or_default()
-            .to_owned(),
-        acquired_at: Utc::now(),
-        heartbeat_at: Utc::now(),
-        ttl_secs: LEASE_TTL.as_secs(),
-    }
-}
-
 fn break_lease(
     ops: &mut dyn RemoteOps,
     lease_dir: &RemotePathBuf,
@@ -663,7 +652,7 @@ mod tests {
             Ok(_) => panic!("expected LeaseBusy"),
         };
         let busy = err.downcast_ref::<LeaseBusy>().expect("expected LeaseBusy");
-        assert_eq!(busy.record.owner, "other");
+        assert_eq!(busy.record.as_ref().unwrap().owner, "other");
         assert!(!busy.stale);
     }
 
@@ -677,7 +666,7 @@ mod tests {
             Ok(_) => panic!("expected LeaseBusy"),
         };
         let busy = err.downcast_ref::<LeaseBusy>().expect("expected LeaseBusy");
-        assert_eq!(busy.record.owner, "other");
+        assert_eq!(busy.record.as_ref().unwrap().owner, "other");
         assert!(busy.stale);
 
         // The foreign lease is untouched: nothing was deleted.
@@ -870,6 +859,10 @@ mod tests {
             .expect("expected LeaseBusy");
             let busy = err.downcast_ref::<LeaseBusy>().expect("expected LeaseBusy");
             assert!(!busy.stale, "an unreadable heartbeat does not prove expiry");
+            assert!(
+                busy.record.is_none(),
+                "a hidden record is reported as unknown, not fabricated"
+            );
         }
 
         // And on a host whose listings are filtered too, the same claim

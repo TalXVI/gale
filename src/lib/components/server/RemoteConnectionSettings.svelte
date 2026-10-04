@@ -14,9 +14,9 @@
 	const formId = $props.id();
 
 	const protocolInfo = $derived(
-		form.form.remote.protocol === 'sftp'
+		form.form.remote.transport.protocol === 'sftp'
 			? m.dedicatedServerDialog_sftpInfo()
-			: form.form.remote.protocol === 'ftps'
+			: form.form.remote.transport.protocol === 'ftps'
 				? m.dedicatedServerDialog_ftpsInfo()
 				: m.dedicatedServerDialog_ftpInfo()
 	);
@@ -32,7 +32,7 @@
 			id={`${formId}-protocol`}
 			type="single"
 			triggerClass="mt-1 w-full"
-			value={form.form.remote.protocol}
+			value={form.form.remote.transport.protocol}
 			onValueChange={(value) => form.changeRemoteProtocol(value as RemoteProtocol)}
 			items={[
 				{ value: 'sftp', label: m.dedicatedServerDialog_protocolSftp() },
@@ -40,7 +40,7 @@
 				{ value: 'ftp', label: m.dedicatedServerDialog_protocolFtp() }
 			]}
 		/>
-		{#if form.form.remote.protocol === 'ftp'}
+		{#if form.form.remote.transport.protocol === 'ftp'}
 			<p class="mt-1 text-sm text-orange-600 dark:text-orange-400">
 				{m.serverPage_ftpPlaintextNote()}
 			</p>
@@ -50,14 +50,14 @@
 		<Label for={`${formId}-host`}>{m.dedicatedServerDialog_host()}</Label><InputField
 			id={`${formId}-host`}
 			class="mt-1 w-full"
-			bind:value={form.form.remote.host}
+			bind:value={form.form.remote.transport.host}
 			placeholder="example.com"
 		/>
 	</div>
 	<div class="grid grid-cols-2 gap-3">
 		<div>
 			<Label for={`${formId}-remote-port`}
-				>{form.form.remote.protocol === 'sftp'
+				>{form.form.remote.transport.protocol === 'sftp'
 					? m.dedicatedServerDialog_sshPort()
 					: m.dedicatedServerDialog_ftpPort()}</Label
 			><InputField
@@ -71,18 +71,18 @@
 			<Label for={`${formId}-username`}>{m.dedicatedServerDialog_username()}</Label><InputField
 				id={`${formId}-username`}
 				class="mt-1 w-full"
-				bind:value={form.form.remote.username}
+				bind:value={form.form.remote.transport.username}
 			/>
 		</div>
 	</div>
-	{#if form.form.remote.protocol === 'sftp'}
+	{#if form.form.remote.transport.protocol === 'sftp'}
 		<div>
 			<Label for={`${formId}-auth`}>{m.dedicatedServerDialog_authentication()}</Label>
 			<Select
 				id={`${formId}-auth`}
 				type="single"
 				triggerClass="mt-1 w-full"
-				bind:value={form.form.remote.authentication}
+				bind:value={form.form.remote.transport.authentication}
 				items={[
 					{ value: 'password', label: m.dedicatedServerDialog_password() },
 					{ value: 'privateKey', label: m.dedicatedServerDialog_privateKeyFile() },
@@ -91,35 +91,36 @@
 			/>
 		</div>
 	{/if}
-	{#if form.form.remote.protocol === 'sftp' && form.form.remote.authentication === 'privateKey'}
+	{#if form.form.remote.transport.protocol === 'sftp' && form.form.remote.transport.authentication === 'privateKey'}
 		<PathField
 			label={m.dedicatedServerDialog_privateKey()}
-			bind:value={form.form.remote.privateKeyPath}
+			bind:value={form.form.remote.transport.privateKeyPath}
 			onclick={() => form.choosePrivateKey()}
 			icon="mdi:file-key"
 		>
 			{m.dedicatedServerDialog_privateKeyInfo()}
 		</PathField>
 	{/if}
-	{#if form.form.remote.protocol !== 'sftp' || form.form.remote.authentication !== 'agent'}
+	{#if form.form.remote.transport.protocol !== 'sftp' || form.form.remote.transport.authentication !== 'agent'}
 		<SecretField
 			id={`${formId}-remote-password`}
-			label={form.form.remote.protocol !== 'sftp' || form.form.remote.authentication === 'password'
+			label={form.form.remote.transport.protocol !== 'sftp' ||
+			form.form.remote.transport.authentication === 'password'
 				? m.dedicatedServerDialog_password()
 				: m.dedicatedServerDialog_keyPassphrase()}
-			bind:value={form.remotePassword}
+			bind:value={form.credentials.remotePassword.value}
 			saved={form.remoteCredentialSaved}
-			rememberLabel={form.form.remote.authentication === 'privateKey'
+			rememberLabel={form.form.remote.transport.authentication === 'privateKey'
 				? m.serverPage_rememberPassphrase()
 				: m.dedicatedServerDialog_rememberPassword()}
-			bind:remember={form.rememberRemotePassword}
+			bind:remember={form.credentials.remotePassword.remember}
 		/>
 	{/if}
 	<div>
 		<Label for={`${formId}-directory`}>{m.dedicatedServerDialog_directory()}</Label><InputField
 			id={`${formId}-directory`}
 			class="mt-1 w-full"
-			bind:value={form.form.remote.serverDirectory}
+			bind:value={form.form.remote.transport.serverDirectory}
 			placeholder="/"
 		/>
 	</div>
