@@ -200,6 +200,7 @@ impl WorkerJournal {
     /// Clears the poll error for a latched credential rejection, including
     /// the generic token error retained by older workers. Other poll errors
     /// and all operational state are kept.
+    #[cfg(any(windows, test))]
     pub fn replace_sync_credential(&mut self, refresh_token: String) {
         if self.sync_reauthorization_required && self.poll_error_is_sync_rejection() {
             self.clear_poll_error();
@@ -214,6 +215,7 @@ impl WorkerJournal {
         self.poll_error.take().is_some()
     }
 
+    #[cfg(any(windows, test))]
     fn poll_error_is_sync_rejection(&self) -> bool {
         match self.poll_error_kind {
             Some(kind) => kind == PollErrorKind::SyncReauthorizationRequired,
