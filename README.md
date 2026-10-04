@@ -27,7 +27,7 @@ Publishing is designed for a single designated owner. Simultaneous publishes fro
 ## Installation
 
 > [!WARNING]
-> The only official sources for Gale are [Github](https://github.com/Kesomannen/gale) and [Thunderstore](https://thunderstore.io/c/lethal-company/p/Kesomannen/GaleModManager/). Any other website claiming to provide an official download is not legit. Particularly, **galemodmanager.com** is unofficial and provides a severly outdated version of the app!
+> The only official sources for Gale are [Github](https://github.com/Kesomannen/gale), [Thunderstore](https://thunderstore.io/c/lethal-company/p/Kesomannen/GaleModManager/) and [Hexium](https://hexium.gg/mod-manager). Any other website claiming to provide an official download is not legit. Particularly, **galemodmanager.com** is unofficial and provides a severly outdated version of the app!
 
 ### Windows
 

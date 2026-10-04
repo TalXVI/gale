@@ -1,6 +1,6 @@
 {
 	"productName": "Gale",
-	"version": "1.22.3",
+	"version": "1.23.1",
 	"identifier": "com.kesomannen.gale",
 	"build": {
 		"beforeBuildCommand": "pnpm run build",
@@ -52,9 +52,7 @@
 	"plugins": {
 		"updater": {
 			"pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDk1M0ZDQTIxMkFDNEUwNkMKUldSczRNUXFJY28vbGNqZE9vTEphdnoycldtTzJGclZKQVJjUWM4djRLOHNaSHdRWXlvQkYva20K",
-			"endpoints": [
-				"https://github.com/TalXVI/gale/releases/latest/download/latest.json"
-			]
+			"endpoints": ["https://github.com/TalXVI/gale/releases/latest/download/latest.json"]
 		},
 		"deep-link": {
 			"desktop": {

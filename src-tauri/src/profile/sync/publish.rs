@@ -635,8 +635,9 @@ mod tests {
                 source: Backend::Thunderstore,
             }],
             game: Some("risk-of-rain-2".to_owned()),
-            ignored_version_updates: Vec::new(),
-            ignored_package_updates: Vec::new(),
+            ignored_version_updates: Default::default(),
+            ignored_package_updates: Default::default(),
+            excluded_files: Default::default(),
             sync: None,
         }
     }

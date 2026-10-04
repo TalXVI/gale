@@ -245,7 +245,13 @@ impl ProfileModKind {
     ) -> impl Iterator<Item = BorrowedMod<'a>> {
         self.direct_dependencies(thunderstore)
             .into_iter()
-            .flat_map(|deps| thunderstore.dependencies(deps))
+            .flat_map(|dependency_idents| {
+                thunderstore.dependencies(
+                    dependency_idents
+                        .iter()
+                        .map(|ident| (ident, self.backend())),
+                )
+            })
     }
 }
 
@@ -328,11 +334,11 @@ impl Profile {
     /// out those already installed.
     fn missing_deps<'a>(
         &'a self,
-        idents: impl IntoIterator<Item = &'a VersionIdent>,
+        dependencies: impl IntoIterator<Item = (&'a VersionIdent, Backend)>,
         thunderstore: &'a Thunderstore,
     ) -> impl Iterator<Item = BorrowedMod<'a>> + 'a {
         thunderstore
-            .dependencies(idents)
+            .dependencies(dependencies)
             .filter(|dep| !self.has_mod(dep.package.uuid))
     }
 

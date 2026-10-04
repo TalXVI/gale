@@ -146,7 +146,7 @@ pub async fn oauth_credentials(app: &AppHandle) -> Result<AuthCredentials> {
     // arrive before — or be routed to — another flow.
     let callback = app.sync_auth().begin_oauth()?;
     let url = format!("{}/auth/login", *super::API_URL);
-    open::that(url).context("failed to open url in browser")?;
+    open::that_detached(url).context("failed to open url in browser")?;
 
     tokio::select! {
         url = callback => {
