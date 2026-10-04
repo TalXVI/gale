@@ -431,6 +431,9 @@ fn start_installed_worker(
     let exe = root.join(local::WORKER_EXE);
     let service = create_service(manager, &exe, root)?;
     let result = (|| {
+        service
+            .set_description(DESCRIPTION)
+            .context("failed to set the service description")?;
         apply_directory_acls(root, private).context("failed to set directory permissions")?;
         install_worker_binary(root)?;
         install_payload()?;
@@ -609,7 +612,7 @@ fn create_service(
         ))),
         account_password: None,
     };
-    let service = manager
+    manager
         .create_service(
             &info,
             ServiceAccess::QUERY_STATUS
@@ -618,11 +621,7 @@ fn create_service(
                 | ServiceAccess::DELETE
                 | ServiceAccess::CHANGE_CONFIG,
         )
-        .context("failed to create the service")?;
-    service
-        .set_description(DESCRIPTION)
-        .context("failed to set the service description")?;
-    Ok(service)
+        .context("failed to create the service")
 }
 
 /// `gale-worker service reinstall --log <file>`: re-registers the service
