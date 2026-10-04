@@ -47,8 +47,12 @@ pub struct ProfileManifest {
     /// File paths could be exported from one OS to another so paths need to be normalized
     /// to use forward slashes, which is not guaranteed by PathBuf on Windows, so we use
     /// strings instead.
-    #[serde(default)]
-    pub excluded_files: HashSet<String>,
+    ///
+    /// `None` leaves the importing profile's own exclusions untouched. Sync
+    /// publications omit the field because exclusions are a local export
+    /// preference, not part of the shared profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excluded_files: Option<HashSet<String>>,
 }
 
 impl ProfileManifest {
@@ -59,7 +63,7 @@ impl ProfileManifest {
             game: None,
             ignored_version_updates: HashSet::new(),
             ignored_package_updates: HashSet::new(),
-            excluded_files: HashSet::new(),
+            excluded_files: None,
             sync: None,
         }
     }
@@ -455,7 +459,7 @@ fn prepare_export(profile: &Profile) -> Result<(ProfileManifest, Vec<PathBuf>)> 
         .map_ok(|file| file.path)
         .collect::<Result<Vec<_>>>()?;
 
-    manifest.excluded_files = excluded_files;
+    manifest.excluded_files = Some(excluded_files);
 
     Ok((manifest, config_paths))
 }
@@ -511,11 +515,7 @@ pub(super) fn build_manifest(profile: &Profile) -> ProfileManifest {
         ignored_version_updates: profile.ignored_version_updates.iter().copied().collect(),
         ignored_package_updates: profile.ignored_package_updates.iter().copied().collect(),
         sync: None,
-        excluded_files: profile
-            .excluded_export_files
-            .iter()
-            .map(|path| path.to_string_lossy().replace("\\", "/"))
-            .collect(),
+        excluded_files: None,
     }
 }
 

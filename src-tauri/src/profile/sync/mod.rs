@@ -1792,6 +1792,20 @@ mod tests {
     }
 
     #[test]
+    fn published_manifests_leave_out_local_export_exclusions() {
+        let mut profile = profile_with_mods(Vec::new());
+        profile
+            .excluded_export_files
+            .insert(Path::new("BepInEx/config/local.cfg").to_owned());
+
+        let manifest = crate::profile::export::build_manifest(&profile);
+
+        assert!(manifest.excluded_files.is_none());
+        let json = serde_json::to_string(&manifest).unwrap();
+        assert!(!json.contains("excludedFiles"));
+    }
+
+    #[test]
     fn mod_set_matches_requires_exact_set() {
         let id = mod_id(1);
         let expected = vec![R2Mod {

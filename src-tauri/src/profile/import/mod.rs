@@ -342,7 +342,7 @@ fn prepare_import(
 
             profile.ignored_version_updates = ignored_version_updates;
             profile.ignored_package_updates = ignored_package_updates;
-            profile.excluded_export_files = excluded_files.into_iter().map(PathBuf::from).collect();
+            apply_excluded_files(profile, excluded_files);
 
             let imported = ImportedProfile {
                 id: profile.id,
@@ -381,7 +381,7 @@ fn prepare_import(
 
             profile.ignored_version_updates = ignored_version_updates;
             profile.ignored_package_updates = ignored_package_updates;
-            profile.excluded_export_files = excluded_files.into_iter().map(PathBuf::from).collect();
+            apply_excluded_files(profile, excluded_files);
 
             let imported = ImportedProfile {
                 id: profile.id,
@@ -397,6 +397,14 @@ fn prepare_import(
     };
 
     Ok((to_install, imported))
+}
+
+/// Manifests without exclusions, such as sync publications, keep the
+/// profile's own export preferences.
+fn apply_excluded_files(profile: &mut Profile, excluded_files: Option<HashSet<String>>) {
+    if let Some(excluded_files) = excluded_files {
+        profile.excluded_export_files = excluded_files.into_iter().map(PathBuf::from).collect();
+    }
 }
 
 pub(super) fn cleanup_failed_profile(profile_id: i64, app: &AppHandle) -> Result<()> {
@@ -662,6 +670,26 @@ mod tests {
             missing: false,
             excluded_export_files: Default::default(),
         }
+    }
+
+    #[test]
+    fn manifests_without_exclusions_keep_the_profiles_own() {
+        let dir = tempdir().unwrap();
+        let mut profile = profile_at(dir.path(), Vec::new());
+        let local = PathBuf::from("BepInEx/config/local.cfg");
+        profile.excluded_export_files.insert(local.clone());
+
+        apply_excluded_files(&mut profile, None);
+        assert_eq!(profile.excluded_export_files, HashSet::from([local]));
+
+        apply_excluded_files(
+            &mut profile,
+            Some(HashSet::from(["BepInEx/config/shared.cfg".to_owned()])),
+        );
+        assert_eq!(
+            profile.excluded_export_files,
+            HashSet::from([PathBuf::from("BepInEx/config/shared.cfg")])
+        );
     }
 
     #[test]
