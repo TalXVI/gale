@@ -159,7 +159,9 @@ impl<'a> ArgsContext<'a> {
         match version {
             3 => Ok(("--doorstop-enable", "--doorstop-target")),
             4 => Ok(("--doorstop-enabled", "--doorstop-target-assembly")),
-            vers => bail!("unsupported doorstop version: {}", vers),
+            vers => {
+                bail!("unsupported doorstop version: {}", vers);
+            }
         }
     }
 

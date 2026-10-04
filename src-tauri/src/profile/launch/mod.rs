@@ -239,7 +239,9 @@ impl ManagedGame {
 
 fn do_launch(mut command: Command, app: &AppHandle, mode: LaunchMode) -> Result<()> {
     match mode.instances() {
-        0 => bail!("instances must be greater than 0"),
+        0 => {
+            bail!("instances must be greater than 0");
+        }
         1 => {
             command.spawn()?;
         }

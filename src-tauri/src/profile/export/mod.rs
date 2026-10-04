@@ -677,7 +677,7 @@ fn list_export_files(profile: &Profile) -> impl Iterator<Item = Result<ExportFil
         let full_path = profile.path.join(&path);
         let size = std::fs::metadata(full_path).map(|meta| meta.len() as usize)?;
 
-        let included = profile.excluded_export_files.get(&path).is_none();
+        let included = !profile.excluded_export_files.contains(&path);
 
         Ok(ExportFile {
             path,

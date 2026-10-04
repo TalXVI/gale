@@ -66,7 +66,9 @@ fn required_token(method: &Method, token: Result<Option<String>>) -> Result<Opti
 
     match token? {
         Some(token) => Ok(Some(token)),
-        None => bail!("sign in to sync before modifying a profile"),
+        None => {
+            bail!("sign in to sync before modifying a profile");
+        }
     }
 }
 
@@ -455,7 +457,7 @@ fn resolve_target(
                 profile_id: None,
                 prior_sync: resolved.and_then(|profile| profile.sync.clone()),
                 dir: resolved.map(|profile| profile.path.clone()),
-                game: *game,
+                game,
             })
         }
     }
@@ -501,11 +503,8 @@ async fn apply_archive(
             .and_then(|applied| applied.mods_revision.as_ref())
             != Some(&latest.mods_revision);
 
-    let before = if needs_install && resolved.dir.is_some() {
-        apply::snapshot_config(
-            resolved.dir.as_ref().unwrap(),
-            resolved.game.mod_loader.mod_config_dirs(),
-        )?
+    let before = if needs_install && let Some(dir) = &resolved.dir {
+        apply::snapshot_config(dir, resolved.game.mod_loader.mod_config_dirs())?
     } else {
         BTreeMap::new()
     };
@@ -748,7 +747,9 @@ pub async fn pull_profile(
         let (_, profile) = manager.profile_by_id(profile_id)?;
 
         match &profile.sync {
-            Some(data) if data.missing => bail!("cannot pull from missing profile"),
+            Some(data) if data.missing => {
+                bail!("cannot pull from missing profile");
+            }
             Some(data) => (data.id.clone(), profile.name.clone(), data.synced_at),
             None => return Ok(apply::ConfigApplyReport::default()),
         }
@@ -890,17 +891,19 @@ fn sync_apply_target<'a>(
     Ok(sync)
 }
 
-/// Runs `apply::apply_selected` on a clone of the sync's applied state and
-/// writes the clone back even when the apply fails part-way, so progress and
-/// decisions made before the failure survive.
+struct ConfigApplySelection<'a> {
+    files: &'a [ConfigPath],
+    restore_deleted: &'a [ConfigPath],
+    remember: bool,
+}
+
+/// Records partial progress and decisions even when applying selected config fails.
 fn apply_selected_and_record<F>(
     profile_dir: &Path,
     config: &BTreeMap<ConfigPath, archive::ValidatedConfigFile>,
     latest: &SyncManifest,
     sync: &mut SyncProfileData,
-    files: &[ConfigPath],
-    restore_deleted: &[ConfigPath],
-    remember: bool,
+    selection: ConfigApplySelection<'_>,
     write: F,
 ) -> Result<Vec<ConfigPath>>
 where
@@ -915,9 +918,9 @@ where
         profile_dir,
         config,
         &mut applied,
-        files,
-        restore_deleted,
-        remember,
+        selection.files,
+        selection.restore_deleted,
+        selection.remember,
         write,
     );
     sync.applied = Some(applied);
@@ -953,9 +956,11 @@ async fn apply_selected_config(
         &normalized.config,
         &normalized.latest,
         sync,
-        &files,
-        &restore_deleted,
-        remember,
+        ConfigApplySelection {
+            files: &files,
+            restore_deleted: &restore_deleted,
+            remember,
+        },
         apply::write_validated,
     );
 
@@ -1335,9 +1340,11 @@ mod tests {
                 &config,
                 latest,
                 sync,
-                &[],
-                &[],
-                false,
+                ConfigApplySelection {
+                    files: &[],
+                    restore_deleted: &[],
+                    remember: false,
+                },
                 apply::write_validated,
             )
         };
@@ -1469,7 +1476,7 @@ mod tests {
         assert!(review.pending.iter().any(|u| u.path == first));
         assert!(!review.declined.iter().any(|u| u.path == first));
 
-        apply::decline_selected(&mut state, &[first.clone()], false).unwrap();
+        apply::decline_selected(&mut state, std::slice::from_ref(&first), false).unwrap();
         publish(subscriber, &mut state, manifest.clone(), owner_v2.clone());
         assert_eq!(
             std::fs::read(subscriber.join(first.as_str())).unwrap(),
@@ -1488,7 +1495,7 @@ mod tests {
             subscriber,
             &normalized.config,
             &mut state,
-            &[first.clone()],
+            std::slice::from_ref(&first),
             &[],
             false,
         )
@@ -1510,7 +1517,7 @@ mod tests {
         assert!(!subscriber.join(second.as_str()).exists());
         assert_eq!(state.pending[&second], PendingConfigReason::DeletedLocally);
 
-        apply::decline_selected(&mut state, &[second.clone()], false).unwrap();
+        apply::decline_selected(&mut state, std::slice::from_ref(&second), false).unwrap();
         publish(subscriber, &mut state, manifest.clone(), deleted_v2.clone());
         assert!(!subscriber.join(second.as_str()).exists());
         assert!(
@@ -1526,8 +1533,8 @@ mod tests {
             subscriber,
             &normalized.config,
             &mut state,
-            &[second.clone()],
-            &[second.clone()],
+            std::slice::from_ref(&second),
+            std::slice::from_ref(&second),
             false,
         )
         .unwrap();
@@ -1634,9 +1641,11 @@ mod tests {
                 &config,
                 &latest_manifest,
                 sync,
-                &[p.clone()],
-                &[],
-                false,
+                ConfigApplySelection {
+                    files: std::slice::from_ref(&p),
+                    restore_deleted: &[],
+                    remember: false,
+                },
                 apply::write_validated,
             )
         });
@@ -1686,9 +1695,11 @@ mod tests {
             &config,
             &latest_manifest,
             &mut sync,
-            &[p.clone(), q.clone()],
-            &[],
-            false,
+            ConfigApplySelection {
+                files: &[p.clone(), q.clone()],
+                restore_deleted: &[],
+                remember: false,
+            },
             |target, file| {
                 calls += 1;
                 if calls == 2 {
@@ -1724,9 +1735,11 @@ mod tests {
             &config,
             &latest_manifest,
             &mut sync,
-            &[p.clone(), q.clone()],
-            &[],
-            false,
+            ConfigApplySelection {
+                files: &[p.clone(), q.clone()],
+                restore_deleted: &[],
+                remember: false,
+            },
             apply::write_validated,
         )
         .unwrap();

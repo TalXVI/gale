@@ -121,7 +121,9 @@ pub async fn import_local_mod(
                     .context("failed to create plugin directory")?;
                 fs::copy(path, target).context("failed to copy file")?;
             }
-            _ => bail!("currently unsupported"),
+            _ => {
+                bail!("currently unsupported");
+            }
         },
     }
 
@@ -148,7 +150,9 @@ fn read_local_mod(
         (Some(kind), _) => kind,
         (_, Some("dll")) => LocalModKind::Dll,
         (_, Some("zip")) => LocalModKind::Zip,
-        _ => bail!("unsupported file type"),
+        _ => {
+            bail!("unsupported file type");
+        }
     };
 
     let manifest = match kind {

@@ -46,7 +46,9 @@ impl HostControl for NoHostControl {
     }
 
     fn restart<'a>(&'a self) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async { bail!("no hosting provider is configured") })
+        Box::pin(async {
+            bail!("no hosting provider is configured");
+        })
     }
 
     fn status<'a>(&'a self) -> BoxFuture<'a, Result<HostStatus>> {

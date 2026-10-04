@@ -284,10 +284,10 @@ impl Thunderstore {
         let profile = manager.active_profile();
 
         deduplicate_results(results, args.max_count.unwrap_or(usize::MAX)).map(|deduplicated| {
-            let deduplicated = deduplicated.map(|backend_mod| FrontendMod::from(backend_mod));
+            let deduplicated = deduplicated.map(FrontendMod::from);
             let is_installed = deduplicated
                 .first()
-                .map_or(false, |m| profile.has_mod(m.uuid));
+                .is_some_and(|m| profile.has_mod(m.uuid));
 
             ModListQueryItem {
                 is_installed,

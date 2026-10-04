@@ -301,7 +301,7 @@ async fn refresh_desktop_token(refresh_token: String, app: &AppHandle) -> Result
         Err(error) if is_refresh_rejected(&error) => {
             error!("failed to refresh access token: {error:#}");
             expire_session(app, &refresh_token)?;
-            bail!("sync session expired; sign in again")
+            bail!("sync session expired; sign in again");
         }
         Err(error) => Err(error.wrap_err("could not refresh sync session; try again")),
     }

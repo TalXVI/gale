@@ -20,7 +20,9 @@ pub fn apply_game_args(
 ) -> Result<()> {
     match &*game.slug {
         "valheim" => valheim_args(command, settings, password),
-        slug => bail!("dedicated server launch is not supported for {slug}"),
+        slug => {
+            bail!("dedicated server launch is not supported for {slug}");
+        }
     }
 }
 
@@ -35,7 +37,9 @@ pub fn validate_game_args(
 
     match &*game.slug {
         "valheim" => validate_valheim(settings, password),
-        slug => bail!("dedicated server launch is not supported for {slug}"),
+        slug => {
+            bail!("dedicated server launch is not supported for {slug}");
+        }
     }
 }
 

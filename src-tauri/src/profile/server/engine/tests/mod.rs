@@ -178,7 +178,7 @@ fn context() -> PlanContext {
 /// The heartbeat would only connect after the 60s interval; deployments
 /// in these tests finish first, so the factory is never exercised.
 fn no_connect() -> Result<Box<dyn RemoteOps>> {
-    eyre::bail!("heartbeat connection not expected in tests")
+    eyre::bail!("heartbeat connection not expected in tests");
 }
 
 fn meta() -> OperationMeta {
@@ -1974,7 +1974,7 @@ async fn restart_verification_requires_evidence_and_stops_promptly() {
         fn restart<'a>(&'a self) -> BoxFuture<'a, Result<()>> {
             Box::pin(async move {
                 if self.fail_restart {
-                    bail!("restart rejected")
+                    bail!("restart rejected");
                 }
                 Ok(())
             })
@@ -2115,14 +2115,18 @@ async fn a_failed_restart_reports_its_reason_in_the_deployment_warnings() {
         fn restart<'a>(&'a self) -> BoxFuture<'a, Result<()>> {
             Box::pin(async move {
                 match self.restart_error {
-                    Some(error) => bail!(error),
+                    Some(error) => {
+                        bail!(error);
+                    }
                     None => Ok(()),
                 }
             })
         }
 
         fn status<'a>(&'a self) -> BoxFuture<'a, Result<HostStatus>> {
-            Box::pin(async move { bail!(self.status_error) })
+            Box::pin(async move {
+                bail!(self.status_error);
+            })
         }
 
         fn name(&self) -> &'static str {

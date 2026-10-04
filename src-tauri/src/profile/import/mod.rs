@@ -214,12 +214,12 @@ pub(super) async fn import_manifest(
                         err
                     );
                 });
-            } else if let Some(revert) = imported.revert {
-                if let Err(restore_err) = restore_imported_profile(imported.id, revert, app) {
-                    return Err(eyre::eyre!(err).wrap_err(format!(
-                        "failed to restore the previous mod set: {restore_err:#}"
-                    )));
-                }
+            } else if let Some(revert) = imported.revert
+                && let Err(restore_err) = restore_imported_profile(imported.id, revert, app)
+            {
+                return Err(eyre::eyre!(err).wrap_err(format!(
+                    "failed to restore the previous mod set: {restore_err:#}"
+                )));
             }
 
             Err(err.into())

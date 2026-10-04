@@ -109,7 +109,9 @@ pub(super) fn generate_latest(
 
     let latest_snapshot = match latest_snapshot {
         Some(snapshot) => snapshot,
-        None => bail!("no previous version found to compare against"),
+        None => {
+            bail!("no previous version found to compare against");
+        }
     };
 
     let old_mods = borrow_mods(latest_snapshot, thunderstore);

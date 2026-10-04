@@ -767,7 +767,7 @@ fn bundled_exe(name: &str) -> Result<PathBuf> {
     bail!(
         "{} was not found next to Gale or in target/. Package it with the app or run `cargo build --features worker --bin gale-worker`",
         name
-    )
+    );
 }
 
 #[cfg(windows)]

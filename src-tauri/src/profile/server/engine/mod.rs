@@ -523,11 +523,15 @@ fn ensure_ownership(lease: &Lease, session: &mut Session) -> Result<()> {
             }
             Ownership::Lost { holder } => match holder {
                 Some(owner) => {
-                    bail!("the deployment lease was taken over by {owner}; aborting this operation")
+                    bail!(
+                        "the deployment lease was taken over by {owner}; aborting this operation"
+                    );
                 }
-                None => bail!(
-                    "the deployment lease was removed by another executor; aborting this operation"
-                ),
+                None => {
+                    bail!(
+                        "the deployment lease was removed by another executor; aborting this operation"
+                    );
+                }
             },
             Ownership::Unverifiable(err) => {
                 warn!(attempt, %err, "could not verify deployment lease ownership; retrying");

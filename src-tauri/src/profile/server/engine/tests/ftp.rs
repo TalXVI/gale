@@ -18,7 +18,9 @@ fn ftp_ops(addr: std::net::SocketAddr) -> Result<Box<dyn RemoteOps>> {
     };
     match remote::connect(&settings, "pw")? {
         ConnectionAttempt::Connected(conn) => Ok(conn),
-        _ => eyre::bail!("unexpected trust prompt from the fake FTP server"),
+        _ => {
+            eyre::bail!("unexpected trust prompt from the fake FTP server");
+        }
     }
 }
 
@@ -42,7 +44,9 @@ fn ftps_connection(server: &remote::fake_ftp::FakeFtp) -> Result<Box<dyn RemoteO
     };
     match remote::connect(&settings, "pw")? {
         ConnectionAttempt::Connected(conn) => Ok(conn),
-        _ => eyre::bail!("pinned fake FTPS certificate was not accepted"),
+        _ => {
+            eyre::bail!("pinned fake FTPS certificate was not accepted");
+        }
     }
 }
 
@@ -68,7 +72,9 @@ fn ftps_ops(addr: std::net::SocketAddr, certificate: &str) -> Result<Box<dyn Rem
     };
     match remote::connect(&settings, "pw")? {
         ConnectionAttempt::Connected(conn) => Ok(conn),
-        _ => eyre::bail!("pinned fake FTPS certificate was not accepted"),
+        _ => {
+            eyre::bail!("pinned fake FTPS certificate was not accepted");
+        }
     }
 }
 
