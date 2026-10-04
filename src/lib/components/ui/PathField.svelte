@@ -40,6 +40,7 @@
 	<button
 		class="group hover:border-primary-400 dark:bg-primary-900 dark:hover:border-primary-500 bg-primary-100 flex grow basis-0 items-center truncate rounded-lg border border-transparent py-1 pr-1 pl-3 text-right"
 		{onclick}
+		aria-label={label ?? undefined}
 	>
 		<div class="mr-2 rounded-sm">
 			<Icon {icon} class="text-primary-600 dark:text-primary-300 align-middle" />

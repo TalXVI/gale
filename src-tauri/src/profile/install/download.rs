@@ -7,6 +7,7 @@ use eyre::{Context, Result, eyre};
 use futures_util::StreamExt;
 use http::header;
 use reqwest::{StatusCode, header::HeaderValue};
+use reqwest_middleware::ClientWithMiddleware;
 use tauri::AppHandle;
 use tracing::{debug, warn};
 
@@ -39,6 +40,25 @@ pub(super) async fn download(
         "downloading mod"
     );
 
+    let progress = |bytes| emit(InstallEvent::AddProgress { mods: 0, bytes }, app);
+    let check = || check_cancel(cancel, options);
+
+    fetch(app.http(), &url, install.file_size, &progress, &check).await
+}
+
+/// Downloads the file at `url` into memory, retrying (and resuming) if the
+/// connection is interrupted.
+///
+/// `progress` receives the change in downloaded bytes, which is negative when a
+/// partial download has to be discarded. `check_cancel` is polled while data
+/// arrives and stops the download when it returns an error.
+pub(crate) async fn fetch(
+    client: &ClientWithMiddleware,
+    url: &str,
+    size_hint: u64,
+    progress: &(dyn Fn(i64) + Sync),
+    check_cancel: &(dyn Fn() -> InstallResult<()> + Sync),
+) -> InstallResult<Vec<u8>> {
     // how many times in a row a download may fail without making any progress
     // before we give up
     const MAX_RETRIES: usize = 5;
@@ -48,7 +68,7 @@ pub(super) async fn download(
     const INITIAL_BACKOFF: Duration = Duration::from_secs(2);
     const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
-    let mut response = Vec::with_capacity(install.file_size as usize);
+    let mut response = Vec::with_capacity(size_hint as usize);
     let mut retries = 0;
     let mut attempts = 0;
     let mut backoff = INITIAL_BACKOFF;
@@ -57,7 +77,7 @@ pub(super) async fn download(
         let downloaded = response.len();
         attempts += 1;
 
-        match try_download(&mut response, &url, cancel, options, app).await {
+        match try_download(&mut response, url, client, progress, check_cancel).await {
             Ok(()) => break Ok(response),
             Err(InstallError::Cancelled) => return Err(InstallError::Cancelled),
             Err(InstallError::Error(err)) => {
@@ -71,7 +91,7 @@ pub(super) async fn download(
                 if response.len() > downloaded {
                     debug!(
                         downloaded = response.len(),
-                        total = install.file_size,
+                        total = size_hint,
                         "download interrupted, will resume where it left off"
                     );
 
@@ -88,7 +108,7 @@ pub(super) async fn download(
                 warn!(
                     attempt = attempts,
                     downloaded = response.len(),
-                    total = install.file_size,
+                    total = size_hint,
                     err = ?err,
                     url = %url,
                     backoff = ?backoff,
@@ -111,13 +131,13 @@ pub(super) async fn download(
 async fn try_download(
     buf: &mut Vec<u8>,
     url: &str,
-    cancel: &AtomicBool,
-    options: &InstallOptions,
-    app: &AppHandle,
+    client: &ClientWithMiddleware,
+    progress: &(dyn Fn(i64) + Sync),
+    check_cancel: &(dyn Fn() -> InstallResult<()> + Sync),
 ) -> InstallResult<()> {
     const UPDATE_DELAY: Duration = Duration::from_millis(100);
 
-    let (response, expected_len) = match send_download_request(buf, url, app).await? {
+    let (response, expected_len) = match send_download_request(buf, url, client, progress).await? {
         Some((res, len)) => (res, len),
         None => return Ok(()), // download already complete
     };
@@ -132,26 +152,14 @@ async fn try_download(
 
         if last_update.elapsed() >= UPDATE_DELAY {
             last_update = Instant::now();
-            emit(
-                InstallEvent::AddProgress {
-                    mods: 0,
-                    bytes: buf.len() as i64 - last_size_update,
-                },
-                app,
-            );
+            progress(buf.len() as i64 - last_size_update);
             last_size_update = buf.len() as i64;
 
-            check_cancel(cancel, options)?;
+            check_cancel()?;
         }
     }
 
-    emit(
-        InstallEvent::AddProgress {
-            mods: 0,
-            bytes: buf.len() as i64 - last_size_update,
-        },
-        app,
-    );
+    progress(buf.len() as i64 - last_size_update);
 
     // the connection may have been closed cleanly before all data was sent
     if let Some(expected_len) = expected_len
@@ -171,12 +179,12 @@ async fn try_download(
 async fn send_download_request(
     buf: &mut Vec<u8>,
     url: &str,
-    app: &AppHandle,
+    client: &ClientWithMiddleware,
+    progress: &(dyn Fn(i64) + Sync),
 ) -> Result<Option<(reqwest::Response, Option<u64>)>, InstallError> {
     let resumed_from = buf.len();
 
-    let mut request = app
-        .http()
+    let mut request = client
         .get(url)
         // ask for an uncompressed body, since we can't resume an archive from the
         // byte offsets of a compressed response
@@ -207,7 +215,7 @@ async fn send_download_request(
                 return Ok(None);
             }
 
-            discard_partial_download(buf, app);
+            discard_partial_download(buf, progress);
             return Err(eyre!("server rejected range request at offset {resumed_from}").into());
         }
         // the server ignored the range request, so the whole file must be downloaded again
@@ -218,7 +226,7 @@ async fn send_download_request(
                 "server ignored range request, restarting download"
             );
 
-            discard_partial_download(buf, app);
+            discard_partial_download(buf, progress);
             response
         }
         _ => response.error_for_status().context("request failed")?,
@@ -234,7 +242,7 @@ async fn send_download_request(
     if let Some(start) = content_range.and_then(|range| range.start)
         && start != expected_start
     {
-        discard_partial_download(buf, app);
+        discard_partial_download(buf, progress);
         return Err(eyre!("unexpected download offset {start}, expected {expected_start}").into());
     }
 
@@ -276,18 +284,12 @@ fn parse_content_range(value: &HeaderValue) -> ContentRange {
 }
 
 /// Clears a partially downloaded file, undoing its contribution to the install progress.
-fn discard_partial_download(buf: &mut Vec<u8>, app: &AppHandle) {
+fn discard_partial_download(buf: &mut Vec<u8>, progress: &(dyn Fn(i64) + Sync)) {
     if buf.is_empty() {
         return;
     }
 
-    emit(
-        InstallEvent::AddProgress {
-            mods: 0,
-            bytes: -(buf.len() as i64),
-        },
-        app,
-    );
+    progress(-(buf.len() as i64));
 
     buf.clear();
 }

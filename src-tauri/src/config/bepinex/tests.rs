@@ -206,8 +206,23 @@ fn check_to_string() {
 
 #[test]
 fn check_from_string() {
-    let left = de::from_reader(TEST_STR.as_bytes()).unwrap();
-    let right = test_file();
+    let mut left = de::from_reader(TEST_STR.as_bytes()).unwrap();
+    let mut right = test_file();
+
+    // NaN is unequal to itself. Check its semantic value before comparing
+    // the rest of the parsed document, including its type and range.
+    for file in [&mut left, &mut right] {
+        let EntryKind::Normal(entry) = &mut file.sections[1].entries[1] else {
+            panic!("expected the floating-point entry");
+        };
+        for value in [&mut entry.value, entry.default_value.as_mut().unwrap()] {
+            let Value::Single(number) = value else {
+                panic!("expected Single");
+            };
+            assert!(number.value.is_nan());
+            number.value = 0.0;
+        }
+    }
 
     assert_eq!(left, right);
 }

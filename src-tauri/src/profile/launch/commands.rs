@@ -1,7 +1,11 @@
 use eyre::Context;
 use tauri::{AppHandle, command};
 
-use crate::{profile::sync, state::ManagerExt, util::cmd::Result};
+use crate::{
+    profile::{server, sync},
+    state::ManagerExt,
+    util::cmd::Result,
+};
 
 #[command]
 pub async fn launch_game(app: AppHandle, vanilla: bool, args: Option<String>) -> Result<()> {
@@ -12,6 +16,11 @@ pub async fn launch_game(app: AppHandle, vanilla: bool, args: Option<String>) ->
 
     let prefs = app.lock_prefs();
     let manager = app.lock_manager();
+
+    // A vanilla launch leaves the profile's files alone.
+    if !vanilla {
+        server::ensure_profile_unlocked(&app, manager.active_profile().id)?;
+    }
 
     manager
         .active_game()

@@ -317,6 +317,7 @@ fn prepare_import(
 
     let (to_install, imported) = match target {
         ImportTarget::Existing(profile_id) => {
+            super::server::ensure_profile_unlocked(app, profile_id)?;
             let (game, profile) = manager.profile_by_id_mut(profile_id)?;
 
             let (to_install, revert) = incremental_update(options.merge, installs, profile)?;
@@ -345,6 +346,7 @@ fn prepare_import(
                 game.find_profile_index(&name)
             {
                 // overwrite an existing profile
+                super::server::ensure_profile_unlocked(app, game.profiles[profile_index].id)?;
                 let profile = game.set_active_profile(profile_index)?;
                 let (to_install, revert) = incremental_update(options.merge, installs, profile)?;
 
@@ -628,6 +630,7 @@ mod tests {
             modpack: None,
             sync: None,
             custom_args: String::new(),
+            server_settings: None,
             missing: false,
             excluded_export_files: Default::default(),
         }

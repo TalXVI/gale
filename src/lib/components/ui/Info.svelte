@@ -1,5 +1,6 @@
 <script lang="ts">
 	import Icon from '@iconify/svelte';
+	import { m } from '$lib/paraglide/messages';
 	import Tooltip from './Tooltip.svelte';
 	import type { Snippet } from 'svelte';
 
@@ -10,7 +11,11 @@
 	let { children }: Props = $props();
 </script>
 
-<Tooltip class="text-primary-500 dark:text-primary-400 cursor-help px-2 py-1" delayDuration={300}>
+<Tooltip
+	aria-label={m.ui_moreInformation()}
+	class="text-primary-500 dark:text-primary-400 cursor-help px-2 py-1"
+	delayDuration={300}
+>
 	<Icon icon="mdi:question-mark-circle" />
 
 	{#snippet tooltip()}

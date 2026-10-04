@@ -1,6 +1,6 @@
 use tauri::{AppHandle, command};
 
-use crate::{state::ManagerExt, util::cmd::Result};
+use crate::util::cmd::Result;
 
 use super::{
     ConfigUpdatePolicy, ListedSyncProfile, SyncProfileMetadata,
@@ -137,7 +137,7 @@ pub async fn login(app: AppHandle) -> Result<auth::User> {
 
 #[command]
 pub async fn logout(app: AppHandle) -> Result<()> {
-    app.sync_auth().set_creds(None, app.db())?;
+    auth::logout(&app).await?;
 
     Ok(())
 }

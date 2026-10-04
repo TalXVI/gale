@@ -42,7 +42,7 @@ use crate::{
 
 mod cache;
 pub mod commands;
-mod download;
+pub(crate) mod download;
 mod fs;
 mod installers;
 pub use installers::*;

@@ -13,7 +13,9 @@ use crate::{
     db::{self, Db},
     events::EventBuffer,
     prefs::Prefs,
-    profile::{self, ModManager, install::queue::InstallQueue, sync},
+    profile::{
+        self, ModManager, install::queue::InstallQueue, server::runtime::ServerRuntime, sync,
+    },
     thunderstore::{self, Thunderstore},
 };
 
@@ -28,6 +30,7 @@ pub struct AppState {
     sync_socket: sync::socket::State,
     event_buffer: EventBuffer,
     is_first_run: bool,
+    server_runtime: Mutex<ServerRuntime>,
 }
 
 impl AppState {
@@ -41,6 +44,10 @@ impl AppState {
 
     pub fn lock_thunderstore(&self) -> MutexGuard<'_, Thunderstore> {
         self.thunderstore.lock().unwrap()
+    }
+
+    pub fn lock_server_runtime(&self) -> MutexGuard<'_, ServerRuntime> {
+        self.server_runtime.lock().unwrap()
     }
 }
 
@@ -67,6 +74,7 @@ pub fn setup(app: &AppHandle) -> Result<()> {
         install_queue: InstallQueue::new(app.to_owned()),
         event_buffer: EventBuffer::new(app.to_owned()),
         is_first_run: !db_existed && !migrated,
+        server_runtime: Mutex::new(ServerRuntime::default()),
     };
 
     app.manage(state);
@@ -83,14 +91,20 @@ pub fn setup(app: &AppHandle) -> Result<()> {
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn create_http_client() -> Result<reqwest_middleware::ClientWithMiddleware> {
-    let base = reqwest::Client::builder()
+/// Gale's HTTP client without the response cache, for processes that have no
+/// app cache directory of their own, such as the worker.
+pub(crate) fn base_http_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
         .user_agent(concat!("Kesomannen-Gale/", env!("CARGO_PKG_VERSION")))
         // without these, a stalled connection would hang the request (and thus the
         // install queue) indefinitely, instead of failing so that we can retry it
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
-        .build()?;
+        .build()
+}
+
+fn create_http_client() -> Result<reqwest_middleware::ClientWithMiddleware> {
+    let base = base_http_client()?;
 
     let http = reqwest_middleware::ClientBuilder::new(base)
         .with(create_http_cache())
@@ -142,6 +156,9 @@ pub trait ManagerExt<R> {
 
     fn lock_thunderstore(&self) -> MutexGuard<'_, Thunderstore> {
         self.app_state().lock_thunderstore()
+    }
+    fn lock_server_runtime(&self) -> MutexGuard<'_, ServerRuntime> {
+        self.app_state().lock_server_runtime()
     }
 
     fn db(&self) -> &Db {

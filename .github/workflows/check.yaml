@@ -6,6 +6,7 @@ on:
   pull_request:
     branches:
       - main
+      - master
 
 jobs:
   check-backend:
@@ -19,19 +20,18 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          sudo apt update;
-          sudo apt-get install -y libappindicator3-dev librsvg2-dev libudev-dev patchelf \
-            libwebkit2gtk-4.1-0=2.44.0-2 \
-            libwebkit2gtk-4.1-dev=2.44.0-2 \
-            libjavascriptcoregtk-4.1-0=2.44.0-2 \
-            libjavascriptcoregtk-4.1-dev=2.44.0-2 \
-            gir1.2-javascriptcoregtk-4.1=2.44.0-2 \
-            gir1.2-webkit2-4.1=2.44.0-2
+          sudo apt-get update
+          sudo apt-get install -y libappindicator3-dev librsvg2-dev libudev-dev patchelf libwebkit2gtk-4.1-dev
 
       - name: Run clippy lint
         run: |
           cd src-tauri
           cargo clippy --all-targets -- -D warnings
+
+      - name: Run clippy lint with the worker
+        run: |
+          cd src-tauri
+          cargo clippy --all-targets --features worker -- -D warnings
 
   check-frontend:
     runs-on: ubuntu-latest
@@ -56,8 +56,126 @@ jobs:
       - name: Compile locales
         run: pnpm locale:compile
 
+      - name: Install test browser
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Run dialog regressions
+        run: pnpm test
+
       - name: Run Prettier lint
         run: pnpm lint
 
       - name: Run Svelte check
         run: pnpm check
+
+  test-backend:
+    strategy:
+      fail-fast: false
+      matrix:
+        # The worker also ships for Linux hosts, where it runs without the
+        # Windows service and tray code.
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libappindicator3-dev librsvg2-dev libudev-dev patchelf libwebkit2gtk-4.1-dev
+
+      # The Windows-only service, tray, and managed-worker code is linted
+      # nowhere else.
+      - name: Run clippy lint with the worker
+        if: runner.os == 'Windows'
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --features worker -- -D warnings
+
+      - name: Run worker and desktop regressions
+        run: cargo test --manifest-path src-tauri/Cargo.toml --features worker --lib
+
+      - name: Build the worker
+        run: cargo build --manifest-path src-tauri/Cargo.toml --features worker --bin gale-worker
+
+  # The FTPS data-channel close races the server's reply on Windows. One
+  # passing run proves little, so the FTP tests repeat.
+  ftp-stress:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Repeat the FTP and FTPS regressions
+        shell: bash
+        run: |
+          for run in $(seq 20); do
+            echo "::group::run $run"
+            cargo test --manifest-path src-tauri/Cargo.toml --features worker --lib -- \
+              profile::server::remote::ftp:: profile::server::engine::tests::ftp:: || exit 1
+            echo "::endgroup::"
+          done
+
+  # Installs, health-checks, and removes the GaleWorker service the way
+  # "Set up worker" does, on a disposable runner. Runners are elevated, so
+  # the install runs without the UAC step. The worker polls an unreachable
+  # sync URL: the check covers the service, not Gale sync.
+  worker-service:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the worker
+        run: cargo build --manifest-path src-tauri/Cargo.toml --features worker --bin gale-worker
+
+      - name: Install the service from a staged payload
+        shell: pwsh
+        run: |
+          $staging = Join-Path $env:RUNNER_TEMP 'worker-staging'
+          New-Item -ItemType Directory -Force $staging | Out-Null
+          $root = Join-Path $env:ProgramData 'Gale\worker'
+          @{
+            workerId = 'this-pc'
+            listen = '127.0.0.1:8472'
+            profileId = 'ci-profile'
+            game = 'valheim'
+            syncUrl = 'http://127.0.0.1:9'
+            remote = @{
+              transport = @{ protocol = 'ftp'; host = '127.0.0.1'; port = 21; username = 'ci'; serverDirectory = '/' }
+            }
+            pollIntervalSecs = 300
+            stateDir = Join-Path $root 'private'
+            secretsFile = Join-Path $root 'private\secrets.env'
+            statusFile = Join-Path $root 'status.json'
+          } | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8NoBOM (Join-Path $staging 'gale-worker.json')
+          'GALE_WORKER_TOKEN=ci-token' | Set-Content -Encoding utf8NoBOM (Join-Path $staging 'secrets.env')
+
+          $log = Join-Path $env:RUNNER_TEMP 'install.log'
+          & src-tauri/target/debug/gale-worker.exe service install --from $staging --log $log
+          $code = $LASTEXITCODE
+          if (Test-Path $log) { Get-Content $log }
+          if ($code -ne 0) { exit $code }
+
+      - name: Check the running service
+        shell: pwsh
+        run: |
+          if ((Get-Service GaleWorker).Status -ne 'Running') { throw 'GaleWorker is not running' }
+          $health = Invoke-WebRequest http://127.0.0.1:8472/v1/health
+          if ($health.StatusCode -ne 204) { throw "health returned $($health.StatusCode)" }
+          $status = Invoke-RestMethod http://127.0.0.1:8472/v1/status -Headers @{ Authorization = 'Bearer ci-token' }
+          if ($status.profileId -ne 'ci-profile') { throw "status reported profile $($status.profileId)" }
+          $denied = Invoke-WebRequest http://127.0.0.1:8472/v1/status -SkipHttpErrorCheck
+          if ($denied.StatusCode -ne 401) { throw "an unauthenticated status returned $($denied.StatusCode)" }
+
+      - name: Uninstall the service
+        if: always()
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'uninstall.log'
+          & src-tauri/target/debug/gale-worker.exe service uninstall --log $log
+          $code = $LASTEXITCODE
+          if (Test-Path $log) { Get-Content $log }
+          if ($code -ne 0) { exit $code }
+          if (Get-Service GaleWorker -ErrorAction SilentlyContinue) { throw 'GaleWorker is still registered' }
+          if (Test-Path (Join-Path $env:ProgramData 'Gale\worker')) { throw 'the worker directory was left behind' }

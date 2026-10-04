@@ -24,7 +24,6 @@
 			"icons/icon.icns",
 			"icons/icon.ico"
 		],
-		"windows": {},
 		"linux": {
 			"appimage": {
 				"files": {

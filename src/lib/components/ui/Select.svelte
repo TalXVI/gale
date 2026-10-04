@@ -12,6 +12,9 @@
 		placeholder?: string;
 		items: { value: string; label: string; disabled?: boolean }[];
 		triggerClass?: string;
+		id?: string;
+		'aria-label'?: string;
+		'aria-describedby'?: string;
 		icon?: string;
 		avoidCollisions?: boolean;
 		item?: Snippet<[{ label: string; value: string; selected: boolean }]>;
@@ -33,6 +36,9 @@
 		open = $bindable(false),
 		value = $bindable(),
 		triggerClass,
+		id,
+		'aria-label': ariaLabel,
+		'aria-describedby': ariaDescribedby,
 		items,
 		placeholder,
 		icon,
@@ -56,6 +62,9 @@
 
 <Select.Root bind:value={value as never} bind:open {...restProps}>
 	<Select.Trigger
+		{id}
+		aria-label={ariaLabel}
+		aria-describedby={ariaDescribedby}
 		class={[
 			triggerClass,
 			'group enabled:hover:border-primary-400 dark:bg-primary-900 dark:enabled:hover:border-primary-500 bg-primary-100 flex items-center gap-2 overflow-hidden rounded-lg border border-transparent py-1 pr-2 pl-3'

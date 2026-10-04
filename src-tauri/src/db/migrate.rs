@@ -106,6 +106,7 @@ fn read_manager_data(prefs: &Prefs) -> Result<SaveData> {
                 sync_data: None,
                 custom_args: String::new(),
                 ignored_package_updates: None,
+                server_settings: None,
                 excluded_export_files: None,
             });
 
