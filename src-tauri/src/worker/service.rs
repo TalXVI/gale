@@ -735,9 +735,11 @@ fn icacls(path: &Path, grants: &[&str]) -> Result<()> {
         .context("failed to run icacls")?;
     ensure!(
         output.status.success(),
-        "icacls failed for {}: {}",
+        "icacls failed for {} ({}): {}{}",
         path.display(),
-        String::from_utf8_lossy(&output.stdout)
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
     Ok(())
 }
