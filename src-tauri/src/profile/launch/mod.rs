@@ -211,7 +211,7 @@ impl ManagedGame {
             });
 
             if is_proton && let Some(proxy_dll) = self.game.mod_loader.proxy_dll() {
-                command.env("WINEDLLOVERRIDE", format!("{proxy_dll}=n,b"));
+                command.env("WINEDLLOVERRIDES", format!("{proxy_dll}=n,b"));
 
                 if matches!(platform, Some(Platform::Steam))
                     && let Some(steam) = &self.game.platforms.steam
@@ -239,7 +239,9 @@ impl ManagedGame {
 
 fn do_launch(mut command: Command, app: &AppHandle, mode: LaunchMode) -> Result<()> {
     match mode.instances() {
-        0 => bail!("instances must be greater than 0"),
+        0 => {
+            bail!("instances must be greater than 0");
+        }
         1 => {
             command.spawn()?;
         }

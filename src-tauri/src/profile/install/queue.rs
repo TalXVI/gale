@@ -435,7 +435,11 @@ enum CacheStatus {
 fn try_cache_install(batch: &InstallBatch, index: usize, app: &AppHandle) -> Result<CacheStatus> {
     let install = &batch.mods[index];
 
-    let cache_path = super::cache::path(&install.ident, &app.lock_prefs());
+    let cache_path = super::cache::path(
+        &app.lock_prefs().cache_dir(),
+        &install.ident,
+        install.id.backend,
+    );
 
     if !cache_path.exists() {
         return Ok(CacheStatus::Miss);
@@ -490,7 +494,11 @@ fn install_from_download(
 
     let install = &batch.mods[index];
 
-    let cache_path = super::cache::path(&install.ident, &app.lock_prefs());
+    let cache_path = super::cache::path(
+        &app.lock_prefs().cache_dir(),
+        &install.ident,
+        install.id.backend,
+    );
     let package_name = install.ident.full_name();
 
     let (game, _) = manager.profile_by_id(batch.profile_id)?;

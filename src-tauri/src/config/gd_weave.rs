@@ -78,7 +78,9 @@ impl TryFrom<Value> for frontend::Value {
 
                 Err(eyre!("unsupported number value"))
             }
-            value => bail!("unsupported JSON value type: {}", value),
+            value => {
+                bail!("unsupported JSON value type: {}", value);
+            }
         }
     }
 }
@@ -96,7 +98,9 @@ impl TryFrom<frontend::Value> for Value {
                     .ok_or_eyre("cannot serialize NaN or infinite value")?;
                 Value::Number(value)
             }
-            _ => bail!("unsupported config value"),
+            _ => {
+                bail!("unsupported config value");
+            }
         })
     }
 }

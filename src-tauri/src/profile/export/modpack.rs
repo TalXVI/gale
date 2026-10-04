@@ -375,7 +375,7 @@ async fn submit_package(
     if status == StatusCode::BAD_REQUEST
         && let Ok(Some(err)) = handle_bad_request(response).await
     {
-        bail!("{}", err)
+        bail!("{}", err);
     }
 
     bail!("unexpected error: {}", status);

@@ -21,7 +21,13 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libappindicator3-dev librsvg2-dev libudev-dev patchelf libwebkit2gtk-4.1-dev
+          sudo apt-get install -y libappindicator3-dev librsvg2-dev libudev-dev patchelf \
+            libwebkit2gtk-4.1-0 \
+            libwebkit2gtk-4.1-dev \
+            libjavascriptcoregtk-4.1-0 \
+            libjavascriptcoregtk-4.1-dev \
+            gir1.2-javascriptcoregtk-4.1 \
+            gir1.2-webkit2-4.1
 
       - name: Run clippy lint
         run: |
@@ -167,6 +173,26 @@ jobs:
           if ($status.profileId -ne 'ci-profile') { throw "status reported profile $($status.profileId)" }
           $denied = Invoke-WebRequest http://127.0.0.1:8472/v1/status -SkipHttpErrorCheck
           if ($denied.StatusCode -ne 401) { throw "an unauthenticated status returned $($denied.StatusCode)" }
+
+      - name: Reinstall without replacing configuration or private state
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:ProgramData 'Gale\worker'
+          $config = Get-FileHash (Join-Path $root 'gale-worker.json')
+          $secrets = Get-FileHash (Join-Path $root 'private\secrets.env')
+          $retained = Join-Path $root 'private\retained-state.txt'
+          'retained worker state' | Set-Content $retained
+          $log = Join-Path $env:RUNNER_TEMP 'reinstall.log'
+          & src-tauri/target/debug/gale-worker.exe service reinstall --log $log
+          $code = $LASTEXITCODE
+          if (Test-Path $log) { Get-Content $log }
+          if ($code -ne 0) { exit $code }
+          if ((Get-Service GaleWorker).Status -ne 'Running') { throw 'GaleWorker is not running after reinstall' }
+          if ((Get-FileHash $config.Path).Hash -ne $config.Hash) { throw 'reinstall changed the configuration' }
+          if ((Get-FileHash $secrets.Path).Hash -ne $secrets.Hash) { throw 'reinstall changed the secrets' }
+          if ((Get-Content $retained) -ne 'retained worker state') { throw 'reinstall lost private state' }
+          $status = Invoke-RestMethod http://127.0.0.1:8472/v1/status -Headers @{ Authorization = 'Bearer ci-token' }
+          if ($status.profileId -ne 'ci-profile') { throw 'reinstall changed the profile binding' }
 
       - name: Uninstall the service
         if: always()

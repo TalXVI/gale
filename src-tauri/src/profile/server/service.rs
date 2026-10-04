@@ -51,14 +51,18 @@ impl Connector {
     pub(crate) fn connect(&self) -> Result<Box<dyn RemoteOps>> {
         match remote::connect(&self.settings, &self.password)? {
             ConnectionAttempt::Connected(connection) => Ok(connection),
-            ConnectionAttempt::HostKeyUntrusted { fingerprint } => bail!(
-                "SFTP host key is not trusted ({fingerprint}); {}",
-                self.pin_advice.host_key
-            ),
-            ConnectionAttempt::CertificateUntrusted { fingerprint } => bail!(
-                "FTPS certificate is not trusted ({fingerprint}); {}",
-                self.pin_advice.certificate
-            ),
+            ConnectionAttempt::HostKeyUntrusted { fingerprint } => {
+                bail!(
+                    "SFTP host key is not trusted ({fingerprint}); {}",
+                    self.pin_advice.host_key
+                );
+            }
+            ConnectionAttempt::CertificateUntrusted { fingerprint } => {
+                bail!(
+                    "FTPS certificate is not trusted ({fingerprint}); {}",
+                    self.pin_advice.certificate
+                );
+            }
         }
     }
 }

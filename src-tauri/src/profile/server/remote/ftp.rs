@@ -561,7 +561,7 @@ where
                 Err(error)
                     if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
                 {
-                    bail!("timed out waiting for the FTP server to close the data connection")
+                    bail!("timed out waiting for the FTP server to close the data connection");
                 }
                 Err(error) => return Err(error).context("failed to drain FTP data socket"),
             }
@@ -626,7 +626,9 @@ fn ftp_store(
     // wherever the protocol exposes it.
     let stored = match ftp_mlst(ftp, path)? {
         Mlst::Facts(facts) => facts.size,
-        Mlst::Absent => bail!("FTP upload for {path} completed but the file is absent"),
+        Mlst::Absent => {
+            bail!("FTP upload for {path} completed but the file is absent");
+        }
         Mlst::Unsupported => ftp_size(ftp, path)?,
     };
     if let Some(stored) = stored {

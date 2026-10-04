@@ -177,12 +177,16 @@ pub(super) fn persist_state(session: &mut Session) -> Result<()> {
             .context("failed to reconnect before verifying temporary deployment state")?;
         match session.ops.read(&temporary, state::MAX_STATE_BYTES)? {
             Some(actual) if actual == bytes => {}
-            Some(_) => bail!(
-                "temporary remote deployment state at {temporary} does not read back as written"
-            ),
-            None => bail!(
-                "temporary remote deployment state was written to {temporary} but cannot be read back"
-            ),
+            Some(_) => {
+                bail!(
+                    "temporary remote deployment state at {temporary} does not read back as written"
+                );
+            }
+            None => {
+                bail!(
+                    "temporary remote deployment state was written to {temporary} but cannot be read back"
+                );
+            }
         }
         Ok(())
     })
@@ -209,14 +213,18 @@ pub(super) fn persist_state(session: &mut Session) -> Result<()> {
     .context("could not verify the written deployment state")?;
     match verified {
         Some(actual) if actual == bytes => {}
-        Some(_) => bail!(
-            "remote deployment state at {target} does not read back as written; \
+        Some(_) => {
+            bail!(
+                "remote deployment state at {target} does not read back as written; \
              refusing to treat the deployment state as durable"
-        ),
-        None => bail!(
-            "remote deployment state was written to {target} but cannot be read back; \
+            );
+        }
+        None => {
+            bail!(
+                "remote deployment state was written to {target} but cannot be read back; \
              refusing to treat the deployment state as durable"
-        ),
+            );
+        }
     }
 
     session.base_seq = session.state.operation_seq;

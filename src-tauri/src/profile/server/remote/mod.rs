@@ -242,7 +242,7 @@ impl<C> Reached<C> {
         match self {
             Self::Trusted(connection) => Ok(connection),
             Self::Untrusted { .. } => {
-                bail!("server trust verification failed while {while_doing}")
+                bail!("server trust verification failed while {while_doing}");
             }
         }
     }
@@ -355,7 +355,7 @@ fn connect_socket(settings: &TransportSettings, io_timeout: Duration) -> Result<
         last_error
             .map(|error| error.to_string())
             .unwrap_or_else(|| "unknown network error".to_owned())
-    )
+    );
 }
 
 fn bound_io(stream: &TcpStream, timeout: Duration) -> std::io::Result<()> {

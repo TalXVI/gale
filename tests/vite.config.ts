@@ -8,7 +8,8 @@ export default defineConfig({
 	resolve: {
 		alias: {
 			$lib: fileURLToPath(new URL('../src/lib', import.meta.url)),
-			'$app/state': fileURLToPath(new URL('./dialog/app-state.svelte.ts', import.meta.url))
+			'$app/state': fileURLToPath(new URL('./dialog/app-state.svelte.ts', import.meta.url)),
+			'$app/navigation': fileURLToPath(new URL('./mods/navigation.ts', import.meta.url))
 		}
 	}
 });

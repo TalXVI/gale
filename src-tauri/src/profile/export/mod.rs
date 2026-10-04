@@ -20,7 +20,7 @@ use walkdir::WalkDir;
 use zip::{ZipWriter, write::SimpleFileOptions};
 
 use super::{Profile, Result, install::ModInstall};
-use crate::thunderstore::Backend;
+use crate::thunderstore::{Backend, FromBackend};
 use crate::{
     state::ManagerExt,
     thunderstore::{LegacyProfileCreateResponse, PackageIdent, Thunderstore, VersionIdent},
@@ -39,11 +39,34 @@ pub struct ProfileManifest {
     #[serde(default, rename = "community")]
     pub game: Option<String>,
     #[serde(default, rename = "ignoredUpdates")]
-    pub ignored_version_updates: Vec<Uuid>,
+    pub ignored_version_updates: HashSet<Uuid>,
     #[serde(default)]
-    pub ignored_package_updates: Vec<Uuid>,
+    pub ignored_package_updates: HashSet<Uuid>,
     #[serde(default, rename = "galeSync", skip_serializing_if = "Option::is_none")]
     pub sync: Option<SyncManifest>,
+    /// File paths could be exported from one OS to another so paths need to be normalized
+    /// to use forward slashes, which is not guaranteed by PathBuf on Windows, so we use
+    /// strings instead.
+    ///
+    /// `None` leaves the importing profile's own exclusions untouched. Sync
+    /// publications omit the field because exclusions are a local export
+    /// preference, not part of the shared profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excluded_files: Option<HashSet<String>>,
+}
+
+impl ProfileManifest {
+    pub fn new(name: String, mods: Vec<R2Mod>) -> Self {
+        Self {
+            name,
+            mods,
+            game: None,
+            ignored_version_updates: HashSet::new(),
+            ignored_package_updates: HashSet::new(),
+            excluded_files: None,
+            sync: None,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -63,11 +86,9 @@ impl R2Mod {
     }
 
     pub fn to_install(&self, thunderstore: &Thunderstore) -> Result<ModInstall> {
-        // Prefer backend, otherwise fallback to generic lookup
-        let borrowed_mod = thunderstore
-            .backend(self.source)
-            .find_ident(&self.version_ident())
-            .or_else(|_| thunderstore.find_ident(&self.version_ident()))?;
+        // prefer to use the source specified in the manifest, but fall back to the other source if it's not available
+        let borrowed_mod =
+            thunderstore.find_ident(&self.version_ident(), FromBackend::Prefer(self.source))?;
 
         Ok(ModInstall::new(borrowed_mod).with_state(self.enabled))
     }
@@ -373,10 +394,18 @@ pub fn manifest_revision(manifest: &ProfileManifest) -> Result<ModRevision> {
             ))
     });
 
-    let mut ignored_version_updates = manifest.ignored_version_updates.clone();
+    let mut ignored_version_updates = manifest
+        .ignored_version_updates
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
     ignored_version_updates.sort();
 
-    let mut ignored_package_updates = manifest.ignored_package_updates.clone();
+    let mut ignored_package_updates = manifest
+        .ignored_package_updates
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
     ignored_package_updates.sort();
 
     let canonical = RevisionManifest {
@@ -414,7 +443,8 @@ where
 }
 
 fn prepare_export(profile: &Profile) -> Result<(ProfileManifest, Vec<PathBuf>)> {
-    let manifest = build_manifest(profile);
+    let mut manifest = build_manifest(profile);
+    let mut excluded_files = HashSet::new();
 
     let config_paths = list_export_files(profile)
         .filter_ok(|file| {
@@ -422,11 +452,14 @@ fn prepare_export(profile: &Profile) -> Result<(ProfileManifest, Vec<PathBuf>)> 
                 true
             } else {
                 trace!(path = %file.path.display(), "excluding file from export");
+                excluded_files.insert(file.path.to_string_lossy().replace("\\", "/"));
                 false
             }
         })
         .map_ok(|file| file.path)
         .collect::<Result<Vec<_>>>()?;
+
+    manifest.excluded_files = Some(excluded_files);
 
     Ok((manifest, config_paths))
 }
@@ -482,6 +515,7 @@ pub(super) fn build_manifest(profile: &Profile) -> ProfileManifest {
         ignored_version_updates: profile.ignored_version_updates.iter().copied().collect(),
         ignored_package_updates: profile.ignored_package_updates.iter().copied().collect(),
         sync: None,
+        excluded_files: None,
     }
 }
 
@@ -643,7 +677,7 @@ fn list_export_files(profile: &Profile) -> impl Iterator<Item = Result<ExportFil
         let full_path = profile.path.join(&path);
         let size = std::fs::metadata(full_path).map(|meta| meta.len() as usize)?;
 
-        let included = profile.excluded_export_files.get(&path).is_none();
+        let included = !profile.excluded_export_files.contains(&path);
 
         Ok(ExportFile {
             path,
@@ -680,10 +714,13 @@ where
     Ok(())
 }
 
-pub(super) fn find_config<'a>(
+pub(super) fn find_config<'a, P>(
     root: &'a Path,
-    config_dirs: &'a [&str],
-) -> impl Iterator<Item = PathBuf> + 'a {
+    config_dirs: &'a [P],
+) -> impl Iterator<Item = PathBuf> + 'a
+where
+    P: AsRef<Path> + 'a,
+{
     static INCLUDE_SET: LazyLock<GlobSet> = LazyLock::new(|| {
         GlobSetBuilder::new()
             .add(Glob::new("*.{cfg,txt,json,yml,yaml,ini}").unwrap())
@@ -757,9 +794,14 @@ mod tests {
                 r2_mod("ModB", 4, 5, 6, false, Backend::Hexium),
             ],
             game: Some("risk-of-rain-2".to_owned()),
-            ignored_version_updates: vec![Uuid::from_u128(0x01), Uuid::from_u128(0x02)],
-            ignored_package_updates: vec![Uuid::from_u128(0x03), Uuid::from_u128(0x04)],
+            ignored_version_updates: [Uuid::from_u128(0x01), Uuid::from_u128(0x02)]
+                .into_iter()
+                .collect(),
+            ignored_package_updates: [Uuid::from_u128(0x03), Uuid::from_u128(0x04)]
+                .into_iter()
+                .collect(),
             sync: None,
+            excluded_files: Default::default(),
         }
     }
 
@@ -768,8 +810,8 @@ mod tests {
         let base = base_manifest();
         let mut reordered = base.clone();
         reordered.mods.reverse();
-        reordered.ignored_version_updates.reverse();
-        reordered.ignored_package_updates.reverse();
+        reordered.ignored_version_updates = base.ignored_version_updates.iter().copied().collect();
+        reordered.ignored_package_updates = base.ignored_package_updates.iter().copied().collect();
 
         assert_eq!(
             manifest_revision(&base).unwrap(),
@@ -811,11 +853,15 @@ mod tests {
         assert_ne!(manifest_revision(&changed).unwrap(), base_revision);
 
         let mut changed = base.clone();
-        changed.ignored_version_updates[0] = Uuid::from_u128(0xff);
+        changed
+            .ignored_version_updates
+            .insert(Uuid::from_u128(0xff));
         assert_ne!(manifest_revision(&changed).unwrap(), base_revision);
 
         let mut changed = base.clone();
-        changed.ignored_package_updates[0] = Uuid::from_u128(0xee);
+        changed
+            .ignored_package_updates
+            .insert(Uuid::from_u128(0xee));
         assert_ne!(manifest_revision(&changed).unwrap(), base_revision);
     }
 

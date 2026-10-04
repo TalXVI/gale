@@ -146,7 +146,7 @@ pub async fn oauth_credentials(app: &AppHandle) -> Result<AuthCredentials> {
     // arrive before — or be routed to — another flow.
     let callback = app.sync_auth().begin_oauth()?;
     let url = format!("{}/auth/login", *super::API_URL);
-    open::that(url).context("failed to open url in browser")?;
+    open::that_detached(url).context("failed to open url in browser")?;
 
     tokio::select! {
         url = callback => {
@@ -179,6 +179,7 @@ pub async fn oauth_credentials(app: &AppHandle) -> Result<AuthCredentials> {
 /// Forces a token grant with the desktop's stored refresh token. A second
 /// OAuth login may invalidate the earlier chain, so worker provisioning
 /// calls this afterwards to find out whether the desktop session survived.
+#[cfg(windows)]
 pub async fn verify_session(app: &AppHandle) -> Result<()> {
     let _refresh_guard = app.sync_auth().refresh_lock.lock().await;
     let refresh_token = {
@@ -301,7 +302,7 @@ async fn refresh_desktop_token(refresh_token: String, app: &AppHandle) -> Result
         Err(error) if is_refresh_rejected(&error) => {
             error!("failed to refresh access token: {error:#}");
             expire_session(app, &refresh_token)?;
-            bail!("sync session expired; sign in again")
+            bail!("sync session expired; sign in again");
         }
         Err(error) => Err(error.wrap_err("could not refresh sync session; try again")),
     }

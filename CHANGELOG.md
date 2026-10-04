@@ -2,13 +2,30 @@
 
 ## Unreleased
 
+### Fixed
+
+- File and URL open actions freezing the app in some environments
+
+## 1.23.1 (2026-10-03)
+
+### Fixed
+
+- Updated webkit versions and altered AppImage build to fix issues with white screens on Linux (thanks [@arrowmaster](https://github.com/arrowmaster))
+
+## 1.23.0 (2026-10-02)
+
 ### Added
 
 - Copy link context menu option to copy a mod's Thunderstore or Hexium URL
 - Ukrainian translation (thanks [@VoronUA1](https://github.com/VoronUA1))
 - Note in the modpack upload dialog in case the modpack was uploaded as a hidden mod (thanks [@bwoebi](https://github.com/bwoebi))
+- Option to view both the Thunderstore and Hexium versions of a mod in the mod details menu, when possible
+  - Clicking the "Install" button will install the version from the currently selected source
+  - The previous behavior was to always pick whichever source had a higher version number; this is now picked as the default option instead of being forced
+- Mod context menu option to switch between sources
 - Ability to configure which files are included in code exports and synced profiles
   - A dialog is now opened if a profile export was rejected due to size limits, instead of a standard error message
+- Support for the Nucleus mod loader (thanks [@u0068](https://github.com/u0068))
 
 ### Changed
 
@@ -18,7 +35,13 @@
 - The custom launch argument fields now support prefixes with arguments, similarly to Steam's custom arguments (thanks [@avnyu](https://github.com/avnyu))
   - For example, this now supports cases like `cmd --arg %command%`. Previously `cmd --arg` would be treated as a single executable
   - **Includes a breaking change**: words containing a `=` (such as `--opt=value` or `ENV=value`) were previously always passed as environment variables. After this change, only valid environment variable names will be treated as such (meaning `--opt=value` will now be passed as an argument).
-- Massively improved Russian translation
+- The dependency solver now always prefers the source of the installed mod for dependencies
+  - This means dependencies of Thunderstore mods will always be installed from Thunderstore and vice versa, as long as the dependency string is found on that platform
+  - If the dependency is already in the profile, it will be used regardless of source
+- When considering which source to prioritize for a mod, deprecation status is now taken into account
+  - Deprecated mod sources will always be overriden by non-deprecated mods, even if the non-deprecated version has a lower or equal version number
+- The current version of a mod is no longer shown in the "Change version" context menu
+- Minor UI changes
 
 ### Fixed
 
@@ -27,8 +50,12 @@
 - Deleted config files remaining in the config editor until the app is restarted
 - Sync donation notice reappearing each time the dialog is opened
 - Config file editor sometimes becoming stale after switching profiles
+- `gale://` and `ror2mm://` deep links installing from an automatically determined source instead of the source specified in the link
+  - This means the "Install with mod manager" buttons on the Thunderstore and Hexium sites will now always install from the correct source
+- Mods from profile imports sometimes being installed from the incorrect source
 - `WEBKIT_DISABLE_DMABUF_RENDERER=1` is now automatically set on Linux when an NVIDIA GPU is detected, which should fix issues with rendering on certain systems
 - UI sometimes freezing when exporting a large profile code or file
+- Massively improved Russian translation
 
 ## 1.22.3 (2026-09-16)
 

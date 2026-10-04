@@ -30,7 +30,7 @@ pub fn create_launch_command(
 #[allow(unused_variables)] // allow unused game_dir on windows
 fn create_steam_command(game_dir: &Path, game: Game, prefs: &Prefs) -> Result<Command> {
     let Some(steam) = &game.platforms.steam else {
-        bail!("{} is not available on Steam", game.name)
+        bail!("{} is not available on Steam", game.name);
     };
 
     let mut command = create_base_steam_command()?;
@@ -219,7 +219,7 @@ fn get_steam_app_info(app_id: u32) -> Result<serde_json::Value> {
 
 fn create_epic_command(game: Game) -> Result<Command> {
     let Some(epic) = &game.platforms.epic_games else {
-        bail!("{} is not available on Epic Games", game.name)
+        bail!("{} is not available on Epic Games", game.name);
     };
 
     let url = format!(
@@ -250,9 +250,11 @@ pub(crate) fn locate_dir(
         Some(Platform::XboxStore) => xbox_dir(platforms, display_name),
         #[cfg(windows)]
         Some(Platform::EpicGames) => epic_dir(platforms, display_name),
-        _ => bail!(
-            "directory not found for {display_name} - the selected platform cannot be located automatically"
-        ),
+        _ => {
+            bail!(
+                "directory not found for {display_name} - the selected platform cannot be located automatically"
+            );
+        }
     }
 }
 
@@ -279,7 +281,7 @@ fn xbox_dir(platforms: &Platforms<'_>, display_name: &str) -> Result<PathBuf> {
     use eyre::{Context, ensure};
 
     let Some(xbox) = &platforms.xbox_store else {
-        bail!("{display_name} is not available on Xbox Store")
+        bail!("{display_name} is not available on Xbox Store");
     };
 
     let name = xbox.identifier.unwrap_or(display_name);
@@ -317,7 +319,7 @@ fn epic_dir(platforms: &Platforms<'_>, display_name: &str) -> Result<PathBuf> {
     use crate::util;
 
     let Some(epic) = &platforms.epic_games else {
-        bail!("{display_name} is not available on Epic Games")
+        bail!("{display_name} is not available on Epic Games");
     };
 
     let name = epic.identifier.unwrap_or(display_name);

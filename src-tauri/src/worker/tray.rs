@@ -253,7 +253,7 @@ fn wait_for_companion_exit() -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    bail!("the Worker tray companion did not exit within 5 seconds")
+    bail!("the Worker tray companion did not exit within 5 seconds");
 }
 
 #[derive(Debug, Clone, Copy)]

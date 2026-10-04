@@ -12,6 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -20,6 +21,19 @@ use suppaftp::rustls::{
 };
 
 use super::ftps_verifier::{certificate_fingerprint, crypto_provider};
+
+fn take_reset(remaining: &AtomicUsize) -> bool {
+    let mut current = remaining.load(Ordering::SeqCst);
+    loop {
+        let Some(next) = current.checked_sub(1) else {
+            return false;
+        };
+        match remaining.compare_exchange_weak(current, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+}
 
 /// Behaviors the fake server can exhibit.
 #[derive(Default, Clone, Copy)]
@@ -808,13 +822,7 @@ fn serve(stream: TcpStream, shared: &Shared) {
                     let sequence = retr_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                     let mut reset = (sequence
                         >= reset_retr_at.load(std::sync::atomic::Ordering::SeqCst)
-                        && reset_retr_remaining
-                            .fetch_update(
-                                std::sync::atomic::Ordering::SeqCst,
-                                std::sync::atomic::Ordering::SeqCst,
-                                |remaining| remaining.checked_sub(1),
-                            )
-                            .is_ok())
+                        && take_reset(reset_retr_remaining))
                     .then(|| reset_after_completion.load(std::sync::atomic::Ordering::SeqCst));
                     if reset.is_none() {
                         let mut guard = path_reset.lock().unwrap();

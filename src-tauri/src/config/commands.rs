@@ -13,10 +13,7 @@ use crate::{
 // The config cache is populated for the active profile only, so a request
 // pinned to a profile that is no longer active is rejected rather than
 // silently applied to the wrong one.
-fn active_profile_guarded<'m>(
-    manager: &'m mut ModManager,
-    profile_id: i64,
-) -> Result<&'m mut Profile> {
+fn active_profile_guarded(manager: &mut ModManager, profile_id: i64) -> Result<&mut Profile> {
     let profile = manager.active_profile_mut();
     if profile.id != profile_id {
         return Err(eyre!("active profile changed while the config editor was open").into());
@@ -114,7 +111,7 @@ pub fn open_config_file(file: &Path, profile_id: i64, app: AppHandle) -> Result<
 
     let profile = active_profile_guarded(&mut manager, profile_id)?;
     let path = profile.path.join(file);
-    open::that(&path)
+    open::that_detached(&path)
         .with_context(|| format!("failed to open config file at {}", path.display()))?;
 
     Ok(())

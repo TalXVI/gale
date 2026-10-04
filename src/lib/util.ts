@@ -9,9 +9,13 @@ import {
 	type LaunchOption,
 	type ModId,
 	type Prefs,
-	type RgbaColor
+	type RgbaColor,
+	type DeduplicatedMod,
+	type ModContextItem,
+	type ContextItem
 } from './types';
 import { convertFileSrc } from '@tauri-apps/api/core';
+import { compare } from 'semver';
 import games from './state/game.svelte';
 import { m } from './paraglide/messages';
 import * as api from '$lib/api';
@@ -105,6 +109,39 @@ export function timeSince(date: Date | string): string {
 	return m.util_timeSince_interval_null();
 }
 
+export function compareVersions(v1: string | null, v2: string | null): number {
+	if (v1 === null || v2 === null) {
+		return Number(v1 !== null) - Number(v2 !== null);
+	}
+	return compare(v1, v2);
+}
+
+export function getPreferredBackend({ hexium, thunderstore }: DeduplicatedMod<Mod>): Backend {
+	if (hexium && !thunderstore) return Backend.Hexium;
+	if (!hexium && thunderstore) return Backend.Thunderstore;
+
+	if (hexium?.isDeprecated && !thunderstore?.isDeprecated) return Backend.Thunderstore;
+	if (!hexium?.isDeprecated && thunderstore?.isDeprecated) return Backend.Hexium;
+
+	const versionCmp = compareVersions(thunderstore?.version ?? null, hexium?.version ?? null);
+	if (versionCmp > 0) return Backend.Thunderstore;
+	if (versionCmp < 0) return Backend.Hexium;
+
+	return Backend.Thunderstore;
+}
+
+export function extractDeduplicatedMod<T>(
+	deduplicated: DeduplicatedMod<T>,
+	backend: Backend
+): T | null {
+	switch (backend) {
+		case Backend.Thunderstore:
+			return deduplicated.thunderstore;
+		case Backend.Hexium:
+			return deduplicated.hexium;
+	}
+}
+
 export function isOutdated(mod: Mod): boolean {
 	if (mod.versions.length === 0) {
 		return false;
@@ -142,7 +179,7 @@ export function communityUrl(backend: Backend, author: string, mod?: string) {
 	}
 }
 
-export function modIconSrc(mod: Mod) {
+export function modIconSrc(mod: Mod, enabled?: boolean) {
 	if (mod.type === 'remote') {
 		if (mod.backend === Backend.Thunderstore) {
 			let fullName = `${mod.author}-${mod.name}-${mod.version}`;
@@ -151,7 +188,7 @@ export function modIconSrc(mod: Mod) {
 			return hexiumIconUrl(mod.author ?? '', mod.name);
 		}
 	} else if (mod.icon !== null) {
-		let path = mod.enabled === false ? mod.icon + '.old' : mod.icon;
+		let path = enabled === false ? mod.icon + '.old' : mod.icon;
 		return convertFileSrc(path);
 	} else {
 		return `games/${games.active?.slug}.webp`;
@@ -271,4 +308,48 @@ export function shouldWarnForeignDownload(id: ModId, prefs: Prefs): boolean {
 export function rgbToHex(color: RgbaColor): string {
 	const [r, g, b] = color;
 	return `#${((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1).toUpperCase()}`;
+}
+
+export function mapModContextItem<T, U>(
+	item: ModContextItem<T>,
+	mapItem: (item: U) => T
+): ModContextItem<U> {
+	return {
+		label: item.label,
+		icon: item.icon,
+		showFor: item.showFor ? (mod, locked) => item.showFor!(mapItem(mod), locked) : undefined,
+		onclick: (mod) => item.onclick(mapItem(mod)),
+		children: item.children
+			? (mod) => item.children!(mapItem(mod)).map((child) => mapModContextItem(child, mapItem))
+			: undefined
+	};
+}
+
+export function resolveModContextItems<T>(
+	items: ModContextItem<T>[],
+	mod: T,
+	locked: boolean
+): ContextItem[] {
+	return items
+		.map((item) => resolveModContextItem(item, mod, locked))
+		.filter((item) => item !== null);
+}
+
+export function resolveModContextItem<T>(
+	item: ModContextItem<T>,
+	mod: T,
+	locked: boolean
+): ContextItem | null {
+	if (item.showFor && !item.showFor(mod, locked)) {
+		return null;
+	}
+
+	const children = item.children?.(mod);
+
+	return {
+		label: item.label,
+		icon: item.icon,
+		onclick: () => item.onclick(mod),
+		children: children ? resolveModContextItems(children, mod, locked) : undefined
+	};
 }

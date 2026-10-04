@@ -15,7 +15,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 use tempfile::tempdir;
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -26,7 +26,7 @@ use crate::{
         install::{InstallOptions, ModInstall},
     },
     state::ManagerExt,
-    thunderstore::{Backend, ModId, Thunderstore},
+    thunderstore::{Backend, FromBackend, ModId, Thunderstore},
     util::{self, error::IoResultExt},
 };
 
@@ -90,13 +90,20 @@ pub(super) fn resolve_manifest_sources(
     for r2mod in &mut manifest.mods {
         // first try the backend stored in the manifest, if it's not there,
         // then try falling back to checking any other backend and update the source as needed
-        if thunderstore
-            .backend(r2mod.source)
-            .find_ident(&r2mod.version_ident())
-            .is_err()
-            && let Ok(package) = thunderstore.find_ident(&r2mod.version_ident())
-        {
-            r2mod.source = package.package.backend;
+        match thunderstore.find_ident(&r2mod.version_ident(), FromBackend::Prefer(r2mod.source)) {
+            Ok(found) if found.package.backend == r2mod.source => (),
+            Ok(found) => {
+                warn!(
+                    ident = %r2mod.version_ident(),
+                    source = ?r2mod.source,
+                    found_backend = ?found.package.backend,
+                    "import mod was not found in the expected backend, falling back",
+                );
+                r2mod.source = found.package.backend;
+            }
+            Err(err) => {
+                debug!(?err, "import mod was not found");
+            }
         }
     }
 }
@@ -207,12 +214,12 @@ pub(super) async fn import_manifest(
                         err
                     );
                 });
-            } else if let Some(revert) = imported.revert {
-                if let Err(restore_err) = restore_imported_profile(imported.id, revert, app) {
-                    return Err(eyre::eyre!(err).wrap_err(format!(
-                        "failed to restore the previous mod set: {restore_err:#}"
-                    )));
-                }
+            } else if let Some(revert) = imported.revert
+                && let Err(restore_err) = restore_imported_profile(imported.id, revert, app)
+            {
+                return Err(eyre::eyre!(err).wrap_err(format!(
+                    "failed to restore the previous mod set: {restore_err:#}"
+                )));
             }
 
             Err(err.into())
@@ -247,10 +254,20 @@ pub(super) async fn import_profile(
             // the install succeeded; backed-up originals are no longer needed
             clear_revert_dir(&imported.path);
 
+            let excluded_files = {
+                let manager = app.lock_manager();
+                manager
+                    .profile_by_id(imported.id)?
+                    .1
+                    .excluded_export_files
+                    .clone()
+            };
+
             match import_config(
                 &imported.path,
                 &data.path,
                 imported.game.mod_loader.mod_config_dirs(),
+                |path| !excluded_files.contains(path),
                 &options,
             )
             .context("error importing config")
@@ -293,6 +310,7 @@ fn prepare_import(
         mods,
         ignored_version_updates,
         ignored_package_updates,
+        excluded_files,
         ..
     } = manifest;
 
@@ -322,8 +340,9 @@ fn prepare_import(
 
             let (to_install, revert) = incremental_update(options.merge, installs, profile)?;
 
-            profile.ignored_version_updates = ignored_version_updates.into_iter().collect();
-            profile.ignored_package_updates = ignored_package_updates.into_iter().collect();
+            profile.ignored_version_updates = ignored_version_updates;
+            profile.ignored_package_updates = ignored_package_updates;
+            apply_excluded_files(profile, excluded_files);
 
             let imported = ImportedProfile {
                 id: profile.id,
@@ -360,8 +379,9 @@ fn prepare_import(
                 )
             };
 
-            profile.ignored_version_updates = ignored_version_updates.into_iter().collect();
-            profile.ignored_package_updates = ignored_package_updates.into_iter().collect();
+            profile.ignored_version_updates = ignored_version_updates;
+            profile.ignored_package_updates = ignored_package_updates;
+            apply_excluded_files(profile, excluded_files);
 
             let imported = ImportedProfile {
                 id: profile.id,
@@ -377,6 +397,14 @@ fn prepare_import(
     };
 
     Ok((to_install, imported))
+}
+
+/// Manifests without exclusions, such as sync publications, keep the
+/// profile's own export preferences.
+fn apply_excluded_files(profile: &mut Profile, excluded_files: Option<HashSet<String>>) {
+    if let Some(excluded_files) = excluded_files {
+        profile.excluded_export_files = excluded_files.into_iter().map(PathBuf::from).collect();
+    }
 }
 
 pub(super) fn cleanup_failed_profile(profile_id: i64, app: &AppHandle) -> Result<()> {
@@ -519,20 +547,28 @@ fn incremental_update(
 }
 
 #[tracing::instrument(skip_all, fields(dest = %dest.display(), src = %src.display()))]
-pub fn import_config(
+pub fn import_config<P, F>(
     dest: &Path,
     src: &Path,
-    config_dirs: &[&str],
+    config_dirs: &[P],
+    mut dest_files_filter: F,
     options: &ImportOptions,
-) -> Result<()> {
+) -> Result<()>
+where
+    P: AsRef<Path>,
+    F: FnMut(&Path) -> bool,
+{
     let src_files: HashSet<PathBuf> = super::export::list_files(src)
         .filter(|path| options.import_all || is_always_imported(path))
         .collect();
 
-    let dest_files: HashSet<PathBuf> = super::export::find_config(dest, config_dirs).collect();
+    let dest_files: HashSet<PathBuf> = super::export::find_config(dest, config_dirs)
+        .filter(|file| dest_files_filter(file))
+        .collect();
 
     if !options.merge {
         // remove existing extra config files that are not in the imported profile
+        // and were not explicitly ignored by the dest_files_filter
         for extra_file in dest_files.difference(&src_files) {
             let extra_path = dest.join(extra_file);
             trace!(
@@ -634,6 +670,51 @@ mod tests {
             missing: false,
             excluded_export_files: Default::default(),
         }
+    }
+
+    #[test]
+    fn manifests_without_exclusions_keep_the_profiles_own() {
+        let dir = tempdir().unwrap();
+        let mut profile = profile_at(dir.path(), Vec::new());
+        let local = PathBuf::from("BepInEx/config/local.cfg");
+        profile.excluded_export_files.insert(local.clone());
+
+        apply_excluded_files(&mut profile, None);
+        assert_eq!(profile.excluded_export_files, HashSet::from([local]));
+
+        apply_excluded_files(
+            &mut profile,
+            Some(HashSet::from(["BepInEx/config/shared.cfg".to_owned()])),
+        );
+        assert_eq!(
+            profile.excluded_export_files,
+            HashSet::from([PathBuf::from("BepInEx/config/shared.cfg")])
+        );
+    }
+
+    #[test]
+    fn replacing_config_preserves_excluded_files() {
+        let dest = tempdir().unwrap();
+        let src = tempdir().unwrap();
+        let config_dir = dest.path().join("BepInEx/config");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(config_dir.join("keep.cfg"), "local settings").unwrap();
+        fs::write(config_dir.join("remove.cfg"), "old settings").unwrap();
+
+        import_config(
+            dest.path(),
+            src.path(),
+            &["BepInEx/config"],
+            |path| path != Path::new("BepInEx/config/keep.cfg"),
+            &ImportOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(config_dir.join("keep.cfg")).unwrap(),
+            "local settings"
+        );
+        assert!(!config_dir.join("remove.cfg").exists());
     }
 
     #[test]

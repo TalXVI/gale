@@ -51,6 +51,7 @@ impl<'a> ArgsContext<'a> {
             ModLoaderKind::Shimloader {} => self.add_shimloader_args(),
             ModLoaderKind::Lovely {} => self.add_lovely_args(),
             ModLoaderKind::ReturnOfModding { .. } => self.add_return_of_modding_args(),
+            ModLoaderKind::Nucleus {} => self.add_nucleus_args(),
         }
     }
 
@@ -158,7 +159,9 @@ impl<'a> ArgsContext<'a> {
         match version {
             3 => Ok(("--doorstop-enable", "--doorstop-target")),
             4 => Ok(("--doorstop-enabled", "--doorstop-target-assembly")),
-            vers => bail!("unsupported doorstop version: {}", vers),
+            vers => {
+                bail!("unsupported doorstop version: {}", vers);
+            }
         }
     }
 
@@ -230,6 +233,14 @@ impl<'a> ArgsContext<'a> {
         let path = self.format_path(self.profile_dir)?;
 
         self.command.arg("--rom_modding_root_folder").arg(path);
+
+        Ok(())
+    }
+
+    fn add_nucleus_args(&mut self) -> Result<()> {
+        let path = self.format_path(self.profile_dir.join("mods/u0068-Nucleus/Nucleus.dll"))?;
+
+        self.command.arg("--customdll").arg(path);
 
         Ok(())
     }

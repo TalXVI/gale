@@ -403,7 +403,7 @@ pub fn open_dedicated_server_dir(app: AppHandle) -> Result<()> {
         }
     };
 
-    open::that(&path).wrap_err_with(|| {
+    open::that_detached(&path).wrap_err_with(|| {
         format!(
             "failed to open dedicated server directory {}",
             path.display()

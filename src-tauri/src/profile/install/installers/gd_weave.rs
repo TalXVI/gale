@@ -53,9 +53,13 @@ impl PackageInstaller for GDWeaveModInstaller {
         }
 
         let root = match roots.len() {
-            0 => bail!("no mod root found"),
+            0 => {
+                bail!("no mod root found");
+            }
             1 => roots.into_iter().next().unwrap(),
-            _ => bail!("multiple mod roots found"),
+            _ => {
+                bail!("multiple mod roots found");
+            }
         };
 
         install::fs::extract(archive, dest, |relative_path| {

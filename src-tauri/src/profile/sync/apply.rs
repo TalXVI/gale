@@ -135,7 +135,7 @@ fn create_staging_file(
     bail!(
         "failed to create a unique staging file for {}",
         target.display()
-    )
+    );
 }
 
 fn stage_validated(target: &Path, file: &archive::ValidatedConfigFile) -> Result<PathBuf> {
@@ -439,10 +439,12 @@ fn local_review_reason(profile_dir: &Path, path: &ConfigPath) -> Result<PendingC
     let target = checked_target(profile_dir, path)?;
     match fs::symlink_metadata(&target) {
         Ok(metadata) if metadata.is_file() => Ok(PendingConfigReason::ModifiedLocally),
-        Ok(_) => bail!(
-            "synced config path is not a regular file: {}",
-            target.display()
-        ),
+        Ok(_) => {
+            bail!(
+                "synced config path is not a regular file: {}",
+                target.display()
+            );
+        }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             Ok(PendingConfigReason::DeletedLocally)
         }
@@ -991,8 +993,10 @@ mod tests {
         let p = path("a.cfg");
         write(dir.path(), &p, b"local");
 
-        let mut state = AppliedState::default();
-        state.latest = Some(latest(&[("a.cfg", b"remote"), ("b.cfg", b"bee")]));
+        let mut state = AppliedState {
+            latest: Some(latest(&[("a.cfg", b"remote"), ("b.cfg", b"bee")])),
+            ..Default::default()
+        };
         state.config.insert(
             p.clone(),
             applied_file(None, None, Some(hash(b"remote")), ConfigUpdatePolicy::Ask),
@@ -1034,7 +1038,7 @@ mod tests {
                 dir.path(),
                 &bad_config,
                 &mut state,
-                &[p.clone()],
+                std::slice::from_ref(&p),
                 &[],
                 false
             )
@@ -1060,15 +1064,22 @@ mod tests {
                 dir.path(),
                 &config,
                 &mut no_latest,
-                &[p.clone()],
+                std::slice::from_ref(&p),
                 &[],
                 false
             )
             .is_err()
         );
 
-        let written =
-            apply_selected(dir.path(), &config, &mut state, &[p.clone()], &[], false).unwrap();
+        let written = apply_selected(
+            dir.path(),
+            &config,
+            &mut state,
+            std::slice::from_ref(&p),
+            &[],
+            false,
+        )
+        .unwrap();
         assert_eq!(written, vec![p.clone()]);
         assert_eq!(fs::read(dir.path().join(p.as_path())).unwrap(), b"remote");
         let record = &state.config[&p];
@@ -1085,23 +1096,25 @@ mod tests {
         let p = path("a.cfg");
         let q = path("b.cfg");
 
-        let mut state = AppliedState::default();
-        state.latest = Some(latest(&[("a.cfg", b"remote"), ("b.cfg", b"bee")]));
+        let mut state = AppliedState {
+            latest: Some(latest(&[("a.cfg", b"remote"), ("b.cfg", b"bee")])),
+            ..Default::default()
+        };
         state
             .pending
             .insert(p.clone(), PendingConfigReason::ModifiedLocally);
 
         assert!(decline_selected(&mut state, &[p.clone(), p.clone()], false).is_err());
-        assert!(decline_selected(&mut state, &[q.clone()], false).is_err());
+        assert!(decline_selected(&mut state, std::slice::from_ref(&q), false).is_err());
         assert!(decline_selected(&mut state, &[path("nope.cfg")], false).is_err());
 
         let mut no_latest = AppliedState::default();
         no_latest
             .pending
             .insert(p.clone(), PendingConfigReason::ModifiedLocally);
-        assert!(decline_selected(&mut no_latest, &[p.clone()], false).is_err());
+        assert!(decline_selected(&mut no_latest, std::slice::from_ref(&p), false).is_err());
 
-        decline_selected(&mut state, &[p.clone()], false).unwrap();
+        decline_selected(&mut state, std::slice::from_ref(&p), false).unwrap();
         assert_eq!(state.config[&p].declined, Some(hash(b"remote")));
         assert_eq!(state.config[&p].policy, ConfigUpdatePolicy::Ask);
         assert!(!state.pending.contains_key(&p));
@@ -1122,8 +1135,10 @@ mod tests {
         let p = path("a.cfg");
         write(dir.path(), &p, b"local");
 
-        let mut state = AppliedState::default();
-        state.latest = Some(latest(&[("a.cfg", b"v1")]));
+        let mut state = AppliedState {
+            latest: Some(latest(&[("a.cfg", b"v1")])),
+            ..Default::default()
+        };
         state.config.insert(
             p.clone(),
             applied_file(None, None, Some(hash(b"v1")), ConfigUpdatePolicy::Ask),
@@ -1336,7 +1351,15 @@ mod tests {
         assert_eq!(state.latest.as_ref().unwrap().config[&p].hash, hash(b"A"));
 
         let config = archive_map(&[("a.cfg", b"A")]);
-        apply_selected(dir.path(), &config, &mut state, &[p.clone()], &[], false).unwrap();
+        apply_selected(
+            dir.path(),
+            &config,
+            &mut state,
+            std::slice::from_ref(&p),
+            &[],
+            false,
+        )
+        .unwrap();
         assert_eq!(read_file(dir.path(), &p), b"A");
 
         let mut state = round_trip(&state);
@@ -1354,7 +1377,15 @@ mod tests {
         assert!(review.declined.is_empty());
 
         let config = archive_map(&[("a.cfg", b"B")]);
-        apply_selected(dir.path(), &config, &mut state, &[p.clone()], &[], false).unwrap();
+        apply_selected(
+            dir.path(),
+            &config,
+            &mut state,
+            std::slice::from_ref(&p),
+            &[],
+            false,
+        )
+        .unwrap();
         assert_eq!(read_file(dir.path(), &p), b"B");
 
         let report = receive(dir.path(), &mut state, &[("a.cfg", b"C")]);
@@ -1379,7 +1410,7 @@ mod tests {
         receive(dir.path(), &mut state, &[("a.cfg", b"A")]);
         assert_eq!(state.pending[&p], PendingConfigReason::ModifiedLocally);
 
-        decline_selected(&mut state, &[p.clone()], false).unwrap();
+        decline_selected(&mut state, std::slice::from_ref(&p), false).unwrap();
         assert!(state.pending.is_empty());
         assert_eq!(state.declined[&p], PendingConfigReason::ModifiedLocally);
         assert_eq!(state.config[&p].declined, Some(hash(b"A")));
@@ -1402,7 +1433,7 @@ mod tests {
         assert_eq!(review.pending.len(), 1);
         assert_eq!(review.declined.len(), 0);
 
-        decline_selected(&mut state, &[p.clone()], false).unwrap();
+        decline_selected(&mut state, std::slice::from_ref(&p), false).unwrap();
         assert_eq!(state.config[&p].declined, Some(hash(b"B")));
         assert_eq!(state.config[&p].policy, ConfigUpdatePolicy::Ask);
 
@@ -1430,7 +1461,15 @@ mod tests {
         assert_eq!(state.pending[&p], PendingConfigReason::ModifiedLocally);
 
         let config = archive_map(&[("a.cfg", b"A")]);
-        apply_selected(dir.path(), &config, &mut state, &[p.clone()], &[], true).unwrap();
+        apply_selected(
+            dir.path(),
+            &config,
+            &mut state,
+            std::slice::from_ref(&p),
+            &[],
+            true,
+        )
+        .unwrap();
         assert_eq!(read_file(dir.path(), &p), b"A");
         assert_eq!(state.config[&p].policy, ConfigUpdatePolicy::AlwaysApply);
 
@@ -1465,7 +1504,7 @@ mod tests {
         );
 
         receive(dir.path(), &mut state, &[("a.cfg", b"A")]);
-        decline_selected(&mut state, &[p.clone()], true).unwrap();
+        decline_selected(&mut state, std::slice::from_ref(&p), true).unwrap();
         assert_eq!(state.config[&p].policy, ConfigUpdatePolicy::AlwaysKeep);
         assert_eq!(state.config[&p].declined, Some(hash(b"A")));
 
@@ -1492,7 +1531,15 @@ mod tests {
         assert_eq!(review.declined.len(), 1);
 
         let config = archive_map(&[("a.cfg", b"C")]);
-        apply_selected(dir.path(), &config, &mut state, &[p.clone()], &[], false).unwrap();
+        apply_selected(
+            dir.path(),
+            &config,
+            &mut state,
+            std::slice::from_ref(&p),
+            &[],
+            false,
+        )
+        .unwrap();
         assert_eq!(read_file(dir.path(), &p), b"C");
         assert!(state.declined.is_empty());
         assert_eq!(state.config[&p].policy, ConfigUpdatePolicy::AlwaysKeep);
@@ -1549,8 +1596,10 @@ mod tests {
     fn policy_can_be_changed_later_and_persists() {
         let p = path("a.cfg");
 
-        let mut state = AppliedState::default();
-        state.latest = Some(latest(&[("a.cfg", b"remote")]));
+        let mut state = AppliedState {
+            latest: Some(latest(&[("a.cfg", b"remote")])),
+            ..Default::default()
+        };
 
         set_policy(&mut state, &p, ConfigUpdatePolicy::AlwaysApply).unwrap();
 
@@ -1613,7 +1662,7 @@ mod tests {
         receive(dir.path(), &mut state, &[("a.cfg", b"A")]);
         assert_eq!(state.pending[&p], PendingConfigReason::ModifiedLocally);
 
-        decline_selected(&mut state, &[p.clone()], false).unwrap();
+        decline_selected(&mut state, std::slice::from_ref(&p), false).unwrap();
         assert_eq!(state.declined[&p], PendingConfigReason::ModifiedLocally);
 
         fs::remove_file(dir.path().join(p.as_path())).unwrap();
@@ -1722,7 +1771,7 @@ mod tests {
         );
 
         receive(dir.path(), &mut state, &[("a.cfg", b"A")]);
-        decline_selected(&mut state, &[p.clone()], false).unwrap();
+        decline_selected(&mut state, std::slice::from_ref(&p), false).unwrap();
 
         let review = current_review_items(dir.path(), &state).unwrap();
         assert_eq!(review.declined.len(), 1);
@@ -1748,8 +1797,10 @@ mod tests {
         let q = path("b.cfg");
         write(dir.path(), &q, b"local-b");
 
-        let mut state = AppliedState::default();
-        state.latest = Some(latest(&[("a.cfg", b"A"), ("b.cfg", b"B")]));
+        let mut state = AppliedState {
+            latest: Some(latest(&[("a.cfg", b"A"), ("b.cfg", b"B")])),
+            ..Default::default()
+        };
         state
             .pending
             .insert(p.clone(), PendingConfigReason::DeletedLocally);
@@ -1759,7 +1810,17 @@ mod tests {
 
         let config = archive_map(&[("a.cfg", b"A"), ("b.cfg", b"B")]);
 
-        assert!(apply_selected(dir.path(), &config, &mut state, &[p.clone()], &[], false).is_err());
+        assert!(
+            apply_selected(
+                dir.path(),
+                &config,
+                &mut state,
+                std::slice::from_ref(&p),
+                &[],
+                false
+            )
+            .is_err()
+        );
         assert!(!dir.path().join(p.as_path()).exists());
 
         assert!(
@@ -1767,8 +1828,8 @@ mod tests {
                 dir.path(),
                 &config,
                 &mut state,
-                &[q.clone()],
-                &[p.clone()],
+                std::slice::from_ref(&q),
+                std::slice::from_ref(&p),
                 false
             )
             .is_err()
@@ -1779,8 +1840,8 @@ mod tests {
             dir.path(),
             &config,
             &mut state,
-            &[p.clone()],
-            &[p.clone()],
+            std::slice::from_ref(&p),
+            std::slice::from_ref(&p),
             false,
         )
         .unwrap();
@@ -1827,7 +1888,7 @@ mod tests {
         );
 
         receive(dir.path(), &mut state, &[("a.cfg", b"A")]);
-        decline_selected(&mut state, &[p.clone()], false).unwrap();
+        decline_selected(&mut state, std::slice::from_ref(&p), false).unwrap();
         assert_eq!(state.declined[&p], PendingConfigReason::ModifiedLocally);
 
         set_policy(&mut state, &p, ConfigUpdatePolicy::AlwaysApply).unwrap();
@@ -1857,7 +1918,7 @@ mod tests {
         );
 
         receive(dir.path(), &mut state, &[("a.cfg", b"A")]);
-        decline_selected(&mut state, &[p.clone()], false).unwrap();
+        decline_selected(&mut state, std::slice::from_ref(&p), false).unwrap();
         assert_eq!(state.declined[&p], PendingConfigReason::ModifiedLocally);
 
         set_policy(&mut state, &p, ConfigUpdatePolicy::Ask).unwrap();
@@ -1878,8 +1939,10 @@ mod tests {
     fn policy_set_at_round_trips_and_defaults_to_none() {
         let p = path("a.cfg");
 
-        let mut state = AppliedState::default();
-        state.latest = Some(latest(&[("a.cfg", b"A")]));
+        let mut state = AppliedState {
+            latest: Some(latest(&[("a.cfg", b"A")])),
+            ..Default::default()
+        };
 
         set_policy(&mut state, &p, ConfigUpdatePolicy::AlwaysApply).unwrap();
         assert_eq!(state.config[&p].policy_set_at, Some(hash(b"A")));
@@ -1902,8 +1965,10 @@ mod tests {
         write(dir.path(), &p, b"custom-a");
         write(dir.path(), &q, b"custom-b");
 
-        let mut state = AppliedState::default();
-        state.latest = Some(latest(&[("a.cfg", b"A"), ("b.cfg", b"A")]));
+        let mut state = AppliedState {
+            latest: Some(latest(&[("a.cfg", b"A"), ("b.cfg", b"A")])),
+            ..Default::default()
+        };
         state.config.insert(
             p.clone(),
             applied_file(None, None, None, ConfigUpdatePolicy::AlwaysApply),
