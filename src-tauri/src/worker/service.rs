@@ -360,8 +360,6 @@ fn install_inner(staging: &Path, log: &Path) -> Result<()> {
     std::fs::create_dir_all(&private)
         .with_context(|| format!("failed to create {}", private.display()))?;
 
-    apply_directory_acls(&root, &private).context("failed to set directory permissions")?;
-
     // A different binding makes the old journal meaningless. Its pending
     // work and rotated token belong to another profile/remote. Read the
     // old binding before stopping the old service so nothing rewrites
@@ -380,26 +378,26 @@ fn install_inner(staging: &Path, log: &Path) -> Result<()> {
     let manager = open_manager_for_create()?;
     remove_existing_service(&manager, log)?;
 
-    if binding_changed {
-        provision_log(log, "binding changed; clearing prior worker state");
-        let _ = std::fs::remove_file(private.join(journal::JOURNAL_FILE));
-        let _ = std::fs::remove_file(root.join(local::STATUS_FILE));
-    }
+    start_installed_worker(&manager, &root, &private, &config.listen, log, || {
+        if binding_changed {
+            provision_log(log, "binding changed; clearing prior worker state");
+            let _ = std::fs::remove_file(private.join(journal::JOURNAL_FILE));
+            let _ = std::fs::remove_file(root.join(local::STATUS_FILE));
+        }
 
-    // Files copied after the ACLs are set inherit the locked-down set.
-    config
-        .save(&installed)
-        .context("failed to install worker config")?;
-    install_secrets(staged_secrets, &private, &config.state_dir)?;
-    // A staged SSH key accompanies private-key configs. The service's
-    // virtual account cannot read user-profile paths.
-    let staged_key = staging.join(local::SSH_KEY_FILE);
-    if staged_key.is_file() {
-        std::fs::copy(&staged_key, private.join(local::SSH_KEY_FILE))
-            .context("failed to install the SSH private key")?;
-    }
-
-    start_installed_worker(&manager, &root, &config.listen, log)
+        // The ACLs are locked down before any credentials are written.
+        config
+            .save(&installed)
+            .context("failed to install worker config")?;
+        install_secrets(staged_secrets, &private, &config.state_dir)?;
+        // The service's virtual account cannot read user-profile paths.
+        let staged_key = staging.join(local::SSH_KEY_FILE);
+        if staged_key.is_file() {
+            std::fs::copy(&staged_key, private.join(local::SSH_KEY_FILE))
+                .context("failed to install the SSH private key")?;
+        }
+        Ok(())
+    })
 }
 
 /// The managed worker's sync credential lives only in the journal: the
@@ -423,19 +421,43 @@ fn install_secrets(mut staged: Secrets, private: &Path, state_dir: &Path) -> Res
 fn start_installed_worker(
     manager: &ServiceManager,
     root: &Path,
+    private: &Path,
     listen: &str,
     log: &Path,
+    install_payload: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
-    let exe = install_worker_binary(root)?;
+    // SCM registration creates the virtual account. Even a numeric service
+    // SID cannot be granted by icacls until Windows can resolve that account.
+    let exe = root.join(local::WORKER_EXE);
     let service = create_service(manager, &exe, root)?;
-    configure_recovery(&service).context("failed to configure crash recovery")?;
-    grant_user_control().context("failed to grant user control")?;
-    provision_log(log, "starting service");
-    service
-        .start(&[] as &[&OsStr])
-        .context("failed to start the service")?;
-    wait_for_state(&service, ServiceState::Running)?;
-    await_listen_ready(listen)
+    let result = (|| {
+        apply_directory_acls(root, private).context("failed to set directory permissions")?;
+        install_worker_binary(root)?;
+        install_payload()?;
+        configure_recovery(&service).context("failed to configure crash recovery")?;
+        grant_user_control().context("failed to grant user control")?;
+        provision_log(log, "starting service");
+        service
+            .start(&[] as &[&OsStr])
+            .context("failed to start the service")?;
+        wait_for_state(&service, ServiceState::Running)?;
+        await_listen_ready(listen)
+    })();
+    if let Err(err) = result {
+        provision_log(log, "removing incomplete service registration");
+        let cleanup = stop_and_wait(&service).and_then(|()| {
+            service
+                .delete()
+                .context("failed to delete the incomplete service")
+        });
+        drop(service);
+        let cleanup = cleanup.and_then(|()| wait_until_deleted(manager));
+        return match cleanup {
+            Ok(()) => Err(err),
+            Err(cleanup) => Err(err).wrap_err(format!("service cleanup also failed: {cleanup:#}")),
+        };
+    }
+    Ok(())
 }
 
 /// `gale-worker service uninstall --log <file>`. Stops and deletes the
@@ -499,7 +521,7 @@ fn wait_until_deleted(manager: &ServiceManager) -> Result<()> {
             Ok(service) => {
                 drop(service);
                 if Instant::now() > deadline {
-                    bail!("service was still present after the delete timeout")
+                    bail!("service was still present after the delete timeout");
                 }
                 std::thread::sleep(Duration::from_millis(250));
             }
@@ -627,9 +649,7 @@ fn reinstall_inner(log: &Path) -> Result<()> {
 
     let manager = open_manager_for_create()?;
     remove_existing_service(&manager, log)?;
-    apply_directory_acls(&root, &private).context("failed to set directory permissions")?;
-
-    start_installed_worker(&manager, &root, &config.listen, log)
+    start_installed_worker(&manager, &root, &private, &config.listen, log, || Ok(()))
 }
 
 /// SCM-managed crash recovery: restart after 5s, then 15s, then every 60s.
@@ -677,7 +697,7 @@ fn grant_user_control() -> Result<()> {
 /// The SID of the service's virtual account, `NT SERVICE\<name>`, derived
 /// the way Windows derives service SIDs: `S-1-5-80` followed by the SHA-1
 /// of the upper-cased UTF-16 service name, read as five little-endian
-/// 32-bit values. Granting by SID works before the service exists.
+/// 32-bit values. The service must be registered before icacls can resolve it.
 fn service_sid(name: &str) -> String {
     let utf16: Vec<u8> = name
         .to_uppercase()
