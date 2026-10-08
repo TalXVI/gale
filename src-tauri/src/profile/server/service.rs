@@ -198,6 +198,29 @@ impl DeployService {
         .await
     }
 
+    /// Rechecks the restart requested by an earlier deployment without
+    /// fetching a publication or touching its payload and runtime configs.
+    #[cfg(feature = "worker")]
+    pub(crate) async fn resume_deferred_restart(
+        &self,
+        expected_operation_id: String,
+        host: &dyn HostControl,
+        meta: OperationMeta,
+        progress: &mut ProgressReporter,
+    ) -> Result<ServerDeploymentState> {
+        let session = self.read_session().await?;
+        let connector = self.connector.clone();
+        engine::resume_deferred_restart(
+            session,
+            move || connector.connect(),
+            expected_operation_id,
+            host,
+            meta,
+            progress,
+        )
+        .await
+    }
+
     /// Sets a persistent per-file update policy, pinned at the canonical
     /// publication's hash for that file.
     pub(crate) async fn set_config_policy(

@@ -50,7 +50,7 @@ use crate::{
             service::{Connector, DeployService, PinAdvice},
             settings::RestartPolicy,
             spec::DeploymentSpec,
-            state::OperationKind,
+            state::{OperationKind, RestartOutcome},
         },
         sync::FetchedPublication,
     },
@@ -60,12 +60,12 @@ use crate::{
 /// Everything a request handler or the poll loop needs.
 pub struct WorkerContext {
     config: WorkerConfig,
-    secrets: Secrets,
     journal: Arc<Journal>,
     sync: SyncClient,
     /// The deployment service desktop Local mode runs too, bound to this
     /// worker's profile and remote.
     service: DeployService,
+    host: Box<dyn host::HostControl>,
     /// Serializes operations inside this process. Cross-executor safety is
     /// the remote lease's job; this keeps a manual request and an automatic
     /// poll from racing in the same process.
@@ -108,8 +108,11 @@ impl WorkerContext {
             },
             token: secrets.token()?,
             sync: SyncClient::new(config.clone(), secrets.seed_refresh_token()),
+            host: host::from_settings(
+                &config.remote.host_control,
+                secrets.dat_host_password().as_deref(),
+            ),
             config,
-            secrets,
             journal: Arc::new(journal),
             operation_lock: Mutex::new(()),
             publication_lock: Mutex::new(()),
@@ -157,13 +160,6 @@ impl WorkerContext {
             Some(policy) => policy,
             None => self.journal.state.lock().await.restart_policy,
         }
-    }
-
-    fn host(&self) -> Box<dyn host::HostControl> {
-        host::from_settings(
-            &self.config.remote.host_control,
-            self.secrets.dat_host_password().as_deref(),
-        )
     }
 
     /// The latest canonical publication.
@@ -454,7 +450,7 @@ async fn run_deployment(
                 plan_hash,
                 force,
                 policy,
-                ctx.host().as_ref(),
+                ctx.host.as_ref(),
                 meta,
                 &mut progress,
             )
@@ -598,11 +594,63 @@ fn retry_delay(attempts: u32) -> Duration {
     Duration::from_secs((60_u64 << attempts.min(6)).min(30 * 60))
 }
 
-/// One poll cycle. Observes the newest publication, then drives pending
-/// work.
+/// One poll cycle. Observes publications, deploys owed mods, and rechecks
+/// previously requested restarts even when publication polling fails.
 async fn poll_once(ctx: &Arc<WorkerContext>) {
     if observe_publication(ctx).await.is_ok() {
         deploy_pending(ctx).await;
+    }
+    resume_deferred_restart(ctx).await;
+}
+
+/// A deployment's WhenEmpty request survives disabled automatic mod
+/// deployment and Worker restarts through its durable operation record.
+async fn resume_deferred_restart(ctx: &Arc<WorkerContext>) {
+    let Ok(_operation) = ctx.operation_lock.try_lock() else {
+        return;
+    };
+    let expected_operation_id = {
+        let state = ctx.journal.state.lock().await;
+        let Some(record) = state
+            .last_operation
+            .as_ref()
+            .filter(|record| record.restart == RestartOutcome::AwaitingEmpty)
+        else {
+            return;
+        };
+        record.id.clone()
+    };
+    let meta = ctx.meta(OperationKind::Automatic);
+    let mut progress = ctx.reporter(
+        meta.id.clone(),
+        SyncOperation::Deploy,
+        &DeploySelection {
+            include_mods: false,
+            configs: None,
+        },
+    );
+    match ctx
+        .service
+        .resume_deferred_restart(
+            expected_operation_id,
+            ctx.host.as_ref(),
+            meta,
+            &mut progress,
+        )
+        .await
+    {
+        Ok(state) => {
+            if let Some(record) = state.last_operation
+                && let Err(error) = ctx.journal.record_operation(record).await
+            {
+                warn!(%error, "failed to journal deferred restart result");
+            }
+            ctx.clear_progress();
+        }
+        Err(error) => {
+            warn!(%error, "deferred restart check failed");
+            progress.failed();
+        }
     }
 }
 
@@ -833,6 +881,10 @@ pub async fn run(
 #[cfg(test)]
 #[path = "server_publication_tests.rs"]
 mod publication_tests;
+
+#[cfg(test)]
+#[path = "server_restart_tests.rs"]
+mod restart_tests;
 
 #[cfg(test)]
 mod tests {

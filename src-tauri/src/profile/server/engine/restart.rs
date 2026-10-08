@@ -61,15 +61,24 @@ pub(in crate::profile::server) async fn apply_restart_policy_reporting(
             progress.item("Checking server status");
             do_restart(host, host.status().await.ok(), progress).await
         }
-        RestartPolicy::WhenEmpty => match host.status().await {
-            Ok(status) if status.players == Some(0) => {
-                do_restart(host, Some(status), progress).await
-            }
-            _ => {
-                progress.item("Waiting until the server is empty");
-                RestartOutcome::AwaitingEmpty.into()
-            }
+        RestartPolicy::WhenEmpty => match empty_server_status(host, progress).await {
+            Some(status) => do_restart(host, Some(status), progress).await,
+            None => RestartOutcome::AwaitingEmpty.into(),
         },
+    }
+}
+
+/// Presence must explicitly report zero before a WhenEmpty restart.
+pub(super) async fn empty_server_status(
+    host: &dyn HostControl,
+    progress: &mut ProgressReporter,
+) -> Option<HostStatus> {
+    match host.status().await {
+        Ok(status) if status.players == Some(0) => Some(status),
+        _ => {
+            progress.item("Waiting until the server is empty");
+            None
+        }
     }
 }
 
@@ -85,7 +94,7 @@ fn observed_restart(saw_stopped: &mut bool, saw_booting: &mut bool, status: &Hos
         && (*saw_stopped || (*saw_booting && status.booting == Some(false)))
 }
 
-async fn do_restart(
+pub(super) async fn do_restart(
     host: &dyn HostControl,
     before: Option<HostStatus>,
     progress: &mut ProgressReporter,

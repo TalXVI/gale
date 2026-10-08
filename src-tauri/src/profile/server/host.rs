@@ -62,9 +62,8 @@ impl HostControl for NoHostControl {
 
 /// DatHost game-server API adapter.
 ///
-/// - `GET  /api/0.1/game-servers/{id}` refreshes and returns `booting`.
-/// - `GET  /api/0.1/game-servers/{id}/metrics` returns the player count
-///   where the game supports it.
+/// - `GET  /api/0.1/game-servers/{id}` refreshes `booting` and returns
+///   the connected player count in `players_online`.
 /// - `POST /api/0.1/game-servers/{id}/start` is documented to *restart* an
 ///   already-running server, so Gale uses it for both start and restart.
 pub struct DatHostControl {
@@ -79,12 +78,7 @@ pub struct DatHostControl {
 struct DatHostServer {
     on: bool,
     booting: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DatHostMetrics {
-    /// Present only for games with a metrics probe.
-    player_count: Option<u32>,
+    players_online: Option<u32>,
 }
 
 impl DatHostControl {
@@ -142,14 +136,10 @@ impl HostControl for DatHostControl {
     fn status<'a>(&'a self) -> BoxFuture<'a, Result<HostStatus>> {
         Box::pin(async move {
             let server: DatHostServer = self.get("").await?;
-            let players = match self.get::<DatHostMetrics>("metrics").await {
-                Ok(metrics) => metrics.player_count,
-                Err(_) => None,
-            };
             Ok(HostStatus {
                 running: Some(server.on),
                 booting: server.booting,
-                players,
+                players: server.players_online,
             })
         })
     }
@@ -244,10 +234,12 @@ mod tests {
                     .unwrap()
                     .pop_front()
                     .unwrap_or(false);
-                axum::Json(serde_json::json!({"on": true, "booting": booting})).into_response()
-            }
-            "GET /game-servers/server-1/metrics" => {
-                axum::Json(serde_json::json!({"player_count": api.players})).into_response()
+                axum::Json(serde_json::json!({
+                    "on": true,
+                    "booting": booting,
+                    "players_online": api.players,
+                }))
+                .into_response()
             }
             "POST /game-servers/server-1/start" if api.fail_restart => {
                 StatusCode::SERVICE_UNAVAILABLE.into_response()
@@ -270,10 +262,7 @@ mod tests {
     async fn restart_policy_uses_authenticated_host_status_and_restart_requests() {
         use RestartOutcome::*;
         use RestartPolicy::*;
-        let status = [
-            "GET /game-servers/server-1/",
-            "GET /game-servers/server-1/metrics",
-        ];
+        let status = ["GET /game-servers/server-1/"];
         let restart = "POST /game-servers/server-1/start";
         for (policy, required, players, fail_status, fail_restart, expected, calls) in [
             (Immediate, false, Some(0), false, false, NotRequired, vec![]),
@@ -312,9 +301,7 @@ mod tests {
                 false,
                 false,
                 Restarted,
-                vec![
-                    status[0], status[1], restart, status[0], status[1], status[0], status[1],
-                ],
+                vec![status[0], restart, status[0], status[0]],
             ),
             (
                 Immediate,
@@ -323,9 +310,7 @@ mod tests {
                 false,
                 false,
                 Restarted,
-                vec![
-                    status[0], status[1], restart, status[0], status[1], status[0], status[1],
-                ],
+                vec![status[0], restart, status[0], status[0]],
             ),
             (
                 Immediate,
@@ -334,7 +319,7 @@ mod tests {
                 false,
                 true,
                 Failed,
-                vec![status[0], status[1], restart],
+                vec![status[0], restart],
             ),
             (
                 Immediate,
@@ -372,7 +357,11 @@ mod tests {
                 .outcome;
             task.abort();
             assert_eq!(outcome, expected, "policy {policy:?}, players {players:?}");
-            assert_eq!(*api.calls.lock().unwrap(), calls);
+            assert_eq!(
+                *api.calls.lock().unwrap(),
+                calls,
+                "policy {policy:?}, players {players:?}"
+            );
             assert!(api.violations.lock().unwrap().is_empty());
         }
     }
@@ -382,5 +371,12 @@ mod tests {
         let server: DatHostServer =
             serde_json::from_value(serde_json::json!({"on": true})).unwrap();
         assert_eq!(server.booting, None);
+    }
+
+    #[test]
+    fn missing_dat_host_player_count_stays_unknown() {
+        let server: DatHostServer =
+            serde_json::from_value(serde_json::json!({"on": true, "booting": false})).unwrap();
+        assert_eq!(server.players_online, None);
     }
 }

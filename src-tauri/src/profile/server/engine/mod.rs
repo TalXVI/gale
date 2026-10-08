@@ -355,6 +355,119 @@ pub async fn complete_with_progress(
     })
 }
 
+/// Rechecks a deferred restart without staging or deploying files. The
+/// operation that requested it must still be authoritative under the lease.
+#[cfg(any(feature = "worker", test))]
+pub async fn resume_deferred_restart(
+    session: Session,
+    connect: impl FnMut() -> Result<Box<dyn RemoteOps>> + Send + 'static,
+    expected_operation_id: String,
+    host: &dyn HostControl,
+    meta: OperationMeta,
+    progress: &mut ProgressReporter,
+) -> Result<ServerDeploymentState> {
+    progress.phase(SyncPhase::CheckingLease);
+    let (mut session, lease) = tokio::task::spawn_blocking(move || {
+        let mut session = session;
+        let mut lease = session.acquire_lease(&meta, false)?;
+        let prepared: Result<bool> = (|| {
+            refresh_state(&mut session)?;
+            let pending = session.state.restart_required
+                && session
+                    .state
+                    .last_operation
+                    .as_ref()
+                    .is_some_and(|operation| {
+                        operation.id == expected_operation_id
+                            && operation.restart == RestartOutcome::AwaitingEmpty
+                    });
+            if pending {
+                ensure_ownership(&lease, &mut session)?;
+            }
+            Ok(pending)
+        })();
+        match prepared {
+            Ok(true) => {
+                lease::start_heartbeat(&mut lease, connect);
+                Ok((session, Some(lease)))
+            }
+            other => {
+                lease.release(session.ops.as_mut());
+                other.map(|_| (session, None))
+            }
+        }
+    })
+    .await
+    .context("deferred restart preparation task failed")??;
+
+    let Some(mut lease) = lease else {
+        progress.succeeded();
+        return Ok(session.state);
+    };
+    progress.phase(SyncPhase::ApplyingRestart);
+    let report = if !host.can_restart() {
+        RestartOutcome::AwaitingManual.into()
+    } else if let Some(before) = restart::empty_server_status(host, progress).await {
+        // Persist intent before the request. A crash or a failed final state
+        // write must not leave AwaitingEmpty eligible to restart again.
+        let (prepared_session, held) = tokio::task::spawn_blocking(move || {
+            let prepared = (|| {
+                ensure_ownership(&lease, &mut session)?;
+                let mut record = session
+                    .state
+                    .last_operation
+                    .clone()
+                    .ok_or_else(|| eyre::eyre!("deferred restart operation is missing"))?;
+                record.restart = RestartOutcome::StartupUnverified;
+                session.state.record_operation(record);
+                persist_state(&mut session)
+            })();
+            if let Err(error) = prepared {
+                lease.release(session.ops.as_mut());
+                return Err(error);
+            }
+            Ok((session, lease))
+        })
+        .await
+        .context("deferred restart intent task failed")??;
+        session = prepared_session;
+        lease = held;
+        restart::do_restart(host, Some(before), progress).await
+    } else {
+        RestartOutcome::AwaitingEmpty.into()
+    };
+    progress.phase(SyncPhase::ReleasingLease);
+    let state = tokio::task::spawn_blocking(move || {
+        let result: Result<ServerDeploymentState> = (|| {
+            ensure_ownership(&lease, &mut session)?;
+            if report.outcome != RestartOutcome::AwaitingEmpty {
+                let mut record = session
+                    .state
+                    .last_operation
+                    .take()
+                    .ok_or_else(|| eyre::eyre!("deferred restart operation is missing"))?;
+                record.restart = report.outcome;
+                if let Some(warning) = report.warning {
+                    record.error = Some(match record.error {
+                        Some(error) => format!("{error}; {warning}"),
+                        None => warning,
+                    });
+                }
+                session.state.restart_required = report.outcome != RestartOutcome::Restarted;
+                session.state.record_operation(record);
+                persist_state(&mut session)?;
+            }
+            Ok(session.state.clone())
+        })();
+        lease.release(session.ops.as_mut());
+        result
+    })
+    .await
+    .context("deferred restart finalization task failed")??;
+    progress.succeeded();
+    Ok(state)
+}
+
 /// Executes an approved plan under the deployment lease.
 ///
 /// This function takes the lease *before* reading the authoritative

@@ -23,6 +23,8 @@ use crate::{
     thunderstore::{Backend, PackageIdent},
 };
 
+mod deferred_restart;
+
 const BASE: &str = "/srv";
 const STATE_REMOTE: &str = "/srv/BepInEx/config/.gale-server-state.json";
 const LEASE_DIR_REMOTE: &str = "/srv/BepInEx/config/.gale-deploy.lock";
