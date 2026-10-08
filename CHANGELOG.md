@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## 1.24.1 (2026-10-08)
+
+### Changed
+
+- Profile updates now pull mods only, including updates before launch. Local configs stay unchanged, even with an older "always apply" policy.
+- Config updates are available under **Configs (optional)** in Profile sync. Select the files you want to apply. Initial profile imports still include published configs.
+
+### Fixed
+
+- Fresh Thunderstore mod releases are available before the cached catalog refreshes. Profile imports resolve the exact published versions and their dependencies.
+- Dedicated-server restarts deferred while players are online resume when the server becomes empty.
+- Config files observed locally and later deleted still require confirmation before being restored.
+
+## 1.24.0 (2026-10-04)
+
 ### Fixed
 
 - File and URL open actions freezing the app in some environments
