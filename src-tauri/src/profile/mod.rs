@@ -19,7 +19,7 @@ use crate::{
     game::{self, Game, mod_loader::ModLoader},
     prefs::Prefs,
     state::ManagerExt,
-    thunderstore::{self, Backend, BorrowedMod, ModId, Thunderstore, VersionIdent},
+    thunderstore::{self, Backend, BorrowedMod, FromBackend, ModId, Thunderstore, VersionIdent},
     util::fs::PathExt,
 };
 
@@ -340,6 +340,36 @@ impl Profile {
         thunderstore
             .dependencies(dependencies)
             .filter(|dep| !self.has_mod(dep.package.uuid))
+    }
+
+    /// Resolves the dependency graph using versions planned for installation or
+    /// already installed in this profile before consulting catalog requirements.
+    fn resolve_install_dependencies<'a>(
+        &self,
+        dependencies: impl IntoIterator<Item = (&'a VersionIdent, Backend)>,
+        planned: &[BorrowedMod<'a>],
+        thunderstore: &'a Thunderstore,
+    ) -> Result<Vec<BorrowedMod<'a>>> {
+        thunderstore::resolve_dependencies(dependencies, |ident, backend| {
+            if let Some(dependency) = planned
+                .iter()
+                .find(|m| m.package.full_name() == ident.full_name())
+            {
+                return Ok(*dependency);
+            }
+            if let Some((installed, _)) = self
+                .thunderstore_mods()
+                .find(|(m, _)| m.ident.full_name() == ident.full_name())
+            {
+                return installed.id.borrow(thunderstore);
+            }
+            thunderstore.find_ident(ident, FromBackend::Prefer(backend))
+        })
+        .filter_ok(|dep| {
+            planned.iter().any(|m| m.package.uuid == dep.package.uuid)
+                || !self.has_mod(dep.package.uuid)
+        })
+        .collect()
     }
 
     fn log_path(&self) -> Result<PathBuf> {
@@ -752,7 +782,7 @@ impl ModManager {
             .unique()
             .collect_vec();
 
-        thunderstore::cache::write_packages(packages, self.active_game, prefs)
+        thunderstore::cache::write_packages(packages, self.active_game, prefs, thunderstore)
     }
 
     fn add_saved_game(&mut self, base_path: &Path, saved_game: db::ManagedGameData) -> bool {

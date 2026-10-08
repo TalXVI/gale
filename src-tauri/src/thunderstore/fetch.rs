@@ -170,17 +170,22 @@ async fn fetch_single_packages(
         game: Game,
         cancel_token: &CancellationToken,
     ) -> Result<usize> {
-        let bytes = tokio::select! {
+        let (bytes, generated_at) = tokio::select! {
             biased;
             () = cancel_token.cancelled() => {
                 debug!("fetch cancelled while fetching packages for {}", backend);
                 return Ok(0);
             }
             res = async {
-                let response = app.http().get(&index_url).send().await?;
-                let bytes = response.error_for_status()?.bytes().await?;
+                let response = app.http().get(&index_url).send().await?.error_for_status()?;
+                let generated_at = response.headers().get(reqwest::header::LAST_MODIFIED)
+                    .map(|value| -> Result<_> {
+                        Ok(chrono::DateTime::parse_from_rfc2822(value.to_str()?)?.to_utc())
+                    })
+                    .transpose()?;
+                let bytes = response.bytes().await?;
 
-                Ok::<_, reqwest_middleware::Error>(bytes)
+                Ok::<_, eyre::Report>((bytes, generated_at))
             } => res?,
         };
 
@@ -238,7 +243,9 @@ async fn fetch_single_packages(
 
                         let backend_state = state.backend_mut(backend);
                         let prev_count = backend_state.packages.len();
-                        backend_state.packages.extend(packages);
+                        for (_, package) in packages {
+                            backend_state.insert_package(package, generated_at);
+                        }
 
                         package_count += backend_state.packages.len() - prev_count;
                     } else {
@@ -273,7 +280,7 @@ async fn fetch_single_packages(
         backend_state.packages_fetched = true;
 
         if !write_directly {
-            backend_state.packages = package_buffer;
+            backend_state.replace_packages(package_buffer, generated_at);
         }
 
         chunk_fetcher.abort();

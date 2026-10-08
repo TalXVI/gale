@@ -3,6 +3,7 @@ use futures_util::TryFutureExt;
 use itertools::Itertools;
 use tauri::{AppHandle, command};
 use tracing::warn;
+use uuid::Uuid;
 
 use super::{Backend, query::QueryModsArgs};
 use crate::{
@@ -62,6 +63,11 @@ pub fn trigger_mod_fetch(app: AppHandle) -> Result<()> {
     });
 
     Ok(())
+}
+
+#[command]
+pub async fn pull_live_mod(package_uuid: Uuid, game: &str, app: AppHandle) -> Result<String> {
+    Ok(super::details::pull_live_package(package_uuid, game, &app).await?)
 }
 
 #[command]

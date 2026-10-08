@@ -148,6 +148,7 @@ pub fn run(context: tauri::Context) {
             thunderstore::commands::has_api_token,
             thunderstore::commands::clear_api_token,
             thunderstore::commands::trigger_mod_fetch,
+            thunderstore::commands::pull_live_mod,
             thunderstore::commands::get_categories,
             prefs::commands::get_prefs,
             prefs::commands::set_prefs,

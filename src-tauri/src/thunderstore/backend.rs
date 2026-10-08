@@ -2,10 +2,12 @@ use crate::{
     game::Game,
     thunderstore::{BorrowedMod, PackageIdent, PackageListing, VersionIdent, cache::MarkdownKind},
 };
+use chrono::{DateTime, Utc};
 use eyre::eyre;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     fmt::{Display, Formatter},
     str::FromStr,
 };
@@ -63,6 +65,17 @@ impl Backend {
             })
         } else {
             None
+        }
+    }
+
+    /// Returns the live package listing endpoint when the backend supports it.
+    pub(crate) fn package_detail_url(self, game: Game, uuid: Uuid) -> Option<String> {
+        match self {
+            Backend::Thunderstore if game.backends.contains(&self) => Some(format!(
+                "https://thunderstore.io/c/{}/api/v1/package/{uuid}/",
+                game.slug
+            )),
+            _ => None,
         }
     }
 
@@ -185,6 +198,7 @@ pub struct ThunderstoreBackend {
     // IndexMap is not used for ordering here, but for fast iteration,
     // since we iterate over all mods when resolving identifiers and querying.
     pub(super) packages: IndexMap<Uuid, PackageListing>,
+    live_packages: HashMap<Uuid, DateTime<Utc>>,
     pub(super) backend: Backend,
 }
 
@@ -194,6 +208,7 @@ impl ThunderstoreBackend {
             packages_fetched: false,
             is_fetching: false,
             packages: IndexMap::new(),
+            live_packages: HashMap::new(),
             backend,
         }
     }
@@ -202,6 +217,66 @@ impl ThunderstoreBackend {
     /// the last call to [`crate::thunderstore::Thunderstore::switch_game`].
     pub fn packages_fetched(&self) -> bool {
         self.packages_fetched
+    }
+
+    /// Inserts a catalog listing without overwriting a live pull with stale data.
+    pub(super) fn insert_package(
+        &mut self,
+        package: PackageListing,
+        generated_at: Option<DateTime<Utc>>,
+    ) {
+        if let Some(observed_at) = self.live_packages.get(&package.uuid)
+            && self.packages.get(&package.uuid).is_some_and(|current| {
+                catalog_precedes_live(current, &package, *observed_at, generated_at)
+            })
+        {
+            return;
+        }
+
+        self.live_packages.remove(&package.uuid);
+        self.packages.insert(package.uuid, package);
+    }
+
+    pub(super) fn insert_live_package(
+        &mut self,
+        package: PackageListing,
+        observed_at: DateTime<Utc>,
+    ) {
+        self.live_packages.insert(package.uuid, observed_at);
+        self.packages.insert(package.uuid, package);
+    }
+
+    pub(super) fn live_observed_at(&self, uuid: Uuid) -> Option<DateTime<Utc>> {
+        self.live_packages.get(&uuid).copied()
+    }
+
+    pub(super) fn live_packages(&self) -> impl Iterator<Item = &PackageListing> {
+        self.packages
+            .values()
+            .filter(|package| self.live_packages.contains_key(&package.uuid))
+    }
+
+    /// Keeps live pulls until the bulk catalog catches up or removes the listing.
+    pub(super) fn replace_packages(
+        &mut self,
+        packages: IndexMap<Uuid, PackageListing>,
+        generated_at: Option<DateTime<Utc>>,
+    ) {
+        for (uuid, current) in std::mem::replace(&mut self.packages, packages) {
+            if let Some(observed_at) = self.live_packages.get(&uuid)
+                && let Some(incoming) = self.packages.get_mut(&uuid)
+                && catalog_precedes_live(&current, incoming, *observed_at, generated_at)
+            {
+                *incoming = current;
+            } else if let Some(observed_at) = self.live_packages.get(&uuid)
+                && !self.packages.contains_key(&uuid)
+                && generated_at.is_some_and(|generated| generated < *observed_at)
+            {
+                self.packages.insert(uuid, current);
+            } else {
+                self.live_packages.remove(&uuid);
+            }
+        }
     }
 
     /// Returns an iterator over the latest versions of every package.
@@ -271,5 +346,20 @@ impl ThunderstoreBackend {
         self.is_fetching = false;
         self.packages_fetched = false;
         self.packages = IndexMap::new();
+        self.live_packages.clear();
+    }
+}
+
+fn catalog_precedes_live(
+    live: &PackageListing,
+    catalog: &PackageListing,
+    observed_at: DateTime<Utc>,
+    generated_at: Option<DateTime<Utc>>,
+) -> bool {
+    match live.date_updated.cmp(&catalog.date_updated) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        // Withdrawals and moderation do not advance the publication timestamp.
+        std::cmp::Ordering::Equal => generated_at.is_some_and(|generated| generated < observed_at),
     }
 }

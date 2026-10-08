@@ -2,11 +2,13 @@ import { mockConvertFileSrc, mockIPC } from '@tauri-apps/api/mocks';
 import { mount } from 'svelte';
 import type { Mod, ProfileMod } from '$lib/types';
 import { Backend, ModType } from '$lib/types';
+import Toasts from '$lib/components/misc/Toasts.svelte';
 import '../../src/app.css';
 
 const params = new URLSearchParams(location.search);
 const calls: { cmd: string; args: unknown }[] = [];
 Object.assign(window, { calls, navigations: [] });
+let livePulled = false;
 
 const local: ProfileMod = {
 	enabled: false,
@@ -75,6 +77,33 @@ mockIPC((cmd, args) => {
 		case 'get_profile_info':
 			return { activeId: 1, profiles: [{ id: 1, name: 'Review', sync: null }] };
 		case 'query_profile':
+			if (params.has('live')) {
+				const data = remote(Backend.Thunderstore, '1.1.3', '00000000-0000-0000-0000-000000000013');
+				data.versions = livePulled
+					? [{ name: '1.1.4', uuid: '00000000-0000-0000-0000-000000000014' }, ...data.versions]
+					: data.versions;
+				return {
+					mods: [{ enabled: true, configFile: null, alternateBackend: null, data }],
+					unknownMods: [],
+					totalModCount: 1,
+					updates: livePulled
+						? [
+								{
+									fullName: 'Author-DualSourceMod',
+									ignore: false,
+									isCrossBackend: false,
+									updatedId: {
+										packageUuid: data.uuid,
+										versionUuid: '00000000-0000-0000-0000-000000000014',
+										backend: Backend.Thunderstore
+									},
+									old: '1.1.3',
+									new: '1.1.4'
+								}
+							]
+						: []
+				};
+			}
 			return {
 				mods: [local],
 				unknownMods: [1, 3].map((n) => ({
@@ -92,7 +121,7 @@ mockIPC((cmd, args) => {
 					data: {
 						thunderstore: remote(
 							Backend.Thunderstore,
-							params.get('ts') ?? '1.0.0',
+							livePulled ? '1.1.4' : (params.get('ts') ?? '1.0.0'),
 							'00000000-0000-0000-0000-000000000010'
 						),
 						hexium: remote(
@@ -125,6 +154,23 @@ mockIPC((cmd, args) => {
 			return { backendSkipConfirm: true };
 		case 'get_download_size':
 			return 0;
+		case 'pull_live_mod':
+			return new Promise<string>((resolve, reject) => {
+				setTimeout(
+					() => {
+						if (params.has('liveError')) {
+							reject({
+								message: 'Required dependency Author-Loader-2.0.0 is not available in the catalog',
+								detail: 'Dependency not available'
+							});
+						} else {
+							livePulled = true;
+							resolve('1.1.4');
+						}
+					},
+					params.has('liveDelay') ? 1000 : 0
+				);
+			});
 		case 'is_installing':
 			return false;
 		case 'force_remove_mods':
@@ -137,6 +183,7 @@ mockIPC((cmd, args) => {
 	}
 });
 mockConvertFileSrc('windows');
+mount(Toasts, { target: document.body });
 
 if (params.has('browse')) {
 	const { default: Page } = await import('../../src/routes/browse/+page.svelte');

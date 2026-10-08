@@ -15,7 +15,7 @@
 	import ModListItem from '$lib/components/mod-list/ModListItem.svelte';
 	import ProfileLockedBanner from '$lib/components/mod-list/ProfileLockedBanner.svelte';
 	import ModListFilters from '$lib/components/mod-list/ModListFilters.svelte';
-	import { defaultContextItems } from '$lib/context';
+	import { defaultContextItems, pullLiveContextItem } from '$lib/context';
 	import InstallModButton from '$lib/components/mod-list/InstallModButton.svelte';
 	import profiles from '$lib/state/profile.svelte';
 	import { modQuery } from '$lib/state/misc.svelte';
@@ -32,6 +32,7 @@
 
 	const sortOptions: SortBy[] = ['lastUpdated', 'newest', 'rating', 'downloads'];
 	const contextItems: ModContextItem[] = [
+		pullLiveContextItem(refresh),
 		{
 			label: m.browse_contextItem_hideMod(),
 			icon: 'mdi:eye-off',

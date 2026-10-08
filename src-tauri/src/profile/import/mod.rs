@@ -32,6 +32,7 @@ use crate::{
 
 pub mod commands;
 mod local;
+mod metadata;
 mod r2modman;
 mod revert;
 
@@ -187,14 +188,22 @@ pub(super) enum ImportTarget {
 }
 
 pub(super) async fn import_manifest(
-    manifest: ProfileManifest,
+    mut manifest: ProfileManifest,
     target: ImportTarget,
     options: ImportOptions,
     install_options: InstallOptions,
     app: &AppHandle,
 ) -> Result<ImportedProfile> {
-    wait_for_profile_installs(&target, &manifest.name, app).await;
+    if !options.ignore_missing_mods {
+        let game = match &target {
+            ImportTarget::Existing(id) => app.lock_manager().profile_by_id(*id)?.0,
+            ImportTarget::Named { game } => *game,
+        };
+        metadata::refresh_manifest_metadata(&manifest.mods, game, app).await?;
+        resolve_manifest_sources(&mut manifest, &app.lock_thunderstore());
+    }
 
+    wait_for_profile_installs(&target, &manifest.name, app).await;
     let (to_install, imported) = prepare_import(&options, manifest, target, app)?;
 
     match app
@@ -316,6 +325,15 @@ fn prepare_import(
 
     let mut manager = app.lock_manager();
     let thunderstore = app.lock_thunderstore();
+
+    if !options.ignore_missing_mods {
+        let game = match &target {
+            ImportTarget::Existing(id) => manager.profile_by_id(*id)?.0,
+            ImportTarget::Named { game } => *game,
+        };
+        eyre::ensure!(manager.active_game == game, "The active game has changed");
+        thunderstore.game_context(game)?;
+    }
 
     let installs = mods
         .into_iter()

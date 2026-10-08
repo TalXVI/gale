@@ -1,4 +1,4 @@
-use eyre::Result;
+use eyre::{Context, Result, ensure};
 use query::QueryModsArgs;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -21,6 +21,9 @@ pub mod token;
 
 mod fetch;
 pub use fetch::wait_for_fetch;
+
+mod details;
+pub(crate) use details::{apply_live_packages, fetch_package_detail};
 
 mod models;
 pub use models::*;
@@ -208,6 +211,21 @@ impl From<Option<Backend>> for FromBackend {
 }
 
 impl Thunderstore {
+    pub(crate) fn game_context(&self, game: Game) -> Result<CancellationToken> {
+        ensure!(self.game == Some(game), "The active game has changed");
+        Ok(self.fetch_cancel_token.clone())
+    }
+
+    /// Checks required dependency versions before building an installation queue.
+    pub fn ensure_dependencies_available<'a>(
+        &'a self,
+        dependencies: impl IntoIterator<Item = (&'a VersionIdent, Backend)>,
+    ) -> Result<()> {
+        ensure_dependencies_available(dependencies, |ident, backend| {
+            self.find_ident(ident, FromBackend::Prefer(backend))
+        })
+    }
+
     pub fn new() -> Self {
         Self {
             game: None,
@@ -474,6 +492,38 @@ impl Thunderstore {
             thunderstore: self,
         }
     }
+}
+
+pub(super) fn ensure_dependencies_available<'a>(
+    dependencies: impl IntoIterator<Item = (&'a VersionIdent, Backend)>,
+    resolve: impl Fn(&VersionIdent, Backend) -> Result<BorrowedMod<'a>>,
+) -> Result<()> {
+    resolve_dependencies(dependencies, resolve).try_for_each(|dependency| dependency.map(|_| ()))
+}
+
+pub(crate) fn resolve_dependencies<'a>(
+    dependencies: impl IntoIterator<Item = (&'a VersionIdent, Backend)>,
+    resolve: impl Fn(&VersionIdent, Backend) -> Result<BorrowedMod<'a>>,
+) -> impl Iterator<Item = Result<BorrowedMod<'a>>> {
+    let mut queue: VecDeque<_> = dependencies.into_iter().collect();
+    let mut visited: HashSet<_> = queue.iter().map(|(ident, _)| ident.full_name()).collect();
+
+    std::iter::from_fn(move || {
+        let (ident, backend) = queue.pop_front()?;
+        Some(
+            resolve(ident, backend)
+                .with_context(|| {
+                    format!("Required dependency {ident} is not available in the catalog")
+                })
+                .inspect(|dependency| {
+                    for (ident, backend) in dependency.dependencies() {
+                        if visited.insert(ident.full_name()) {
+                            queue.push_back((ident, backend));
+                        }
+                    }
+                }),
+        )
+    })
 }
 
 async fn get_categories(

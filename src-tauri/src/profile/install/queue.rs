@@ -18,7 +18,13 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 use zip::ZipArchive;
 
-use crate::{logger, profile::server, state::ManagerExt, util::error::IoResultExt};
+use crate::{
+    logger,
+    profile::{Profile, server},
+    state::ManagerExt,
+    thunderstore::Thunderstore,
+    util::error::IoResultExt,
+};
 
 use super::{
     CancelBehavior, HideReason, InstallError, InstallEvent, InstallOptions, InstallResult,
@@ -244,27 +250,48 @@ fn resolve_with_deps(
     let thunderstore = app.lock_thunderstore();
     let (_, profile) = manager.profile_by_id(profile_id)?;
 
+    resolve_profile_installs(mods, profile, allow_multiple, &thunderstore)
+}
+
+fn resolve_profile_installs(
+    mods: Vec<ModInstall>,
+    profile: &Profile,
+    allow_multiple: bool,
+    thunderstore: &Thunderstore,
+) -> Result<Vec<ModInstall>> {
     if !allow_multiple && mods.len() == 1 && profile.has_mod(mods[0].uuid()) {
         bail!("mod is already installed");
     }
 
-    // find the missing dependencies of each mod and flatten them into one vec
-    let mods = mods
-        .into_iter()
-        .map(|install| {
-            let borrowed = install.id.borrow(&thunderstore)?;
+    let planned = mods
+        .iter()
+        .map(|install| install.id.borrow(thunderstore))
+        .collect::<Result<Vec<_>>>()?;
 
-            Ok(iter::once(install).chain(
-                profile
-                    .missing_deps(borrowed.dependencies(), &thunderstore)
-                    .map(ModInstall::from),
-            ))
+    // Validation and installation use the same resolved dependency versions.
+    let resolved = mods
+        .iter()
+        .map(|install| {
+            let borrowed = install.id.borrow(thunderstore)?;
+            let dependencies = profile.resolve_install_dependencies(
+                borrowed.dependencies(),
+                &planned,
+                thunderstore,
+            )?;
+            Ok(
+                iter::once(install.clone()).chain(dependencies.into_iter().map(|dependency| {
+                    mods.iter()
+                        .find(|planned| planned.uuid() == dependency.package.uuid)
+                        .cloned()
+                        .unwrap_or_else(|| ModInstall::from(dependency))
+                })),
+            )
         })
         .flatten_ok()
         .collect::<Result<Vec<_>>>()
         .context("failed to resolve dependencies")?;
 
-    Ok(mods
+    Ok(resolved
         .into_iter()
         .unique_by(super::ModInstall::uuid) // remove duplicate dependencies
         .rev() // install dependencies first
@@ -561,8 +588,180 @@ fn install_from_download(
 #[cfg(test)]
 mod tests {
     use futures_util::FutureExt;
+    use serde_json::json;
+
+    use crate::{
+        config::ConfigCache,
+        game,
+        prefs::Prefs,
+        thunderstore::{Backend, BorrowedMod, PackageListing},
+        util::fs::JsonStyle,
+    };
 
     use super::*;
+
+    fn listing(name: &str, uuid: u128, version: &str, dependencies: &[&str]) -> PackageListing {
+        let patch = version.parse::<semver::Version>().unwrap().patch;
+        serde_json::from_value(json!({
+            "full_name": format!("Example-{name}"),
+            "uuid4": Uuid::from_u128(uuid),
+            "categories": [],
+            "date_created": "2024-01-01T00:00:00Z",
+            "date_updated": "2024-01-01T00:00:00Z",
+            "has_nsfw_content": false,
+            "is_deprecated": false,
+            "is_pinned": false,
+            "package_url": "https://example.com/",
+            "rating_score": 0,
+            "versions": [{
+                "full_name": format!("Example-{name}-{version}"),
+                "uuid4": Uuid::from_u128(uuid * 100 + u128::from(patch)),
+                "date_created": "2024-01-01T00:00:00Z",
+                "dependencies": dependencies,
+                "description": "Test dependency graph",
+                "downloads": 0,
+                "file_size": 100,
+                "is_active": true,
+                "website_url": ""
+            }]
+        }))
+        .unwrap()
+    }
+
+    fn catalog(packages: &[PackageListing]) -> Thunderstore {
+        let dir = tempfile::tempdir().unwrap();
+        let prefs: Prefs = serde_json::from_value(json!({ "dataDir": dir.path() })).unwrap();
+        let game = game::from_slug("valheim").unwrap();
+        let folder = dir.path().join("valheim");
+        fs::create_dir(&folder).unwrap();
+        crate::util::fs::write_json(
+            folder.join("thunderstore_cache.json"),
+            packages,
+            JsonStyle::Compact,
+        )
+        .unwrap();
+        let mut state = Thunderstore::new();
+        state
+            .backend_mut(Backend::Thunderstore)
+            .read_and_insert_cache(game, &prefs);
+        state
+    }
+
+    fn install(state: &Thunderstore, uuid: u128) -> ModInstall {
+        ModInstall::new(BorrowedMod::latest(
+            state
+                .get_package(Uuid::from_u128(uuid), Backend::Thunderstore)
+                .unwrap(),
+        ))
+    }
+
+    fn profile(mods: Vec<ModInstall>) -> Profile {
+        Profile {
+            id: 1,
+            name: "Dependency test".to_owned(),
+            path: Default::default(),
+            mods: mods.iter().map(ModInstall::profile_mod).collect(),
+            game: game::from_slug("valheim").unwrap(),
+            ignored_version_updates: Default::default(),
+            ignored_package_updates: Default::default(),
+            config_cache: ConfigCache::default(),
+            linked_config: Default::default(),
+            modpack: None,
+            sync: None,
+            custom_args: String::new(),
+            server_settings: None,
+            missing: false,
+            excluded_export_files: Default::default(),
+        }
+    }
+
+    #[test]
+    fn installed_dependency_satisfies_a_withdrawn_older_requirement() {
+        let state = catalog(&[
+            listing("Compat", 1, "1.1.4", &["Example-Loader-1.0.0"]),
+            listing("Loader", 2, "1.0.1", &[]),
+        ]);
+        let profile = profile(vec![install(&state, 2)]);
+
+        let planned =
+            resolve_profile_installs(vec![install(&state, 1)], &profile, false, &state).unwrap();
+
+        assert_eq!(
+            planned.iter().map(ModInstall::uuid).collect_vec(),
+            [Uuid::from_u128(1)]
+        );
+    }
+
+    #[test]
+    fn missing_uninstalled_dependency_still_rejects_the_install() {
+        let state = catalog(&[listing("Compat", 1, "1.1.4", &["Example-Missing-1.0.0"])]);
+
+        let error =
+            resolve_profile_installs(vec![install(&state, 1)], &profile(vec![]), false, &state)
+                .unwrap_err();
+
+        assert!(format!("{error:#}").contains("Example-Missing-1.0.0"));
+    }
+
+    #[test]
+    fn installed_dependency_resolves_its_actual_transitive_requirements() {
+        let state = catalog(&[
+            listing("Compat", 1, "1.1.4", &["Example-Loader-1.0.0"]),
+            listing("Loader", 2, "1.0.1", &["Example-Support-1.0.0"]),
+            listing("Support", 3, "1.0.0", &[]),
+        ]);
+        let profile = profile(vec![install(&state, 2)]);
+        let planned =
+            resolve_profile_installs(vec![install(&state, 1)], &profile, false, &state).unwrap();
+        assert_eq!(
+            planned.iter().map(ModInstall::uuid).collect_vec(),
+            [Uuid::from_u128(3), Uuid::from_u128(1)]
+        );
+    }
+
+    #[test]
+    fn an_unknown_installed_dependency_version_is_not_replaced_with_catalog_metadata() {
+        let state = catalog(&[
+            listing("Compat", 1, "1.1.4", &["Example-Loader-1.0.0"]),
+            listing("Loader", 2, "1.0.0", &[]),
+        ]);
+        let old_state = catalog(&[listing("Loader", 2, "1.0.1", &[])]);
+        let profile = profile(vec![install(&old_state, 2)]);
+        let error = resolve_profile_installs(vec![install(&state, 1)], &profile, false, &state)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("version with id"));
+    }
+
+    #[test]
+    fn planned_dependency_version_keeps_its_state_and_resolves_its_own_dependencies() {
+        let mut loader = listing("Loader", 2, "1.0.1", &["Example-Support-1.0.0"]);
+        loader.versions.push(
+            listing("Loader", 2, "1.0.0", &["Example-Retired-1.0.0"])
+                .versions
+                .remove(0),
+        );
+        let state = catalog(&[
+            listing("Compat", 1, "1.1.4", &["Example-Loader-1.0.0"]),
+            loader,
+            listing("Support", 3, "1.0.0", &[]),
+        ]);
+        let loader_install = install(&state, 2).with_state(false).with_index(4);
+
+        let planned = resolve_profile_installs(
+            vec![install(&state, 1), loader_install],
+            &profile(vec![]),
+            true,
+            &state,
+        )
+        .unwrap();
+
+        assert_eq!(
+            planned.iter().map(ModInstall::uuid).collect_vec(),
+            [Uuid::from_u128(3), Uuid::from_u128(2), Uuid::from_u128(1)]
+        );
+        assert!(!planned[1].enabled());
+        assert_eq!(planned[1].index, Some(4));
+    }
 
     fn test_queue() -> InstallQueue {
         InstallQueue {
