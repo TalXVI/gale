@@ -1,5 +1,6 @@
 import { mockIPC } from '@tauri-apps/api/mocks';
 import { mount } from 'svelte';
+import type { SyncConfigReviewState } from '$lib/types';
 import '../../src/app.css';
 
 const params = new URLSearchParams(location.search);
@@ -72,6 +73,23 @@ let publicationRevision = '2026-09-22T00:00:00Z';
 let mockAuthExpired = false;
 const profileId = params.get('profile') ?? 'first';
 let activeId = 1;
+let subscriberSyncedAt = params.has('upToDate') ? publicationRevision : '2026-01-01T00:00:00Z';
+const subscriberReview: SyncConfigReviewState = {
+	pending: [
+		{ path: 'BepInEx/config/custom.cfg', reason: 'modifiedLocally' },
+		{ path: 'BepInEx/config/new.cfg', reason: 'newFile' },
+		{ path: 'BepInEx/config/deleted.cfg', reason: 'deletedLocally' }
+	],
+	declined: [],
+	policies: [
+		{
+			path: 'BepInEx/config/custom.cfg',
+			policy: params.has('legacyPolicy') ? 'alwaysApply' : 'ask'
+		},
+		{ path: 'BepInEx/config/new.cfg', policy: 'ask' },
+		{ path: 'BepInEx/config/deleted.cfg', policy: 'ask' }
+	]
+};
 const preferences = JSON.parse(
 	sessionStorage.getItem('mock-profile-preferences') ?? '{}'
 ) as Record<string, { restartPolicy: string }>;
@@ -341,7 +359,8 @@ mockIPC(async (cmd, args) => {
 						sync: {
 							id: 'sync-1',
 							owner: { discordId: '1', name: 'owner', displayName: 'Owner', avatar: null },
-							syncedAt: '2026-01-01T00:00:00Z',
+							syncedAt:
+								params.get('component') === 'sync' ? subscriberSyncedAt : '2026-01-01T00:00:00Z',
 							updatedAt: '2026-09-22T00:00:00Z',
 							missing: false
 						},
@@ -378,6 +397,50 @@ mockIPC(async (cmd, args) => {
 			];
 		case 'push_sync_profile':
 			return;
+		case 'get_config_files':
+			return [];
+		case 'get_pending_sync_config':
+			return structuredClone(subscriberReview);
+		case 'pull_sync_profile': {
+			subscriberSyncedAt = publicationRevision;
+			const { default: profiles } = await import('$lib/state/profile.svelte');
+			await profiles.refresh();
+			return { installed: [], pending: structuredClone(subscriberReview.pending) };
+		}
+		case 'apply_sync_config': {
+			const files = args && 'files' in args ? args.files : undefined;
+			if (!Array.isArray(files) || !files.every((file) => typeof file === 'string')) {
+				throw new Error('Expected selected config paths');
+			}
+			subscriberReview.pending = subscriberReview.pending.filter(
+				(item) => !files.includes(item.path)
+			);
+			subscriberReview.declined = subscriberReview.declined.filter(
+				(item) => !files.includes(item.path)
+			);
+			return files;
+		}
+		case 'decline_sync_config': {
+			const files = args && 'files' in args ? args.files : undefined;
+			if (!Array.isArray(files)) throw new Error('Expected selected config paths');
+			subscriberReview.declined.push(
+				...subscriberReview.pending.filter((item) => files.includes(item.path))
+			);
+			subscriberReview.pending = subscriberReview.pending.filter(
+				(item) => !files.includes(item.path)
+			);
+			return;
+		}
+		case 'set_sync_config_policy': {
+			const file = args && 'file' in args ? args.file : undefined;
+			const entry = subscriberReview.policies.find((item) => item.path === file);
+			const policy = args && 'policy' in args ? args.policy : undefined;
+			if (!entry || (policy !== 'ask' && policy !== 'alwaysKeep')) {
+				throw new Error('Expected a published config and review policy');
+			}
+			entry.policy = policy;
+			return;
+		}
 		case 'get_dedicated_server_settings':
 			if (settings == null) return null;
 			// Profile 2 is a plain manual-sync profile. The navbar must
@@ -605,6 +668,9 @@ if (params.get('component') === 'regression') {
 } else if (params.get('component') === 'publish') {
 	const { default: PublishHarness } = await import('./PublishHarness.svelte');
 	mount(PublishHarness, { target: document.getElementById('app')! });
+} else if (params.get('component') === 'sync') {
+	const { default: SyncHarness } = await import('./SyncHarness.svelte');
+	mount(SyncHarness, { target: document.getElementById('app')! });
 } else {
 	const { default: Harness } = await import('./Harness.svelte');
 	const { default: profiles } = await import('$lib/state/profile.svelte');

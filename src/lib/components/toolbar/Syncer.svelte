@@ -3,7 +3,7 @@
 	import Dialog from '$lib/components/ui/Dialog.svelte';
 	import SyncAvatar from '$lib/components/ui/SyncAvatar.svelte';
 	import * as api from '$lib/api';
-	import type { ListedSyncProfile, SyncConfigReviewItem, SyncConfigReviewState } from '$lib/types';
+	import type { ListedSyncProfile, SyncConfigReviewState } from '$lib/types';
 	import { pushInfoToast } from '$lib/toast';
 	import Icon from '@iconify/svelte';
 	import { writeText } from '@tauri-apps/plugin-clipboard-manager';
@@ -137,7 +137,7 @@
 			await api.profile.sync.pull(profileId);
 			await refreshPending(key);
 			config.refresh();
-			pushInfoToast({ message: m.syncer_pull_message() });
+			pushInfoToast({ message: m.syncer_updateMods_message() });
 		} finally {
 			loading = false;
 		}
@@ -185,15 +185,7 @@
 	});
 
 	onMount(() => {
-		let unlistenPending: UnlistenFn | null = null;
 		let unlistenReview: UnlistenFn | null = null;
-
-		listen<{ profileId: number; pending: SyncConfigReviewItem[] }>('sync_config_pending', (evt) => {
-			if (evt.payload.profileId !== profiles.active?.id) return;
-			pushInfoToast({
-				message: m.syncer_pendingConfigToast({ count: evt.payload.pending.length })
-			});
-		}).then((callback) => (unlistenPending = callback));
 
 		listen<{ profileId: number }>('sync_config_review_changed', (evt) => {
 			if (evt.payload.profileId !== profiles.active?.id) return;
@@ -201,7 +193,6 @@
 		}).then((callback) => (unlistenReview = callback));
 
 		return () => {
-			unlistenPending?.();
 			unlistenReview?.();
 		};
 	});
@@ -336,52 +327,10 @@
 		{/if}
 
 		<div class="mt-2 flex flex-wrap items-center gap-2">
-			{#if reviewState.pending.length > 0}
-				<Button
-					onclick={() => {
-						reviewMode = 'pending';
-						syncDialogProfileId = profiles.active?.id ?? null;
-						reviewDialogOpen = true;
-					}}
-					color="primary"
-					icon="mdi:file-document-edit"
-				>
-					{m.syncer_button_reviewConfig({ count: reviewState.pending.length })}
-				</Button>
-			{/if}
-
-			{#if reviewState.declined.length > 0}
-				<Button
-					onclick={() => {
-						reviewMode = 'declined';
-						syncDialogProfileId = profiles.active?.id ?? null;
-						reviewDialogOpen = true;
-					}}
-					color="primary"
-					icon="mdi:file-document-remove"
-				>
-					{m.syncer_button_declinedConfig({ count: reviewState.declined.length })}
-				</Button>
-			{/if}
-
-			{#if reviewState.policies.length > 0}
-				<Button
-					onclick={() => {
-						reviewMode = 'policies';
-						syncDialogProfileId = profiles.active?.id ?? null;
-						reviewDialogOpen = true;
-					}}
-					color="primary"
-					icon="mdi:tune"
-				>
-					{m.syncer_button_configPolicies()}
-				</Button>
-			{/if}
-
 			{#if syncState !== 'missing'}
 				{#if syncState === 'outdated'}
 					<Button onclick={pull} {loading} icon="mdi:cloud-download"
-						>{m.syncer_button_pull()}</Button
+						>{m.syncer_button_updateMods()}</Button
 					>
 				{/if}
 
@@ -414,6 +363,72 @@
 				{m.syncer_button_disconnect()}
 			</Button>
 		</div>
+
+		{#if syncState !== 'missing'}
+			<p class="text-primary-600 dark:text-primary-300 mt-2 text-sm">
+				{m.syncer_modsOnlyHint()}
+			</p>
+		{/if}
+
+		{#if reviewState.policies.length > 0}
+			<section
+				class="border-primary-300 dark:border-primary-600 mt-4 border-t pt-3"
+				aria-label={m.syncer_configsOptional()}
+			>
+				<h3 class="text-primary-800 dark:text-primary-100 font-medium">
+					{m.syncer_configsOptional()}
+				</h3>
+				<p class="text-primary-600 dark:text-primary-300 mt-1 text-sm">
+					{m.syncer_configReviewHint()}
+				</p>
+				<div class="mt-2 flex flex-wrap items-center gap-2">
+					{#if reviewState.pending.length > 0}
+						<Button
+							disabled={loading}
+							onclick={() => {
+								reviewMode = 'pending';
+								syncDialogProfileId = profiles.active?.id ?? null;
+								reviewDialogOpen = true;
+							}}
+							color="primary"
+							icon="mdi:file-document-edit"
+						>
+							{m.syncer_button_reviewConfig({ count: reviewState.pending.length })}
+						</Button>
+					{/if}
+
+					{#if reviewState.declined.length > 0}
+						<Button
+							disabled={loading}
+							onclick={() => {
+								reviewMode = 'declined';
+								syncDialogProfileId = profiles.active?.id ?? null;
+								reviewDialogOpen = true;
+							}}
+							color="primary"
+							icon="mdi:file-document-remove"
+						>
+							{m.syncer_button_declinedConfig({ count: reviewState.declined.length })}
+						</Button>
+					{/if}
+
+					{#if reviewState.policies.length > 0}
+						<Button
+							disabled={loading}
+							onclick={() => {
+								reviewMode = 'policies';
+								syncDialogProfileId = profiles.active?.id ?? null;
+								reviewDialogOpen = true;
+							}}
+							color="primary"
+							icon="mdi:tune"
+						>
+							{m.syncer_button_configPolicies()}
+						</Button>
+					{/if}
+				</div>
+			</section>
+		{/if}
 	{:else if auth.user !== null}
 		<Button onclick={connect} {loading} color="accent" class="mt-2" icon="mdi:cloud-plus">
 			{m.syncer_button_connect()}
@@ -467,6 +482,9 @@
 		profileId={syncDialogProfileId}
 		updates={reviewState}
 		mode={reviewMode}
-		onChanged={() => refreshPending()}
+		onChanged={async () => {
+			await refreshPending();
+			await config.refresh();
+		}}
 	/>
 {/if}

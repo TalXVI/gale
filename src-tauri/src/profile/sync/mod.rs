@@ -155,6 +155,8 @@ pub enum ConfigUpdatePolicy {
 pub enum PendingConfigReason {
     ModifiedLocally,
     DeletedLocally,
+    NewFile,
+    PublishedUpdate,
 }
 
 #[derive(Debug, Serialize)]
@@ -353,12 +355,18 @@ type InstallSnapshots<'a> = (
     &'a BTreeMap<ConfigPath, ContentHash>,
 );
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SyncArchiveAction {
+    Clone,
+    Pull,
+}
+
 /// Applies the config side of a sync archive to `applied`, mutating the state
 /// and the profile's config files together.
 ///
 /// `install` carries the config snapshots taken around a mod install.
-/// `migrate_existing` seeds empty records for a profile that predates
-/// selective sync, so its first pull doesn't ask about untouched files.
+/// `migrate_existing` seeds records for profiles that predate selective sync,
+/// preserving their existing configs, including locally deleted files.
 ///
 /// Partial progress stays in `applied` when a file fails, so the caller must
 /// persist it even on error.
@@ -369,6 +377,7 @@ fn apply_to_state(
     latest: SyncManifest,
     install: Option<InstallSnapshots<'_>>,
     migrate_existing: bool,
+    action: SyncArchiveAction,
 ) -> Result<apply::ConfigApplyReport> {
     if let Some((before, after)) = install {
         apply::record_installer_written(before, after, applied);
@@ -381,7 +390,11 @@ fn apply_to_state(
 
     apply::preserve_pending_policy_boundaries(applied);
     applied.latest = Some(latest);
-    apply::apply_available_config(profile_dir, config, applied)
+    let config_mode = match action {
+        SyncArchiveAction::Clone => apply::ConfigReceiveMode::Apply,
+        SyncArchiveAction::Pull => apply::ConfigReceiveMode::Review,
+    };
+    apply::receive_config(profile_dir, config, applied, config_mode)
 }
 
 /// Whether the profile's installed thunderstore mods exactly match the
@@ -467,7 +480,7 @@ async fn apply_archive(
     normalized: NormalizedArchive<'_>,
     metadata: SyncProfileMetadata,
     override_name: Option<String>,
-    clone: bool,
+    action: SyncArchiveAction,
     target: ImportTarget,
     app: &AppHandle,
 ) -> Result<apply::ConfigApplyReport> {
@@ -485,7 +498,8 @@ async fn apply_archive(
         super::server::ensure_profile_unlocked(app, profile_id)?;
     }
 
-    if clone && resolved.profile_id.is_none() && resolved.dir.is_some() {
+    if action == SyncArchiveAction::Clone && resolved.profile_id.is_none() && resolved.dir.is_some()
+    {
         ensure_clone_target(resolved.prior_sync.as_ref(), &metadata.id, &manifest.name)?;
     }
 
@@ -495,7 +509,7 @@ async fn apply_archive(
         .as_ref()
         .is_some_and(|sync| sync.published.is_some());
 
-    let needs_install = clone
+    let needs_install = action == SyncArchiveAction::Clone
         || resolved
             .prior_sync
             .as_ref()
@@ -624,6 +638,7 @@ async fn apply_archive(
             latest,
             install_snapshots,
             migrate_existing,
+            action,
         ) {
             Ok(report) => {
                 profile.sync = Some(SyncProfileData {
@@ -728,7 +743,7 @@ async fn clone_profile(id: &str, override_name: Option<String>, app: &AppHandle)
         normalized,
         metadata,
         override_name,
-        true,
+        SyncArchiveAction::Clone,
         ImportTarget::Named { game },
         app,
     )
@@ -767,7 +782,7 @@ pub async fn pull_profile(
                 normalized,
                 metadata,
                 Some(name),
-                false,
+                SyncArchiveAction::Pull,
                 ImportTarget::Existing(profile_id),
                 app,
             )
@@ -808,7 +823,7 @@ fn pending_config_items(profile_id: i64, app: &AppHandle) -> Result<apply::Confi
         return Ok(apply::ConfigReviewState::default());
     };
 
-    // a file hand-edited to match the published revision is no longer pending
+    // Reconcile local edits and newly created files before reporting review.
     let mut applied = applied.clone();
     if apply::reconcile_review_state(&profile.path, &mut applied)? {
         profile.sync.as_mut().unwrap().applied = Some(applied.clone());
@@ -1853,6 +1868,7 @@ mod tests {
             latest_manifest.clone(),
             None,
             false,
+            SyncArchiveAction::Clone,
         );
 
         assert!(result.is_err());
@@ -1870,11 +1886,84 @@ mod tests {
             latest_manifest,
             None,
             false,
+            SyncArchiveAction::Clone,
         )
         .unwrap();
 
         assert_eq!(std::fs::read(dir.path().join("b.cfg")).unwrap(), b"B");
         assert_eq!(applied.config[&q].applied, Some(hash(b"B")));
         assert_eq!(report.installed, vec![q]);
+    }
+
+    #[test]
+    fn mod_pull_preserves_configs_and_queues_new_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = config_path("custom.cfg");
+        let new = config_path("new.cfg");
+        std::fs::write(dir.path().join(existing.as_path()), b"my-settings").unwrap();
+        let mut applied = AppliedState::default();
+        applied.config.insert(
+            existing.clone(),
+            AppliedFile {
+                written: Some(hash(b"my-settings")),
+                policy: ConfigUpdatePolicy::AlwaysApply,
+                ..Default::default()
+            },
+        );
+        let latest_manifest = latest(&[("custom.cfg", b"published"), ("new.cfg", b"new")]);
+        let config = BTreeMap::from([
+            (existing.clone(), vfile(b"published")),
+            (new.clone(), vfile(b"new")),
+        ]);
+        let before = BTreeMap::from([(existing.clone(), hash(b"my-settings"))]);
+        let report = apply_to_state(
+            &mut applied,
+            dir.path(),
+            &config,
+            latest_manifest.clone(),
+            Some((&before, &before)),
+            false,
+            SyncArchiveAction::Pull,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(dir.path().join(existing.as_path())).unwrap(),
+            b"my-settings"
+        );
+        assert!(!dir.path().join(new.as_path()).exists());
+        assert!(report.installed.is_empty());
+        assert!(applied.pending.contains_key(&existing));
+        assert!(applied.pending.contains_key(&new));
+        assert_eq!(applied.mods_revision, Some(latest_manifest.mods_revision));
+    }
+
+    #[test]
+    fn initial_clone_installs_published_configs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = config_path("new.cfg");
+        let latest_manifest = latest(&[("new.cfg", b"published")]);
+        let config = BTreeMap::from([(path.clone(), vfile(b"published"))]);
+        let mut applied = AppliedState::default();
+        let snapshot = BTreeMap::new();
+
+        let report = apply_to_state(
+            &mut applied,
+            dir.path(),
+            &config,
+            latest_manifest.clone(),
+            Some((&snapshot, &snapshot)),
+            false,
+            SyncArchiveAction::Clone,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(dir.path().join(path.as_path())).unwrap(),
+            b"published"
+        );
+        assert_eq!(report.installed, vec![path]);
+        assert!(applied.pending.is_empty());
+        assert_eq!(applied.mods_revision, Some(latest_manifest.mods_revision));
     }
 }

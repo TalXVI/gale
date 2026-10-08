@@ -278,10 +278,27 @@ fn record_declined(
     }
 }
 
+#[cfg(test)]
 pub(super) fn apply_available_config(
     profile_dir: &Path,
     config: &BTreeMap<ConfigPath, archive::ValidatedConfigFile>,
     state: &mut AppliedState,
+) -> Result<ConfigApplyReport> {
+    receive_config(profile_dir, config, state, ConfigReceiveMode::Apply)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ConfigReceiveMode {
+    Apply,
+    Review,
+}
+
+/// Routine mod pulls only queue review; initial imports may write configs.
+pub(super) fn receive_config(
+    profile_dir: &Path,
+    config: &BTreeMap<ConfigPath, archive::ValidatedConfigFile>,
+    state: &mut AppliedState,
+    mode: ConfigReceiveMode,
 ) -> Result<ConfigApplyReport> {
     state.pending.retain(|path, _| config.contains_key(path));
     state.declined.retain(|path, _| config.contains_key(path));
@@ -311,7 +328,16 @@ pub(super) fn apply_available_config(
         };
         let hash = file.hash.clone();
 
-        match decide(local.as_ref(), &hash, state.config.get(path)) {
+        let mut action = decide(local.as_ref(), &hash, state.config.get(path));
+        if mode == ConfigReceiveMode::Review
+            && matches!(action, ConfigAction::Write | ConfigAction::Pend(_))
+        {
+            action = ConfigAction::Pend(review_reason(local.as_ref(), state, path));
+        }
+        if mode == ConfigReceiveMode::Review && matches!(action, ConfigAction::Decline(_)) {
+            action = ConfigAction::Decline(review_reason(local.as_ref(), state, path));
+        }
+        match action {
             ConfigAction::Record => record_applied(state, path, hash),
             ConfigAction::Keep => {
                 state.pending.remove(path);
@@ -435,10 +461,43 @@ pub(super) fn review_items(state: &AppliedState) -> ConfigReviewState {
     }
 }
 
-fn local_review_reason(profile_dir: &Path, path: &ConfigPath) -> Result<PendingConfigReason> {
+fn review_reason(
+    local: Option<&ContentHash>,
+    state: &AppliedState,
+    path: &ConfigPath,
+) -> PendingConfigReason {
+    let record = state.config.get(path);
+    match local {
+        Some(hash) if record.and_then(|record| record.written.as_ref()) == Some(hash) => {
+            PendingConfigReason::PublishedUpdate
+        }
+        Some(_) => PendingConfigReason::ModifiedLocally,
+        None if (record.is_none()
+            && !state.pending.contains_key(path)
+            && !state.declined.contains_key(path))
+            || (state.pending.get(path).or_else(|| state.declined.get(path))
+                == Some(&PendingConfigReason::NewFile)
+                && record.is_none_or(|record| record.written.is_none())) =>
+        {
+            PendingConfigReason::NewFile
+        }
+        None => PendingConfigReason::DeletedLocally,
+    }
+}
+
+fn local_review_reason(
+    profile_dir: &Path,
+    path: &ConfigPath,
+    state: &AppliedState,
+) -> Result<PendingConfigReason> {
     let target = checked_target(profile_dir, path)?;
     match fs::symlink_metadata(&target) {
-        Ok(metadata) if metadata.is_file() => Ok(PendingConfigReason::ModifiedLocally),
+        Ok(metadata) if metadata.is_file() => {
+            let bytes = fs::read(&target)
+                .with_context(|| format!("failed to read config file: {}", target.display()))?;
+            let hash = ContentHash::from_hash(blake3::hash(&bytes));
+            Ok(review_reason(Some(&hash), state, path))
+        }
         Ok(_) => {
             bail!(
                 "synced config path is not a regular file: {}",
@@ -446,7 +505,18 @@ fn local_review_reason(profile_dir: &Path, path: &ConfigPath) -> Result<PendingC
             );
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            Ok(PendingConfigReason::DeletedLocally)
+            // Only an advertised file that never existed locally is new.
+            if state.pending.get(path).or_else(|| state.declined.get(path))
+                == Some(&PendingConfigReason::NewFile)
+                && state
+                    .config
+                    .get(path)
+                    .is_none_or(|record| record.written.is_none())
+            {
+                Ok(PendingConfigReason::NewFile)
+            } else {
+                Ok(PendingConfigReason::DeletedLocally)
+            }
         }
         Err(err) => {
             Err(err).with_context(|| format!("failed to inspect config path: {}", target.display()))
@@ -461,7 +531,7 @@ pub(super) fn current_review_items(
     let mut review = review_items(state);
 
     for item in review.pending.iter_mut().chain(review.declined.iter_mut()) {
-        item.reason = local_review_reason(profile_dir, &item.path)?;
+        item.reason = local_review_reason(profile_dir, &item.path, state)?;
     }
 
     Ok(review)
@@ -469,7 +539,8 @@ pub(super) fn current_review_items(
 
 /// Clears review entries for files whose local bytes now match the published
 /// revision, e.g. after the user hand-edited a config into the published
-/// state. Returns whether any state changed.
+/// state. Records newly advertised files that now exist locally, so a later
+/// deletion requires restore confirmation. Returns whether any state changed.
 ///
 /// Missing files are skipped (they're still legitimately pending), while
 /// other read errors propagate.
@@ -502,9 +573,20 @@ pub(super) fn reconcile_review_state(profile_dir: &Path, state: &mut AppliedStat
             }
         };
 
-        if ContentHash::from_hash(blake3::hash(&bytes)) == hash {
+        let local_hash = ContentHash::from_hash(blake3::hash(&bytes));
+        if local_hash == hash {
             record_applied(state, &path, hash);
             changed = true;
+        } else {
+            let local_reason = review_reason(Some(&local_hash), state, &path);
+            for entries in [&mut state.pending, &mut state.declined] {
+                if let Some(reason) = entries.get_mut(&path)
+                    && *reason == PendingConfigReason::NewFile
+                {
+                    *reason = local_reason;
+                    changed = true;
+                }
+            }
         }
     }
 
@@ -588,7 +670,7 @@ where
 
     let mut targets = Vec::with_capacity(files.len());
     for path in files {
-        let reason = local_review_reason(profile_dir, path)?;
+        let reason = local_review_reason(profile_dir, path, state)?;
         ensure!(
             reason != PendingConfigReason::DeletedLocally || restored.contains(path),
             "config file was deleted locally; confirm restoring it: {path}"
@@ -752,6 +834,198 @@ mod tests {
         state.latest = Some(latest(entries));
         let config = archive_map(entries);
         apply_available_config(dir, &config, state).unwrap()
+    }
+
+    #[test]
+    fn review_preserves_personalized_untouched_installer_and_deleted_configs() {
+        let dir = tempdir().unwrap();
+        let entries: &[(&str, &[u8])] = &[
+            ("custom.cfg", b"remote"),
+            ("untouched.cfg", b"remote"),
+            ("installer.cfg", b"remote"),
+            ("deleted.cfg", b"remote"),
+        ];
+        let mut state = AppliedState {
+            latest: Some(latest(entries)),
+            ..Default::default()
+        };
+        for name in ["custom.cfg", "untouched.cfg", "deleted.cfg"] {
+            state.config.insert(
+                path(name),
+                applied_file(
+                    Some(hash(b"old")),
+                    Some(hash(b"old")),
+                    None,
+                    ConfigUpdatePolicy::AlwaysApply,
+                ),
+            );
+        }
+        write(dir.path(), &path("custom.cfg"), b"personal");
+        write(dir.path(), &path("untouched.cfg"), b"old");
+        write(dir.path(), &path("installer.cfg"), b"default");
+        state.config.insert(
+            path("installer.cfg"),
+            applied_file(None, Some(hash(b"default")), None, ConfigUpdatePolicy::Ask),
+        );
+        let report = receive_config(
+            dir.path(),
+            &archive_map(entries),
+            &mut state,
+            ConfigReceiveMode::Review,
+        )
+        .unwrap();
+        assert!(report.installed.is_empty());
+        assert_eq!(read_file(dir.path(), &path("custom.cfg")), b"personal");
+        assert_eq!(read_file(dir.path(), &path("untouched.cfg")), b"old");
+        assert_eq!(read_file(dir.path(), &path("installer.cfg")), b"default");
+        assert!(!dir.path().join("deleted.cfg").exists());
+        assert_eq!(
+            state.pending[&path("custom.cfg")],
+            PendingConfigReason::ModifiedLocally
+        );
+        assert_eq!(
+            state.pending[&path("untouched.cfg")],
+            PendingConfigReason::PublishedUpdate
+        );
+        assert_eq!(
+            state.pending[&path("installer.cfg")],
+            PendingConfigReason::PublishedUpdate
+        );
+        assert_eq!(
+            state.pending[&path("deleted.cfg")],
+            PendingConfigReason::DeletedLocally
+        );
+    }
+
+    #[test]
+    fn reviewed_new_config_can_be_declined_and_explicitly_applied_without_restore() {
+        let dir = tempdir().unwrap();
+        let p = path("new.cfg");
+        let entries: &[(&str, &[u8])] = &[("new.cfg", b"remote")];
+        let config = archive_map(entries);
+        let mut state = AppliedState {
+            latest: Some(latest(entries)),
+            ..Default::default()
+        };
+        receive_config(dir.path(), &config, &mut state, ConfigReceiveMode::Review).unwrap();
+        assert_eq!(
+            current_review_items(dir.path(), &state).unwrap().pending[0].reason,
+            PendingConfigReason::NewFile
+        );
+        receive_config(dir.path(), &config, &mut state, ConfigReceiveMode::Review).unwrap();
+        assert_eq!(
+            current_review_items(dir.path(), &state).unwrap().pending[0].reason,
+            PendingConfigReason::NewFile
+        );
+        decline_selected(&mut state, std::slice::from_ref(&p), false).unwrap();
+        receive_config(dir.path(), &config, &mut state, ConfigReceiveMode::Review).unwrap();
+        assert!(!dir.path().join(p.as_path()).exists());
+        assert_eq!(
+            current_review_items(dir.path(), &state).unwrap().declined[0].reason,
+            PendingConfigReason::NewFile
+        );
+        apply_selected(
+            dir.path(),
+            &config,
+            &mut state,
+            std::slice::from_ref(&p),
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(read_file(dir.path(), &p), b"remote");
+        assert!(state.pending.is_empty());
+        assert!(state.declined.is_empty());
+
+        fs::remove_file(dir.path().join(p.as_path())).unwrap();
+        let entries: &[(&str, &[u8])] = &[("new.cfg", b"next")];
+        let config = archive_map(entries);
+        state.latest = Some(latest(entries));
+        receive_config(dir.path(), &config, &mut state, ConfigReceiveMode::Review).unwrap();
+        assert_eq!(
+            current_review_items(dir.path(), &state).unwrap().pending[0].reason,
+            PendingConfigReason::DeletedLocally
+        );
+        assert!(
+            apply_selected(
+                dir.path(),
+                &config,
+                &mut state,
+                std::slice::from_ref(&p),
+                &[],
+                false
+            )
+            .is_err()
+        );
+        assert!(!dir.path().join(p.as_path()).exists());
+    }
+
+    #[test]
+    fn legacy_pending_config_without_record_still_requires_restore_confirmation() {
+        let dir = tempdir().unwrap();
+        let p = path("deleted.cfg");
+        let config = archive_map(&[("deleted.cfg", b"remote")]);
+        let mut state = AppliedState {
+            latest: Some(latest(&[("deleted.cfg", b"remote")])),
+            pending: BTreeMap::from([(p.clone(), PendingConfigReason::ModifiedLocally)]),
+            ..Default::default()
+        };
+        receive_config(dir.path(), &config, &mut state, ConfigReceiveMode::Review).unwrap();
+        assert_eq!(state.pending[&p], PendingConfigReason::DeletedLocally);
+        assert!(
+            apply_selected(
+                dir.path(),
+                &config,
+                &mut state,
+                std::slice::from_ref(&p),
+                &[],
+                false
+            )
+            .is_err()
+        );
+        assert!(!dir.path().join(p.as_path()).exists());
+    }
+
+    #[test]
+    fn reviewed_new_config_created_locally_then_deleted_requires_restore() {
+        for declined in [false, true] {
+            let dir = tempdir().unwrap();
+            let p = path("new.cfg");
+            let entries: &[(&str, &[u8])] = &[("new.cfg", b"remote")];
+            let config = archive_map(entries);
+            let mut state = AppliedState {
+                latest: Some(latest(entries)),
+                ..Default::default()
+            };
+            receive_config(dir.path(), &config, &mut state, ConfigReceiveMode::Review).unwrap();
+            if declined {
+                decline_selected(&mut state, std::slice::from_ref(&p), false).unwrap();
+            }
+
+            write(dir.path(), &p, b"my-settings");
+            reconcile_review_state(dir.path(), &mut state).unwrap();
+            fs::remove_file(dir.path().join(p.as_path())).unwrap();
+
+            let review = current_review_items(dir.path(), &state).unwrap();
+            let item = review
+                .pending
+                .first()
+                .or_else(|| review.declined.first())
+                .unwrap();
+            assert_eq!(item.reason, PendingConfigReason::DeletedLocally);
+            assert!(
+                apply_selected(
+                    dir.path(),
+                    &config,
+                    &mut state,
+                    std::slice::from_ref(&p),
+                    &[],
+                    false,
+                )
+                .is_err()
+            );
+            assert!(!dir.path().join(p.as_path()).exists());
+        }
     }
 
     #[test]

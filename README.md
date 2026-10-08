@@ -22,6 +22,8 @@ Selective profile sync requires this fork for both profile owners and subscriber
 
 Configuration preservation is designed for BepInEx-style loaders (for example Valheim). Other mod loaders are not covered and may not preserve local configuration safely.
 
+Profile updates pull mods only, including updates before launch. Published configs remain available under **Configs (optional)** in Profile sync. Review the files and apply only the ones you want to replace locally. Importing a profile for the first time still includes its published configs.
+
 Publishing is designed for a single designated owner. Simultaneous publishes from multiple machines are last-writer-wins and not supported.
 
 ## Installation

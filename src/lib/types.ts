@@ -104,7 +104,7 @@ export type SyncConfigUpdatePolicy = 'ask' | 'alwaysApply' | 'alwaysKeep';
 
 export type SyncConfigReviewItem = {
 	path: string;
-	reason: PendingSyncConfigReason;
+	reason: PendingSyncConfigReason | 'newFile' | 'publishedUpdate';
 };
 
 export type SyncConfigPolicyEntry = {

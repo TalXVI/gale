@@ -2,7 +2,6 @@
 	import Dialog from '$lib/components/ui/Dialog.svelte';
 	import Button from '$lib/components/ui/Button.svelte';
 	import Checkbox from '$lib/components/ui/Checkbox.svelte';
-	import Label from '$lib/components/ui/Label.svelte';
 	import Select from '$lib/components/ui/Select.svelte';
 	import * as api from '$lib/api';
 	import type { SyncConfigReviewState, SyncConfigUpdatePolicy } from '$lib/types';
@@ -24,12 +23,14 @@
 	let { open = $bindable(), profileId, updates, mode, onChanged }: Props = $props();
 
 	let selected: SvelteSet<string> = $state(new SvelteSet());
-	let remember = $state(false);
 	let loading = $state(false);
+	const id = $props.id();
 
 	let reasonLabel = $derived({
 		modifiedLocally: m.syncConfigReviewDialog_reason_modifiedLocally(),
-		deletedLocally: m.syncConfigReviewDialog_reason_deletedLocally()
+		deletedLocally: m.syncConfigReviewDialog_reason_deletedLocally(),
+		newFile: m.syncConfigReviewDialog_reason_newFile(),
+		publishedUpdate: m.syncConfigReviewDialog_reason_publishedUpdate()
 	});
 
 	let title = $derived(
@@ -52,7 +53,6 @@
 
 	let policyItems = $derived([
 		{ value: 'ask', label: m.syncConfigReviewDialog_policy_ask() },
-		{ value: 'alwaysApply', label: m.syncConfigReviewDialog_policy_alwaysApply() },
 		{ value: 'alwaysKeep', label: m.syncConfigReviewDialog_policy_alwaysKeep() }
 	]);
 
@@ -60,7 +60,6 @@
 		mode;
 		if (open) {
 			selected = new SvelteSet();
-			remember = false;
 		}
 	});
 
@@ -89,7 +88,7 @@
 
 		loading = true;
 		try {
-			await api.profile.sync.applyConfig(files, remember, restoreDeleted, profileId);
+			await api.profile.sync.applyConfig(files, false, restoreDeleted, profileId);
 			pushInfoToast({ message: m.syncConfigReviewDialog_applyMessage() });
 			selected = new SvelteSet();
 			await onChanged();
@@ -101,7 +100,7 @@
 	async function declineSelected() {
 		loading = true;
 		try {
-			await api.profile.sync.declineConfig([...selected], remember, profileId);
+			await api.profile.sync.declineConfig([...selected], false, profileId);
 			pushInfoToast({ message: m.syncConfigReviewDialog_declineMessage() });
 			selected = new SvelteSet();
 			await onChanged();
@@ -122,6 +121,11 @@
 </script>
 
 <Dialog bind:open {title}>
+	{#if mode !== 'policies'}
+		<p class="text-primary-600 dark:text-primary-300 mt-2 text-sm">
+			{m.syncConfigReviewDialog_replaceHint()}
+		</p>
+	{/if}
 	{#if mode === 'policies'}
 		{#if updates.policies.length === 0}
 			<div class="text-primary-600 dark:text-primary-300 my-4 text-center">
@@ -140,7 +144,7 @@
 							triggerClass="ml-auto shrink-0"
 							items={policyItems}
 							type="single"
-							value={entry.policy}
+							value={entry.policy === 'alwaysApply' ? 'ask' : entry.policy}
 							onValueChange={(value) => setPolicy(entry.path, value)}
 							disabled={loading}
 							avoidCollisions={false}
@@ -160,6 +164,8 @@
 					class="dark:bg-primary-900 bg-primary-100 flex items-center gap-2.5 rounded-md px-3 py-1.5"
 				>
 					<Checkbox
+						id={`${id}-${update.path}`}
+						disabled={loading}
 						checked={selected.has(update.path)}
 						onCheckedChange={(checked) => {
 							if (checked) {
@@ -169,19 +175,18 @@
 							}
 						}}
 					/>
-					<span class="text-primary-800 dark:text-primary-100 truncate" title={update.path}>
+					<label
+						for={`${id}-${update.path}`}
+						class="text-primary-800 dark:text-primary-100 truncate"
+						title={update.path}
+					>
 						{update.path}
-					</span>
+					</label>
 					<span class="text-primary-500 dark:text-primary-400 shrink-0 text-sm">
 						{reasonLabel[update.reason]}
 					</span>
 				</div>
 			{/each}
-		</div>
-
-		<div class="mt-3 flex items-center gap-2">
-			<Label>{m.syncConfigReviewDialog_remember()}</Label>
-			<Checkbox bind:checked={remember} />
 		</div>
 
 		<div class="mt-4 flex justify-end gap-2">
