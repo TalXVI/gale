@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 1.25.0 (2026-10-12)
+
+### Added
+
+- When the same mod is listed on both Thunderstore and Hexium, Gale shows when the other site has a newer version, or a listing that isn't deprecated or delisted. **Switch to …** moves the mod to that site. Gale never changes a mod's site on its own.
+- The **Publish update** dialog has a search bar for the config file list. Hidden files keep their selection and are still published.
+
+### Fixed
+
+- A profile can no longer contain the same mod from both Thunderstore and Hexium. Installing the other site's copy is refused with a message naming the installed site and version. Pack dependencies that require a newer version update the installed copy instead of adding a second one.
+- Publishing, imports, and profile pulls refuse a mod list that contains the same mod twice, and name the duplicated mod.
+- Dedicated-server staging refuses two packages that write different contents to the same file, instead of keeping whichever was staged last.
+- Browse shows one entry per mod across both sites and marks it installed if either copy is installed.
+
 ## 1.24.1 (2026-10-08)
 
 ### Changed
