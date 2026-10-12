@@ -6,15 +6,15 @@
 
 ### Added
 
-- When the same mod is listed on both Thunderstore and Hexium, Gale shows when the other site has a newer version, or a listing that isn't deprecated or delisted. **Switch to …** moves the mod to that site. Gale never changes a mod's site on its own.
-- The **Publish update** dialog has a search bar for the config file list. Hidden files keep their selection and are still published.
+- If a mod is on both Thunderstore and Hexium, Gale tells you when the other site has a newer version, or a listing that isn't deprecated or delisted. Click **Switch to …** to move the mod to that site. Gale never switches sites by itself.
+- The **Publish update** dialog has a search bar for config files. Publishing still includes selected files that the search hides.
 
 ### Fixed
 
-- A profile can no longer contain the same mod from both Thunderstore and Hexium. Installing the other site's copy is refused with a message naming the installed site and version. Pack dependencies that require a newer version update the installed copy instead of adding a second one.
-- Publishing, imports, and profile pulls refuse a mod list that contains the same mod twice, and name the duplicated mod.
-- Dedicated-server staging refuses two packages that write different contents to the same file, instead of keeping whichever was staged last.
-- Browse shows one entry per mod across both sites and marks it installed if either copy is installed.
+- A profile can no longer hold the same mod from both Thunderstore and Hexium. Gale refuses to install the second copy and tells you which site and version you already have. When a modpack needs a newer version of a mod, Gale updates the copy you have instead of adding another.
+- Publishing, importing, and pulling a profile now fail if the mod list has the same mod twice. The error names the mod.
+- Dedicated-server staging now fails when two packages write different contents to the same file. Before, the package staged last won.
+- Browse shows each mod once, even when both sites list it, and marks it installed if you have either copy.
 
 ## 1.24.1 (2026-10-08)
 
