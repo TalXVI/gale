@@ -66,3 +66,29 @@ test('configs-only publication accepts a removal without local writes', async ({
 	);
 	expect(call.args.mode).toEqual({ kind: 'config', files: [], removeFiles: [paths.removed] });
 });
+
+test('search filters the list but hidden selections still publish', async ({ page }) => {
+	await page.goto('/tests/dialog/?component=publish');
+	const dialog = page.getByRole('dialog', { name: 'Publish update' });
+	const row = (path: string) => dialog.getByTitle(path).locator('..');
+	const search = dialog.getByPlaceholder('Search config files');
+
+	await search.fill('modified');
+	await expect(row(paths.modified)).toBeVisible();
+	await expect(row(paths.new)).toHaveCount(0);
+	await expect(row(paths.published)).toHaveCount(0);
+
+	await search.fill('no such config');
+	await expect(dialog.getByText('No config files match your search.')).toBeVisible();
+
+	await search.fill('modified');
+	await dialog.getByRole('button', { name: 'Publish' }).click();
+	const call = await page.evaluate(() =>
+		(window as any).calls.findLast((entry: any) => entry.cmd === 'push_sync_profile')
+	);
+	expect(call.args.mode).toEqual({
+		kind: 'both',
+		files: [paths.new, paths.modified],
+		removeFiles: []
+	});
+});

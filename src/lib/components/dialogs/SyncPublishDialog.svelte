@@ -3,6 +3,7 @@
 	import Button from '$lib/components/ui/Button.svelte';
 	import Checkbox from '$lib/components/ui/Checkbox.svelte';
 	import InfoBox from '$lib/components/ui/InfoBox.svelte';
+	import SearchBar from '$lib/components/ui/SearchBar.svelte';
 	import Select from '$lib/components/ui/Select.svelte';
 	import Spinner from '$lib/components/ui/Spinner.svelte';
 	import * as api from '$lib/api';
@@ -27,6 +28,14 @@
 	let selected: SvelteSet<string> = $state(new SvelteSet());
 	let loading = $state(false);
 	let filesLoading = $state(false);
+	let search = $state('');
+
+	let shownFiles = $derived.by(() => {
+		const query = search.trim().toLowerCase();
+		return query.length === 0
+			? files
+			: files.filter((file) => file.path.toLowerCase().includes(query));
+	});
 
 	let modeItems = $derived([
 		{ value: 'mods', label: m.syncPublishDialog_mode_mods() },
@@ -71,6 +80,7 @@
 			if (id !== profileId) return;
 			files = loaded;
 			selected = new SvelteSet(defaultPaths());
+			search = '';
 		} catch {
 			files = [];
 			selected = new SvelteSet();
@@ -145,49 +155,59 @@
 				{m.syncPublishDialog_empty()}
 			</div>
 		{:else}
-			<div class="mt-2 flex max-h-60 flex-col gap-1 overflow-y-auto pr-1">
-				{#each files as file (file.path)}
-					<div
-						class="dark:bg-primary-900 bg-primary-100 flex items-center gap-2.5 rounded-md px-3 py-1.5"
-					>
-						<Checkbox
-							checked={selected.has(file.path)}
-							onCheckedChange={(checked) => {
-								if (checked) {
-									selected.add(file.path);
-								} else {
-									selected.delete(file.path);
-								}
-							}}
-						/>
-						<span class="text-primary-800 dark:text-primary-100 truncate" title={file.path}>
-							{file.path}
-						</span>
-						{#if file.size !== null}
-							<span class="text-primary-500 dark:text-primary-400 shrink-0 text-sm">
-								{shortenFileSize(file.size)}
-							</span>
-						{/if}
-						<span
-							title={file.status === 'removed'
-								? m.syncPublishDialog_removedDescription()
-								: undefined}
-							class={[
-								'ml-auto shrink-0 rounded px-2 py-0.5 text-xs font-medium',
-								{
-									new: 'bg-accent-600 text-white',
-									modified: 'text-primary-900 bg-yellow-500',
-									published:
-										'bg-primary-300 text-primary-600 dark:bg-primary-700 dark:text-primary-300',
-									removed: 'bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-200'
-								}[file.status]
-							]}
-						>
-							{statusLabel[file.status]}
-						</span>
-					</div>
-				{/each}
+			<div class="relative mt-2">
+				<SearchBar bind:value={search} placeholder={m.syncPublishDialog_searchPlaceholder()} />
 			</div>
+
+			{#if shownFiles.length === 0}
+				<div class="text-primary-600 dark:text-primary-300 my-4 text-center">
+					{m.syncPublishDialog_noMatches()}
+				</div>
+			{:else}
+				<div class="mt-2 flex max-h-60 flex-col gap-1 overflow-y-auto pr-1">
+					{#each shownFiles as file (file.path)}
+						<div
+							class="dark:bg-primary-900 bg-primary-100 flex items-center gap-2.5 rounded-md px-3 py-1.5"
+						>
+							<Checkbox
+								checked={selected.has(file.path)}
+								onCheckedChange={(checked) => {
+									if (checked) {
+										selected.add(file.path);
+									} else {
+										selected.delete(file.path);
+									}
+								}}
+							/>
+							<span class="text-primary-800 dark:text-primary-100 truncate" title={file.path}>
+								{file.path}
+							</span>
+							{#if file.size !== null}
+								<span class="text-primary-500 dark:text-primary-400 shrink-0 text-sm">
+									{shortenFileSize(file.size)}
+								</span>
+							{/if}
+							<span
+								title={file.status === 'removed'
+									? m.syncPublishDialog_removedDescription()
+									: undefined}
+								class={[
+									'ml-auto shrink-0 rounded px-2 py-0.5 text-xs font-medium',
+									{
+										new: 'bg-accent-600 text-white',
+										modified: 'text-primary-900 bg-yellow-500',
+										published:
+											'bg-primary-300 text-primary-600 dark:bg-primary-700 dark:text-primary-300',
+										removed: 'bg-red-100 text-red-700 dark:bg-red-900 dark:text-red-200'
+									}[file.status]
+								]}
+							>
+								{statusLabel[file.status]}
+							</span>
+						</div>
+					{/each}
+				</div>
+			{/if}
 		{/if}
 	{/if}
 
