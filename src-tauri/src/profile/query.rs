@@ -6,7 +6,10 @@ use serde::Serialize;
 use tracing::warn;
 use uuid::Uuid;
 
-use super::{Dependant, LocalMod, Profile, ProfileMod, ProfileModKind};
+use super::{
+    Dependant, LocalMod, Profile, ProfileMod, ProfileModKind,
+    update::{AlternativeReason, SourceAlternative},
+};
 use crate::thunderstore::{
     self, Backend, BorrowedMod, FrontendMod, Thunderstore,
     query::{QueryModsArgs, Queryable, SortBy, SortOrder},
@@ -48,13 +51,6 @@ impl<'a> QueryableProfileMod<'a> {
 }
 
 impl Queryable for QueryableProfileMod<'_> {
-    fn uuid(&self) -> Uuid {
-        match &self.kind {
-            QueryableProfileModKind::Local(local) => local.uuid(),
-            QueryableProfileModKind::Thunderstore(remote) => remote.uuid(),
-        }
-    }
-
     fn full_name(&self) -> &str {
         use QueryableProfileModKind as Kind;
 
@@ -139,8 +135,35 @@ pub struct FrontendProfileMod {
 #[serde(rename_all = "camelCase")]
 pub struct AlternateBackend {
     pub backend: Backend,
+    pub package_uuid: Uuid,
     pub latest_version: String,
     pub latest_version_uuid: Uuid,
+    pub reason: Option<AlternativeReason>,
+}
+
+impl From<SourceAlternative<'_>> for AlternateBackend {
+    fn from(alternative: SourceAlternative<'_>) -> Self {
+        let SourceAlternative { target, reason } = alternative;
+        let latest = target.version;
+
+        Self {
+            backend: target.package.backend,
+            package_uuid: target.package.uuid,
+            latest_version: latest.version().to_string(),
+            latest_version_uuid: latest.uuid,
+            reason,
+        }
+    }
+}
+
+/// An installed mod that no longer resolves in the catalog.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnknownMod {
+    #[serde(flatten)]
+    pub dependant: Dependant,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alternative: Option<AlternateBackend>,
 }
 
 impl Profile {
@@ -148,7 +171,7 @@ impl Profile {
         &self,
         args: &QueryModsArgs,
         thunderstore: &Thunderstore,
-    ) -> (Vec<FrontendProfileMod>, Vec<Dependant>) {
+    ) -> (Vec<FrontendProfileMod>, Vec<UnknownMod>) {
         let mut unknown = Vec::new();
 
         let mods = self
@@ -165,7 +188,11 @@ impl Profile {
                         profile_mod.ident(),
                         self.name
                     );
-                    unknown.push(Dependant::from(profile_mod));
+                    let alternative = self.alternative_of(profile_mod, thunderstore);
+                    unknown.push(UnknownMod {
+                        dependant: Dependant::from(profile_mod),
+                        alternative,
+                    });
                     None
                 }
             });
@@ -174,31 +201,16 @@ impl Profile {
             .into_iter()
             .take(args.max_count.unwrap_or(usize::MAX))
             .map(|queryable| {
+                let index = queryable.index;
                 let (data, uuid, alternate_backend) = match queryable.kind {
                     QueryableProfileModKind::Local(local) => {
                         (FrontendMod::from(local.clone()), local.uuid, None)
                     }
-                    QueryableProfileModKind::Thunderstore(remote) => {
-                        // check if the mod also exists on the other backend
-                        let alternate_backend = remote.backend().other();
-                        let alternate_backend = thunderstore
-                            .get_package(remote.package.uuid, alternate_backend)
-                            .ok()
-                            .map(|pkg| {
-                                let latest = pkg.latest_released();
-                                AlternateBackend {
-                                    backend: alternate_backend,
-                                    latest_version: latest.version().to_string(),
-                                    latest_version_uuid: latest.uuid,
-                                }
-                            });
-
-                        (
-                            FrontendMod::from(remote),
-                            remote.package.uuid,
-                            alternate_backend,
-                        )
-                    }
+                    QueryableProfileModKind::Thunderstore(remote) => (
+                        FrontendMod::from(remote),
+                        remote.package.uuid,
+                        self.alternative_of(&self.mods[index], thunderstore),
+                    ),
                 };
 
                 FrontendProfileMod {
@@ -212,13 +224,20 @@ impl Profile {
 
         (query_result, unknown)
     }
+
+    fn alternative_of(
+        &self,
+        profile_mod: &ProfileMod,
+        thunderstore: &Thunderstore,
+    ) -> Option<AlternateBackend> {
+        let (entry, _) = profile_mod.as_thunderstore()?;
+
+        self.source_alternative(entry, thunderstore)
+            .map(AlternateBackend::from)
+    }
 }
 
 impl Queryable for LocalMod {
-    fn uuid(&self) -> Uuid {
-        self.uuid
-    }
-
     fn full_name(&self) -> &str {
         &self.name
     }
@@ -255,5 +274,59 @@ impl Queryable for LocalMod {
 
     fn backend(&self) -> thunderstore::Backend {
         thunderstore::Backend::Thunderstore
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profile::install::queue::tests::{catalog, catalogs, install, listing, profile};
+
+    fn args() -> QueryModsArgs {
+        QueryModsArgs {
+            max_count: None,
+            search_term: None,
+            include_categories: Default::default(),
+            exclude_categories: Default::default(),
+            include_nsfw: true,
+            include_deprecated: true,
+            include_disabled: true,
+            include_enabled: true,
+            sort_by: SortBy::Name,
+            sort_order: SortOrder::Ascending,
+        }
+    }
+
+    #[test]
+    fn unknown_mod_serializes_flat_with_its_alternative() {
+        // the installed 1.0.0 is no longer in the Thunderstore catalog
+        let state = catalogs(&[
+            (Backend::Thunderstore, &[listing("Mod", 1, "1.0.1", &[])]),
+            (Backend::Hexium, &[listing("Mod", 2, "1.0.1", &[])]),
+        ]);
+        let previous = catalog(&[listing("Mod", 1, "1.0.0", &[])]);
+        let profile = profile(vec![install(&previous, 1)]);
+
+        let (mods, unknown) = profile.query_mods(&args(), &state);
+
+        assert!(mods.is_empty());
+        assert_eq!(unknown.len(), 1);
+
+        let value = serde_json::to_value(&unknown[0]).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "fullName": "Example-Mod-1.0.0",
+                "uuid": "00000000-0000-0000-0000-000000000001",
+                "backend": "Thunderstore",
+                "alternative": {
+                    "backend": "Hexium",
+                    "packageUuid": "00000000-0000-0000-0000-000000000002",
+                    "latestVersion": "1.0.1",
+                    "latestVersionUuid": "00000000-0000-0000-0000-0000000000c9",
+                    "reason": "delisted"
+                }
+            })
+        );
     }
 }

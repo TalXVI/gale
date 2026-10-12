@@ -72,12 +72,15 @@
 	let hasRefreshed = $state(false);
 	let refreshing = false;
 
-	function itemUuid(item: BrowsedMod) {
-		return item.data.thunderstore?.uuid ?? item.data.hexium?.uuid;
+	function itemHasUuid(item: BrowsedMod, uuid: string | undefined) {
+		return (
+			uuid !== undefined &&
+			(item.data.thunderstore?.uuid === uuid || item.data.hexium?.uuid === uuid)
+		);
 	}
 
 	function findItemByUuid(uuid: string | undefined) {
-		return mods.find((mod) => itemUuid(mod) === uuid) ?? null;
+		return mods.find((mod) => itemHasUuid(mod, uuid)) ?? null;
 	}
 
 	async function refresh() {
@@ -86,8 +89,10 @@
 
 		mods = await api.thunderstore.query({ ...modQuery.current, maxCount });
 		if (selectedMod) {
-			// isInstalled might have changed
-			selectedMod = findItemByUuid(itemUuid(selectedMod));
+			// isInstalled might have changed; either half's uuid identifies the item
+			selectedMod = findItemByUuid(
+				selectedMod.data.thunderstore?.uuid ?? selectedMod.data.hexium?.uuid
+			);
 		}
 
 		refreshing = false;
@@ -120,7 +125,7 @@
 	function onModClicked(evt: MouseEvent, mod: Mod) {
 		if (evt.ctrlKey) {
 			installLatest(mod);
-		} else if (selectedMod && itemUuid(selectedMod) === mod.uuid) {
+		} else if (selectedMod && itemHasUuid(selectedMod, mod.uuid)) {
 			selectedMod = null;
 		} else {
 			selectedMod = findItemByUuid(mod.uuid);
@@ -166,7 +171,7 @@
 					{combinedDownloads}
 					mod={shownMod}
 					isInstalled={mod.isInstalled}
-					selected={selectedMod !== null && itemUuid(selectedMod) === shownMod.uuid}
+					selected={selectedMod !== null && itemHasUuid(selectedMod, shownMod.uuid)}
 					locked={profiles.activeLocked}
 					oninstall={() => installLatest(shownMod)}
 					onclick={(evt) => onModClicked(evt, shownMod)}

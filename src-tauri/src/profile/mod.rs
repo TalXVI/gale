@@ -6,7 +6,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use export::modpack::ModpackArgs;
-use eyre::{Context, ContextCompat, OptionExt, Result, anyhow, ensure, eyre};
+use eyre::{Context, ContextCompat, OptionExt, Result, anyhow, bail, ensure, eyre};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
@@ -113,6 +113,27 @@ pub struct ThunderstoreMod {
     pub id: ModId,
 }
 
+/// Identifies the folder a mod installs into. Compared case-insensitively because
+/// two entries whose names differ only in case still collide on Windows.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ModKey(String);
+
+impl ModKey {
+    pub fn new(full_name: &str) -> Self {
+        Self(full_name.to_lowercase())
+    }
+}
+
+/// A dependency that an install must add to the profile.
+pub(crate) enum DependencyInstall<'a> {
+    Add(BorrowedMod<'a>),
+    /// A newer version of the installed entry `installed`, which it replaces.
+    Raise {
+        installed: Uuid,
+        target: BorrowedMod<'a>,
+    },
+}
+
 impl ProfileMod {
     fn new(kind: ProfileModKind) -> Self {
         Self {
@@ -148,6 +169,21 @@ impl ProfileMod {
 
     pub fn full_name(&self) -> Cow<'_, str> {
         self.kind.full_name()
+    }
+
+    pub fn key(&self) -> ModKey {
+        ModKey::new(&self.full_name())
+    }
+
+    fn installed_from(&self) -> String {
+        match &self.kind {
+            ProfileModKind::Thunderstore(ts_mod) => format!(
+                "from {} {}",
+                ts_mod.id.backend.display_name(),
+                ts_mod.ident.version()
+            ),
+            ProfileModKind::Local(_) => "as a local mod".to_owned(),
+        }
     }
 
     fn as_thunderstore(&self) -> Option<(&ThunderstoreMod, bool)> {
@@ -292,6 +328,11 @@ impl Profile {
         self.get_mod(uuid).is_ok()
     }
 
+    /// Whether an entry with this name is installed, from either site.
+    pub fn has_name(&self, key: &ModKey) -> bool {
+        self.find_by_key(key).is_some()
+    }
+
     fn thunderstore_mods(&self) -> impl Iterator<Item = (&ThunderstoreMod, bool)> {
         self.mods.iter().filter_map(ProfileMod::as_thunderstore)
     }
@@ -342,34 +383,117 @@ impl Profile {
             .filter(|dep| !self.has_mod(dep.package.uuid))
     }
 
+    fn find_by_key(&self, key: &ModKey) -> Option<(usize, &ProfileMod)> {
+        self.mods
+            .iter()
+            .enumerate()
+            .find(|(_, profile_mod)| profile_mod.key() == *key)
+    }
+
+    fn installed_thunderstore(&self, key: &ModKey) -> Option<&ThunderstoreMod> {
+        self.thunderstore_mods()
+            .map(|(ts_mod, _)| ts_mod)
+            .find(|ts_mod| ModKey::new(ts_mod.ident.full_name()) == *key)
+    }
+
+    /// Errors if an entry other than `except` already holds the folder `key`.
+    fn ensure_key_free(&self, key: &ModKey, except: Option<Uuid>) -> Result<()> {
+        let Some(existing) = self
+            .mods
+            .iter()
+            .find(|profile_mod| profile_mod.key() == *key && Some(profile_mod.uuid()) != except)
+        else {
+            return Ok(());
+        };
+
+        bail!(
+            "{} is already installed {}",
+            existing.full_name(),
+            existing.installed_from()
+        )
+    }
+
+    pub fn insert_mod(&mut self, index: Option<usize>, profile_mod: ProfileMod) -> Result<()> {
+        self.ensure_key_free(&profile_mod.key(), None)?;
+
+        match index {
+            Some(index) if index < self.mods.len() => self.mods.insert(index, profile_mod),
+            _ => self.mods.push(profile_mod),
+        }
+
+        Ok(())
+    }
+
     /// Resolves the dependency graph using versions planned for installation or
     /// already installed in this profile before consulting catalog requirements.
+    ///
+    /// An installed mod satisfies a requirement at or below its version. A newer
+    /// pinned version becomes a [`DependencyInstall::Raise`] of the installed entry.
     fn resolve_install_dependencies<'a>(
         &self,
         dependencies: impl IntoIterator<Item = (&'a VersionIdent, Backend)>,
         planned: &[BorrowedMod<'a>],
         thunderstore: &'a Thunderstore,
-    ) -> Result<Vec<BorrowedMod<'a>>> {
-        thunderstore::resolve_dependencies(dependencies, |ident, backend| {
+    ) -> Result<Vec<DependencyInstall<'a>>> {
+        let resolved = thunderstore::resolve_dependencies(dependencies, |ident, backend| {
+            let key = ModKey::new(ident.full_name());
             if let Some(dependency) = planned
                 .iter()
-                .find(|m| m.package.full_name() == ident.full_name())
+                .find(|m| ModKey::new(m.package.full_name()) == key)
             {
                 return Ok(*dependency);
             }
-            if let Some((installed, _)) = self
-                .thunderstore_mods()
-                .find(|(m, _)| m.ident.full_name() == ident.full_name())
-            {
-                return installed.id.borrow(thunderstore);
+            if let Some(installed) = self.installed_thunderstore(&key) {
+                let satisfied = match (
+                    installed.ident.version().parse::<semver::Version>(),
+                    ident.version().parse::<semver::Version>(),
+                ) {
+                    (Ok(installed), Ok(pinned)) => installed >= pinned,
+                    _ => true,
+                };
+                if satisfied {
+                    return installed.id.borrow(thunderstore);
+                }
+                return thunderstore
+                    .find_ident(ident, FromBackend::Prefer(installed.id.backend))
+                    .with_context(|| {
+                        format!(
+                            "{ident} is required but neither backend has it; the installed {} is {} from {}",
+                            installed.ident.full_name(),
+                            installed.ident.version(),
+                            installed.id.backend.display_name(),
+                        )
+                    });
             }
             thunderstore.find_ident(ident, FromBackend::Prefer(backend))
         })
-        .filter_ok(|dep| {
-            planned.iter().any(|m| m.package.uuid == dep.package.uuid)
-                || !self.has_mod(dep.package.uuid)
-        })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+
+        Ok(resolved
+            .into_iter()
+            .filter_map(|dependency| {
+                if planned
+                    .iter()
+                    .any(|m| m.package.uuid == dependency.package.uuid)
+                {
+                    return Some(DependencyInstall::Add(dependency));
+                }
+                let key = ModKey::new(dependency.ident().full_name());
+                match self.installed_thunderstore(&key) {
+                    None => Some(DependencyInstall::Add(dependency)),
+                    Some(installed)
+                        if installed.id.package_uuid == dependency.package.uuid
+                            && installed.id.version_uuid == dependency.version.uuid =>
+                    {
+                        None
+                    }
+                    Some(installed) => Some(DependencyInstall::Raise {
+                        installed: installed.id.package_uuid,
+                        target: dependency,
+                    }),
+                }
+            })
+            .collect())
     }
 
     fn log_path(&self) -> Result<PathBuf> {
@@ -455,7 +579,7 @@ impl LocalMod {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Dependant {
     #[serde(rename = "fullName")]

@@ -1,6 +1,6 @@
 import { mockConvertFileSrc, mockIPC } from '@tauri-apps/api/mocks';
 import { mount } from 'svelte';
-import type { Mod, ProfileMod } from '$lib/types';
+import type { AlternativeReason, Mod, ProfileMod, UnknownMod } from '$lib/types';
 import { Backend, ModType } from '$lib/types';
 import Toasts from '$lib/components/misc/Toasts.svelte';
 import '../../src/app.css';
@@ -76,7 +76,50 @@ mockIPC((cmd, args) => {
 		}
 		case 'get_profile_info':
 			return { activeId: 1, profiles: [{ id: 1, name: 'Review', sync: null }] };
-		case 'query_profile':
+		case 'query_profile': {
+			if (params.has('alt')) {
+				const data = remote(Backend.Thunderstore, '1.0.0', '00000000-0000-0000-0000-000000000010');
+				data.uuid = '00000000-0000-0000-0000-000000000020';
+				data.isDeprecated = params.get('alt') === 'deprecatedHere';
+				return {
+					mods: [
+						{
+							enabled: true,
+							configFile: null,
+							alternateBackend: {
+								backend: Backend.Hexium,
+								packageUuid: '00000000-0000-0000-0000-000000000021',
+								latestVersion: '0.3.3',
+								latestVersionUuid: '00000000-0000-0000-0000-000000000022',
+								reason: params.get('alt') as AlternativeReason
+							},
+							data
+						}
+					],
+					unknownMods: [],
+					totalModCount: 1,
+					updates: []
+				};
+			}
+			const unknownMods: UnknownMod[] = [1, 3].map((n) => ({
+				uuid: `00000000-0000-0000-0000-${String(n).padStart(12, '0')}`,
+				fullName: `Author-Missing${n}-1.0.0`,
+				backend: Backend.Thunderstore
+			}));
+			if (params.has('delistedAlt')) {
+				unknownMods.push({
+					uuid: '00000000-0000-0000-0000-000000000005',
+					fullName: 'Author-Gone-1.0.0',
+					backend: Backend.Thunderstore,
+					alternative: {
+						backend: Backend.Hexium,
+						packageUuid: '00000000-0000-0000-0000-000000000021',
+						latestVersion: '0.3.3',
+						latestVersionUuid: '00000000-0000-0000-0000-000000000022',
+						reason: 'delisted'
+					}
+				});
+			}
 			if (params.has('live')) {
 				const data = remote(Backend.Thunderstore, '1.1.3', '00000000-0000-0000-0000-000000000013');
 				data.versions = livePulled
@@ -106,14 +149,11 @@ mockIPC((cmd, args) => {
 			}
 			return {
 				mods: [local],
-				unknownMods: [1, 3].map((n) => ({
-					uuid: `00000000-0000-0000-0000-${String(n).padStart(12, '0')}`,
-					fullName: `Author-Missing${n}-1.0.0`,
-					backend: Backend.Thunderstore
-				})),
+				unknownMods,
 				totalModCount: 3,
 				updates: []
 			};
+		}
 		case 'query_thunderstore':
 			return [
 				{
@@ -151,7 +191,7 @@ mockIPC((cmd, args) => {
 		case 'get_markdown':
 			return null;
 		case 'get_prefs':
-			return { backendSkipConfirm: true };
+			return { backendSkipConfirm: !params.has('confirm') };
 		case 'get_download_size':
 			return 0;
 		case 'pull_live_mod':
@@ -175,6 +215,7 @@ mockIPC((cmd, args) => {
 			return false;
 		case 'force_remove_mods':
 		case 'install_mod':
+		case 'change_mod_version':
 		case 'stop_querying_thunderstore':
 		case 'log_err':
 			return;

@@ -78,7 +78,7 @@ impl ThunderstoreBackend {
                     if let Some(observed_at) = entry.live_observed_at {
                         self.insert_live_package(entry.package, observed_at);
                     } else {
-                        self.packages.insert(entry.package.uuid, entry.package);
+                        self.store_package(entry.package);
                     }
                 }
             }

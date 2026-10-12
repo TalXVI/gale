@@ -15,13 +15,7 @@ pub async fn install_mod(id: ModId, app: AppHandle) -> Result<()> {
     let install = ModInstall::try_from_id(id, &app.lock_thunderstore())?;
 
     app.install_queue()
-        .install_with_deps(
-            vec![install],
-            profile_id,
-            InstallOptions::default(),
-            false,
-            &app,
-        )?
+        .install_with_deps(vec![install], profile_id, InstallOptions::default(), &app)?
         .await
         .ignore_cancel()?;
 

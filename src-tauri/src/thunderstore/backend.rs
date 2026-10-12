@@ -1,5 +1,6 @@
 use crate::{
     game::Game,
+    profile::ModKey,
     thunderstore::{BorrowedMod, PackageIdent, PackageListing, VersionIdent, cache::MarkdownKind},
 };
 use chrono::{DateTime, Utc};
@@ -48,6 +49,14 @@ impl Backend {
         match self {
             Backend::Thunderstore => Backend::Hexium,
             Backend::Hexium => Backend::Thunderstore,
+        }
+    }
+
+    /// The site name shown to users. Unlike [`Display`], this is not used in paths.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Backend::Thunderstore => "Thunderstore",
+            Backend::Hexium => "Hexium",
         }
     }
 
@@ -198,6 +207,8 @@ pub struct ThunderstoreBackend {
     // IndexMap is not used for ordering here, but for fast iteration,
     // since we iterate over all mods when resolving identifiers and querying.
     pub(super) packages: IndexMap<Uuid, PackageListing>,
+    /// Package uuids by name. Kept in step with `packages`; see [`Self::store_package`].
+    names: HashMap<ModKey, Uuid>,
     live_packages: HashMap<Uuid, DateTime<Utc>>,
     pub(super) backend: Backend,
 }
@@ -208,9 +219,32 @@ impl ThunderstoreBackend {
             packages_fetched: false,
             is_fetching: false,
             packages: IndexMap::new(),
+            names: HashMap::new(),
             live_packages: HashMap::new(),
             backend,
         }
+    }
+
+    /// Stores `package`, replacing any listing with the same uuid, and indexes its name.
+    pub(super) fn store_package(&mut self, package: PackageListing) {
+        if let Some(previous) = self.packages.get(&package.uuid) {
+            let previous_key = ModKey::new(previous.full_name());
+            if self.names.get(&previous_key) == Some(&package.uuid) {
+                self.names.remove(&previous_key);
+            }
+        }
+
+        self.names
+            .insert(ModKey::new(package.full_name()), package.uuid);
+        self.packages.insert(package.uuid, package);
+    }
+
+    fn rebuild_names(&mut self) {
+        self.names = self
+            .packages
+            .values()
+            .map(|package| (ModKey::new(package.full_name()), package.uuid))
+            .collect();
     }
 
     /// Whether packages have been succesfully fetched at least one since
@@ -234,7 +268,7 @@ impl ThunderstoreBackend {
         }
 
         self.live_packages.remove(&package.uuid);
-        self.packages.insert(package.uuid, package);
+        self.store_package(package);
     }
 
     pub(super) fn insert_live_package(
@@ -243,7 +277,7 @@ impl ThunderstoreBackend {
         observed_at: DateTime<Utc>,
     ) {
         self.live_packages.insert(package.uuid, observed_at);
-        self.packages.insert(package.uuid, package);
+        self.store_package(package);
     }
 
     pub(super) fn live_observed_at(&self, uuid: Uuid) -> Option<DateTime<Utc>> {
@@ -277,6 +311,7 @@ impl ThunderstoreBackend {
                 self.live_packages.remove(&uuid);
             }
         }
+        self.rebuild_names();
     }
 
     /// Returns an iterator over the latest versions of every package.
@@ -299,6 +334,11 @@ impl ThunderstoreBackend {
             .values()
             .find(|package| package.ident.as_str() == full_name)
             .ok_or_else(|| eyre!("package {full_name} not found"))
+    }
+
+    /// Finds a package by name, ignoring letter case.
+    pub fn find_package_by_key(&self, key: &ModKey) -> Option<&PackageListing> {
+        self.names.get(key).and_then(|uuid| self.packages.get(uuid))
     }
 
     pub fn get_mod(&self, package_uuid: Uuid, version_uuid: Uuid) -> eyre::Result<BorrowedMod<'_>> {
@@ -346,6 +386,7 @@ impl ThunderstoreBackend {
         self.is_fetching = false;
         self.packages_fetched = false;
         self.packages = IndexMap::new();
+        self.names.clear();
         self.live_packages.clear();
     }
 }

@@ -182,10 +182,14 @@ export type ProfileMod = {
 	data: Mod;
 };
 
+export type AlternativeReason = 'newer' | 'deprecatedHere' | 'delisted' | 'olderButNotDeprecated';
+
 export type AlternateBackendInfo = {
 	backend: Backend;
+	packageUuid: string;
 	latestVersion: string;
 	latestVersionUuid: string;
+	reason: AlternativeReason | null;
 };
 
 export type ModVersion = {
@@ -236,6 +240,10 @@ export type Dependant = {
 	fullName: string;
 	uuid: string;
 	backend: Backend;
+};
+
+export type UnknownMod = Dependant & {
+	alternative?: AlternateBackendInfo;
 };
 
 export type DependantWithVersion = {
@@ -695,7 +703,7 @@ export type AvailableUpdate = {
 export type ProfileQuery = {
 	mods: ProfileMod[];
 	totalModCount: number;
-	unknownMods: Dependant[];
+	unknownMods: UnknownMod[];
 	updates: AvailableUpdate[];
 };
 

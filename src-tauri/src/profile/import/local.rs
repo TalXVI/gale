@@ -14,7 +14,7 @@ use zip::ZipArchive;
 use crate::{
     game::mod_loader::{ModLoader, ModLoaderKind},
     prefs::{Backends, Prefs},
-    profile::{LocalMod, Profile, ProfileMod, install::InstallOptions},
+    profile::{LocalMod, ModKey, Profile, ProfileMod, install::InstallOptions},
     state::ManagerExt,
     thunderstore::{Backend, PackageManifest},
     util::{self, fs::PathExt},
@@ -85,9 +85,10 @@ pub async fn import_local_mod(
     let mod_loader = manager.active_mod_loader();
     let profile = manager.active_profile_mut();
 
+    let key = ModKey::new(&local_mod.name);
     let existing = profile
         .local_mods()
-        .find(|(LocalMod { name, .. }, _)| *name == local_mod.name);
+        .find(|(LocalMod { name, .. }, _)| ModKey::new(name) == key);
 
     let existing = existing.map(|(LocalMod { uuid, .. }, _)| *uuid);
 
@@ -96,6 +97,8 @@ pub async fn import_local_mod(
             .force_remove_mod(uuid)
             .context("failed to remove existing version")?;
     }
+
+    profile.ensure_key_free(&key, None)?;
 
     match kind {
         LocalModKind::Zip => {
@@ -127,7 +130,7 @@ pub async fn import_local_mod(
         },
     }
 
-    profile.mods.push(ProfileMod::new_local(local_mod));
+    profile.insert_mod(None, ProfileMod::new_local(local_mod))?;
 
     profile.save(app, true)?;
 

@@ -3,6 +3,8 @@
 	import type { MouseEventHandler } from 'svelte/elements';
 	import { formatModName, isNonReleaseVersion, modIconSrc } from '$lib/util';
 	import Icon from '@iconify/svelte';
+	import Tooltip from '../ui/Tooltip.svelte';
+	import { m } from '$lib/paraglide/messages';
 	import type { Snippet } from 'svelte';
 	import type { ClassValue } from 'clsx';
 
@@ -75,7 +77,18 @@
 					<Icon class="text-primary-500 dark:text-primary-400 mr-1 shrink-0" icon="mdi:pin" />
 				{/if}
 				{#if mod.data.isDeprecated}
-					<Icon class="mr-1 shrink-0 text-yellow-500" icon="mdi:warning" />
+					{#if mod.alternateBackend?.reason === 'olderButNotDeprecated'}
+						<Tooltip
+							text={m.page_modDetails_olderNotDeprecated({
+								site: mod.alternateBackend.backend,
+								version: mod.alternateBackend.latestVersion
+							})}
+						>
+							<Icon class="mr-1 shrink-0 text-yellow-500" icon="mdi:warning" />
+						</Tooltip>
+					{:else}
+						<Icon class="mr-1 shrink-0 text-yellow-500" icon="mdi:warning" />
+					{/if}
 				{/if}
 				{#if update}
 					{#if isNonReleaseVersion(update.new)}
@@ -86,6 +99,26 @@
 							icon="mdi:arrow-up-circle"
 						/>
 					{/if}
+				{/if}
+				{#if mod.alternateBackend?.reason === 'newer'}
+					<Icon
+						class="text-accent-600 dark:text-accent-500 mr-1 shrink-0"
+						icon="mdi:swap-horizontal"
+					/>
+					<span class="text-primary-500 dark:text-primary-400 shrink-0 text-xs">
+						{m.page_modListItem_newerOnSource({
+							version: mod.alternateBackend.latestVersion,
+							site: mod.alternateBackend.backend
+						})}
+					</span>
+				{:else if mod.alternateBackend?.reason === 'deprecatedHere'}
+					<Icon
+						class="text-accent-600 dark:text-accent-500 mr-1 shrink-0"
+						icon="mdi:swap-horizontal"
+					/>
+					<span class="text-primary-500 dark:text-primary-400 shrink-0 text-xs">
+						{m.page_modListItem_notDeprecatedOn({ site: mod.alternateBackend.backend })}
+					</span>
 				{/if}
 			</div>
 

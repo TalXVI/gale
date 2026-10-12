@@ -12,7 +12,8 @@ import {
 	type RgbaColor,
 	type DeduplicatedMod,
 	type ModContextItem,
-	type ContextItem
+	type ContextItem,
+	type AlternativeReason
 } from './types';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import { compare } from 'semver';
@@ -114,6 +115,12 @@ export function compareVersions(v1: string | null, v2: string | null): number {
 		return Number(v1 !== null) - Number(v2 !== null);
 	}
 	return compare(v1, v2);
+}
+
+/// Whether the UI asks the user to switch to the other source's listing.
+/// Informational reasons like 'olderButNotDeprecated' never prompt.
+export function isSwitchPrompt(reason: AlternativeReason | null | undefined): boolean {
+	return reason === 'newer' || reason === 'deprecatedHere' || reason === 'delisted';
 }
 
 export function getPreferredBackend({ hexium, thunderstore }: DeduplicatedMod<Mod>): Backend {

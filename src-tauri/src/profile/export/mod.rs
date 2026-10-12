@@ -19,7 +19,7 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 use zip::{ZipWriter, write::SimpleFileOptions};
 
-use super::{Profile, Result, install::ModInstall};
+use super::{ModKey, Profile, Result, install::ModInstall};
 use crate::thunderstore::{Backend, FromBackend};
 use crate::{
     state::ManagerExt,
@@ -83,6 +83,10 @@ pub struct R2Mod {
 impl R2Mod {
     pub fn version_ident(&self) -> VersionIdent {
         self.ident.with_version(&self.version)
+    }
+
+    pub fn key(&self) -> ModKey {
+        ModKey::new(self.ident.as_str())
     }
 
     pub fn to_install(&self, thunderstore: &Thunderstore) -> Result<ModInstall> {
@@ -483,6 +487,41 @@ where
     write_config(paths.iter(), profile_path, &mut zip, opts)?;
 
     zip.finish()?;
+
+    Ok(())
+}
+
+/// Rejects a mod list that names the same mod more than once.
+pub fn ensure_unique_mods(mods: &[R2Mod]) -> Result<()> {
+    let mut groups: BTreeMap<ModKey, Vec<&R2Mod>> = BTreeMap::new();
+    for r2mod in mods {
+        groups.entry(r2mod.key()).or_default().push(r2mod);
+    }
+
+    let duplicates = groups
+        .values()
+        .filter(|group| group.len() > 1)
+        .map(|group| {
+            let copies = group
+                .iter()
+                .map(|r2mod| {
+                    format!(
+                        "{} from {}",
+                        r2mod.version_ident().version(),
+                        r2mod.source.display_name()
+                    )
+                })
+                .join(", ");
+
+            format!(
+                "{} is listed {} times: {copies}",
+                group[0].ident.as_str(),
+                group.len()
+            )
+        })
+        .join("; ");
+
+    ensure!(duplicates.is_empty(), "{duplicates}");
 
     Ok(())
 }
@@ -1154,5 +1193,23 @@ mod tests {
         let mut mmp = manifest.clone();
         mmp.mods[0].version = semver::Version::new(2, 0, 14).into();
         assert_ne!(mods_revision, manifest_revision(&mmp).unwrap());
+    }
+
+    #[test]
+    fn every_duplicated_mod_is_listed_with_its_versions_and_sites() {
+        let mods = vec![
+            r2_mod("Mod", 1, 0, 0, true, Backend::Thunderstore),
+            r2_mod("Other", 2, 0, 0, true, Backend::Thunderstore),
+            r2_mod("mod", 1, 0, 1, false, Backend::Hexium),
+            r2_mod("OTHER", 2, 0, 0, true, Backend::Hexium),
+        ];
+
+        let error = ensure_unique_mods(&mods).unwrap_err();
+
+        assert_eq!(
+            format!("{error:#}"),
+            "Author-Mod is listed 2 times: 1.0.0 from Thunderstore, 1.0.1 from Hexium; \
+             Author-Other is listed 2 times: 2.0.0 from Thunderstore, 2.0.0 from Hexium"
+        );
     }
 }

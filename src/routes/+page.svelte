@@ -11,10 +11,13 @@
 		ListItem,
 		Backend,
 		ProfileMod,
-		ModId
+		ModId,
+		AlternateBackendInfo,
+		UnknownMod
 	} from '$lib/types';
 	import {
 		isNonReleaseVersion,
+		isSwitchPrompt,
 		mapModContextItem,
 		resolveModContextItems,
 		shouldWarnForeignDownload
@@ -80,14 +83,13 @@
 			onclick: () => {},
 			showFor: (mod, profileLocked) => mod.alternateBackend !== null && !profileLocked,
 			children: (mod) => {
-				if (!mod.alternateBackend) return [];
-
-				const { backend, latestVersion, latestVersionUuid } = mod.alternateBackend;
+				const alt = mod.alternateBackend;
+				if (!alt) return [];
 
 				return [
 					{
-						label: `${backend} (${latestVersion})`,
-						onclick: () => changeModVersion(mod, { backend, versionUuid: latestVersionUuid })
+						label: `${alt.backend} (${alt.latestVersion})`,
+						onclick: () => switchSource(alt)
 					}
 				];
 			}
@@ -116,7 +118,7 @@
 	let mods: ProfileMod[] = $state([]);
 	let items: ListItem[] = $state([]);
 	let totalModCount = $state(0);
-	let unknownMods: Dependant[] = $state([]);
+	let unknownMods: UnknownMod[] = $state([]);
 	// map from package uuids to updates
 	let updates: Map<string, AvailableUpdate> = $state(new Map());
 
@@ -136,6 +138,7 @@
 	let refreshPromise: Promise<void> | null = $state(null);
 
 	let foreignDownloadDialogOpen = $state(false);
+	let foreignConfirm: () => Promise<void> = async () => {};
 
 	async function refresh() {
 		if (refreshPromise !== null) {
@@ -222,6 +225,29 @@
 		await refresh();
 	}
 
+	/// Switches the installed copy of a mod to another source's listing,
+	/// confirming first when the target counts as a foreign download.
+	async function switchSource(alt: AlternateBackendInfo) {
+		const targetId: ModId = {
+			packageUuid: alt.packageUuid,
+			versionUuid: alt.latestVersionUuid,
+			backend: alt.backend
+		};
+
+		const prefs = await api.prefs.get();
+		if (shouldWarnForeignDownload(targetId, prefs)) {
+			foreignConfirm = () => doSwitchSource(targetId);
+			foreignDownloadDialogOpen = true;
+		} else {
+			await doSwitchSource(targetId);
+		}
+	}
+
+	async function doSwitchSource(targetId: ModId) {
+		await api.profile.update.changeModVersion(targetId);
+		await refresh();
+	}
+
 	async function updateModToLatest(mod: ProfileMod) {
 		await api.profile.update.mods([mod.data.uuid], false);
 		await refresh();
@@ -273,6 +299,7 @@
 			<UnknownModsBanner
 				mods={unknownMods}
 				uninstallAll={() => forceUninstall(...unknownMods.map((mod) => mod.uuid))}
+				switchSource={(alt) => switchSource(alt)}
 			/>
 		{/if}
 
@@ -339,6 +366,7 @@
 					onclick={async () => {
 						const prefs = await api.prefs.get();
 						if (shouldWarnForeignDownload(update.updatedId, prefs)) {
+							foreignConfirm = () => updateModToLatest(selectedMod!);
 							foreignDownloadDialogOpen = true;
 						} else {
 							updateModToLatest(selectedMod!);
@@ -347,6 +375,42 @@
 				>
 					{m.page_modDetails_button({ version: update.new })}
 				</Button>
+			{/if}
+
+			{#if selectedMod.alternateBackend?.reason && !locked}
+				{@const alt = selectedMod.alternateBackend}
+
+				<p class="text-primary-600 dark:text-primary-300 mt-3 text-sm">
+					{#if alt.reason === 'newer'}
+						{m.page_modDetails_switchNewer({
+							site: alt.backend,
+							version: alt.latestVersion,
+							currentSite: selectedMod.data.backend
+						})}
+					{:else if alt.reason === 'deprecatedHere'}
+						{m.page_modDetails_switchDeprecatedHere({
+							site: alt.backend,
+							currentSite: selectedMod.data.backend
+						})}
+					{:else if alt.reason === 'olderButNotDeprecated'}
+						{m.page_modDetails_olderNotDeprecated({
+							site: alt.backend,
+							version: alt.latestVersion
+						})}
+					{/if}
+				</p>
+
+				{#if isSwitchPrompt(alt.reason)}
+					<Button
+						color="primary"
+						icon="mdi:swap-horizontal"
+						size="lg"
+						class="mt-2"
+						onclick={() => switchSource(alt)}
+					>
+						{m.page_modDetails_switchButton({ site: alt.backend, version: alt.latestVersion })}
+					</Button>
+				{/if}
 			{/if}
 		</ModDetails>
 	{/if}
@@ -404,7 +468,4 @@
 	positive
 />
 
-<ForeignDownloadDialog
-	bind:open={foreignDownloadDialogOpen}
-	onConfirm={() => updateModToLatest(selectedMod!)}
-/>
+<ForeignDownloadDialog bind:open={foreignDownloadDialogOpen} onConfirm={() => foreignConfirm()} />

@@ -12,7 +12,7 @@ use tauri::AppHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::{game::Game, state::ManagerExt, thunderstore::query::Queryable};
+use crate::{game::Game, profile::ModKey, state::ManagerExt, thunderstore::query::Queryable};
 
 pub mod cache;
 pub mod commands;
@@ -130,9 +130,9 @@ impl ModId {
 
 /// A mod that exists on one or both backends.
 ///
-/// Mod UUIDs on Hexium mimic those on Thunderstore, so we can deduplicate mods from each
-/// by UUID. This struct is then used by the frontend to display a single combined mod entry for
-/// each unique mod.
+/// Listings of one mod on both sites are matched by name, since their package UUIDs can differ.
+/// This struct is then used by the frontend to display a single combined mod entry for each
+/// unique mod.
 #[derive(Debug, Serialize)]
 pub struct DeduplicatedMod<T> {
     pub thunderstore: Option<T>,
@@ -152,10 +152,6 @@ impl<T> DeduplicatedMod<T> {
             thunderstore: self.thunderstore.map(&mut f),
             hexium: self.hexium.map(f),
         }
-    }
-
-    fn first(&self) -> Option<&T> {
-        self.thunderstore.as_ref().or(self.hexium.as_ref())
     }
 }
 
@@ -345,6 +341,11 @@ impl Thunderstore {
             Self::cmp_package_listing,
             from.into(),
         )
+    }
+
+    /// Finds the package named `key` on one backend, ignoring letter case.
+    pub fn find_package_by_key(&self, key: &ModKey, backend: Backend) -> Option<&PackageListing> {
+        self.backend(backend).find_package_by_key(key)
     }
 
     pub fn get_mod(

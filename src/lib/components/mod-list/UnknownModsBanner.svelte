@@ -1,17 +1,19 @@
 <script lang="ts">
 	import { m } from '$lib/paraglide/messages';
-	import type { Dependant } from '$lib/types';
+	import type { AlternateBackendInfo, UnknownMod } from '$lib/types';
+	import { isSwitchPrompt } from '$lib/util';
 	import InfoBox from '../ui/InfoBox.svelte';
 	import Button from '../ui/Button.svelte';
 	import Dialog from '../ui/Dialog.svelte';
 	import ModCardList from '../ui/ModCardList.svelte';
 
 	type Props = {
-		mods: Dependant[];
+		mods: UnknownMod[];
 		uninstallAll: () => Promise<void>;
+		switchSource: (alternative: AlternateBackendInfo) => void;
 	};
 
-	let { mods, uninstallAll }: Props = $props();
+	let { mods, uninstallAll, switchSource }: Props = $props();
 
 	let dialogOpen = $state(false);
 </script>
@@ -32,7 +34,24 @@
 		{m.unknownModsBanner_dialog_content_2()}
 	</div>
 
-	<ModCardList {mods} />
+	<ModCardList {mods}>
+		{#snippet cardChildren({ mod })}
+			{@const alt = mod.alternative}
+			{#if alt && isSwitchPrompt(alt.reason)}
+				<div class="text-primary-500 dark:text-primary-400 text-sm">
+					{m.unknownModsBanner_unavailable({ site: mod.backend })}
+				</div>
+				<Button
+					color="primary"
+					icon="mdi:swap-horizontal"
+					class="mt-1"
+					onclick={() => switchSource(alt)}
+				>
+					{m.page_modDetails_switchButton({ site: alt.backend, version: alt.latestVersion })}
+				</Button>
+			{/if}
+		{/snippet}
+	</ModCardList>
 
 	<div class="mt-2 flex justify-end gap-2">
 		<Button color="primary" onclick={() => (dialogOpen = false)}

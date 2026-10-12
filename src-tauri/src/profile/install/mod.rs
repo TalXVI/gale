@@ -18,7 +18,7 @@
 /// - `queue`: handles the queue of mod installations, orchestrating the other modules
 /// - `installers`: contains installers handle the modloader-specific file placement
 use std::{
-    fmt::{Debug, Display},
+    fmt::Display,
     iter, process,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -35,7 +35,7 @@ use uuid::Uuid;
 use super::Profile;
 use crate::{
     prefs::Prefs,
-    profile::{ProfileMod, ProfileModKind, ThunderstoreMod},
+    profile::{ModKey, ProfileMod, ProfileModKind, ThunderstoreMod},
     state::ManagerExt,
     thunderstore::{BorrowedMod, ModId, Thunderstore, VersionIdent, query::Queryable},
 };
@@ -47,9 +47,6 @@ mod fs;
 mod installers;
 pub use installers::*;
 pub mod queue;
-
-type BeforeInstallHandler =
-    Box<dyn Fn(&ModInstall, &mut Profile) -> Result<()> + 'static + Send + Sync>;
 
 /// Decides what to do when a batch is cancelled while being installed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -64,10 +61,9 @@ pub enum CancelBehavior {
     Prevent,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct InstallOptions {
     cancel_behavior: CancelBehavior,
-    before_install: Option<BeforeInstallHandler>,
 }
 
 impl InstallOptions {
@@ -82,27 +78,6 @@ impl InstallOptions {
     pub fn cancel_behavior(mut self, behavior: CancelBehavior) -> Self {
         self.cancel_behavior = behavior;
         self
-    }
-
-    pub fn before_install(mut self, before_install: BeforeInstallHandler) -> Self {
-        self.before_install = Some(before_install);
-        self
-    }
-}
-
-impl Debug for InstallOptions {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("InstallOptions")
-            .field("cancel_behavior", &self.cancel_behavior)
-            .field(
-                "before_install",
-                if self.before_install.is_some() {
-                    &Some("<handler>")
-                } else {
-                    &None::<()>
-                },
-            )
-            .finish()
     }
 }
 
@@ -124,6 +99,11 @@ pub struct ModInstall {
     ///
     /// This is mainly used to retain the install date when updating mods.
     install_time: Option<DateTime<Utc>>,
+    /// The installed entry, by package uuid, that this install replaces.
+    ///
+    /// Its files and record are removed before this install is written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    replaces: Option<Uuid>,
 }
 
 impl ModInstall {
@@ -136,6 +116,7 @@ impl ModInstall {
             enabled: true,
             index: None,
             install_time: None,
+            replaces: None,
         }
     }
 
@@ -158,6 +139,16 @@ impl ModInstall {
         self
     }
 
+    /// Marks the installed entry with package uuid `uuid` as replaced by this install.
+    pub fn replacing(mut self, uuid: Uuid) -> Self {
+        self.replaces = Some(uuid);
+        self
+    }
+
+    pub fn replaces(&self) -> Option<Uuid> {
+        self.replaces
+    }
+
     pub fn mod_id(&self) -> &ModId {
         &self.id
     }
@@ -167,8 +158,20 @@ impl ModInstall {
         self.id.package_uuid
     }
 
+    pub fn key(&self) -> ModKey {
+        ModKey::new(self.ident.full_name())
+    }
+
     pub fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    pub fn index(&self) -> Option<usize> {
+        self.index
+    }
+
+    pub fn install_time(&self) -> Option<DateTime<Utc>> {
+        self.install_time
     }
 
     /// The `ProfileMod` record this install would add to the profile.
@@ -185,17 +188,8 @@ impl ModInstall {
     fn insert_into(self, profile: &mut Profile) -> Result<()> {
         let uuid = self.uuid();
         let enabled = self.enabled;
-        let index = self.index;
-        let profile_mod = self.profile_mod();
 
-        match index {
-            Some(index) if index < profile.mods.len() => {
-                profile.mods.insert(index, profile_mod);
-            }
-            _ => {
-                profile.mods.push(profile_mod);
-            }
-        }
+        profile.insert_mod(self.index, self.profile_mod())?;
 
         if !enabled {
             profile.force_toggle_mod(uuid)?;
@@ -215,17 +209,35 @@ impl From<BorrowedMod<'_>> for ModInstall {
 impl ModInstall {
     /// Builds a `ModInstall` for tests without needing a [`BorrowedMod`].
     pub fn test(ident: &str, package_uuid: Uuid, version_uuid: Uuid, enabled: bool) -> Self {
+        Self::test_on(
+            crate::thunderstore::Backend::Thunderstore,
+            ident,
+            package_uuid,
+            version_uuid,
+            enabled,
+        )
+    }
+
+    /// Like [`Self::test`], for a mod listed on `backend`.
+    pub fn test_on(
+        backend: crate::thunderstore::Backend,
+        ident: &str,
+        package_uuid: Uuid,
+        version_uuid: Uuid,
+        enabled: bool,
+    ) -> Self {
         Self {
             id: ModId {
                 package_uuid,
                 version_uuid,
-                backend: crate::thunderstore::Backend::Thunderstore,
+                backend,
             },
             ident: ident.parse().unwrap(),
             file_size: 0,
             enabled,
             index: None,
             install_time: None,
+            replaces: None,
         }
     }
 }

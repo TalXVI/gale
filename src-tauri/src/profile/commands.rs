@@ -11,7 +11,7 @@ use uuid::Uuid;
 use super::{Dependant, Profile, actions::ActionResult, server};
 use crate::{
     game::{self, Game, platform::Platform},
-    profile::{FrontendManagedGame, query::FrontendProfileMod},
+    profile::{FrontendManagedGame, query::FrontendProfileMod, query::UnknownMod},
     state::ManagerExt,
     thunderstore::{
         Backend, BorrowedMod, FromBackend, ModId, Thunderstore, VersionIdent, cache::MarkdownKind,
@@ -180,7 +180,7 @@ pub struct ProfileQuery {
     mods: Vec<FrontendProfileMod>,
     total_mod_count: usize,
     updates: Vec<FrontendAvailableUpdate>,
-    unknown_mods: Vec<Dependant>,
+    unknown_mods: Vec<UnknownMod>,
 }
 
 #[command]

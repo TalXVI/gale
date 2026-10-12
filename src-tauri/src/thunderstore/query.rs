@@ -7,14 +7,13 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 use tracing::info;
-use uuid::Uuid;
 
 use super::{
     Backend, BorrowedMod, DeduplicatedMod, Thunderstore,
     models::{FrontendMod, FrontendModKind, FrontendVersion},
 };
 use crate::{
-    profile::{LocalMod, ModManager},
+    profile::{LocalMod, ModKey, ModManager},
     state::ManagerExt,
     util,
 };
@@ -86,11 +85,6 @@ pub async fn query_loop(app: AppHandle) -> Result<()> {
 /// Abstracts logic needed for `query_mods`, allowing it to be reused
 /// for both Thunderstore and profile querying.
 pub trait Queryable {
-    /// The package's UUID.
-    ///
-    /// This is not unique across backends, but should be unique for every package within a backend.
-    fn uuid(&self) -> uuid::Uuid;
-
     /// The package's full name, including the author.
     fn full_name(&self) -> &str;
 
@@ -118,10 +112,6 @@ pub trait Queryable {
 }
 
 impl Queryable for BorrowedMod<'_> {
-    fn uuid(&self) -> uuid::Uuid {
-        self.package.uuid
-    }
-
     fn full_name(&self) -> &str {
         self.package.ident.as_str()
     }
@@ -275,19 +265,37 @@ impl Thunderstore {
         args: &QueryModsArgs,
         manager: &ModManager,
     ) -> impl Iterator<Item = ModListQueryItem> {
-        let included_mods = self
-            .latest()
-            .filter(|borrowed| !manager.hidden_mods.contains(&borrowed.package.uuid));
+        // The halves can have different uuids, so the hidden uuids are resolved
+        // to names on both backends first. Filtering before deduplication keeps
+        // hidden mods from consuming slots in a `max_count` window.
+        let hidden_keys: HashSet<ModKey> = manager
+            .hidden_mods
+            .iter()
+            .filter_map(|uuid| {
+                [Backend::Thunderstore, Backend::Hexium]
+                    .into_iter()
+                    .find_map(|backend| self.get_package(*uuid, backend).ok())
+            })
+            .map(|package| ModKey::new(package.full_name()))
+            .collect();
 
-        let results = query_mods(args, included_mods);
+        let results = query_mods(
+            args,
+            self.latest()
+                .filter(|m| !hidden_keys.contains(&ModKey::new(m.full_name()))),
+        );
 
         let profile = manager.active_profile();
 
         deduplicate_results(results, args.max_count.unwrap_or(usize::MAX)).map(|deduplicated| {
+            let is_installed = [
+                deduplicated.thunderstore.as_ref(),
+                deduplicated.hexium.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|m| profile.has_name(&ModKey::new(m.full_name())));
             let deduplicated = deduplicated.map(FrontendMod::from);
-            let is_installed = deduplicated
-                .first()
-                .is_some_and(|m| profile.has_mod(m.uuid));
 
             ModListQueryItem {
                 is_installed,
@@ -335,7 +343,8 @@ where
     results
 }
 
-/// Combine query results from multiple backends into a single list of [`DeduplicatedMod`], merging by UUID.
+/// Combines query results from multiple backends into a single list of [`DeduplicatedMod`],
+/// merging listings that share a name (`owner-name`, ignoring case).
 fn deduplicate_results<T>(
     results: impl IntoIterator<Item = T>,
     max_count: usize,
@@ -345,13 +354,13 @@ where
 {
     use indexmap::map::Entry;
 
-    let mut deduped_mods: IndexMap<Uuid, DeduplicatedMod<T>> = IndexMap::new();
+    let mut deduped_mods: IndexMap<ModKey, DeduplicatedMod<T>> = IndexMap::new();
 
     // We need to loop through all results as packages from different sources
     // might be ranked differently, and we want to make sure we get every duplicate.
     for result in results {
         let accepting_new_mods = deduped_mods.len() < max_count;
-        let entry = deduped_mods.entry(result.uuid());
+        let entry = deduped_mods.entry(ModKey::new(result.full_name()));
 
         match entry {
             Entry::Occupied(mut occupied_entry) => {
@@ -367,4 +376,154 @@ where
     }
 
     deduped_mods.into_values()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use chrono::Utc;
+    use indexmap::IndexMap;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::profile::{
+        ManagedGame, Profile,
+        install::queue::tests::{catalogs, install_from, listing, profile},
+    };
+
+    fn args() -> QueryModsArgs {
+        QueryModsArgs {
+            max_count: None,
+            search_term: None,
+            include_categories: Default::default(),
+            exclude_categories: Default::default(),
+            include_nsfw: true,
+            include_deprecated: true,
+            include_disabled: true,
+            include_enabled: true,
+            sort_by: SortBy::Name,
+            sort_order: SortOrder::Ascending,
+        }
+    }
+
+    fn manager_with(profile: Profile) -> ModManager {
+        let game = profile.game;
+        let managed = ManagedGame {
+            id: 1,
+            game,
+            path: profile.path.clone(),
+            active_profile_id: profile.id,
+            profiles: vec![profile],
+            favorite: false,
+        };
+        ModManager {
+            active_game: game,
+            hidden_mods: Default::default(),
+            games: HashMap::from([(game, managed)]),
+        }
+    }
+
+    #[test]
+    fn the_name_index_tracks_cache_live_bulk_and_cleared_packages() {
+        let mut state = catalogs(&[(Backend::Thunderstore, &[listing("Mod", 1, "1.0.0", &[])])]);
+
+        // found after a cache load, ignoring letter case
+        assert_eq!(
+            state
+                .find_package_by_key(&ModKey::new("example-MOD"), Backend::Thunderstore)
+                .map(|package| package.uuid),
+            Some(Uuid::from_u128(1))
+        );
+
+        // found after a live listing is applied
+        state
+            .backend_mut(Backend::Thunderstore)
+            .insert_live_package(listing("Live", 9, "1.0.0", &[]), Utc::now());
+        assert!(
+            state
+                .find_package_by_key(&ModKey::new("Example-Live"), Backend::Thunderstore)
+                .is_some()
+        );
+
+        // rebuilt by a bulk replacement, which also forgets removed packages
+        state.backend_mut(Backend::Thunderstore).replace_packages(
+            IndexMap::from([(Uuid::from_u128(5), listing("Replaced", 5, "1.0.0", &[]))]),
+            None,
+        );
+        assert!(
+            state
+                .find_package_by_key(&ModKey::new("Example-Replaced"), Backend::Thunderstore)
+                .is_some()
+        );
+        assert!(
+            state
+                .find_package_by_key(&ModKey::new("Example-Mod"), Backend::Thunderstore)
+                .is_none()
+        );
+
+        // forgotten after the backend is cleared
+        state.backend_mut(Backend::Thunderstore).clear_packages();
+        assert!(
+            state
+                .find_package_by_key(&ModKey::new("Example-Replaced"), Backend::Thunderstore)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn same_name_listings_merge_and_count_as_installed() {
+        let state = catalogs(&[
+            (Backend::Thunderstore, &[listing("Mod", 1, "1.0.0", &[])]),
+            (Backend::Hexium, &[listing("Mod", 2, "1.0.1", &[])]),
+        ]);
+
+        // only the hexium copy is installed, under its own uuid
+        let profile = profile(vec![install_from(&state, Backend::Hexium, 2)]);
+        let manager = manager_with(profile);
+
+        let items: Vec<_> = state.query_mods(&args(), &manager).collect();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].is_installed);
+        assert!(items[0].data.thunderstore.is_some());
+        assert!(items[0].data.hexium.is_some());
+    }
+
+    #[test]
+    fn hidden_mods_do_not_shorten_a_browse_page() {
+        // "Example-Twin" is listed on both backends under different uuids.
+        let state = catalogs(&[
+            (
+                Backend::Thunderstore,
+                &[
+                    listing("Twin", 1, "1.0.0", &[]),
+                    listing("Alpha", 2, "1.0.0", &[]),
+                    listing("Beta", 3, "1.0.0", &[]),
+                ],
+            ),
+            (Backend::Hexium, &[listing("Twin", 4, "1.0.0", &[])]),
+        ]);
+
+        // only the hexium uuid is hidden; the name is still excluded
+        let mut manager = manager_with(profile(vec![]));
+        manager.hidden_mods.insert(Uuid::from_u128(4));
+
+        let items: Vec<_> = state
+            .query_mods(
+                &QueryModsArgs {
+                    max_count: Some(2),
+                    ..args()
+                },
+                &manager,
+            )
+            .collect();
+
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|item| {
+            [item.data.thunderstore.as_ref(), item.data.hexium.as_ref()]
+                .into_iter()
+                .flatten()
+                .all(|m| m.name != "Twin")
+        }));
+    }
 }

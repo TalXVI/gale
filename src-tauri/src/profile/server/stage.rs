@@ -8,11 +8,12 @@
 //! are authoritative.
 
 use std::{
+    collections::{BTreeMap, btree_map::Entry},
     io::Cursor,
     path::{Path, PathBuf},
 };
 
-use eyre::{Context, Result};
+use eyre::{Context, Result, ensure};
 use futures_util::future::BoxFuture;
 use reqwest_middleware::ClientWithMiddleware;
 use tracing::info;
@@ -28,13 +29,16 @@ use super::{
 use crate::{
     game::mod_loader::ModLoader,
     profile::{
-        export::{ContentHash, R2Mod},
+        export::{ContentHash, R2Mod, ensure_unique_mods},
         install::{InstallError, cache, download},
         sync::FetchedPublication,
     },
     thunderstore::{Backend, VersionIdent},
     util,
 };
+
+/// The package that first wrote each deploy path, with the hash of the bytes it wrote.
+type Owners = BTreeMap<DeployPathBuf, (VersionIdent, Backend, ContentHash)>;
 
 /// How package payloads are obtained. Local mode and the worker share this
 /// contract; each supplies its own cache directory and HTTP client.
@@ -181,6 +185,10 @@ pub async fn stage_publication(
         return Ok(desired);
     }
 
+    ensure_unique_mods(&publication.manifest.mods).context(
+        "the publication lists the same mod more than once; republish after removing the extra copies",
+    )?;
+
     let enabled: Vec<&R2Mod> = publication
         .manifest
         .mods
@@ -188,14 +196,21 @@ pub async fn stage_publication(
         .filter(|m| m.enabled)
         .collect();
     let total = enabled.len();
+    let mut owners = Owners::new();
 
     for (index, r2mod) in enabled.iter().enumerate() {
         let ident = r2mod.version_ident();
         progress(index, total, ident.full_name());
 
         let tree = source.stage(&ident, r2mod.source).await?;
-        collect_tree(&tree, spec, &mut desired)
-            .with_context(|| format!("failed to stage files of {ident}"))?;
+        collect_tree(
+            &tree,
+            spec,
+            &mut desired,
+            &mut owners,
+            (&ident, r2mod.source),
+        )
+        .with_context(|| format!("failed to stage files of {ident}"))?;
     }
     progress(total, total, "");
 
@@ -205,7 +220,15 @@ pub async fn stage_publication(
 }
 
 /// Collects the payload files in one staged package tree.
-fn collect_tree(root: &Path, spec: &DeploymentSpec, desired: &mut DesiredDeployment) -> Result<()> {
+///
+/// A path already written by another package is accepted only when the bytes match.
+fn collect_tree(
+    root: &Path,
+    spec: &DeploymentSpec,
+    desired: &mut DesiredDeployment,
+    owners: &mut Owners,
+    (ident, backend): (&VersionIdent, Backend),
+) -> Result<()> {
     for entry in WalkDir::new(root).follow_links(false) {
         let entry = entry.context("failed to enumerate staged package")?;
         if !entry.file_type().is_file() {
@@ -230,7 +253,21 @@ fn collect_tree(root: &Path, spec: &DeploymentSpec, desired: &mut DesiredDeploym
         }
 
         let file = staged_file(entry.path(), &relative)?;
-        desired.insert(relative, file);
+        match owners.entry(relative.clone()) {
+            Entry::Vacant(owner) => {
+                owner.insert((ident.clone(), backend, file.hash.clone()));
+                desired.insert(relative, file);
+            }
+            Entry::Occupied(owner) => {
+                let (first, first_backend, hash) = owner.get();
+                ensure!(
+                    *hash == file.hash,
+                    "{relative} is written by {first} from {} and {ident} from {} with different contents",
+                    first_backend.display_name(),
+                    backend.display_name(),
+                );
+            }
+        }
     }
 
     Ok(())
@@ -467,6 +504,111 @@ mod tests {
                 .keys()
                 .all(|path| path.as_str() == "BepInEx/plugins/Mod/Mod.dll"),
             "the bundled config must not enter the deployment set"
+        );
+    }
+
+    fn mod_entry(name: &str, patch: u64, source: Backend) -> R2Mod {
+        R2Mod {
+            ident: PackageIdent::from(("Author", name)),
+            version: semver::Version::new(1, 0, patch).into(),
+            enabled: true,
+            source,
+        }
+    }
+
+    /// Serves a different prepared package tree for each mod name.
+    struct TreeSource(BTreeMap<String, std::path::PathBuf>);
+
+    impl PayloadSource for TreeSource {
+        fn stage<'a>(
+            &'a self,
+            ident: &'a VersionIdent,
+            _backend: Backend,
+        ) -> BoxFuture<'a, eyre::Result<std::path::PathBuf>> {
+            let root = self.0[ident.full_name()].clone();
+            Box::pin(async move { Ok(root) })
+        }
+    }
+
+    fn plugin_tree(bytes: &[u8]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin_dir = dir.path().join("BepInEx/plugins/Shared");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(plugin_dir.join("Shared.dll"), bytes).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn a_publication_listing_one_mod_twice_is_refused_before_staging() {
+        let publication = publication(vec![
+            mod_entry("SomeMod", 0, Backend::Thunderstore),
+            mod_entry("somemod", 1, Backend::Hexium),
+        ]);
+
+        let error = stage_publication(&publication, &FailSource, &spec(), true, |_, _, _| {})
+            .await
+            .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(
+            message.starts_with(
+                "the publication lists the same mod more than once; republish after removing the extra copies: "
+            ),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("Author-SomeMod"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn packages_writing_different_bytes_to_one_path_are_refused() {
+        let first = plugin_tree(b"first");
+        let second = plugin_tree(b"second");
+        let source = TreeSource(BTreeMap::from([
+            ("Author-First".to_owned(), first.path().to_path_buf()),
+            ("Author-Second".to_owned(), second.path().to_path_buf()),
+        ]));
+        let publication = publication(vec![
+            mod_entry("First", 0, Backend::Thunderstore),
+            mod_entry("Second", 0, Backend::Hexium),
+        ]);
+
+        let error = stage_publication(&publication, &source, &spec(), true, |_, _, _| {})
+            .await
+            .unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(
+                "BepInEx/plugins/Shared/Shared.dll is written by Author-First-1.0.0 from Thunderstore \
+                 and Author-Second-1.0.0 from Hexium with different contents"
+            ),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn packages_writing_identical_bytes_to_one_path_deploy_it_once() {
+        let first = plugin_tree(b"same");
+        let second = plugin_tree(b"same");
+        let source = TreeSource(BTreeMap::from([
+            ("Author-First".to_owned(), first.path().to_path_buf()),
+            ("Author-Second".to_owned(), second.path().to_path_buf()),
+        ]));
+        let publication = publication(vec![
+            mod_entry("First", 0, Backend::Thunderstore),
+            mod_entry("Second", 0, Backend::Hexium),
+        ]);
+
+        let desired = stage_publication(&publication, &source, &spec(), true, |_, _, _| {})
+            .await
+            .unwrap();
+
+        assert_eq!(
+            desired.keys().map(|path| path.as_str()).collect::<Vec<_>>(),
+            ["BepInEx/plugins/Shared/Shared.dll"]
         );
     }
 }

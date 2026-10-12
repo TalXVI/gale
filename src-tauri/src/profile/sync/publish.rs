@@ -402,12 +402,23 @@ async fn reconcile_published_inner(app: &AppHandle, profile_id: i64) -> Result<(
     Ok(())
 }
 
+/// Refuses to publish a profile that lists the same mod twice. Runs before any request.
+fn ensure_unique_profile_mods(app: &AppHandle, profile_id: i64) -> Result<()> {
+    let manager = app.lock_manager();
+    let (_, profile) = manager.profile_by_id(profile_id)?;
+
+    export::ensure_unique_mods(&export::build_manifest(profile).mods).context(
+        "the profile has more than one copy of the same mod; uninstall every copy of each listed mod, install the one you want, then publish again",
+    )
+}
+
 pub(super) async fn publish_profile(
     app: &AppHandle,
     profile_id: i64,
     mode: PublishMode,
 ) -> Result<()> {
     let _guard = publication_guard().await;
+    ensure_unique_profile_mods(app, profile_id)?;
     reconcile_published_inner(app, profile_id).await?;
 
     let (profile_dir, profile_name, sync_id, published, live_manifest, live_config) = {
@@ -484,6 +495,7 @@ pub(super) async fn publish_profile(
 
 pub(super) async fn create_profile(app: &AppHandle, profile_id: i64) -> Result<String> {
     let _guard = publication_guard().await;
+    ensure_unique_profile_mods(app, profile_id)?;
 
     let Some(user) = auth::user_info(app) else {
         bail!("not logged in");

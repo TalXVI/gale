@@ -163,6 +163,96 @@ test('Pull live reports dependency errors and leaves the current update state al
 	await expect(page.getByText('1.1.3', { exact: true }).first()).toBeVisible();
 });
 
+test('a newer listing on the other source offers an explicit switch', async ({ page }) => {
+	await page.goto('/tests/mods/?alt=newer&confirm');
+	const row = page.locator('div[role=button]').filter({ hasText: 'DualSourceMod' }).first();
+	await expect(row.getByText('0.3.3 on Hexium', { exact: true })).toBeVisible();
+	await row.click();
+	await page.getByRole('button', { name: 'Switch to Hexium 0.3.3' }).click();
+	// the target is a foreign download, so prefs require confirmation first
+	await expect(page.getByText('Download from other source')).toBeVisible();
+	await page.getByRole('button', { name: 'Continue', exact: true }).click();
+	await expect
+		.poll(() =>
+			page.evaluate(() =>
+				(window as any).calls.find((call: any) => call.cmd === 'change_mod_version')
+			)
+		)
+		.toMatchObject({
+			args: {
+				id: {
+					packageUuid: '00000000-0000-0000-0000-000000000021',
+					versionUuid: '00000000-0000-0000-0000-000000000022',
+					backend: 'Hexium'
+				}
+			}
+		});
+	// doSwitchSource refreshes the profile after switching, so a second
+	// query_profile must land after the change_mod_version call
+	await expect
+		.poll(() =>
+			page.evaluate(() => {
+				const calls: any[] = (window as any).calls;
+				const switchIndex = calls.findIndex((call: any) => call.cmd === 'change_mod_version');
+				return calls.findIndex(
+					(call: any, index: number) => call.cmd === 'query_profile' && index > switchIndex
+				);
+			})
+		)
+		.toBeGreaterThanOrEqual(0);
+	expect(
+		await page.evaluate(() => (window as any).calls.some((call: any) => call.cmd === 'update_mods'))
+	).toBe(false);
+});
+
+test('a listing deprecated only here offers a switch to the other source', async ({ page }) => {
+	await page.goto('/tests/mods/?alt=deprecatedHere');
+	const row = page.locator('div[role=button]').filter({ hasText: 'DualSourceMod' }).first();
+	await expect(row.getByText('Not deprecated on Hexium', { exact: true })).toBeVisible();
+	await row.click();
+	await expect(
+		page.getByText('This mod is deprecated on Thunderstore but not on Hexium.')
+	).toBeVisible();
+	await page.getByRole('button', { name: 'Switch to Hexium 0.3.3' }).click();
+	await expect
+		.poll(() =>
+			page.evaluate(() =>
+				(window as any).calls.find((call: any) => call.cmd === 'change_mod_version')
+			)
+		)
+		.toMatchObject({
+			args: {
+				id: {
+					packageUuid: '00000000-0000-0000-0000-000000000021',
+					versionUuid: '00000000-0000-0000-0000-000000000022',
+					backend: 'Hexium'
+				}
+			}
+		});
+});
+
+test('a delisted unknown mod offers a switch to the other source', async ({ page }) => {
+	await page.goto('/tests/mods/?delistedAlt');
+	await page.getByRole('button', { name: 'Details', exact: true }).click();
+	const dialog = page.getByRole('dialog', { name: 'Unknown mods' });
+	await dialog.getByRole('button', { name: 'Switch to Hexium 0.3.3' }).click();
+	await expect
+		.poll(() =>
+			page.evaluate(() =>
+				(window as any).calls.find((call: any) => call.cmd === 'change_mod_version')
+			)
+		)
+		.toMatchObject({
+			args: {
+				id: {
+					packageUuid: '00000000-0000-0000-0000-000000000021',
+					versionUuid: '00000000-0000-0000-0000-000000000022',
+					backend: 'Hexium'
+				}
+			}
+		});
+});
+
 test('repeated Pull live clicks share the in-flight request', async ({ page }) => {
 	await page.goto('/tests/mods/?live&liveDelay');
 	const row = page.locator('div[role=button]').filter({ hasText: 'DualSourceMod' }).last();

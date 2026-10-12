@@ -22,7 +22,7 @@ use crate::{
     game::Game,
     prefs::Backends,
     profile::{
-        export::{PROFILE_DATA_PREFIX, ProfileManifest},
+        export::{PROFILE_DATA_PREFIX, ProfileManifest, ensure_unique_mods},
         install::{InstallOptions, ModInstall},
     },
     state::ManagerExt,
@@ -36,7 +36,7 @@ mod metadata;
 mod r2modman;
 mod revert;
 
-use super::Profile;
+use super::{ModKey, Profile};
 pub use local::{import_local_mod, import_local_mod_base64};
 use revert::{ImportRevert, backup_removed_mod, replacement_paths, restore_after_failed_update};
 pub(crate) use revert::{clear_revert_dir, restore_imported_profile, revert_dir};
@@ -194,6 +194,10 @@ pub(super) async fn import_manifest(
     install_options: InstallOptions,
     app: &AppHandle,
 ) -> Result<ImportedProfile> {
+    ensure_unique_mods(&manifest.mods).context(
+        "the imported profile lists the same mod more than once; the publisher must remove the extra copies and publish again",
+    )?;
+
     if !options.ignore_missing_mods {
         let game = match &target {
             ImportTarget::Existing(id) => app.lock_manager().profile_by_id(*id)?.0,
@@ -479,19 +483,21 @@ fn incremental_update(
     installs: impl IntoIterator<Item = ModInstall>,
     profile: &mut Profile,
 ) -> Result<(Vec<ModInstall>, ImportRevert)> {
-    let current_mods: HashMap<ModId, bool> = profile
+    let current: Vec<(ModId, ModKey, bool)> = profile
         .thunderstore_mods()
-        .map(|(ts_mod, enabled)| (ts_mod.id.clone(), enabled))
+        .map(|(ts_mod, enabled)| {
+            (
+                ts_mod.id.clone(),
+                ModKey::new(ts_mod.ident.full_name()),
+                enabled,
+            )
+        })
         .collect();
 
-    let current_ids: HashSet<&ModId> = current_mods.keys().collect();
-
-    let mut new_mods: HashMap<ModId, ModInstall> = installs
+    let new_mods: HashMap<ModId, ModInstall> = installs
         .into_iter()
         .map(|install| (install.mod_id().clone(), install))
         .collect();
-
-    let new_ids: HashSet<&ModId> = new_mods.keys().collect();
 
     let revert_dir = revert_dir(&profile.path);
     if revert_dir.exists() {
@@ -508,25 +514,34 @@ fn incremental_update(
 
     let mut revert = ImportRevert::default();
 
-    let remove_mods: Vec<Uuid> = if merge {
-        // remove only version mismatches
-        current_mods
-            .keys()
-            .filter(|id| {
-                new_mods.values().any(|install| {
-                    install.mod_id().package_uuid == id.package_uuid
-                        && install.mod_id().version_uuid != id.version_uuid
-                })
-            })
-            .map(|id| id.package_uuid)
-            .collect()
-    } else {
-        // remove all extra mods
-        current_ids
-            .difference(&new_ids)
-            .map(|id| id.package_uuid)
-            .collect()
-    };
+    // a name held by several entries is removed entirely and reinstalled from the
+    // manifest — only when the manifest lists that name
+    let duplicated: HashSet<ModKey> = current
+        .iter()
+        .map(|(_, key, _)| key.clone())
+        .duplicates()
+        .collect();
+    let manifest_keys: HashSet<ModKey> = new_mods.values().map(ModInstall::key).collect();
+
+    let mut kept: HashMap<ModId, bool> = HashMap::new();
+    let mut remove_mods: Vec<Uuid> = Vec::new();
+    for (id, key, enabled) in current {
+        let superseded = if merge {
+            // remove only the entries whose name the manifest replaces with another version
+            new_mods
+                .values()
+                .any(|install| install.key() == key && install.mod_id() != &id)
+        } else {
+            // remove all extra mods
+            !new_mods.contains_key(&id)
+        };
+
+        if superseded || (duplicated.contains(&key) && manifest_keys.contains(&key)) {
+            remove_mods.push(id.package_uuid);
+        } else {
+            kept.insert(id, enabled);
+        }
+    }
 
     for uuid in remove_mods {
         if let Err(err) = backup_removed_mod(profile, uuid, &mut revert) {
@@ -534,10 +549,14 @@ fn incremental_update(
         }
     }
 
-    let to_toggle: Vec<Uuid> = current_ids
-        .intersection(&new_ids)
-        .filter(|id| *current_mods.get(*id).unwrap() != new_mods.get(id).unwrap().enabled())
-        .map(|id| id.package_uuid)
+    let to_toggle: Vec<Uuid> = kept
+        .iter()
+        .filter(|(id, enabled)| {
+            new_mods
+                .get(*id)
+                .is_some_and(|install| install.enabled() != **enabled)
+        })
+        .map(|(id, _)| id.package_uuid)
         .collect();
     for uuid in to_toggle {
         if let Err(err) = profile.force_toggle_mod(uuid) {
@@ -546,17 +565,9 @@ fn incremental_update(
         revert.toggled.push(uuid);
     }
 
-    // we have to clone and collect the ids because new_ids.difference() borrows new_mods,
-    // which prevents us from getting the ModInstalls back (since that requires mutably borrowing the map)
-
-    let ids_to_install: Vec<ModId> = new_ids
-        .difference(&current_ids)
-        .map(|id| (*id).clone())
-        .collect();
-
-    let to_install: Vec<ModInstall> = ids_to_install
-        .into_iter()
-        .map(move |id| new_mods.remove(&id).unwrap())
+    let to_install: Vec<ModInstall> = new_mods
+        .into_values()
+        .filter(|install| !kept.contains_key(install.mod_id()))
         .collect();
 
     revert.replacement_paths = replacement_paths(&to_install, profile);
@@ -856,5 +867,116 @@ mod tests {
         assert_eq!(fs::read(plugin_dir_a.join("plugin.dll")).unwrap(), b"data");
         // a successful restore cleans the revert dir so a retry can proceed
         assert!(!revert_dir(dir.path()).exists());
+    }
+
+    fn hexium_id(seed: u128) -> ModId {
+        ModId {
+            backend: Backend::Hexium,
+            ..mod_id(seed)
+        }
+    }
+
+    #[test]
+    fn merge_import_replaces_a_thunderstore_copy_with_the_manifests_hexium_copy() {
+        let dir = tempdir().unwrap();
+        let hexium = hexium_id(2);
+
+        let mut profile = profile_at(
+            dir.path(),
+            vec![ts_mod("Author-ModA-1.0.0", mod_id(1), true)],
+        );
+        let installs = vec![ModInstall::test_on(
+            Backend::Hexium,
+            "Author-ModA-1.0.1",
+            hexium.package_uuid,
+            hexium.version_uuid,
+            true,
+        )];
+
+        let (to_install, revert) = incremental_update(true, installs, &mut profile).unwrap();
+
+        assert!(profile.mods.is_empty());
+        assert_eq!(
+            revert
+                .removed
+                .iter()
+                .map(|backup| backup.profile_mod.uuid())
+                .collect_vec(),
+            [Uuid::from_u128(1)]
+        );
+        assert_eq!(
+            to_install
+                .iter()
+                .map(|install| install.mod_id().clone())
+                .collect_vec(),
+            [hexium]
+        );
+    }
+
+    #[test]
+    fn strict_import_reinstalls_a_name_the_profile_holds_twice() {
+        let dir = tempdir().unwrap();
+        let thunderstore = mod_id(1);
+
+        let mut profile = profile_at(
+            dir.path(),
+            vec![
+                ts_mod("Author-ModA-1.0.0", thunderstore.clone(), true),
+                ts_mod("Author-ModA-1.0.0", hexium_id(2), true),
+            ],
+        );
+        let installs = vec![ModInstall::test(
+            "Author-ModA-1.0.0",
+            thunderstore.package_uuid,
+            thunderstore.version_uuid,
+            true,
+        )];
+
+        let (to_install, revert) = incremental_update(false, installs, &mut profile).unwrap();
+
+        assert!(profile.mods.is_empty());
+        let mut removed: Vec<_> = revert
+            .removed
+            .iter()
+            .map(|backup| backup.profile_mod.uuid())
+            .collect();
+        removed.sort();
+        assert_eq!(removed, vec![Uuid::from_u128(1), Uuid::from_u128(2)]);
+        assert_eq!(
+            to_install
+                .iter()
+                .map(|install| install.mod_id().clone())
+                .collect_vec(),
+            [thunderstore]
+        );
+    }
+
+    #[test]
+    fn merge_import_keeps_a_duplicated_name_the_manifest_does_not_list() {
+        let dir = tempdir().unwrap();
+        let listed = mod_id(3);
+
+        let mut profile = profile_at(
+            dir.path(),
+            vec![
+                ts_mod("Author-Dup-1.0.0", mod_id(1), true),
+                ts_mod("Author-Dup-1.0.0", hexium_id(2), true),
+                ts_mod("Author-Listed-1.0.0", listed.clone(), true),
+            ],
+        );
+        let installs = vec![ModInstall::test(
+            "Author-Listed-1.0.0",
+            listed.package_uuid,
+            listed.version_uuid,
+            true,
+        )];
+
+        let (to_install, revert) = incremental_update(true, installs, &mut profile).unwrap();
+
+        // both Dup entries survive untouched and nothing is scheduled
+        assert_eq!(profile.mods.len(), 3);
+        assert!(revert.removed.is_empty());
+        assert!(revert.toggled.is_empty());
+        assert!(to_install.is_empty());
     }
 }
