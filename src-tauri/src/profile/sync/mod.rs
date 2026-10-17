@@ -106,6 +106,20 @@ pub struct SyncProfileData {
     pub applied: Option<AppliedState>,
 }
 
+impl SyncProfileData {
+    fn observe_metadata(&mut self, metadata: &SyncProfileMetadata) {
+        assert_eq!(
+            self.id, metadata.id,
+            "sync metadata belongs to another profile"
+        );
+        if metadata.updated_at >= self.updated_at {
+            self.updated_at = metadata.updated_at;
+            self.owner = metadata.owner.clone();
+            self.missing = false;
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PublishedState {
@@ -645,7 +659,9 @@ async fn apply_archive(
                     id: metadata.id,
                     owner: metadata.owner,
                     synced_at: metadata.updated_at,
-                    updated_at: metadata.updated_at,
+                    updated_at: profile.sync.as_ref().map_or(metadata.updated_at, |sync| {
+                        sync.updated_at.max(metadata.updated_at)
+                    }),
                     missing: false,
                     published,
                     applied: Some(applied),
@@ -796,15 +812,12 @@ pub async fn pull_profile(
                 return Ok(apply::ConfigApplyReport::default());
             };
 
+            ensure!(
+                sync.id == id,
+                "profile sync target changed while refreshing"
+            );
             match metadata {
-                Some(metadata) => {
-                    *sync = SyncProfileData {
-                        synced_at: sync.synced_at,
-                        published: sync.published.clone(),
-                        applied: sync.applied.clone(),
-                        ..metadata.into()
-                    };
-                }
+                Some(metadata) => sync.observe_metadata(&metadata),
                 None => sync.missing = true,
             }
 
@@ -1631,6 +1644,45 @@ mod tests {
             published: None,
             applied: Some(applied),
         }
+    }
+
+    #[test]
+    fn metadata_observations_keep_newest_revision_and_pending_config() {
+        let pending_path = config_path("a.cfg");
+        let mut data = sync_data(
+            "sync",
+            AppliedState {
+                pending: BTreeMap::from([(
+                    pending_path.clone(),
+                    PendingConfigReason::PublishedUpdate,
+                )]),
+                ..Default::default()
+            },
+        );
+        let synced_at = data.synced_at;
+        data.updated_at = synced_at;
+        data.missing = true;
+        let mut metadata = SyncProfileMetadata {
+            id: "sync".to_owned(),
+            created_at: synced_at,
+            updated_at: synced_at + chrono::Duration::seconds(2),
+            owner: data.owner.clone(),
+            manifest: base_manifest(),
+        };
+        metadata.owner.display_name = "Current owner".to_owned();
+        data.observe_metadata(&metadata);
+        assert!(!data.missing);
+
+        metadata.updated_at = synced_at + chrono::Duration::seconds(1);
+        metadata.owner.display_name = "Stale owner".to_owned();
+        data.observe_metadata(&metadata);
+        assert_eq!(data.updated_at, synced_at + chrono::Duration::seconds(2));
+        assert_eq!(data.synced_at, synced_at);
+        assert_eq!(data.owner.display_name, "Current owner");
+        assert_eq!(
+            data.applied.unwrap().pending,
+            BTreeMap::from([(pending_path, PendingConfigReason::PublishedUpdate)])
+        );
     }
 
     #[test]

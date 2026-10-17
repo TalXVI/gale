@@ -203,6 +203,15 @@
 		await wrapApiCall(() => api.profile.sync.fetch(profileId), m.syncer_refresh_message());
 	}
 
+	async function openMainDialog() {
+		mainDialogOpen = true;
+		refreshPending();
+		const profileId = profiles.active?.id;
+		if (profileId !== undefined && syncInfo !== null && !syncInfo.missing) {
+			await api.profile.sync.fetch(profileId);
+		}
+	}
+
 	async function disconnect() {
 		// capture before the confirmation dialog so the operation stays pinned
 		// to the profile that was active when it was clicked
@@ -267,10 +276,7 @@
 		style.classes,
 		'dark:bg-primary-800 dark:hover:bg-primary-700 bg-primary-200 hover:bg-primary-300 mx-2 my-auto flex shrink-0 items-center gap-1.5 rounded-md px-2.5 py-1 text-sm'
 	]}
-	onclick={() => {
-		mainDialogOpen = true;
-		refreshPending();
-	}}
+	onclick={openMainDialog}
 >
 	<Icon class="text-lg md:text-base" icon={style.icon} />
 

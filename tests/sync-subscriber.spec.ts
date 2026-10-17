@@ -20,6 +20,52 @@ async function openSync(page: Page, query = '') {
 	return page.getByRole('dialog', { name: 'Profile sync', exact: true });
 }
 
+test('opening sync discovers missed mod updates while a config remains pending', async ({
+	page
+}, testInfo) => {
+	const dialog = await openSync(page, '&staleSync');
+	await expect.poll(async () => (await calls(page, 'fetch_sync_profile')).length).toBe(1);
+	expect((await calls(page, 'fetch_sync_profile'))[0].args).toEqual({ profileId: 1 });
+	expect(await calls(page, 'pull_sync_profile')).toHaveLength(0);
+	const review = dialog.getByRole('button', { name: 'Review config updates (1)' });
+	await expect(review).toBeVisible();
+	await page.screenshot({ path: testInfo.outputPath('missed-publication.png') });
+	await dialog.getByRole('button', { name: 'Update mods', exact: true }).click();
+	await expect(dialog.getByRole('button', { name: 'Update mods', exact: true })).toHaveCount(0);
+	await expect(review).toBeVisible();
+	expect(await calls(page, 'pull_sync_profile')).toHaveLength(1);
+	expect(await calls(page, 'apply_sync_config')).toHaveLength(0);
+	expect(await calls(page, 'decline_sync_config')).toHaveLength(0);
+});
+
+test('pending configs can be declined while publication status refresh is pending', async ({
+	page
+}) => {
+	await page.goto('/tests/dialog/?component=sync&staleSync');
+	await page.evaluate(() => Reflect.get(window, 'hold')('fetch_sync_profile'));
+	try {
+		await page.getByRole('button', { name: /Up to date/ }).click();
+		await expect.poll(async () => (await calls(page, 'fetch_sync_profile')).length).toBe(1);
+		const dialog = page.getByRole('dialog', { name: 'Profile sync', exact: true });
+		const reviewButton = dialog.getByRole('button', { name: 'Review config updates (1)' });
+		await expect(reviewButton).toBeEnabled();
+		await reviewButton.click();
+		const review = page.getByRole('dialog', { name: 'Config updates', exact: true });
+		await review.getByRole('checkbox', { name: paths.custom, exact: true }).check();
+		await review.getByRole('button', { name: 'Decline selected' }).click();
+		await expect.poll(async () => (await calls(page, 'decline_sync_config')).length).toBe(1);
+		expect((await calls(page, 'decline_sync_config'))[0].args).toEqual({
+			files: [paths.custom],
+			remember: false,
+			profileId: 1
+		});
+		await expect(review.getByText('No pending config updates.')).toBeVisible();
+		expect(await calls(page, 'apply_sync_config')).toHaveLength(0);
+	} finally {
+		await page.evaluate(() => Reflect.get(window, 'release')());
+	}
+});
+
 test('one click updates mods without a config prompt or config write', async ({
 	page
 }, testInfo) => {

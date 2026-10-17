@@ -74,6 +74,7 @@ let mockAuthExpired = false;
 const profileId = params.get('profile') ?? 'first';
 let activeId = 1;
 let subscriberSyncedAt = params.has('upToDate') ? publicationRevision : '2026-01-01T00:00:00Z';
+let subscriberUpdatedAt = params.has('staleSync') ? subscriberSyncedAt : publicationRevision;
 const subscriberReview: SyncConfigReviewState = {
 	pending: [
 		{ path: 'BepInEx/config/custom.cfg', reason: 'modifiedLocally' },
@@ -90,6 +91,10 @@ const subscriberReview: SyncConfigReviewState = {
 		{ path: 'BepInEx/config/deleted.cfg', policy: 'ask' }
 	]
 };
+if (params.has('staleSync')) {
+	subscriberReview.pending = subscriberReview.pending.slice(0, 1);
+	subscriberReview.policies = subscriberReview.policies.slice(0, 1);
+}
 const preferences = JSON.parse(
 	sessionStorage.getItem('mock-profile-preferences') ?? '{}'
 ) as Record<string, { restartPolicy: string }>;
@@ -361,7 +366,8 @@ mockIPC(async (cmd, args) => {
 							owner: { discordId: '1', name: 'owner', displayName: 'Owner', avatar: null },
 							syncedAt:
 								params.get('component') === 'sync' ? subscriberSyncedAt : '2026-01-01T00:00:00Z',
-							updatedAt: '2026-09-22T00:00:00Z',
+							updatedAt:
+								params.get('component') === 'sync' ? subscriberUpdatedAt : '2026-09-22T00:00:00Z',
 							missing: false
 						},
 						customArgs: '',
@@ -401,6 +407,12 @@ mockIPC(async (cmd, args) => {
 			return [];
 		case 'get_pending_sync_config':
 			return structuredClone(subscriberReview);
+		case 'fetch_sync_profile': {
+			subscriberUpdatedAt = publicationRevision;
+			const { default: profiles } = await import('$lib/state/profile.svelte');
+			await profiles.refresh();
+			return;
+		}
 		case 'pull_sync_profile': {
 			subscriberSyncedAt = publicationRevision;
 			const { default: profiles } = await import('$lib/state/profile.svelte');
