@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 1.25.1 (2026-10-17)
+
+### Fixed
+
+- Profile sync checks for new updates when you open it, even when **Pull before launch** is off.
+- Profile sync reconnects after an outage and keeps the latest known update status.
+- Config review stays available while Gale checks for profile updates. Updating mods still leaves pending configs untouched.
+
 ## 1.25.0 (2026-10-12)
 
 ### Added
