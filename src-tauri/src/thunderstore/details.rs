@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use eyre::{Context, Result, bail, ensure, eyre};
+use eyre::{Context, Result, ensure, eyre};
 use reqwest_middleware::ClientWithMiddleware;
 use tauri::AppHandle;
 use uuid::Uuid;
@@ -31,7 +31,7 @@ pub(super) async fn pull_live_package(
 
     let (package, observed_at) = tokio::select! {
         biased;
-        () = cancel_token.cancelled() => bail!("The active game has changed"),
+        () = cancel_token.cancelled() => return Err(eyre!("The active game has changed")),
         result = fetch_package_detail(app.http(), &url, uuid, &ident) => result?,
     };
 

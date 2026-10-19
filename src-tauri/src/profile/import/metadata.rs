@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use eyre::{Context, Result, bail, ensure, eyre};
+use eyre::{Context, Result, ensure, eyre};
 use reqwest_middleware::ClientWithMiddleware;
 use tauri::AppHandle;
 use uuid::Uuid;
@@ -97,7 +97,7 @@ pub(super) async fn refresh_manifest_metadata(
     }
     let packages = tokio::select! {
         biased;
-        () = cancel_token.cancelled() => bail!("The active game has changed"),
+        () = cancel_token.cancelled() => return Err(eyre!("The active game has changed")),
         result = fetch_required_packages(app.http(), &required) => result?,
     };
 

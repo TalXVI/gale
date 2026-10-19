@@ -6,7 +6,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use export::modpack::ModpackArgs;
-use eyre::{Context, ContextCompat, OptionExt, Result, anyhow, bail, ensure, eyre};
+use eyre::{Context, ContextCompat, OptionExt, Result, anyhow, ensure, eyre};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
@@ -406,11 +406,11 @@ impl Profile {
             return Ok(());
         };
 
-        bail!(
+        Err(eyre!(
             "{} is already installed {}",
             existing.full_name(),
             existing.installed_from()
-        )
+        ))
     }
 
     pub fn insert_mod(&mut self, index: Option<usize>, profile_mod: ProfileMod) -> Result<()> {
