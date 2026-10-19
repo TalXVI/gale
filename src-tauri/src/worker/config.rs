@@ -60,6 +60,8 @@ pub struct WorkerConfig {
     pub worker_id: String,
     /// Address the HTTP API binds to.
     pub listen: String,
+    /// Windows account that provisioned the service and may start or stop it.
+    pub controller_sid: Option<String>,
     /// The sync profile this worker is bound to. Requests cannot redirect
     /// it to another profile; this binding is the security boundary.
     pub profile_id: String,
@@ -90,6 +92,7 @@ impl Default for WorkerConfig {
         Self {
             worker_id: String::new(),
             listen: DEFAULT_LISTEN.to_owned(),
+            controller_sid: None,
             profile_id: String::new(),
             game: String::new(),
             sync_url: None,
@@ -127,7 +130,24 @@ impl WorkerConfig {
             "profileId cannot be empty"
         );
         ensure!(!self.game.trim().is_empty(), "game cannot be empty");
-        ensure!(!self.listen.trim().is_empty(), "listen cannot be empty");
+        let listen: std::net::SocketAddr = self
+            .listen
+            .parse()
+            .context("listen must be an IP address and port")?;
+        ensure!(
+            listen.ip().is_loopback(),
+            "the plaintext Worker API must listen on loopback; use a TLS reverse proxy for remote access"
+        );
+        if let Some(sid) = &self.controller_sid {
+            ensure!(
+                sid.starts_with("S-1-")
+                    && sid[4..]
+                        .split('-')
+                        .all(|part| !part.is_empty()
+                            && part.bytes().all(|byte| byte.is_ascii_digit())),
+                "controllerSid must be a numeric Windows SID"
+            );
+        }
         ensure!(
             self.poll_interval_secs >= MIN_POLL_SECS,
             "pollIntervalSecs must be at least {MIN_POLL_SECS}"
@@ -192,6 +212,15 @@ mod tests {
         let mut value = valid_json();
         value["pollIntervalSecs"] = serde_json::json!(MIN_POLL_SECS - 1);
         assert!(load(value).is_err());
+    }
+
+    #[test]
+    fn security_worker_refuses_a_public_plaintext_listener() {
+        for address in ["0.0.0.0:8472", "192.168.1.2:8472", "[::]:8472"] {
+            let mut value = valid_json();
+            value["listen"] = serde_json::json!(address);
+            assert!(load(value).is_err(), "accepted {address}");
+        }
     }
 
     /// The worker is the executor: the profile's executor choice it was

@@ -4,7 +4,7 @@
 //! installs or runs as that service. Keeping them in one place keeps the
 //! two binaries' on-disk contract identical.
 
-use eyre::{Context, Result, bail};
+use eyre::{Context, OptionExt, Result, bail};
 use std::ffi::OsStr;
 use std::{
     ops::RangeInclusive,
@@ -26,6 +26,32 @@ pub const SERVICE_NAME: &str = "GaleWorker";
 /// The managed worker's fixed identity in lease records and status
 /// responses.
 pub const WORKER_ID: &str = "this-pc";
+
+/// Resolve the provisioning account before elevation can change its identity.
+pub fn current_user_sid() -> Result<String> {
+    let output = std::process::Command::new("whoami")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()
+        .context("failed to resolve the current Windows account")?;
+    eyre::ensure!(
+        output.status.success(),
+        "whoami failed to resolve the current Windows account"
+    );
+    let output = String::from_utf8_lossy(&output.stdout);
+    let sid = output
+        .trim()
+        .rsplit('"')
+        .nth(1)
+        .ok_or_eyre("whoami returned no account SID")?;
+    eyre::ensure!(
+        sid.starts_with("S-1-")
+            && sid[4..]
+                .split('-')
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())),
+        "whoami returned an invalid account SID"
+    );
+    Ok(sid.to_owned())
+}
 
 /// Preferred loopback port for the managed worker's HTTP API.
 pub const DEFAULT_PORT: u16 = 8472;

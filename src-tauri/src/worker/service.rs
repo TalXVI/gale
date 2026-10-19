@@ -62,11 +62,11 @@ const UPDATE_MUTEX: &str = r"Local\GaleWorkerUpdate";
 const UPDATE_LOCK_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 
 /// The SDDL DACL applied to the service. It is the Windows default plus
-/// start/stop rights for interactive users, so Gale can control the
-/// worker without elevation. Configuration changes still need admin.
+/// read access for interactive users. Start/stop rights are granted only
+/// to the provisioning account. Configuration changes still need admin.
 const SERVICE_SDDL: &str = "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)\
 (A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)\
-(A;;CCLCSWLOCRRCRPWP;;;IU)\
+(A;;CCLCSWLOCRRC;;;IU)\
 (A;;CCLCSWLOCRRC;;;SU)";
 
 // ---------- service entry ----------
@@ -378,7 +378,7 @@ fn install_inner(staging: &Path, log: &Path) -> Result<()> {
     let manager = open_manager_for_create()?;
     remove_existing_service(&manager, log)?;
 
-    start_installed_worker(&manager, &root, &private, &config.listen, log, || {
+    start_installed_worker(&manager, &root, &private, &config, log, || {
         if binding_changed {
             provision_log(log, "binding changed; clearing prior worker state");
             let _ = std::fs::remove_file(private.join(journal::JOURNAL_FILE));
@@ -422,7 +422,7 @@ fn start_installed_worker(
     manager: &ServiceManager,
     root: &Path,
     private: &Path,
-    listen: &str,
+    config: &WorkerConfig,
     log: &Path,
     install_payload: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
@@ -438,13 +438,14 @@ fn start_installed_worker(
         install_worker_binary(root)?;
         install_payload()?;
         configure_recovery(&service).context("failed to configure crash recovery")?;
-        grant_user_control().context("failed to grant user control")?;
+        grant_user_control(config.controller_sid.as_deref())
+            .context("failed to grant user control")?;
         provision_log(log, "starting service");
         service
             .start(&[] as &[&OsStr])
             .context("failed to start the service")?;
         wait_for_state(&service, ServiceState::Running)?;
-        await_listen_ready(listen)
+        await_listen_ready(&config.listen)
     })();
     if let Err(err) = result {
         provision_log(log, "removing incomplete service registration");
@@ -648,7 +649,7 @@ fn reinstall_inner(log: &Path) -> Result<()> {
 
     let manager = open_manager_for_create()?;
     remove_existing_service(&manager, log)?;
-    start_installed_worker(&manager, &root, &private, &config.listen, log, || Ok(()))
+    start_installed_worker(&manager, &root, &private, &config, log, || Ok(()))
 }
 
 /// SCM-managed crash recovery: restart after 5s, then 15s, then every 60s.
@@ -680,9 +681,13 @@ fn configure_recovery(service: &windows_service::service::Service) -> Result<()>
 
 /// `sc.exe sdset` is the supported way to replace a service DACL; the
 /// windows-service crate has no security-descriptor API.
-fn grant_user_control() -> Result<()> {
+fn grant_user_control(controller_sid: Option<&str>) -> Result<()> {
+    let mut sddl = SERVICE_SDDL.to_owned();
+    if let Some(sid) = controller_sid {
+        sddl.push_str(&format!("(A;;LCRPWP;;;{sid})"));
+    }
     let output = std::process::Command::new("sc.exe")
-        .args(["sdset", local::SERVICE_NAME, SERVICE_SDDL])
+        .args(["sdset", local::SERVICE_NAME, &sddl])
         .output()
         .context("failed to run sc.exe sdset")?;
     ensure!(

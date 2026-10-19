@@ -8,7 +8,7 @@
 //! starts with Windows, restarts after crashes through SCM failure
 //! actions, and recovers pending work through its journal. Day-to-day
 //! start/stop/status calls go through the SCM unelevated because install
-//! grants interactive users control rights.
+//! grants the provisioning Windows account control rights.
 
 use eyre::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -353,6 +353,7 @@ async fn provision_windows(
     );
 
     let config = WorkerConfig {
+        controller_sid: Some(local::current_user_sid()?),
         worker_id: local::WORKER_ID.to_owned(),
         listen: listen.clone(),
         profile_id: sync_id,
@@ -452,7 +453,7 @@ async fn provision_windows(
 // ---------- control ----------
 
 /// Starts, stops, or restarts the installed service through the SCM.
-/// These calls are unelevated because installation grants interactive users control.
+/// These calls are unelevated for the account that provisioned the service.
 pub async fn control(app: &AppHandle, action: ServiceControlAction) -> Result<LocalWorkerStatus> {
     #[cfg(not(windows))]
     {
