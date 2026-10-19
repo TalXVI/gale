@@ -13,7 +13,7 @@ use crate::{
 };
 
 pub fn run(args: Vec<String>, app: &AppHandle) {
-    info!("running cli with args: {args:?}");
+    info!("running cli");
 
     let no_gui = args.iter().any(|arg| arg == "--no-gui");
     if no_gui {

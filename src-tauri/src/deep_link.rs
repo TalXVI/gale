@@ -38,7 +38,10 @@ pub fn handle(app: &AppHandle, url: String) -> bool {
             async move { import_profile_file(&url, &app).await },
         );
     } else {
-        warn!("unsupported deep link protocol: {}", url);
+        warn!("unsupported deep link protocol");
+        if url.contains("://") {
+            return true;
+        }
         return false;
     }
 

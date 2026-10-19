@@ -41,7 +41,7 @@ impl SftpConnection {
         match settings.trusted_host_key.as_deref() {
             Some(expected) => ensure!(
                 expected == fingerprint,
-                "SSH host key has changed. Expected {expected}, received {fingerprint}. Refusing to send credentials."
+                "SSH host key has changed. Refusing to send credentials. Verify the server key before updating its trust setting."
             ),
             None => return Ok(Reached::Untrusted { fingerprint }),
         }
