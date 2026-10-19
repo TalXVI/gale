@@ -80,13 +80,6 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         cli::run(args, app.handle());
     }
 
-    let handle = app.handle().to_owned();
-    tauri::async_runtime::spawn(async move {
-        if let Err(err) = game::update_list_task(&handle).await {
-            warn!("failed to update games list: {err}");
-        }
-    });
-
     info!("setup done");
 
     Ok(())

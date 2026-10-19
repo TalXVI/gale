@@ -243,8 +243,7 @@ impl Default for Prefs {
                 .keep(logger::FILE_NAME)
                 .keep(db::FILE_NAME)
                 .keep(db::SHM_FILE_NAME)
-                .keep(db::WAL_FILE_NAME)
-                .keep(game::CACHE_FILE_NAME),
+                .keep(db::WAL_FILE_NAME),
 
             fetch_mods_automatically: true,
             pull_before_launch: true,
@@ -265,7 +264,6 @@ impl Prefs {
             db::FILE_NAME,
             db::SHM_FILE_NAME,
             db::WAL_FILE_NAME,
-            game::CACHE_FILE_NAME,
         ]);
 
         let window = app.get_webview_window("main").unwrap();

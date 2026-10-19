@@ -1,7 +1,6 @@
 //! Which games ship a dedicated server, and where to find it.
 //!
-//! This metadata lives here rather than in `games.json` because that list is
-//! refreshed at runtime from upstream, which doesn't carry it.
+//! Dedicated-server definitions are a separate bundled overlay on the game list.
 
 use std::{collections::HashMap, sync::LazyLock};
 
