@@ -421,9 +421,9 @@ pub(super) async fn publish_profile(
     ensure_unique_profile_mods(app, profile_id)?;
     reconcile_published_inner(app, profile_id).await?;
 
-    let (profile_dir, profile_name, sync_id, published, live_manifest, live_config) = {
+    let (profile_dir, profile_name, sync_id, published, live_manifest, live_config, excluded) = {
         let manager = app.lock_manager();
-        let (game, profile) = manager.profile_by_id(profile_id)?;
+        let (_, profile) = manager.profile_by_id(profile_id)?;
 
         let sync = profile.sync.as_ref().ok_or_eyre("profile is not synced")?;
 
@@ -448,19 +448,22 @@ pub(super) async fn publish_profile(
             sync.id.clone(),
             published,
             export::build_manifest(profile),
-            export::collect_config_files(&profile.path, game.mod_loader.mod_config_dirs())?,
+            export::collect_export_config(profile)?,
+            profile.excluded_export_files.clone(),
         )
     };
 
     let published_bytes = load_snapshot_bytes(&published, &profile_dir)?;
 
-    let (manifest, config) = merge_publication(
+    let (manifest, mut config) = merge_publication(
         mode,
         published.manifest,
         published_bytes,
         live_manifest,
         &live_config,
     )?;
+    // Exclusions also remove bytes retained from an earlier publication.
+    config.retain(|path, _| !excluded.contains(path.as_path()));
 
     let (bytes, mut state) = build_publication(&profile_name, manifest, &config)?;
 
@@ -503,13 +506,13 @@ pub(super) async fn create_profile(app: &AppHandle, profile_id: i64) -> Result<S
 
     let (profile_dir, profile_name, manifest, config) = {
         let manager = app.lock_manager();
-        let (game, profile) = manager.profile_by_id(profile_id)?;
+        let (_, profile) = manager.profile_by_id(profile_id)?;
 
         (
             profile.path.clone(),
             profile.name.clone(),
             export::build_manifest(profile),
-            export::collect_config_files(&profile.path, game.mod_loader.mod_config_dirs())?,
+            export::collect_export_config(profile)?,
         )
     };
 
@@ -572,10 +575,10 @@ pub(super) async fn list_config_files(
 
     let (live_config, published_config) = {
         let manager = app.lock_manager();
-        let (game, profile) = manager.profile_by_id(profile_id)?;
+        let (_, profile) = manager.profile_by_id(profile_id)?;
 
         (
-            export::collect_config_files(&profile.path, game.mod_loader.mod_config_dirs())?,
+            export::collect_export_config(profile)?,
             profile
                 .sync
                 .as_ref()

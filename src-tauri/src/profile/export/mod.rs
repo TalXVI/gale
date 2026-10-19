@@ -562,9 +562,24 @@ pub(super) fn collect_config_files(
     root: &Path,
     config_dirs: &[&str],
 ) -> Result<BTreeMap<ConfigPath, Vec<u8>>> {
+    read_config_files(root, find_config(root, config_dirs))
+}
+
+pub(super) fn collect_export_config(profile: &Profile) -> Result<BTreeMap<ConfigPath, Vec<u8>>> {
+    let paths = list_export_files(profile)
+        .filter_ok(|file| file.included)
+        .map_ok(|file| file.path)
+        .collect::<Result<Vec<_>>>()?;
+    read_config_files(&profile.path, paths)
+}
+
+fn read_config_files(
+    root: &Path,
+    paths: impl IntoIterator<Item = PathBuf>,
+) -> Result<BTreeMap<ConfigPath, Vec<u8>>> {
     let mut files = BTreeMap::new();
 
-    for file in find_config(root, config_dirs) {
+    for file in paths {
         let path = file
             .components()
             .map(|component| {
