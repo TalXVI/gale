@@ -1,6 +1,6 @@
 {
 	"name": "gale",
-	"version": "1.25.1",
+	"version": "1.26.0",
 	"private": true,
 	"scripts": {
 		"dev": "vite dev",
@@ -62,12 +62,5 @@
 		"rehype-sanitize": "^6.0.0",
 		"semver": "^7.8.5",
 		"svelte-exmarkdown": "^5.0.2"
-	},
-	"pnpm": {
-		"overrides": {
-			"@sveltejs/kit>cookie": "^0.7.2",
-			"source-map-js@<1.2.2": "^1.2.2",
-			"uuid@13.0.0": "^13.0.1"
-		}
 	}
 }

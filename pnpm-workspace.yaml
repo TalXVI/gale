@@ -4,3 +4,8 @@ packages:
 onlyBuiltDependencies:
   - '@tailwindcss/oxide'
   - esbuild
+
+overrides:
+  '@sveltejs/kit>cookie': ^0.7.2
+  'source-map-js@<1.2.2': ^1.2.2
+  uuid@13.0.0: ^13.0.1
