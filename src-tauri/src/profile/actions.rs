@@ -485,33 +485,7 @@ impl ManagedGame {
 
         #[cfg(target_os = "windows")]
         {
-            use std::os::windows::process::CommandExt;
-            use std::process::Command;
-
-            const NO_WINDOW: u32 = 0x08000000;
-
-            let command = format!(
-                "$ws = New-Object -ComObject WScript.Shell; \
-                 $shortcut = $ws.CreateShortcut('{}'); \
-                 $shortcut.TargetPath = '{}'; \
-                 $shortcut.Arguments = '--game \"{}\" --profile \"{}\" --launch --no-gui'; \
-                 $shortcut.Save()",
-                shortcut_path.to_string_lossy().replace("\\", "\\\\"),
-                command.replace("\\", "\\\\"),
-                self.game.slug,
-                profile.name
-            );
-
-            let result = Command::new("powershell")
-                .creation_flags(NO_WINDOW)
-                .arg("-Command")
-                .arg(&command)
-                .status()
-                .context("failed to execute PowerShell command")?;
-
-            if !result.success() {
-                bail!("PowerShell failed to create shortcut");
-            }
+            write_windows_shortcut(&shortcut_path, &command, &self.game.slug, &profile.name)?;
         }
 
         #[cfg(target_os = "linux")]
@@ -537,5 +511,67 @@ impl ManagedGame {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn write_windows_shortcut(
+    shortcut_path: &std::path::Path,
+    executable: &str,
+    game: &str,
+    profile: &str,
+) -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+
+    const NO_WINDOW: u32 = 0x08000000;
+
+    const SCRIPT: &str = "$ErrorActionPreference = 'Stop'; \
+                $ws = New-Object -ComObject WScript.Shell; \
+                $shortcut = $ws.CreateShortcut($env:GALE_SHORTCUT_PATH); \
+                $shortcut.TargetPath = $env:GALE_SHORTCUT_TARGET; \
+                $shortcut.Arguments = $env:GALE_SHORTCUT_ARGUMENTS; \
+                $shortcut.Save()";
+
+    let result = Command::new("powershell")
+        .creation_flags(NO_WINDOW)
+        .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
+        .env("GALE_SHORTCUT_PATH", shortcut_path)
+        .env("GALE_SHORTCUT_TARGET", executable)
+        .env(
+            "GALE_SHORTCUT_ARGUMENTS",
+            format!("--game \"{game}\" --profile \"{profile}\" --launch --no-gui"),
+        )
+        .status()
+        .context("failed to execute PowerShell command")?;
+
+    if !result.success() {
+        bail!("PowerShell failed to create shortcut");
+    }
+    Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod shortcut_security_tests {
+    use super::*;
+
+    #[test]
+    fn security_shortcut_treats_profile_name_as_data() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("probe.lnk");
+        let profile = "x'+(Set-Variable galeShortcutInjected 1 -PassThru)+'x";
+        write_windows_shortcut(
+            &path,
+            "C:\\Windows\\System32\\notepad.exe",
+            "among-us",
+            profile,
+        )
+        .unwrap();
+        let output = std::process::Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:GALE_SHORTCUT_PROBE); $s.Arguments"]).env("GALE_SHORTCUT_PROBE", &path).output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            format!("--game \"among-us\" --profile \"{profile}\" --launch --no-gui")
+        );
     }
 }
