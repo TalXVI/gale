@@ -18,6 +18,12 @@ use super::{
     check_cancel, emit,
 };
 
+const MAX_DOWNLOAD_BYTES: u64 = 1024 * 1024 * 1024;
+
+#[derive(Debug, thiserror::Error)]
+#[error("package download exceeds its {0} byte limit")]
+struct DownloadLimit(u64);
+
 /// Downloads the archive of the given mod into memory, retrying (and resuming) if
 /// the connection is interrupted.
 pub(super) async fn download(
@@ -68,7 +74,15 @@ pub(crate) async fn fetch(
     const INITIAL_BACKOFF: Duration = Duration::from_secs(2);
     const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
-    let mut response = Vec::with_capacity(size_hint as usize);
+    let limit = if size_hint == 0 {
+        MAX_DOWNLOAD_BYTES
+    } else {
+        size_hint.min(MAX_DOWNLOAD_BYTES)
+    };
+    if size_hint > MAX_DOWNLOAD_BYTES {
+        return Err(eyre!(DownloadLimit(MAX_DOWNLOAD_BYTES)).into());
+    }
+    let mut response = Vec::new();
     let mut retries = 0;
     let mut attempts = 0;
     let mut backoff = INITIAL_BACKOFF;
@@ -77,7 +91,7 @@ pub(crate) async fn fetch(
         let downloaded = response.len();
         attempts += 1;
 
-        match try_download(&mut response, url, client, progress, check_cancel).await {
+        match try_download(&mut response, url, client, limit, progress, check_cancel).await {
             Ok(()) => break Ok(response),
             Err(InstallError::Cancelled) => return Err(InstallError::Cancelled),
             Err(InstallError::Error(err)) => {
@@ -132,6 +146,7 @@ async fn try_download(
     buf: &mut Vec<u8>,
     url: &str,
     client: &ClientWithMiddleware,
+    limit: u64,
     progress: &(dyn Fn(i64) + Sync),
     check_cancel: &(dyn Fn() -> InstallResult<()> + Sync),
 ) -> InstallResult<()> {
@@ -142,12 +157,22 @@ async fn try_download(
         None => return Ok(()), // download already complete
     };
 
+    if expected_len.is_some_and(|len| len > limit) {
+        return Err(eyre!(DownloadLimit(limit)).into());
+    }
+
     let mut stream = response.bytes_stream();
     let mut last_update = Instant::now();
     let mut last_size_update = buf.len() as i64;
 
     while let Some(item) = stream.next().await {
         let item = item.context("failed to read chunk from stream")?;
+        check_cancel()?;
+        if item.len() as u64 > limit - buf.len() as u64 {
+            return Err(eyre!(DownloadLimit(limit)).into());
+        }
+        buf.try_reserve(item.len())
+            .context("failed to allocate package download buffer")?;
         buf.extend_from_slice(&item);
 
         if last_update.elapsed() >= UPDATE_DELAY {
@@ -246,18 +271,17 @@ async fn send_download_request(
         return Err(eyre!("unexpected download offset {start}, expected {expected_start}").into());
     }
 
-    let expected_len = content_range
-        .and_then(|range| range.total)
-        .or_else(|| {
-            // if the body isn't compressed, the content length must match the data we receive
-            if response.headers().contains_key(header::CONTENT_ENCODING) {
-                // body is compressed and the content range wasn't provided; we can't know the total size of the request
-                None
-            } else {
-                response.content_length()
-            }
-        })
-        .map(|len| len + expected_start);
+    let expected_len = content_range.and_then(|range| range.total).or_else(|| {
+        // if the body isn't compressed, the content length must match the data we receive
+        if response.headers().contains_key(header::CONTENT_ENCODING) {
+            // body is compressed and the content range wasn't provided; we can't know the total size of the request
+            None
+        } else {
+            response
+                .content_length()
+                .map(|len| len.saturating_add(expected_start))
+        }
+    });
 
     Ok(Some((response, expected_len)))
 }
@@ -296,6 +320,9 @@ fn discard_partial_download(buf: &mut Vec<u8>, progress: &(dyn Fn(i64) + Sync)) 
 
 /// Whether an error from [`try_download`] is permanent, in which case retrying is pointless.
 fn is_fatal_download_error(err: &eyre::Report) -> bool {
+    if err.is::<DownloadLimit>() || err.is::<std::collections::TryReserveError>() {
+        return true;
+    }
     let Some(status) = err
         .downcast_ref::<reqwest::Error>()
         .and_then(reqwest::Error::status)
@@ -312,6 +339,39 @@ fn is_fatal_download_error(err: &eyre::Report) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn security_stops_a_chunked_download_at_its_byte_budget() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mod.zip", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 2048];
+            let count = socket.read(&mut request).await.unwrap();
+            assert!(
+                std::str::from_utf8(&request[..count])
+                    .unwrap()
+                    .starts_with("GET /mod.zip HTTP/1.1")
+            );
+            socket.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n9\r\n123456789\r\n0\r\n\r\n").await.unwrap();
+        });
+        let client = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            fetch(&client, &url, 8, &|_| {}, &|| Ok(())),
+        )
+        .await
+        .unwrap();
+        task.await.unwrap();
+        match result {
+            Err(InstallError::Error(error)) => assert!(
+                error.is::<DownloadLimit>(),
+                "unexpected download error: {error:#}"
+            ),
+            _ => panic!("accepted a body larger than the advertised package"),
+        }
+    }
 
     fn parse(value: &str) -> ContentRange {
         parse_content_range(&HeaderValue::from_str(value).unwrap())
