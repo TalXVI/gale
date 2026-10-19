@@ -168,6 +168,7 @@ impl SyncClient {
                 self.api_url(),
                 self.config.profile_id
             ))
+            .timeout(Duration::from_secs(30))
             .bearer_auth(token)
             .send()
             .await
@@ -191,6 +192,7 @@ impl SyncClient {
         let response = self
             .http
             .get(format!("{}/profile/{}", self.api_url(), metadata.id))
+            .timeout(Duration::from_secs(120))
             .bearer_auth(token)
             .send()
             .await

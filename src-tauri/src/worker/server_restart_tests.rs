@@ -47,7 +47,11 @@ impl HostControl for TestHost {
 
     fn status<'a>(&'a self) -> BoxFuture<'a, Result<HostStatus>> {
         Box::pin(async move {
-            assert!(self.ftp.has_dir(LEASE_PATH));
+            // Presence preflight is read-only. Restart verification still
+            // runs under the lease, as does the restart request above.
+            if self.restarts.load(Ordering::SeqCst) > 0 {
+                assert!(self.ftp.has_dir(LEASE_PATH));
+            }
             let booting = self.restarts.load(Ordering::SeqCst) > 0
                 && self.boot_probes.fetch_add(1, Ordering::SeqCst) == 0;
             Ok(HostStatus {

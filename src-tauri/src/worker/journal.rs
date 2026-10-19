@@ -237,21 +237,27 @@ impl WorkerJournal {
 /// the API handlers and the poll loop take turns on the state.
 pub struct Journal {
     path: PathBuf,
+    /// Exact bytes last persisted successfully, including credential rotations.
+    saved: std::sync::Mutex<Option<Vec<u8>>>,
     pub state: Mutex<WorkerJournal>,
 }
 
 impl Journal {
     pub fn load(state_dir: &std::path::Path) -> Result<Self> {
         let path = state_dir.join(JOURNAL_FILE);
-        let state: WorkerJournal = match std::fs::read(&path) {
-            Ok(bytes) => {
-                serde_json::from_slice(&bytes).context("worker journal is not valid JSON")?
+        let (state, saved) = match std::fs::read(&path) {
+            Ok(bytes) => (
+                serde_json::from_slice(&bytes).context("worker journal is not valid JSON")?,
+                Some(bytes),
+            ),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                (WorkerJournal::default(), None)
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => WorkerJournal::default(),
             Err(err) => return Err(err).context("failed to read worker journal"),
         };
         Ok(Self {
             path,
+            saved: std::sync::Mutex::new(saved),
             state: Mutex::new(state),
         })
     }
@@ -262,6 +268,13 @@ impl Journal {
     /// a crash keeps its old mode on reopen, hence the explicit chmod.
     pub fn save(&self, state: &WorkerJournal) -> Result<()> {
         let bytes = serde_json::to_vec_pretty(state)?;
+        let mut saved = self
+            .saved
+            .lock()
+            .map_err(|_| eyre::eyre!("worker journal persistence lock is poisoned"))?;
+        if saved.as_ref() == Some(&bytes) {
+            return Ok(());
+        }
         let tmp = self.path.with_extension("json.tmp");
 
         {
@@ -287,7 +300,9 @@ impl Journal {
                 .context("failed to restrict worker journal permissions")?;
         }
 
-        std::fs::rename(&tmp, &self.path).context("failed to persist worker journal")
+        std::fs::rename(&tmp, &self.path).context("failed to persist worker journal")?;
+        *saved = Some(bytes);
+        Ok(())
     }
 
     /// Records a completed operation.

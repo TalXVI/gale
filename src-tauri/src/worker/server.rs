@@ -388,14 +388,23 @@ async fn deploy(
     let response = run_deployment(
         &ctx,
         request.selection,
-        Some(request.plan_hash),
+        Some(DeployApproval {
+            plan_hash: request.plan_hash,
+            run_id: request.run_id,
+        }),
         request.restart_policy,
         request.force,
         OperationKind::Manual,
-        Some(request.run_id),
+        None,
     )
     .await?;
     Ok(Json(response))
+}
+
+/// The approved plan and the client run whose progress it belongs to.
+struct DeployApproval {
+    plan_hash: String,
+    run_id: String,
 }
 
 /// Shared deployment path for manual API requests and the automatic poll
@@ -404,26 +413,31 @@ async fn deploy(
 async fn run_deployment(
     ctx: &Arc<WorkerContext>,
     selection: DeploySelection,
-    plan_hash: Option<String>,
+    approval: Option<DeployApproval>,
     restart_policy: Option<RestartPolicy>,
     force: bool,
     kind: OperationKind,
-    run_id: Option<String>,
+    publication: Option<FetchedPublication>,
 ) -> Result<DeployResponse> {
     let meta = ctx.meta(kind);
-    let run_id = run_id
+    let run_id = approval
+        .as_ref()
+        .map(|approval| approval.run_id.clone())
         .filter(|id| !id.is_empty())
         .unwrap_or_else(|| meta.id.clone());
     let mut progress = ctx.reporter(run_id, SyncOperation::Deploy, &selection);
     let result = async {
         let policy = ctx.restart_policy(restart_policy).await;
-        let publication = ctx.publication().await?;
+        let publication = match publication {
+            Some(publication) => publication,
+            None => ctx.publication().await?,
+        };
         let response = ctx
             .service
             .deploy(
                 publication,
                 selection,
-                plan_hash,
+                approval.map(|approval| approval.plan_hash),
                 force,
                 policy,
                 ctx.host.as_ref(),
@@ -547,7 +561,7 @@ async fn poll_loop(ctx: Arc<WorkerContext>, shutdown: CancellationToken) {
         loop {
             tokio::select! {
                 _ = interval.tick() => poll_once(&ctx).await,
-                () = ctx.automation_wake.notified() => deploy_pending(&ctx).await,
+                () = ctx.automation_wake.notified() => deploy_pending(&ctx, None).await,
             }
         }
     };
@@ -573,8 +587,8 @@ fn retry_delay(attempts: u32) -> Duration {
 /// One poll cycle. Observes publications, deploys owed mods, and rechecks
 /// previously requested restarts even when publication polling fails.
 async fn poll_once(ctx: &Arc<WorkerContext>) {
-    if observe_publication(ctx).await.is_ok() {
-        deploy_pending(ctx).await;
+    if let Ok(publication) = observe_publication(ctx).await {
+        deploy_pending(ctx, publication).await;
     }
     resume_deferred_restart(ctx).await;
 }
@@ -596,6 +610,21 @@ async fn resume_deferred_restart(ctx: &Arc<WorkerContext>) {
         };
         record.id.clone()
     };
+    // This probe only avoids work. The engine rechecks both the operation
+    // and presence under the lease before it can request a restart.
+    if ctx.host.can_restart() {
+        match ctx.host.status().await {
+            Ok(status) if status.players == Some(0) => {}
+            Ok(_) => {
+                ctx.clear_progress();
+                return;
+            }
+            Err(error) => {
+                warn!(%error, "deferred restart presence check failed");
+                return;
+            }
+        }
+    }
     let meta = ctx.meta(OperationKind::Automatic);
     let mut progress = ctx.reporter(
         meta.id.clone(),
@@ -631,7 +660,7 @@ async fn resume_deferred_restart(ctx: &Arc<WorkerContext>) {
 }
 
 /// Validates and records a canonical publication without doing deployment work.
-async fn observe_publication(ctx: &Arc<WorkerContext>) -> Result<()> {
+async fn observe_publication(ctx: &Arc<WorkerContext>) -> Result<Option<FetchedPublication>> {
     let _guard = ctx.publication_lock.lock().await;
     let last_seen = ctx.journal.state.lock().await.observed_revision();
     let probe = match ctx.sync.poll(&ctx.journal, last_seen).await {
@@ -646,7 +675,7 @@ async fn observe_publication(ctx: &Arc<WorkerContext>) -> Result<()> {
     };
     let mut state = ctx.journal.state.lock().await;
     let recovered = state.clear_poll_error();
-    match probe {
+    match probe.as_ref() {
         Some(publication) => {
             let revision = publication.revision;
             info!(%revision, "observed new publication");
@@ -668,11 +697,11 @@ async fn observe_publication(ctx: &Arc<WorkerContext>) -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(probe)
 }
 
 /// Runs only owed mod work, under the same lock as manual operations.
-async fn deploy_pending(ctx: &Arc<WorkerContext>) {
+async fn deploy_pending(ctx: &Arc<WorkerContext>, publication: Option<FetchedPublication>) {
     let due = {
         let state = ctx.journal.state.lock().await;
         automatic_deploy_due(&state, Utc::now())
@@ -681,19 +710,34 @@ async fn deploy_pending(ctx: &Arc<WorkerContext>) {
     if due {
         // Queue behind manual work rather than losing a refresh wake until
         // the next periodic check. Status requests never wait on this lock.
-        let guard = ctx.operation_lock.lock().await;
+        let (guard, publication) = match ctx.operation_lock.try_lock() {
+            Ok(guard) => (guard, publication),
+            Err(_) => {
+                // Publication can advance while manual work holds the lock.
+                // Fetch again after waiting, even without a newer observation.
+                drop(publication);
+                (ctx.operation_lock.lock().await, None)
+            }
+        };
 
         // Re-check under the operation lock. The action check above
         // may be stale. Owed work is always the mod payload, so the
         // automatic selection is mods-only: configs are never part of
         // unattended synchronization.
-        {
+        let publication = {
             let state = ctx.journal.state.lock().await;
             if !automatic_deploy_due(&state, Utc::now()) {
                 info!("automatic deployment no longer due");
                 return;
             }
-        }
+            // A newer observation while we waited supersedes these bytes.
+            publication.filter(|publication| {
+                state
+                    .pending
+                    .as_ref()
+                    .is_some_and(|work| work.revision == publication.revision)
+            })
+        };
         let selection = DeploySelection {
             include_mods: true,
             configs: None,
@@ -706,7 +750,7 @@ async fn deploy_pending(ctx: &Arc<WorkerContext>) {
             None,
             false,
             OperationKind::Automatic,
-            None,
+            publication,
         )
         .await;
         drop(guard);
@@ -861,6 +905,10 @@ mod publication_tests;
 #[cfg(test)]
 #[path = "server_restart_tests.rs"]
 mod restart_tests;
+
+#[cfg(test)]
+#[path = "server_poll_bench.rs"]
+mod poll_bench;
 
 #[cfg(test)]
 mod tests {
