@@ -9,7 +9,7 @@
 //! reliable player count, `WhenEmpty` execution must fail closed rather
 //! than guessing the server is empty.
 
-use eyre::{Context, Result, bail};
+use eyre::{Context, Result, bail, ensure, eyre};
 use futures_util::future::BoxFuture;
 use serde::Deserialize;
 
@@ -93,13 +93,25 @@ impl DatHostControl {
         }
     }
 
+    fn url(&self, path: &str) -> Result<reqwest::Url> {
+        ensure!(
+            self.server_id != "." && self.server_id != "..",
+            "invalid DatHost server id"
+        );
+        let mut url = reqwest::Url::parse(&self.base)?;
+        url.path_segments_mut()
+            .map_err(|()| eyre!("DatHost base URL cannot contain path segments"))?
+            .pop_if_empty()
+            .push("game-servers")
+            .push(&self.server_id)
+            .push(path);
+        Ok(url)
+    }
+
     async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
         let response = self
             .client
-            .get(format!(
-                "{}/game-servers/{}/{}",
-                self.base, self.server_id, path
-            ))
+            .get(self.url(path)?)
             .basic_auth(&self.username, Some(&self.password))
             .send()
             .await
@@ -119,10 +131,7 @@ impl HostControl for DatHostControl {
     fn restart<'a>(&'a self) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             self.client
-                .post(format!(
-                    "{}/game-servers/{}/start",
-                    self.base, self.server_id
-                ))
+                .post(self.url("start")?)
                 .basic_auth(&self.username, Some(&self.password))
                 .send()
                 .await
@@ -256,6 +265,51 @@ mod tests {
                 StatusCode::BAD_REQUEST.into_response()
             }
         }
+    }
+
+    #[tokio::test]
+    async fn security_dathost_id_stays_one_segment_in_status_and_restart_requests() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for expected in [
+                "GET /game-servers/srv%2F..%2Fother%3Fquery%23frag/ HTTP/1.1",
+                "POST /game-servers/srv%2F..%2Fother%3Fquery%23frag/start HTTP/1.1",
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                let count = socket.read(&mut request).await.unwrap();
+                let request = std::str::from_utf8(&request[..count]).unwrap();
+                let body = br#"{"on":true,"booting":false,"players_online":0}"#;
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                socket.write_all(body).await.unwrap();
+                assert_eq!(request.lines().next().unwrap(), expected);
+                assert!(
+                    request
+                        .to_ascii_lowercase()
+                        .contains("authorization: basic dxnlcjpwyxnz")
+                );
+            }
+        });
+        let mut host = DatHostControl::new(
+            "srv/../other?query#frag".into(),
+            "user".into(),
+            "pass".into(),
+        );
+        host.base = base;
+        assert_eq!(host.status().await.unwrap().players, Some(0));
+        host.restart().await.unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]

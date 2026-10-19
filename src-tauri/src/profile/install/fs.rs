@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use eyre::{Context, Result};
+use eyre::{Context, Result, ensure};
 use tracing::{trace, warn};
 use walkdir::WalkDir;
 use zip::ZipArchive;
@@ -58,6 +58,17 @@ where
             trace!("map_file returned None, skipping",);
             continue;
         };
+
+        ensure!(
+            util::fs::is_enclosed(&relative_target)
+                && relative_target.components().all(|component| {
+                    component
+                        .as_os_str()
+                        .to_str()
+                        .is_some_and(util::fs::is_normal_component)
+                }),
+            "mapped package path must stay inside the extraction directory"
+        );
 
         trace!(
             mapped_path = %relative_target.display(),

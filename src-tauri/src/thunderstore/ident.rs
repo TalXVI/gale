@@ -155,6 +155,10 @@ impl TryFrom<Intern<String>> for VersionIdent {
 
         let name_start = next_segment(&mut indices)?;
 
+        if !crate::util::fs::is_normal_component(&value[..version_start - 1]) {
+            return Err(ParseError);
+        }
+
         return Ok(Self {
             repr: value,
             name_start: name_start as u32,
@@ -312,6 +316,9 @@ impl TryFrom<String> for PackageIdent {
     ///
     /// This does not allocate or copy memory.
     fn try_from(value: String) -> Result<Self, ParseError> {
+        if !crate::util::fs::is_normal_component(&value) {
+            return Err(ParseError);
+        }
         let mut indices = value.match_indices('-').map(|(i, _)| i);
 
         let name_start = indices.next_back().ok_or(ParseError)? as u32 + 1;
@@ -348,6 +355,25 @@ impl Display for PackageIdentPath<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn security_rejects_catalog_identifiers_with_path_components() {
+        for name in [
+            "../owner-name",
+            "owner-../name",
+            "C:/owner-name",
+            "owner-..",
+            "owner-name\\child",
+            "owner-name ",
+            "owner-name.",
+        ] {
+            assert!(name.parse::<PackageIdent>().is_err(), "accepted {name}");
+            assert!(
+                format!("{name}-1.0.0").parse::<VersionIdent>().is_err(),
+                "accepted version of {name}"
+            );
+        }
+    }
 
     #[test]
     fn parse_package_ident() {

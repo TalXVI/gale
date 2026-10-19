@@ -145,6 +145,16 @@ pub fn file_name_owned(path: impl AsRef<Path>) -> String {
         .into_owned()
 }
 
+/// Whether a name is a single filesystem component on Windows and POSIX.
+pub fn is_normal_component(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.ends_with(['.', ' '])
+        && !name.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|'])
+        && !name.chars().any(char::is_control)
+}
+
 pub fn is_enclosed(path: impl AsRef<Path>) -> bool {
     use std::path::Component;
 

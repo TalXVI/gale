@@ -349,6 +349,10 @@ impl<'a> SubdirInstaller<'a> {
  */
 
 fn state_file_path(name: &str, profile: &Profile) -> PathBuf {
+    assert!(
+        util::fs::is_normal_component(name),
+        "package state name must be a single filesystem component"
+    );
     let mut path = profile.path.clone();
 
     path.push("_state");
@@ -604,6 +608,36 @@ mod tests {
         let dir = src.join("BepInEx/config");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("example.cfg"), contents).unwrap();
+    }
+
+    #[test]
+    fn security_rejects_mapped_paths_that_escape_extraction() {
+        use std::io::{Cursor, Write};
+        use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
+
+        let root = tempdir().unwrap();
+        let outside = root.path().join("outside");
+        let outside_name = outside.to_str().unwrap();
+        for (package, target) in [
+            (outside_name, "BepInEx/plugins"),
+            ("../../../outside", "BepInEx/plugins"),
+            ("Author-Mod", outside_name),
+            ("Author-Mod", "../outside"),
+        ] {
+            let dest = root.path().join("extract");
+            let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+            zip.start_file("plugins/probe.txt", SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"untrusted").unwrap();
+            let archive = ZipArchive::new(zip.finish().unwrap()).unwrap();
+            let dirs = [Subdir::flat_separated("plugins", target)];
+            let result = SubdirInstaller::new(&dirs).extract(archive, package, dest);
+            assert!(
+                result.is_err(),
+                "accepted package {package:?}, target {target:?}"
+            );
+            assert!(!outside.exists(), "wrote outside extraction");
+        }
     }
 
     #[test]

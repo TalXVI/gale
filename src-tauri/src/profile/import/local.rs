@@ -185,6 +185,11 @@ fn read_local_mod(
         },
     };
 
+    ensure!(
+        util::fs::is_normal_component(&local_mod.name),
+        "mod name must be a single filesystem component"
+    );
+
     Ok((local_mod, kind))
 }
 
