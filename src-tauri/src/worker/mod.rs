@@ -31,6 +31,7 @@ pub enum ServiceControlAction {
 }
 
 pub(crate) mod api;
+pub(crate) mod auth;
 /// Config-file contract loaded by the worker runtime. The Windows desktop
 /// writes it when provisioning the managed service.
 #[cfg(any(windows, feature = "worker"))]

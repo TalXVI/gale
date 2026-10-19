@@ -4,7 +4,8 @@
 //! one remote at startup, so requests carry selections and approvals, and
 //! never need to say which profile or server they target.
 
-use eyre::{Context, Result, bail, ensure};
+use crate::worker::auth::{CHALLENGE_HEADER, MAX_RESPONSE_BYTES, Proof, RESPONSE_HEADER};
+use eyre::{Context, OptionExt, Result, bail, ensure};
 use futures_util::future::BoxFuture;
 use reqwest::StatusCode;
 
@@ -39,10 +40,8 @@ impl WorkerClient {
             "worker address must not embed credentials"
         );
         if url.scheme() == "http" {
-            // Plaintext http sends the bearer token unencrypted, so it is
-            // only acceptable when the worker runs on this same machine.
-            // Remote workers need https:// or a secure tunnel/reverse
-            // proxy. A LAN is not a trusted transport.
+            // HTTP authenticates messages, but does not encrypt their contents.
+            // Remote access still requires TLS.
             ensure!(
                 is_loopback_host(url.host_str().unwrap_or_default()),
                 "plaintext http:// is only allowed for a worker on this machine; \
@@ -54,7 +53,9 @@ impl WorkerClient {
         Ok(Self {
             base: base.to_owned(),
             token,
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?,
         })
     }
 
@@ -62,26 +63,92 @@ impl WorkerClient {
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<T> {
-        let response = request
-            .bearer_auth(&self.token)
-            .send()
+        let mut request = request.build()?;
+        let proof = if request.url().scheme() == "http" {
+            let target = match request.url().query() {
+                Some(query) => format!("{}?{query}", request.url().path()),
+                None => request.url().path().to_owned(),
+            };
+            let body = request
+                .body()
+                .map(|body| {
+                    body.as_bytes()
+                        .ok_or_eyre("Worker requests must have a buffered body")
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let challenge = self
+                .http
+                .get(format!("{}{}/health", self.base, api::API_BASE))
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+                .context("failed to reach the Worker")?
+                .error_for_status()?;
+            let epoch = challenge
+                .headers()
+                .get(CHALLENGE_HEADER)
+                .ok_or_eyre(
+                    "Worker authentication is unavailable; update or reprovision the Worker",
+                )?
+                .to_str()?
+                .parse::<uuid::Uuid>()?;
+            Some(Proof::sign(
+                &self.token,
+                epoch,
+                request.method().as_str(),
+                &target,
+                body,
+            ))
+        } else {
+            None
+        };
+        let authorization = match &proof {
+            Some(proof) => proof.authorization(),
+            None => format!("Bearer {}", self.token),
+        };
+        let mut authorization: reqwest::header::HeaderValue = authorization.parse()?;
+        authorization.set_sensitive(true);
+        request
+            .headers_mut()
+            .insert(reqwest::header::AUTHORIZATION, authorization);
+        let mut response = self
+            .http
+            .execute(request)
             .await
             .context("failed to reach the worker")?;
-
         let status = response.status();
+        let response_tag = response
+            .headers()
+            .get(RESPONSE_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            ensure!(
+                chunk.len() <= MAX_RESPONSE_BYTES - body.len(),
+                "Worker response exceeds the size limit"
+            );
+            body.extend_from_slice(&chunk);
+        }
+        if let Some(proof) = proof {
+            ensure!(
+                proof.verify_response(&self.token, status.as_u16(), &body, &response_tag),
+                "Worker identity could not be verified; check the bearer token, then update or reprovision the Worker"
+            );
+        }
+
         if status.is_success() {
             if status == StatusCode::NO_CONTENT {
                 // `T` must deserialize from `null`.
                 return serde_json::from_value(serde_json::Value::Null)
                     .context("unexpected empty worker response");
             }
-            return response
-                .json()
-                .await
-                .context("worker response was malformed");
+            return serde_json::from_slice(&body).context("worker response was malformed");
         }
 
-        let message = match response.json::<ErrorResponse>().await {
+        let message = match serde_json::from_slice::<ErrorResponse>(&body) {
             Ok(body) => body.error,
             Err(_) => format!("worker request failed: {status}"),
         };
@@ -192,6 +259,113 @@ fn is_loopback_host(host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::profile::server::worker_client::WorkerClient;
+
+    const HEALTH: &str = "HTTP/1.1 204 No Content\r\nx-gale-challenge: 00000000-0000-4000-8000-000000000001\r\nConnection: close\r\n\r\n";
+    const DENIED: &str =
+        "HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+    const TOKEN: &str = "fixture-private-worker-token";
+
+    fn assert_no_bearer(requests: &[String]) {
+        for request in requests {
+            assert!(!request.contains(TOKEN));
+            assert!(
+                !request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer ")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn security_an_impostor_with_a_health_challenge_still_receives_no_bearer() {
+        let (result, requests) = crate::test_support::http_fixture(
+            &["GET /v1/health HTTP/1.1", "GET /v1/status HTTP/1.1"],
+            |index, _| [HEALTH, DENIED][index].into(),
+            |base| async move {
+                WorkerClient::new(&base, TOKEN.into())
+                    .unwrap()
+                    .status(false)
+                    .await
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            requests[1]
+                .to_ascii_lowercase()
+                .contains("authorization: gale-v1 ")
+        );
+        assert_no_bearer(&requests);
+    }
+
+    #[tokio::test]
+    async fn security_worker_rejects_a_response_without_server_authentication() {
+        let (result, requests) = crate::test_support::http_fixture(
+            &["GET /v1/health HTTP/1.1", "GET /v1/progress HTTP/1.1"],
+            |index, _| {
+                [
+                    HEALTH,
+                    "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnull",
+                ][index]
+                    .into()
+            },
+            |base| async move {
+                let client = WorkerClient::new(&base, TOKEN.into()).unwrap();
+                client
+                    .send::<Option<String>>(client.http.get(format!("{base}/v1/progress")))
+                    .await
+            },
+        )
+        .await;
+        assert!(result.is_err(), "accepted an unsigned successful response");
+        assert_no_bearer(&requests);
+    }
+
+    #[tokio::test]
+    async fn security_loopback_impostor_never_receives_the_worker_bearer() {
+        let (result, requests) = crate::test_support::http_fixture(
+            &["GET /v1/health HTTP/1.1"],
+            |_, _| DENIED.into(),
+            |base| async move {
+                WorkerClient::new(&base, TOKEN.into())
+                    .unwrap()
+                    .status(false)
+                    .await
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_no_bearer(&requests);
+    }
+
+    #[tokio::test]
+    async fn security_signed_responses_reject_changed_body_and_status() {
+        for (status, body, accepted) in [
+            (200u16, "null", true),
+            (201, "null", false),
+            (200, "\"modified\"", false),
+        ] {
+            let (result, _) = crate::test_support::http_fixture(
+                &["GET /v1/health HTTP/1.1", "GET /v1/progress HTTP/1.1"],
+                |index, request| {
+                    if index == 0 { return HEALTH.into(); }
+                    let authorization = request.lines().find(|line| line.to_ascii_lowercase().starts_with("authorization:")).unwrap();
+                    let nonce: uuid::Uuid = authorization.split_whitespace().nth(2).unwrap().split(':').nth(2).unwrap().parse().unwrap();
+                    let tag = crate::test_support::worker_mac(TOKEN, b"response-v1", &[nonce.as_bytes(), &200u16.to_le_bytes(), b"null"]);
+                    format!("HTTP/1.1 {status} OK\r\nx-gale-response: {tag}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                },
+                |base| async move {
+                    let client = WorkerClient::new(&base, TOKEN.into()).unwrap();
+                    client.send::<Option<String>>(client.http.get(format!("{base}/v1/progress"))).await
+                },
+            ).await;
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "response status {status}, body {body}"
+            );
+        }
+    }
 
     #[test]
     fn rejects_non_loopback_plaintext_http() {

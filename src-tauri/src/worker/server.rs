@@ -1,6 +1,7 @@
 //! The worker's HTTP server and automatic-sync poll loop.
 //!
-//! Authentication is a single bearer token (`GALE_WORKER_TOKEN`). The API
+//! Authentication uses a shared token (`GALE_WORKER_TOKEN`). Loopback
+//! clients authenticate messages without transmitting the token. The API
 //! has no profile/server parameters on purpose: the worker is bound to
 //! one profile and one remote at startup, so a remote caller can trigger
 //! a deployment but can never redirect it at another target.
@@ -11,11 +12,11 @@ use std::time::Duration;
 use axum::{
     Json, Router,
     extract::{
-        Query, Request, State,
+        Query, State,
         rejection::{JsonRejection, QueryRejection},
     },
-    http::{StatusCode, header::AUTHORIZATION},
-    middleware::{self, Next},
+    http::StatusCode,
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -32,6 +33,7 @@ use super::{
         ConfigureRequest, DeployRequest, DeployResponse, ErrorResponse, PolicyRequest,
         PreviewRequest, StatusResponse, WorkerRunPhase, WorkerRunReport,
     },
+    auth::{self, ServerAuth},
     config::WorkerConfig,
     journal::{Journal, WorkerJournal},
     secrets::Secrets,
@@ -74,7 +76,7 @@ pub struct WorkerContext {
     publication_lock: Mutex<()>,
     automation_wake: Notify,
     progress: Arc<std::sync::Mutex<Option<SyncProgress>>>,
-    token: String,
+    auth: Arc<ServerAuth>,
 }
 
 impl WorkerContext {
@@ -106,7 +108,7 @@ impl WorkerContext {
                 cache_dir: config.state_dir.join("cache"),
                 http: ClientBuilder::new(state::base_http_client()?).build(),
             },
-            token: secrets.token()?,
+            auth: Arc::new(ServerAuth::new(secrets.token()?)),
             sync: SyncClient::new(config.clone(), secrets.seed_refresh_token()),
             host: host::from_settings(
                 &config.remote.host_control,
@@ -183,13 +185,6 @@ struct ApiError {
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
 impl ApiError {
-    fn unauthorized() -> Self {
-        Self {
-            status: StatusCode::UNAUTHORIZED,
-            message: "missing or invalid bearer token".to_owned(),
-        }
-    }
-
     fn busy() -> Self {
         Self {
             status: StatusCode::CONFLICT,
@@ -250,35 +245,13 @@ impl IntoResponse for ApiError {
     }
 }
 
-/// Admits only callers presenting the worker's bearer token, before any
-/// handler reads the request.
-async fn require_bearer(
-    State(ctx): State<Arc<WorkerContext>>,
-    request: Request,
-    next: Next,
-) -> Response {
-    let authorized = request
-        .headers()
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        // blake3 hashes compare in constant time, so the response time
-        // reveals nothing about how much of a guessed token was right.
-        .is_some_and(|token| blake3::hash(token.as_bytes()) == blake3::hash(ctx.token.as_bytes()));
-    if !authorized {
-        return ApiError::unauthorized().into_response();
-    }
-    next.run(request).await
-}
-
 /// Claims this worker's operation lock, or answers busy when another
 /// operation holds it.
 fn begin_operation(ctx: &WorkerContext) -> ApiResult<MutexGuard<'_, ()>> {
     ctx.operation_lock.try_lock().map_err(|_| ApiError::busy())
 }
 
-/// The worker API. Every route but the health probe requires the bearer
-/// token.
+/// The worker API. Every route but health requires authentication.
 fn router(ctx: Arc<WorkerContext>) -> Router {
     Router::new()
         .route("/v1/status", get(status))
@@ -288,8 +261,11 @@ fn router(ctx: Arc<WorkerContext>) -> Router {
         .route("/v1/policy", post(set_policy))
         .route("/v1/restart-ack", post(acknowledge_external_restart))
         .route("/v1/config", post(configure))
-        .route_layer(middleware::from_fn_with_state(ctx.clone(), require_bearer))
-        .route("/v1/health", get(|| async { StatusCode::NO_CONTENT }))
+        .route_layer(middleware::from_fn_with_state(
+            ctx.auth.clone(),
+            auth::authenticate,
+        ))
+        .route("/v1/health", get(auth::health).with_state(ctx.auth.clone()))
         .with_state(ctx)
 }
 
@@ -919,6 +895,168 @@ mod tests {
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, super::router(ctx)).await });
         format!("http://{address}/v1")
+    }
+
+    #[tokio::test]
+    async fn security_signed_worker_messages_round_trip_and_reject_replay_and_tampering() {
+        use crate::profile::server::worker_client::WorkerClient;
+        use crate::worker::auth::{Proof, RESPONSE_HEADER};
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = poll_test_context(dir.path(), "http://127.0.0.1:1".into());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, super::router(ctx)).await.unwrap();
+        });
+        let client = WorkerClient::new(&base, "token".into()).unwrap();
+        client
+            .configure(
+                false,
+                crate::profile::server::settings::RestartPolicy::Manual,
+            )
+            .await
+            .unwrap();
+        assert!(!client.status(false).await.unwrap().auto_deploy_mods);
+        let body = br#"{"autoDeployMods":true,"restartPolicy":"whenEmpty"}"#;
+        let epoch = reqwest::get(format!("{base}/v1/health"))
+            .await
+            .unwrap()
+            .headers()[crate::worker::auth::CHALLENGE_HEADER]
+            .to_str()
+            .unwrap()
+            .parse::<uuid::Uuid>()
+            .unwrap();
+        let proof = Proof::sign("token", epoch, "POST", "/v1/config", body);
+        let http = reqwest::Client::new();
+        let request = || {
+            http.post(format!("{base}/v1/config"))
+                .header("content-type", "application/json")
+                .header("authorization", proof.authorization())
+                .body(body.to_vec())
+        };
+        let response = request().send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let tag = response.headers()[RESPONSE_HEADER]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(proof.verify_response("token", 204, &response.bytes().await.unwrap(), &tag));
+        assert_eq!(
+            request().send().await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let fresh = Proof::sign("token", epoch, "POST", "/v1/config", body);
+        let modified = http
+            .post(format!("{base}/v1/config"))
+            .header("content-type", "application/json")
+            .header("authorization", fresh.authorization())
+            .body(br#"{"autoDeployMods":false,"restartPolicy":"manual"}"#.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(modified.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            client.status(false).await.unwrap().auto_deploy_mods,
+            "tampered request must not change policy"
+        );
+        let wrong_epoch = Proof::sign("token", uuid::Uuid::new_v4(), "POST", "/v1/config", body);
+        assert_eq!(
+            http.post(format!("{base}/v1/config"))
+                .header("content-type", "application/json")
+                .header("authorization", wrong_epoch.authorization())
+                .body(body.to_vec())
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        // These wire proofs are encoded independently of the production signer.
+        // Valid control first, then mutate one authenticated field per request.
+        for (signed_method, signed_target, timestamp, actual_method, actual_target, accepted) in [
+            (
+                "GET",
+                "/v1/status?refresh=false",
+                Utc::now().timestamp(),
+                "GET",
+                "/v1/status?refresh=false",
+                true,
+            ),
+            (
+                "POST",
+                "/v1/status?refresh=false",
+                Utc::now().timestamp(),
+                "GET",
+                "/v1/status?refresh=false",
+                false,
+            ),
+            (
+                "GET",
+                "/v1/progress",
+                Utc::now().timestamp(),
+                "GET",
+                "/v1/status",
+                false,
+            ),
+            (
+                "GET",
+                "/v1/status?refresh=false",
+                Utc::now().timestamp(),
+                "GET",
+                "/v1/status?refresh=true",
+                false,
+            ),
+            (
+                "GET",
+                "/v1/status",
+                Utc::now().timestamp() - 300,
+                "GET",
+                "/v1/status",
+                false,
+            ),
+            (
+                "GET",
+                "/v1/status",
+                Utc::now().timestamp() + 300,
+                "GET",
+                "/v1/status",
+                false,
+            ),
+        ] {
+            let nonce = uuid::Uuid::new_v4();
+            let tag = crate::test_support::worker_mac(
+                "token",
+                b"request-v1",
+                &[
+                    epoch.as_bytes(),
+                    &timestamp.to_le_bytes(),
+                    nonce.as_bytes(),
+                    signed_method.as_bytes(),
+                    signed_target.as_bytes(),
+                    b"",
+                ],
+            );
+            let authorization = format!("Gale-v1 {epoch}:{timestamp}:{nonce}:{tag}");
+            let response = http
+                .request(
+                    actual_method.parse().unwrap(),
+                    format!("{base}{actual_target}"),
+                )
+                .header("authorization", authorization)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if accepted {
+                    StatusCode::OK
+                } else {
+                    StatusCode::UNAUTHORIZED
+                },
+                "signed {signed_method} {signed_target}, actual {actual_method} {actual_target}, timestamp {timestamp}"
+            );
+        }
+        server.abort();
     }
 
     #[tokio::test]
