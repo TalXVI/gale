@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use eyre::{Context, OptionExt, eyre};
 use itertools::Itertools;
 use serde::Serialize;
-use tauri::{AppHandle, command};
+use tauri::{AppHandle, Manager, command};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -191,6 +191,9 @@ pub fn query_profile(args: QueryModsArgs, app: AppHandle) -> Result<ProfileQuery
 
     let profile = manager.active_profile();
 
+    for icon in profile.icon_assets()? {
+        app.asset_protocol_scope().allow_file(icon)?;
+    }
     let (mods, unknown_mods) = profile.query_mods(&args, &thunderstore);
     let total_mod_count = profile.mods.len();
 

@@ -196,6 +196,9 @@ where
     }
 }
 
+#[cfg(all(test, windows, feature = "worker"))]
+mod security_tests;
+
 #[command]
 pub fn is_first_run(app: AppHandle) -> bool {
     app.app_state().is_first_run

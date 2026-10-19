@@ -167,6 +167,31 @@ pub struct UnknownMod {
 }
 
 impl Profile {
+    pub(super) fn icon_assets(&self) -> Result<Vec<PathBuf>> {
+        let mut icons = Vec::new();
+        for (local, _) in self.local_mods() {
+            let Some(icon) = &local.icon else { continue };
+            if icon.file_name().is_none_or(|name| name != "icon.png") {
+                continue;
+            }
+            let root = self.path.canonicalize()?;
+            for path in [icon.clone(), icon.with_extension("png.old")] {
+                let canonical = match path.canonicalize() {
+                    Ok(path) => path,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                if canonical.starts_with(&root)
+                    && canonical.file_name() == path.file_name()
+                    && canonical.is_file()
+                {
+                    icons.push(canonical);
+                }
+            }
+        }
+        Ok(icons)
+    }
+
     pub(super) fn query_mods(
         &self,
         args: &QueryModsArgs,
@@ -280,7 +305,9 @@ impl Queryable for LocalMod {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profile::install::queue::tests::{catalog, catalogs, install, listing, profile};
+    use crate::profile::install::queue::tests::{
+        catalog, catalogs, install, listing, profile, profile_at,
+    };
 
     fn args() -> QueryModsArgs {
         QueryModsArgs {
@@ -295,6 +322,39 @@ mod tests {
             sort_by: SortBy::Name,
             sort_order: SortOrder::Ascending,
         }
+    }
+
+    #[test]
+    fn security_icon_whitelist_selects_only_icons_inside_the_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile_dir = dir.path().join("profile");
+        let icon = profile_dir.join("BepInEx/plugins/Local/icon.png");
+        std::fs::create_dir_all(icon.parent().unwrap()).unwrap();
+        std::fs::write(&icon, b"fixture-icon").unwrap();
+        std::fs::write(icon.with_extension("png.old"), b"fixture-disabled-icon").unwrap();
+        let private = profile_dir.join("private.cfg");
+        std::fs::write(&private, b"fixture-private-config").unwrap();
+        let outside = dir.path().join("icon.png");
+        std::fs::write(&outside, b"fixture-outside").unwrap();
+        let mut profile = profile_at(profile_dir.clone(), Vec::new());
+        for icon_path in [icon.clone(), private.clone(), outside.clone()] {
+            profile.mods.push(ProfileMod::new_local(LocalMod {
+                icon: Some(icon_path),
+                ..Default::default()
+            }));
+        }
+        let allowed = profile.icon_assets().unwrap();
+        assert!(allowed.contains(&icon.canonicalize().unwrap()));
+        assert!(allowed.contains(&icon.with_extension("png.old").canonicalize().unwrap()));
+        assert!(
+            !allowed.contains(&private.canonicalize().unwrap()),
+            "profile secrets must not be exposed as assets"
+        );
+        assert!(
+            !allowed.contains(&outside.canonicalize().unwrap()),
+            "an icon path outside the profile must not expand the scope"
+        );
+        assert_eq!(allowed.len(), 2);
     }
 
     #[test]

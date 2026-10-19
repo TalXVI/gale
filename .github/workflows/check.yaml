@@ -99,6 +99,8 @@ jobs:
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --features worker -- -D warnings
 
       - name: Run worker and desktop regressions
+        env:
+          GALE_SYNC_URL: http://127.0.0.1:1
         run: cargo test --manifest-path src-tauri/Cargo.toml --features worker --lib
 
       - name: Build the worker

@@ -89,6 +89,11 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn event_handler(app: &AppHandle, event: RunEvent) {
+    if matches!(event, RunEvent::Exit)
+        && let Err(error) = tauri::async_runtime::block_on(app.install_queue().shutdown())
+    {
+        error!(%error, "failed to stop the install queue");
+    }
     if let RunEvent::ExitRequested { api, .. } = event {
         if !app.install_queue().lock().is_processing() {
             return;

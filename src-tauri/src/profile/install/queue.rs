@@ -40,6 +40,7 @@ pub struct InstallQueue {
     /// Notified when any single batch has been completed.
     notify_batch_done: Notify,
     cancel: AtomicBool,
+    worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 #[derive(Default)]
@@ -59,11 +60,28 @@ impl InstallQueue {
             notify_empty: Notify::new(),
             notify_batch_done: Notify::new(),
             cancel,
+            worker: Mutex::new(None),
         });
 
-        tauri::async_runtime::spawn(handle_queue(Arc::clone(&this), app));
+        let tauri::async_runtime::JoinHandle::Tokio(worker) =
+            tauri::async_runtime::spawn(handle_queue(Arc::clone(&this), app));
+        *this.worker.lock().unwrap() = Some(worker);
 
         this
+    }
+
+    /// Stops the worker when its owning application exits, then releases its app handle.
+    pub async fn shutdown(&self) -> Result<()> {
+        let worker = self.worker.lock().unwrap().take();
+        if let Some(worker) = worker {
+            worker.abort();
+            match worker.await {
+                Ok(()) => (),
+                Err(error) if error.is_cancelled() => (),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
     }
 
     pub fn wait_for_empty(&'_ self) -> Notified<'_> {
@@ -950,6 +968,7 @@ pub(crate) mod tests {
             notify_empty: Notify::new(),
             notify_batch_done: Notify::new(),
             cancel: AtomicBool::new(false),
+            worker: Mutex::new(None),
         }
     }
 
