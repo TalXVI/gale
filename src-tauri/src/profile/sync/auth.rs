@@ -6,7 +6,7 @@ use std::{
 
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
-use eyre::{Context, OptionExt, Result, bail, eyre};
+use eyre::{Context, OptionExt, Result, bail, ensure, eyre};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tauri::{AppHandle, Emitter, Manager, Url};
@@ -15,8 +15,13 @@ use tracing::{debug, error, info, warn};
 
 use crate::{db::Db, state::ManagerExt};
 
+struct Session {
+    credentials: Option<AuthCredentials>,
+    unsaved: bool,
+}
+
 pub struct State {
-    creds: Mutex<Option<AuthCredentials>>,
+    creds: Mutex<Session>,
     refresh_lock: AsyncMutex<()>,
     /// The `gale://auth/callback` URL carries no flow identifier, so
     /// OAuth flows are exclusive and each callback resolves at most one
@@ -27,33 +32,52 @@ pub struct State {
 impl State {
     pub fn new(stored_creds: Option<AuthCredentials>) -> Self {
         Self {
-            creds: Mutex::new(stored_creds),
+            creds: Mutex::new(Session {
+                credentials: stored_creds,
+                unsaved: false,
+            }),
             refresh_lock: AsyncMutex::new(()),
             oauth_callback: Mutex::new(None),
         }
     }
 
-    fn creds(&'_ self) -> MutexGuard<'_, Option<AuthCredentials>> {
+    fn creds(&'_ self) -> MutexGuard<'_, Session> {
         self.creds.lock().unwrap()
     }
 
     pub fn set_creds(&self, creds: Option<AuthCredentials>, db: &Db) -> Result<()> {
         let mut stored = self.creds();
-        db.save_auth(creds.as_ref())?;
-        *stored = creds;
+        // A grant already spent the previous refresh token. Retain its replacement
+        // even when persistence fails, and block use until a later save succeeds.
+        stored.credentials = creds;
+        stored.unsaved = true;
+        db.save_auth(stored.credentials.as_ref())?;
+        stored.unsaved = false;
+        Ok(())
+    }
+
+    fn flush_creds(&self, db: &Db) -> Result<()> {
+        let mut stored = self.creds();
+        if stored.unsaved {
+            db.save_auth(stored.credentials.as_ref())?;
+            stored.unsaved = false;
+        }
         Ok(())
     }
 
     fn clear_if_current(&self, refresh_token: &str, db: &Db) -> Result<bool> {
         let mut stored = self.creds();
         if !stored
+            .credentials
             .as_ref()
             .is_some_and(|creds| creds.refresh_token == refresh_token)
         {
             return Ok(false);
         }
+        stored.credentials = None;
+        stored.unsaved = true;
         db.save_auth(None)?;
-        *stored = None;
+        stored.unsaved = false;
         Ok(true)
     }
 
@@ -84,7 +108,7 @@ impl State {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthCredentials {
     user: User,
@@ -151,29 +175,48 @@ pub async fn oauth_credentials(app: &AppHandle) -> Result<AuthCredentials> {
     tokio::select! {
         url = callback => {
          let url = url.context("the sign-in was abandoned")?;
-         let url = Url::parse(&url).context("invalid url")?;
-         let query: HashMap<_, _> = url.query_pairs().collect();
-
-         let access_token = query
-             .get("access_token")
-             .ok_or_eyre("access_token parameter is missing")?
-             .clone()
-             .into_owned();
-
-         let refresh_token = query
-             .get("refresh_token")
-             .ok_or_eyre("refresh_token parameter is missing")?
-             .clone()
-             .into_owned();
-
          app.get_webview_window("main").unwrap().set_focus().ok();
 
-         AuthCredentials::from_tokens(access_token, refresh_token)
+         credentials_from_callback(&url)
         }
         () = tokio::time::sleep(OAUTH_TIMEOUT) => {
             Err(eyre!("auth callback timed out"))
         }
     }
+}
+
+fn credentials_from_callback(url: &str) -> Result<AuthCredentials> {
+    let url = Url::parse(url).context("invalid OAuth callback URL")?;
+    ensure!(
+        url.scheme() == "gale"
+            && url.host_str() == Some("auth")
+            && url.path() == "/callback"
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.port().is_none()
+            && url.fragment().is_none(),
+        "invalid OAuth callback route"
+    );
+    let mut query = HashMap::new();
+    for (name, value) in url.query_pairs() {
+        ensure!(
+            query.insert(name, value).is_none(),
+            "duplicate OAuth callback parameter"
+        );
+    }
+    let access_token = query
+        .get("access_token")
+        .filter(|token| !token.is_empty())
+        .ok_or_eyre("access_token parameter is missing")?
+        .clone()
+        .into_owned();
+    let refresh_token = query
+        .get("refresh_token")
+        .filter(|token| !token.is_empty())
+        .ok_or_eyre("refresh_token parameter is missing")?
+        .clone()
+        .into_owned();
+    AuthCredentials::from_tokens(access_token, refresh_token)
 }
 
 /// Forces a token grant with the desktop's stored refresh token. A second
@@ -182,10 +225,12 @@ pub async fn oauth_credentials(app: &AppHandle) -> Result<AuthCredentials> {
 #[cfg(windows)]
 pub async fn verify_session(app: &AppHandle) -> Result<()> {
     let _refresh_guard = app.sync_auth().refresh_lock.lock().await;
+    app.sync_auth().flush_creds(app.db())?;
     let refresh_token = {
         let state = app.sync_auth();
         let creds = state.creds();
         creds
+            .credentials
             .as_ref()
             .map(|creds| creds.refresh_token.clone())
             .ok_or_eyre("not logged in")?
@@ -236,24 +281,32 @@ pub(crate) fn access_token_expiry(access_token: &str) -> Result<DateTime<Utc>> {
 pub fn user_info(app: &AppHandle) -> Option<User> {
     app.sync_auth()
         .creds()
+        .credentials
         .as_ref()
         .map(|state| state.user.clone())
 }
 
 /// The `POST /auth/token` answer. Every grant rotates the refresh token.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TokenResponse {
     pub(crate) access_token: String,
     pub(crate) refresh_token: String,
 }
 
+impl std::fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TokenResponse { credentials: [redacted] }")
+    }
+}
+
 pub async fn access_token(app: &AppHandle) -> Result<Option<String>> {
     let _refresh_guard = app.sync_auth().refresh_lock.lock().await;
+    app.sync_auth().flush_creds(app.db())?;
     let (refresh_token, access_token, expiry) = {
         let state = app.sync_auth();
         let creds = state.creds.lock().unwrap();
-        let Some(creds) = creds.as_ref() else {
+        let Some(creds) = creds.credentials.as_ref() else {
             return Ok(None);
         };
         (
@@ -308,7 +361,7 @@ async fn refresh_desktop_token(refresh_token: String, app: &AppHandle) -> Result
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GrantTokenRequest {
     pub(crate) refresh_token: String,
@@ -349,6 +402,82 @@ async fn token_grant(
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn security_callback_rejects_spoofed_routes_and_duplicate_tokens() {
+        let payload = BASE64_URL_SAFE_NO_PAD.encode(br#"{"exp":2000000000,"discordId":"fixture","name":"Fixture","displayName":"Fixture","avatar":null}"#);
+        let token = format!("header.{payload}.signature");
+        let query = format!("access_token={token}&refresh_token=fixture-refresh");
+        assert!(credentials_from_callback(&format!("gale://auth/callback?{query}")).is_ok());
+        for url in [
+            format!("gale://auth/callback-extra?{query}"),
+            format!("gale://other/callback?{query}"),
+            format!("https://auth/callback?{query}"),
+            format!("gale://auth/callback?{query}&access_token={token}"),
+            format!("gale://auth/callback?access_token={token}&refresh_token="),
+            format!("gale://auth/callback?{query}#fragment"),
+        ] {
+            assert!(
+                credentials_from_callback(&url).is_err(),
+                "accepted a malformed callback"
+            );
+        }
+    }
+
+    #[test]
+    fn security_unsaved_rotation_retries_sqlite_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sqlite3");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE auth (id INTEGER PRIMARY KEY, data TEXT); INSERT INTO auth VALUES (1, 'legacy-plaintext'); CREATE TRIGGER fail_save BEFORE INSERT ON auth BEGIN SELECT RAISE(FAIL, 'fixture write failure'); END;").unwrap();
+        let db = Db::new(
+            conn,
+            keyring::Entry::new_with_credential(Box::new(keyring::mock::MockCredential::default())),
+        );
+        let old = AuthCredentials {
+            user: User {
+                discord_id: "fixture".into(),
+                name: "Fixture".into(),
+                display_name: "Fixture".into(),
+                avatar: None,
+            },
+            access_token: "access-0".into(),
+            refresh_token: "refresh-0".into(),
+            token_expiry: 2000000000,
+        };
+        let state = State::new(Some(old));
+        let next = AuthCredentials {
+            user: User {
+                discord_id: "fixture".into(),
+                name: "Fixture".into(),
+                display_name: "Fixture".into(),
+                avatar: None,
+            },
+            access_token: "access-1".into(),
+            refresh_token: "refresh-1".into(),
+            token_expiry: 2000000000,
+        };
+        assert!(state.set_creds(Some(next), &db).is_err());
+        let observer = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            observer
+                .query_row("SELECT data FROM auth", (), |row| row.get::<_, String>(0))
+                .unwrap(),
+            "legacy-plaintext"
+        );
+        observer.execute("DROP TRIGGER fail_save", ()).unwrap();
+        state.flush_creds(&db).unwrap();
+        assert_eq!(
+            observer
+                .query_row("SELECT COUNT(*) FROM auth", (), |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.read_auth().unwrap().unwrap().refresh_token(),
+            "refresh-1"
+        );
+    }
 
     #[tokio::test]
     async fn rejected_refresh_is_detected_as_expired_session() {

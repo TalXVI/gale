@@ -20,6 +20,9 @@ mod thunderstore;
 mod util;
 pub mod worker;
 
+#[cfg(test)]
+mod test_support;
+
 /// Installs aws-lc-rs as the process-level rustls `CryptoProvider`.
 ///
 /// The dependency graph compiles two providers, `aws_lc_rs` (this
