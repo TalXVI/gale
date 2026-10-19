@@ -23,7 +23,7 @@
 		"@inlang/paraglide-js": "2.3.0",
 		"@playwright/test": "^1.63.0",
 		"@sveltejs/adapter-static": "^3.0.10",
-		"@sveltejs/kit": "^2.63.0",
+		"@sveltejs/kit": "^2.70.3",
 		"@sveltejs/vite-plugin-svelte": "^7.1.2",
 		"@tailwindcss/vite": "^4.3.0",
 		"@tauri-apps/cli": "^2.11.4",
@@ -32,13 +32,13 @@
 		"prettier": "^3.8.1",
 		"prettier-plugin-svelte": "^3.4.1",
 		"prettier-plugin-tailwindcss": "^0.7.2",
-		"svelte": "^5.56.2",
+		"svelte": "^5.57.2",
 		"svelte-check": "^4.6.0",
 		"tailwindcss": "^4.1.18",
 		"tailwindcss-palette-generator": "^0.10.0",
 		"tslib": "^2.8.1",
 		"typescript": "^5.9.3",
-		"vite": "^8.0.16"
+		"vite": "^8.3.4"
 	},
 	"type": "module",
 	"dependencies": {
@@ -59,7 +59,15 @@
 		"js-convert-case": "^4.2.0",
 		"rehype-highlight": "^7.0.2",
 		"rehype-raw": "^7.0.0",
+		"rehype-sanitize": "^6.0.0",
 		"semver": "^7.8.5",
 		"svelte-exmarkdown": "^5.0.2"
+	},
+	"pnpm": {
+		"overrides": {
+			"@sveltejs/kit>cookie": "^0.7.2",
+			"source-map-js@<1.2.2": "^1.2.2",
+			"uuid@13.0.0": "^13.0.1"
+		}
 	}
 }

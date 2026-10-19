@@ -1,8 +1,9 @@
 <script lang="ts">
 	import type { Plugin } from 'svelte-exmarkdown';
-	import Markdown, { denylist } from 'svelte-exmarkdown';
+	import Markdown from 'svelte-exmarkdown';
 	import { gfmPlugin } from 'svelte-exmarkdown/gfm';
 	import rehypeRaw from 'rehype-raw';
+	import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
 	import 'highlight.js/styles/atom-one-dark.css';
 	import csharp from 'highlight.js/lib/languages/csharp';
 	import json from 'highlight.js/lib/languages/json';
@@ -19,8 +20,18 @@
 
 	const plugins: Plugin[] = [
 		gfmPlugin(),
-		denylist(['script', 'iframe', 'object', 'embed', 'base', 'meta', 'link', 'style', 'title']),
 		{ rehypePlugin: [rehypeRaw] },
+		{
+			rehypePlugin: [
+				rehypeSanitize,
+				{
+					...defaultSchema,
+					tagNames: defaultSchema.tagNames?.concat('button'),
+					// Preserve button labels without allowing form submission.
+					required: { ...defaultSchema.required, button: { type: 'button' } }
+				}
+			]
+		},
 		{
 			rehypePlugin: [rehypeHighlight, { languages: { csharp, json, xml }, ignoreMissing: true }]
 		}
