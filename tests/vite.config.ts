@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 
 export default defineConfig({
 	plugins: [svelte(), tailwindcss()],
+	server: { watch: { ignored: ['**/src-tauri/**'] } },
 	resolve: {
 		alias: {
 			$lib: fileURLToPath(new URL('../src/lib', import.meta.url)),
