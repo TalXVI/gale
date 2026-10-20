@@ -119,6 +119,8 @@ pub struct Shared {
 pub struct FakeFtp {
     pub addr: SocketAddr,
     shared: Shared,
+    /// The control connections the server currently holds.
+    active_connections: Arc<std::sync::atomic::AtomicUsize>,
     /// The most control connections the server has held at once.
     peak_connection_count: Arc<std::sync::atomic::AtomicUsize>,
     /// The fingerprint of the self-signed certificate the server
@@ -337,6 +339,7 @@ impl FakeFtp {
         Self {
             addr,
             shared,
+            active_connections,
             peak_connection_count,
             certificate_fingerprint,
             certificate_der,
@@ -405,6 +408,27 @@ impl FakeFtp {
     pub fn peak_connections(&self) -> usize {
         self.peak_connection_count
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Waits until every control connection has closed, then restarts
+    /// the peak count so a later phase is measured alone. The server
+    /// sees a client's close only once that connection's thread runs,
+    /// so a closed connection can still count for a moment afterwards.
+    pub fn reset_peak_connections(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self
+            .active_connections
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            assert!(
+                Instant::now() < deadline,
+                "FTP connections were still open after 10 seconds"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.peak_connection_count
+            .store(0, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// How many received command lines start with `prefix`

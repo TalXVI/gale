@@ -296,6 +296,7 @@ fn ftps_preview_verifies_each_file_and_directory_exactly_once() {
     let publication = fixture.publication();
     let desired = large_mods_payload(50);
     deploy_initial(&server, &publication, &desired);
+    server.reset_peak_connections();
 
     let mut session = open_ftps(&server).unwrap();
     server.clear_commands();
