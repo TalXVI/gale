@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+## 1.26.0 (2026-10-19)
+
+### Changed
+
+- Your profile sync sign-in is now kept in your system's credential store instead of Gale's database. Gale moves an existing sign-in automatically and erases the old copy.
+- Gale and the Gale Worker now verify each other on every request without sending the Worker token over the connection. After updating Gale, click **Update worker** on the dedicated-server page. Until then, Gale reports that the Worker needs an update.
+- Only the Windows account that set up the Worker can start or stop it without administrator rights. Other accounts can still see its status. A Worker set up with an earlier version keeps running, but needs administrator rights to start or stop until you uninstall it and click **Set up worker** again.
+- The Worker only accepts plain HTTP on this PC. Remote access needs a TLS reverse proxy.
+- The game list ships with Gale and is no longer downloaded at startup. New games arrive with Gale updates.
+
+### Fixed
+
+- Mod READMEs can no longer contain working forms, scripts, or script links.
+- Gale only loads local mod icons from inside the profile, instead of any file on disk.
+- Publishing a profile leaves out config files excluded from export, including files kept from an earlier publication.
+- Gale rejects packages and local mods whose names would install files outside the profile.
+- A download larger than its listed size stops instead of filling memory.
+- Desktop shortcuts work for profile names that contain quotes.
+- A Worker waiting on an unresponsive sync server no longer delays restart checks, and each new publication is downloaded once.
+
 ## 1.25.1 (2026-10-17)
 
 ### Fixed
