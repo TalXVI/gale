@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 1.26.1 (2026-10-22)
+
+### Changed
+
+- Dedicated-server Preview and Deploy finish faster. In local tests with 10 ms of latency per FTP command, Preview takes 28 to 70% less time and Deploy 23 to 35% less.
+- Gale downloads up to four mod packages at once when preparing a deployment, and keeps downloads on disk instead of in memory.
+- Gale and the Worker skip re-downloading a profile publication that hasn't changed.
+
+### Fixed
+
+- Deploying to servers that reply 521 or 553 for an existing folder no longer fails.
+- Servers restricted to their BepInEx folder no longer get a nested BepInEx folder.
+- A mod download that the server restarts no longer keeps leftover bytes from the first attempt.
+
 ## 1.26.0 (2026-10-19)
 
 ### Changed
