@@ -23,6 +23,7 @@ use crate::{
     thunderstore::{Backend, PackageIdent},
 };
 
+mod benchmarks;
 mod deferred_restart;
 
 const BASE: &str = "/srv";
