@@ -78,6 +78,11 @@ pub struct Options {
     pub expire_control_after_transfers: Option<usize>,
     /// Start `LIST` output with `.` and `..`, as `ls -a` style servers do.
     pub list_dot_entries: bool,
+    /// Delay each control command to model remote round-trip costs in benchmarks.
+    pub command_delay: Duration,
+    /// Answer `MKD` on an existing path with this reply instead of `550`.
+    /// RFC 959 shows `521` for an existing directory; others answer `553`.
+    pub mkd_existing_reply: Option<&'static str>,
 }
 
 /// A path-scoped RETR interruption armed by
@@ -690,6 +695,9 @@ fn serve(stream: TcpStream, shared: &Shared) {
         }
         let command = line.trim_end().to_owned();
         commands.lock().unwrap().push(command.clone());
+        if !options.command_delay.is_zero() {
+            std::thread::sleep(options.command_delay);
+        }
         if options
             .expire_control_after
             .is_some_and(|age| connected_at.elapsed() >= age)
@@ -1005,7 +1013,11 @@ fn serve(stream: TcpStream, shared: &Shared) {
             "MKD" => {
                 let mut fs = fs.lock().unwrap();
                 let parent = resolve("/", &format!("{}/..", path));
-                if fs.exists(&path) || !fs.dirs.contains(&parent) {
+                if fs.exists(&path)
+                    && let Some(reply) = options.mkd_existing_reply
+                {
+                    reply.to_owned()
+                } else if fs.exists(&path) || !fs.dirs.contains(&parent) {
                     "550 unavailable".to_owned()
                 } else {
                     fs.dirs.insert(path.clone());

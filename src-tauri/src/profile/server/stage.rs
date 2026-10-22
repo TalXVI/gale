@@ -14,7 +14,7 @@ use std::{
 };
 
 use eyre::{Context, Result, ensure};
-use futures_util::future::BoxFuture;
+use futures_util::{StreamExt, future::BoxFuture, stream};
 use reqwest_middleware::ClientWithMiddleware;
 use tracing::info;
 use walkdir::WalkDir;
@@ -29,7 +29,7 @@ use super::{
 use crate::{
     game::mod_loader::ModLoader,
     profile::{
-        export::{ContentHash, R2Mod, ensure_unique_mods},
+        export::{ContentHash, ensure_unique_mods},
         install::{InstallError, cache, download},
         sync::FetchedPublication,
     },
@@ -39,6 +39,10 @@ use crate::{
 
 /// The package that first wrote each deploy path, with the hash of the bytes it wrote.
 type Owners = BTreeMap<DeployPathBuf, (VersionIdent, Backend, ContentHash)>;
+
+/// Bound concurrent package downloads and archive buffers. Collection stays in
+/// publication order so path ownership and collision errors are deterministic.
+const MAX_STAGING_PACKAGES: usize = 4;
 
 /// How package payloads are obtained. Local mode and the worker share this
 /// contract; each supplies its own cache directory and HTTP client.
@@ -56,6 +60,7 @@ pub trait PayloadSource: Send + Sync {
 ///
 /// Layout: `<root>/<backend>/<full_name>/<version>/`, identical to Gale's install
 /// cache so Local mode can share `prefs.cache_dir()` directly.
+#[derive(Clone)]
 pub struct CachePayloadSource {
     pub root: PathBuf,
     pub client: ClientWithMiddleware,
@@ -78,27 +83,48 @@ impl PayloadSource for CachePayloadSource {
                 return Ok(dest);
             }
 
+            std::fs::create_dir_all(parent).context("failed to create staging directory")?;
+
+            // Concurrent downloads stream to anonymous temporary files, so
+            // only the archive being extracted is held in memory.
             let url = backend.download_url(ident);
-            let bytes = download::fetch(&self.client, &url, 0, &|_| {}, &|| Ok(()))
+            let file =
+                tempfile::tempfile_in(parent).context("failed to create package download")?;
+            let mut sink = download::FileSink::new(file);
+            download::fetch_into(&mut sink, &self.client, &url, 0, &|_| {}, &|| Ok(()))
                 .await
                 .map_err(|err| match err {
                     InstallError::Error(err) => err,
                     InstallError::Cancelled => eyre::eyre!("the download was cancelled"),
                 })
                 .with_context(|| format!("failed to download {ident}"))?;
+            let archive = sink.into_file()?;
 
-            std::fs::create_dir_all(parent).context("failed to create staging directory")?;
-
-            // Extract to a sibling temp dir, then rename into place so an
-            // interrupted extraction can't leave a half-populated tree
-            // behind.
-            let tmp = tempfile::tempdir_in(parent)?;
-            self.extract(bytes, ident, tmp.path())?;
-            commit_staged(tmp, &dest)?;
-            Ok(dest)
+            let _extracting = EXTRACTING.lock().await;
+            let source = self.clone();
+            let ident = ident.clone();
+            let parent = parent.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut { archive }, &mut bytes)
+                    .with_context(|| format!("failed to read the {ident} download"))?;
+                // Extract to a sibling temp dir, then rename into place so an
+                // interrupted extraction can't leave a half-populated tree
+                // behind.
+                let tmp = tempfile::tempdir_in(parent)?;
+                source.extract(bytes, &ident, tmp.path())?;
+                commit_staged(tmp, &dest)?;
+                Ok(dest)
+            })
+            .await
+            .context("package extraction task failed")?
         })
     }
 }
+
+/// Installers read whole archives into memory. Extracting one at a time
+/// bounds that memory however many package downloads are in flight.
+static EXTRACTING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn commit_staged(tmp: tempfile::TempDir, dest: &Path) -> Result<()> {
     if is_staged(dest) {
@@ -189,30 +215,39 @@ pub async fn stage_publication(
         "the publication lists the same mod more than once; republish after removing the extra copies",
     )?;
 
-    let enabled: Vec<&R2Mod> = publication
+    let enabled: Vec<_> = publication
         .manifest
         .mods
         .iter()
         .filter(|m| m.enabled)
+        .map(|r2mod| (r2mod.version_ident(), r2mod.source))
         .collect();
     let total = enabled.len();
     let mut owners = Owners::new();
 
-    for (index, r2mod) in enabled.iter().enumerate() {
-        let ident = r2mod.version_ident();
-        progress(index, total, ident.full_name());
-
-        let tree = source.stage(&ident, r2mod.source).await?;
-        collect_tree(
-            &tree,
-            spec,
-            &mut desired,
-            &mut owners,
-            (&ident, r2mod.source),
-        )
-        .with_context(|| format!("failed to stage files of {ident}"))?;
+    // Progress names the package that collection is waiting on next.
+    let name = |index: usize| {
+        enabled
+            .get(index)
+            .map_or("", |(ident, _)| ident.full_name())
+    };
+    // An owned stream keeps the staging future `Send`; a borrowed one hits
+    // rustc's higher-ranked lifetime limitation.
+    let packages = stream::iter(enabled.clone())
+        .map(|(ident, backend)| async move {
+            let tree = source.stage(&ident, backend).await?;
+            Ok::<_, eyre::Report>((ident, backend, tree))
+        })
+        .buffered(MAX_STAGING_PACKAGES)
+        .enumerate();
+    futures_util::pin_mut!(packages);
+    progress(0, total, name(0));
+    while let Some((index, package)) = packages.next().await {
+        let (ident, backend, tree) = package?;
+        collect_tree(&tree, spec, &mut desired, &mut owners, (&ident, backend))
+            .with_context(|| format!("failed to stage files of {ident}"))?;
+        progress(index + 1, total, name(index + 1));
     }
-    progress(total, total, "");
 
     info!(payload = desired.len(), "staged published mod set");
 
@@ -610,5 +645,40 @@ mod tests {
             desired.keys().map(|path| path.as_str()).collect::<Vec<_>>(),
             ["BepInEx/plugins/Shared/Shared.dll"]
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn staging_preserves_collision_order_when_package_fetches_finish_out_of_order() {
+        struct DelayedSource(TreeSource);
+        impl PayloadSource for DelayedSource {
+            fn stage<'a>(
+                &'a self,
+                ident: &'a VersionIdent,
+                backend: Backend,
+            ) -> BoxFuture<'a, eyre::Result<std::path::PathBuf>> {
+                Box::pin(async move {
+                    if ident.name() == "First" {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                    self.0.stage(ident, backend).await
+                })
+            }
+        }
+        let first = plugin_tree(b"first");
+        let second = plugin_tree(b"second");
+        let source = DelayedSource(TreeSource(BTreeMap::from([
+            ("Author-First".to_owned(), first.path().to_path_buf()),
+            ("Author-Second".to_owned(), second.path().to_path_buf()),
+        ])));
+        let publication = publication(vec![
+            mod_entry("First", 0, Backend::Thunderstore),
+            mod_entry("Second", 0, Backend::Hexium),
+        ]);
+        let error = stage_publication(&publication, &source, &spec(), true, |_, _, _| {})
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains(
+            "is written by Author-First-1.0.0 from Thunderstore and Author-Second-1.0.0 from Hexium"
+        ));
     }
 }

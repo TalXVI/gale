@@ -82,7 +82,7 @@ pub(super) fn execute(
 
     // ---- Uploads: payload first, then published config writes.
     ensure_ownership(lease, session)?;
-    let mut ensured = BTreeSet::new();
+    let mut ensured = BTreeSet::from([session.mapper.base.clone()]);
     let (payload_uploads, config_uploads): (Vec<_>, Vec<_>) = plan
         .uploads
         .iter()

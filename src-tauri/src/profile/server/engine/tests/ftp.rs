@@ -466,9 +466,9 @@ fn ftps_deploy_rejects_payload_drift_after_the_approved_preview() {
     assert!(server.peak_connections() <= 2 + MAX_SNAPSHOT_READERS);
 }
 
-/// Snapshot helpers are read-only connections: during an unchanged
-/// preview every mutating command the fake server receives targets the
-/// deployment lease, never a payload or config path.
+/// Preview is read-only on every connection, including its snapshot
+/// helpers: during an unchanged preview the fake server receives no
+/// mutating command, not even for the deployment lease.
 #[test]
 fn ftps_preview_reader_connections_never_mutate_payload_paths() {
     use remote::fake_ftp::{FakeFtp, Options};
@@ -502,19 +502,10 @@ fn ftps_preview_reader_connections_never_mutate_payload_paths() {
         "reader helpers must be opened for this test to prove anything"
     );
 
-    let mut saw_mutation = false;
     for command in server.commands.lock().unwrap().iter() {
         let verb = command.split(' ').next().unwrap_or_default();
-        if MUTATING.contains(&verb) {
-            saw_mutation = true;
-            let target = command.split(' ').nth(1).unwrap_or_default();
-            assert!(
-                target.starts_with("/BepInEx/config/.gale-deploy.lock"),
-                "{command} mutated a path outside the deployment lease"
-            );
-        }
+        assert!(!MUTATING.contains(&verb), "preview sent {command}");
     }
-    assert!(saw_mutation, "lease acquire/release must have run");
 }
 /// dot-prefixed paths fully visible, exercised through the real FTP
 /// transport. A completed deployment must write, verify, and reload
@@ -884,4 +875,76 @@ fn a_config_policy_persists_across_reconnects_over_ftp() {
         second.state.config.get(&path).map(|r| r.policy),
         Some(ConfigUpdatePolicy::AlwaysKeep)
     );
+}
+
+#[test]
+fn ftps_restricted_root_deploy_does_not_create_a_nested_loader_root() {
+    use remote::fake_ftp::{FakeFtp, Options};
+
+    let server = FakeFtp::spawn(Options {
+        tls: true,
+        ..Default::default()
+    });
+    server.seed_dir("/plugins");
+    server.seed_dir("/config");
+    let publication = mod_fixture().publication();
+    let mut session = open_ftps(&server).unwrap();
+    assert_eq!(
+        session.layout,
+        crate::profile::server::plan::RemoteLayout::MirrorRoot
+    );
+    let deployment = deploy(
+        &mut session,
+        no_connect,
+        &publication,
+        &desired_payload(),
+        &selection(true, false),
+        &context(),
+        &meta(),
+        None,
+        false,
+    )
+    .unwrap();
+    finish(
+        &mut session,
+        deployment,
+        RestartOutcome::AwaitingManual,
+        &meta(),
+    )
+    .unwrap();
+    assert_eq!(
+        server.file("/plugins/Author-ModA/ModA.dll"),
+        Some(b"dll-bytes".to_vec())
+    );
+    assert!(
+        !server.has_dir("/BepInEx"),
+        "the exposed loader root must map to the server root"
+    );
+    assert!(!server.has_dir("/config/.gale-deploy.lock"));
+}
+
+#[test]
+fn identical_state_skips_the_write() {
+    use remote::fake_ftp::{FakeFtp, Options};
+
+    // Any unnecessary write would be truncated and fail verification.
+    let server = FakeFtp::valheim_host(Options {
+        tls: true,
+        truncate_stor_to: Some(32),
+        ..Default::default()
+    });
+    let path = "/BepInEx/config/.gale-server-state.json";
+    let original = ServerDeploymentState {
+        version: state::VERSION,
+        operation_seq: 7,
+        ..Default::default()
+    };
+    let bytes = state::serialize(&original).unwrap();
+    server.seed_file(path, &bytes);
+    let mut session = open_ftps(&server).unwrap();
+    server.clear_commands();
+    persist_state(&mut session).unwrap();
+    assert_eq!(server.file(path), Some(bytes));
+    assert_eq!(server.count("STOR "), 0);
+    assert_eq!(server.count(&format!("RETR {path}")), 1);
 }

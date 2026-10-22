@@ -167,7 +167,7 @@ impl WorkerContext {
     /// The latest canonical publication.
     async fn publication(&self) -> Result<FetchedPublication> {
         self.sync
-            .poll(&self.journal, None)
+            .latest(&self.journal)
             .await?
             .ok_or_else(|| eyre::eyre!("profile has no published revision yet"))
     }

@@ -13,6 +13,7 @@ use reqwest_middleware::ClientWithMiddleware;
 use super::{
     engine::{self, DeploymentResult, OperationMeta, Preview, Session},
     host::HostControl,
+    paths::RemotePathBuf,
     plan::{DeploySelection, DesiredDeployment, PlanContext},
     progress::ProgressReporter,
     remote::{self, ConnectionAttempt, RemoteOps},
@@ -94,24 +95,30 @@ impl DeployService {
     }
 
     /// Opens a session and runs blocking work on it behind the async
-    /// boundary.
+    /// boundary. The work takes the lease and reads deployment state itself.
     pub(crate) async fn with_session<T: Send + 'static>(
         &self,
+        work: impl FnOnce(Session) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        self.spawn_session(engine::connect_session, work).await
+    }
+
+    /// A live read of the remote deployment state.
+    pub(crate) async fn read_session(&self) -> Result<Session> {
+        self.spawn_session(engine::open_session, Ok).await
+    }
+
+    async fn spawn_session<T: Send + 'static>(
+        &self,
+        open: fn(Box<dyn RemoteOps>, &DeploymentSpec, RemotePathBuf) -> Result<Session>,
         work: impl FnOnce(Session) -> Result<T> + Send + 'static,
     ) -> Result<T> {
         let connector = self.connector.clone();
         let spec = self.spec.clone();
         let base = self.connector.settings.server_directory()?;
-        tokio::task::spawn_blocking(move || {
-            work(engine::open_session(connector.connect()?, &spec, base)?)
-        })
-        .await
-        .context("remote operation task failed")?
-    }
-
-    /// A live read of the remote deployment state.
-    pub(crate) async fn read_session(&self) -> Result<Session> {
-        self.with_session(Ok).await
+        tokio::task::spawn_blocking(move || work(open(connector.connect()?, &spec, base)?))
+            .await
+            .context("remote operation task failed")?
     }
 
     /// Stages the publication's payload when the selection includes mods.
@@ -208,7 +215,7 @@ impl DeployService {
         meta: OperationMeta,
         progress: &mut ProgressReporter,
     ) -> Result<ServerDeploymentState> {
-        let session = self.read_session().await?;
+        let session = self.with_session(Ok).await?;
         let connector = self.connector.clone();
         engine::resume_deferred_restart(
             session,

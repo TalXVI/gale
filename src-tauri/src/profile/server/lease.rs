@@ -308,55 +308,17 @@ pub fn acquire(
                     lost: Arc::new(AtomicBool::new(false)),
                 });
             }
-            false => match read_lease(ops, &lease_file)? {
-                Some(record) if !is_stale(&record) => {
-                    return Err(LeaseBusy {
-                        record: Some(record),
-                        stale: false,
-                    }
-                    .into());
-                }
-                // Our own stale lease means this executor crashed
-                // mid-operation and restarted, so it is safe to recover.
-                // A foreign one needs an explicit takeover.
-                Some(record) if record.owner == owner || force => {
+            false => match inspect(ops, lease_dir, &lease_file, owner, force)? {
+                Existing::Busy(busy) => return Err(busy.into()),
+                Existing::Breakable(record) => {
                     warn!(owner = %record.owner, "breaking a stale deployment lease");
                     break_lease(ops, lease_dir, &lease_file, Some(&record))?;
                 }
-                Some(record) => {
-                    return Err(LeaseBusy {
-                        record: Some(record),
-                        stale: true,
-                    }
-                    .into());
+                Existing::Husk if !husk_observed => {
+                    husk_observed = true;
+                    thread::sleep(HUSK_GRACE);
                 }
-                // An empty husk or an unreadable record means the claim
-                // never finished, unless a holder marker is present.
-                // Hosts that filter dot-paths from reads hide the record
-                // of a *live* claim, but cannot hide the marker from a
-                // directory listing; either way it must not be broken
-                // without checking for one first.
-                None => match find_markers(ops, lease_dir) {
-                    Ok(markers) if !markers.is_empty() => {
-                        // A marker proves a claim was established; whether
-                        // its holder is still alive cannot be judged
-                        // without the record. Force is only authorized for
-                        // a confirmed stale lease, never an unknown one.
-                        return Err(LeaseBusy {
-                            record: None,
-                            stale: false,
-                        }
-                        .into());
-                    }
-                    Ok(_) if !husk_observed => {
-                        husk_observed = true;
-                        thread::sleep(HUSK_GRACE);
-                    }
-                    Ok(_) => break_lease(ops, lease_dir, &lease_file, None)?,
-                    Err(err) => {
-                        return Err(err).context("failed to inspect the deployment lease");
-                    }
-                },
+                Existing::Husk => break_lease(ops, lease_dir, &lease_file, None)?,
             },
         }
 
@@ -366,6 +328,80 @@ pub fn acquire(
     }
 
     unreachable!()
+}
+
+/// Reports a lease that [`acquire`] would refuse, without claiming it.
+pub fn probe(
+    ops: &mut dyn RemoteOps,
+    lease_dir: &RemotePathBuf,
+    owner: &str,
+) -> Result<Option<LeaseBusy>> {
+    // Every claim starts by creating the lease directory.
+    if !ops
+        .is_dir(lease_dir)
+        .context("failed to inspect the deployment lease")?
+    {
+        return Ok(None);
+    }
+    Ok(
+        match inspect(ops, lease_dir, &lease_file(lease_dir), owner, false)? {
+            Existing::Busy(busy) => Some(busy),
+            Existing::Breakable(_) | Existing::Husk => None,
+        },
+    )
+}
+
+/// An existing claim on the lease directory, as [`acquire`] treats it.
+enum Existing {
+    Busy(LeaseBusy),
+    /// A stale lease this executor may break.
+    Breakable(LeaseRecord),
+    /// A claim with neither a readable record nor a holder marker.
+    Husk,
+}
+
+fn inspect(
+    ops: &mut dyn RemoteOps,
+    lease_dir: &RemotePathBuf,
+    lease_file: &RemotePathBuf,
+    owner: &str,
+    force: bool,
+) -> Result<Existing> {
+    Ok(match read_lease(ops, lease_file)? {
+        Some(record) if !is_stale(&record) => Existing::Busy(LeaseBusy {
+            record: Some(record),
+            stale: false,
+        }),
+        // Our own stale lease means this executor crashed mid-operation
+        // and restarted, so it is safe to recover. A foreign one needs an
+        // explicit takeover.
+        Some(record) if record.owner == owner || force => Existing::Breakable(record),
+        Some(record) => Existing::Busy(LeaseBusy {
+            record: Some(record),
+            stale: true,
+        }),
+        // An empty husk or an unreadable record means the claim never
+        // finished, unless a holder marker is present. Hosts that filter
+        // dot-paths from reads hide the record of a *live* claim, but cannot
+        // hide the marker from a directory listing; either way it must not be
+        // broken without checking for one first.
+        None => {
+            let markers =
+                find_markers(ops, lease_dir).context("failed to inspect the deployment lease")?;
+            if markers.is_empty() {
+                Existing::Husk
+            } else {
+                // A marker proves a claim was established; whether its
+                // holder is still alive cannot be judged without the record.
+                // Force is only authorized for a confirmed stale lease, never
+                // an unknown one.
+                Existing::Busy(LeaseBusy {
+                    record: None,
+                    stale: false,
+                })
+            }
+        }
+    })
 }
 
 /// Starts a heartbeat that keeps the lease alive through a second

@@ -230,6 +230,7 @@ fn deploy(
         meta,
         expected_plan_hash,
         force,
+        true,
         &mut progress,
     )
 }
@@ -1909,6 +1910,7 @@ async fn deploy_reports_revalidation_mutations_bytes_and_completion() {
         &operation,
         Some(&approved.plan.hash),
         false,
+        false,
         &mut progress,
     )
     .unwrap();
@@ -1934,9 +1936,24 @@ async fn deploy_reports_revalidation_mutations_bytes_and_completion() {
     assert!(position(SyncPhase::VerifyingPayload) < position(SyncPhase::RemovingFiles));
     assert!(position(SyncPhase::CheckingConfigs) < position(SyncPhase::RemovingFiles));
     assert!(position(SyncPhase::RemovingFiles) < position(SyncPhase::UploadingPayload));
-    assert!(position(SyncPhase::UploadingPayload) < position(SyncPhase::PersistingState));
-    assert!(position(SyncPhase::WritingConfigs) < position(SyncPhase::PersistingState));
-    assert!(position(SyncPhase::PersistingState) < position(SyncPhase::ApplyingRestart));
+    assert!(position(SyncPhase::UploadingPayload) < position(SyncPhase::ApplyingRestart));
+    assert!(position(SyncPhase::WritingConfigs) < position(SyncPhase::ApplyingRestart));
+    assert!(position(SyncPhase::ApplyingRestart) < position(SyncPhase::ReleasingLease));
+    // No restart can follow under Manual policy, so state is persisted once,
+    // at release, rather than in a checkpoint.
+    assert!(
+        events
+            .iter()
+            .all(|event| event.phase != SyncPhase::PersistingState)
+    );
+    let persisted = remote_state(&memory);
+    assert!(persisted.restart_required);
+    assert!(!persisted.files.contains_key(&old));
+    for index in 0..4 {
+        assert!(persisted.files.contains_key(&deploy_path(&format!(
+            "BepInEx/plugins/New/file-{index}.dll"
+        ))));
+    }
     let completed = |phase| {
         events
             .iter()
@@ -2181,6 +2198,7 @@ async fn a_failed_restart_reports_its_reason_in_the_deployment_warnings() {
             &operation,
             Some(&approved.plan.hash),
             false,
+            host.can_restart(),
             &mut progress,
         )
         .unwrap();

@@ -52,6 +52,81 @@ pub(super) async fn download(
     fetch(app.http(), &url, install.file_size, &progress, &check).await
 }
 
+/// Where a download's bytes go. A resumed download appends at [`len`].
+///
+/// [`len`]: DownloadSink::len
+pub(crate) trait DownloadSink: Send {
+    fn len(&self) -> u64;
+    fn append(&mut self, bytes: &[u8]) -> Result<()>;
+    /// Discards everything received so far.
+    fn clear(&mut self) -> Result<()>;
+}
+
+impl DownloadSink for Vec<u8> {
+    fn len(&self) -> u64 {
+        Vec::len(self) as u64
+    }
+
+    fn append(&mut self, bytes: &[u8]) -> Result<()> {
+        self.try_reserve(bytes.len())
+            .context("failed to allocate package download buffer")?;
+        self.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn clear(&mut self) -> Result<()> {
+        Vec::clear(self);
+        Ok(())
+    }
+}
+
+/// Streams a download to a file instead of holding it in memory.
+pub(crate) struct FileSink {
+    file: std::fs::File,
+    len: u64,
+}
+
+impl FileSink {
+    /// Takes ownership of an empty file opened for writing.
+    pub(crate) fn new(file: std::fs::File) -> Self {
+        Self { file, len: 0 }
+    }
+
+    /// The file holding the complete download, rewound to its start.
+    pub(crate) fn into_file(mut self) -> Result<std::fs::File> {
+        use std::io::{Seek, SeekFrom};
+        self.file
+            .seek(SeekFrom::Start(0))
+            .context("failed to rewind package download")?;
+        Ok(self.file)
+    }
+}
+
+impl DownloadSink for FileSink {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn append(&mut self, bytes: &[u8]) -> Result<()> {
+        use std::io::Write;
+        self.file
+            .write_all(bytes)
+            .context("failed to write package download")?;
+        self.len += bytes.len() as u64;
+        Ok(())
+    }
+
+    fn clear(&mut self) -> Result<()> {
+        use std::io::{Seek, SeekFrom};
+        self.file
+            .set_len(0)
+            .and_then(|()| self.file.seek(SeekFrom::Start(0)).map(drop))
+            .context("failed to discard partial package download")?;
+        self.len = 0;
+        Ok(())
+    }
+}
+
 /// Downloads the file at `url` into memory, retrying (and resuming) if the
 /// connection is interrupted.
 ///
@@ -65,6 +140,28 @@ pub(crate) async fn fetch(
     progress: &(dyn Fn(i64) + Sync),
     check_cancel: &(dyn Fn() -> InstallResult<()> + Sync),
 ) -> InstallResult<Vec<u8>> {
+    let mut response = Vec::new();
+    fetch_into(
+        &mut response,
+        client,
+        url,
+        size_hint,
+        progress,
+        check_cancel,
+    )
+    .await?;
+    Ok(response)
+}
+
+/// Like [`fetch`], but writes the download to `sink`, which must start empty.
+pub(crate) async fn fetch_into(
+    sink: &mut dyn DownloadSink,
+    client: &ClientWithMiddleware,
+    url: &str,
+    size_hint: u64,
+    progress: &(dyn Fn(i64) + Sync),
+    check_cancel: &(dyn Fn() -> InstallResult<()> + Sync),
+) -> InstallResult<()> {
     // how many times in a row a download may fail without making any progress
     // before we give up
     const MAX_RETRIES: usize = 5;
@@ -82,17 +179,16 @@ pub(crate) async fn fetch(
     if size_hint > MAX_DOWNLOAD_BYTES {
         return Err(eyre!(DownloadLimit(MAX_DOWNLOAD_BYTES)).into());
     }
-    let mut response = Vec::new();
     let mut retries = 0;
     let mut attempts = 0;
     let mut backoff = INITIAL_BACKOFF;
 
     loop {
-        let downloaded = response.len();
+        let downloaded = sink.len();
         attempts += 1;
 
-        match try_download(&mut response, url, client, limit, progress, check_cancel).await {
-            Ok(()) => break Ok(response),
+        match try_download(sink, url, client, limit, progress, check_cancel).await {
+            Ok(()) => break Ok(()),
             Err(InstallError::Cancelled) => return Err(InstallError::Cancelled),
             Err(InstallError::Error(err)) => {
                 // errors like a 404 won't resolve themselves, so retrying is pointless
@@ -102,9 +198,9 @@ pub(crate) async fn fetch(
 
                 // as long as the download keeps making progress, the connection itself
                 // is working, so keep retrying from where it left off
-                if response.len() > downloaded {
+                if sink.len() > downloaded {
                     debug!(
-                        downloaded = response.len(),
+                        downloaded = sink.len(),
                         total = size_hint,
                         "download interrupted, will resume where it left off"
                     );
@@ -121,7 +217,7 @@ pub(crate) async fn fetch(
 
                 warn!(
                     attempt = attempts,
-                    downloaded = response.len(),
+                    downloaded = sink.len(),
                     total = size_hint,
                     err = ?err,
                     url = %url,
@@ -136,14 +232,14 @@ pub(crate) async fn fetch(
     }
 }
 
-/// Downloads the file at `url` into `buf`, resuming from the end of `buf` if it
+/// Downloads the file at `url` into `sink`, resuming from the end of `sink` if it
 /// already contains (partial) data.
 ///
 /// Errors out if the server starts sending at an unexpected offset, or if the
 /// connection is closed before the whole file was received, so that the caller can
 /// retry the download where it left off.
 async fn try_download(
-    buf: &mut Vec<u8>,
+    buf: &mut dyn DownloadSink,
     url: &str,
     client: &ClientWithMiddleware,
     limit: u64,
@@ -168,12 +264,10 @@ async fn try_download(
     while let Some(item) = stream.next().await {
         let item = item.context("failed to read chunk from stream")?;
         check_cancel()?;
-        if item.len() as u64 > limit - buf.len() as u64 {
+        if item.len() as u64 > limit - buf.len() {
             return Err(eyre!(DownloadLimit(limit)).into());
         }
-        buf.try_reserve(item.len())
-            .context("failed to allocate package download buffer")?;
-        buf.extend_from_slice(&item);
+        buf.append(&item)?;
 
         if last_update.elapsed() >= UPDATE_DELAY {
             last_update = Instant::now();
@@ -188,7 +282,7 @@ async fn try_download(
 
     // the connection may have been closed cleanly before all data was sent
     if let Some(expected_len) = expected_len
-        && buf.len() as u64 != expected_len
+        && buf.len() != expected_len
     {
         return Err(eyre!(
             "incomplete download: received {} out of {} bytes",
@@ -202,7 +296,7 @@ async fn try_download(
 }
 
 async fn send_download_request(
-    buf: &mut Vec<u8>,
+    buf: &mut dyn DownloadSink,
     url: &str,
     client: &ClientWithMiddleware,
     progress: &(dyn Fn(i64) + Sync),
@@ -235,12 +329,12 @@ async fn send_download_request(
                 .map(parse_content_range)
                 .and_then(|range| range.total);
 
-            if total == Some(resumed_from as u64) {
+            if total == Some(resumed_from) {
                 debug!(url = %url, downloaded = resumed_from, "download already complete");
                 return Ok(None);
             }
 
-            discard_partial_download(buf, progress);
+            discard_partial_download(buf, progress)?;
             return Err(eyre!("server rejected range request at offset {resumed_from}").into());
         }
         // the server ignored the range request, so the whole file must be downloaded again
@@ -251,13 +345,13 @@ async fn send_download_request(
                 "server ignored range request, restarting download"
             );
 
-            discard_partial_download(buf, progress);
+            discard_partial_download(buf, progress)?;
             response
         }
         _ => response.error_for_status().context("request failed")?,
     };
 
-    let expected_start = buf.len() as u64;
+    let expected_start = buf.len();
 
     let content_range = response
         .headers()
@@ -267,7 +361,7 @@ async fn send_download_request(
     if let Some(start) = content_range.and_then(|range| range.start)
         && start != expected_start
     {
-        discard_partial_download(buf, progress);
+        discard_partial_download(buf, progress)?;
         return Err(eyre!("unexpected download offset {start}, expected {expected_start}").into());
     }
 
@@ -308,14 +402,17 @@ fn parse_content_range(value: &HeaderValue) -> ContentRange {
 }
 
 /// Clears a partially downloaded file, undoing its contribution to the install progress.
-fn discard_partial_download(buf: &mut Vec<u8>, progress: &(dyn Fn(i64) + Sync)) {
-    if buf.is_empty() {
-        return;
+fn discard_partial_download(
+    buf: &mut dyn DownloadSink,
+    progress: &(dyn Fn(i64) + Sync),
+) -> Result<()> {
+    if buf.len() == 0 {
+        return Ok(());
     }
 
     progress(-(buf.len() as i64));
 
-    buf.clear();
+    buf.clear()
 }
 
 /// Whether an error from [`try_download`] is permanent, in which case retrying is pointless.
@@ -371,6 +468,55 @@ mod tests {
             ),
             _ => panic!("accepted a body larger than the advertised package"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_file_download_restarted_by_the_server_keeps_only_the_new_body() {
+        use std::io::Read;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mod.zip", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            // The first response closes mid-body. The resumed request is then
+            // answered from the start, as a server that ignores ranges does.
+            for response in [
+                &b"HTTP/1.1 200 OK
+Content-Length: 10
+Connection: close
+
+01234"[..],
+                b"HTTP/1.1 200 OK
+Content-Length: 10
+Connection: close
+
+ABCDEFGHIJ",
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 2048];
+                let count = socket.read(&mut request).await.unwrap();
+                requests.push(String::from_utf8_lossy(&request[..count]).to_lowercase());
+                socket.write_all(response).await.unwrap();
+            }
+            requests
+        });
+        let client = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let mut sink = FileSink::new(tempfile::tempfile().unwrap());
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            fetch_into(&mut sink, &client, &url, 0, &|_| {}, &|| Ok(())),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let requests = task.await.unwrap();
+        assert!(requests[1].contains("range: bytes=5-"), "{}", requests[1]);
+        let mut downloaded = String::new();
+        sink.into_file()
+            .unwrap()
+            .read_to_string(&mut downloaded)
+            .unwrap();
+        assert_eq!(downloaded, "ABCDEFGHIJ");
     }
 
     fn parse(value: &str) -> ContentRange {

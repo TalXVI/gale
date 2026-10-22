@@ -326,14 +326,18 @@ impl RemoteOps for FtpConnection {
 
     fn ensure_dir(&mut self, path: &RemotePath) -> Result<()> {
         self.renew_if_needed()?;
-        let original = self.ftp.pwd()?;
-        if self.ftp.cwd(path.as_str()).is_ok() {
-            self.ftp.cwd(original)?;
-            return Ok(());
+        // MKD creates a missing directory in one round trip. Servers refuse an
+        // existing directory with different codes (550, 521, 553), so any
+        // refusal is accepted once a probe proves the directory exists.
+        // Transport failures still fail.
+        match self.ftp.mkdir(path.as_str()) {
+            Ok(()) => Ok(()),
+            Err(error @ FtpError::UnexpectedResponse(_)) if self.is_dir(path)? => {
+                debug!(path = %path, %error, "MKD refused an existing directory");
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
         }
-        self.ftp.cwd(&original)?;
-        self.ftp.mkdir(path.as_str())?;
-        Ok(())
     }
 
     fn claim_dir(&mut self, path: &RemotePath) -> Result<bool> {
@@ -804,6 +808,32 @@ mod tests {
 
     fn remote_path(path: &str) -> RemotePathBuf {
         RemotePathBuf::new(path).unwrap()
+    }
+
+    #[test]
+    fn directory_creation_is_idempotent_and_refuses_existing_files() {
+        let cases = [
+            (false, None),
+            (true, None),
+            (false, Some("521 directory already exists")),
+            (true, Some("553 file name not allowed")),
+        ];
+        for (no_mlst, mkd_existing_reply) in cases {
+            let server = FakeFtp::valheim_host(FakeFtpOptions {
+                no_mlst,
+                mkd_existing_reply,
+                ..Default::default()
+            });
+            let mut ops = ftp_connect(&server);
+            let dir = remote_path("/BepInEx/plugins/New");
+            ops.ensure_dir(&dir).unwrap();
+            ops.ensure_dir(&dir).unwrap();
+            let file = remote_path("/BepInEx/plugins/New/plugin.dll");
+            ops.write(&file, b"payload").unwrap();
+            assert!(ops.ensure_dir(&file).is_err());
+            assert_eq!(server.file(file.as_str()), Some(b"payload".to_vec()));
+            assert!(ops.ensure_dir(&remote_path("/missing/child")).is_err());
+        }
     }
 
     /// Waits for `operation` on another thread, failing the test instead of

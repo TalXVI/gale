@@ -76,6 +76,8 @@ pub struct SyncClient {
     /// them is serialized here. The slot also caches the current access
     /// token: one grant serves as many polls as its expiry allows.
     refresh_lock: Arc<tokio::sync::Mutex<CredentialSlot>>,
+    /// The publication [`Self::latest`] last validated.
+    publications: sync::PublicationCache,
 }
 
 impl SyncClient {
@@ -88,6 +90,7 @@ impl SyncClient {
                 access: None,
                 unsaved: false,
             })),
+            publications: sync::PublicationCache::new(),
         }
     }
 
@@ -228,6 +231,20 @@ impl SyncClient {
             .context("canonical publication failed validation")?;
 
         Ok(Some(publication))
+    }
+
+    /// The latest canonical publication, for manual operations. The archive
+    /// is downloaded again only when the revision differs from the one the
+    /// previous call validated.
+    pub async fn latest(&self, journal: &Arc<Journal>) -> Result<Option<FetchedPublication>> {
+        let token = self.access_token(journal).await?;
+        let Some(metadata) = self.manifest(&token).await? else {
+            return Ok(None);
+        };
+        self.publications
+            .get_or_fetch(&metadata, || self.archive_bytes(&token, &metadata))
+            .await
+            .map(Some)
     }
 }
 
@@ -807,6 +824,36 @@ pub(crate) mod tests {
 
         assert!(probe.is_none());
         assert_eq!(api.archive_hits.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn latest_downloads_only_a_changed_revision() {
+        let first = Utc::now();
+        let api = MockApi::default();
+        let mut previous = manifest("valheim");
+        *api.publication.lock().unwrap() =
+            Some((metadata("valheim", first), archive_zip(&previous)));
+        let url = serve(api.clone()).await;
+        let (_dir, journal) = journal().await;
+        let client = SyncClient::new(config(url.url.clone()), None);
+
+        for _ in 0..2 {
+            let publication = client.latest(&journal).await.unwrap().unwrap();
+            assert_eq!(publication.revision, first);
+            assert_eq!(publication.manifest.mods[0].version.to_string(), "1.0.0");
+        }
+        assert_eq!(api.meta_hits.load(Ordering::Relaxed), 2);
+        assert_eq!(api.archive_hits.load(Ordering::Relaxed), 1);
+
+        let second = first + chrono::Duration::seconds(1);
+        previous.mods[0].version = semver::Version::new(2, 0, 0).into();
+        let mut changed = metadata("valheim", second);
+        changed.manifest = previous.clone();
+        *api.publication.lock().unwrap() = Some((changed, archive_zip(&previous)));
+        let publication = client.latest(&journal).await.unwrap().unwrap();
+        assert_eq!(publication.revision, second);
+        assert_eq!(publication.manifest.mods[0].version.to_string(), "2.0.0");
+        assert_eq!(api.archive_hits.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]

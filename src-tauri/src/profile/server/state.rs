@@ -151,6 +151,9 @@ pub struct ServerDeploymentState {
 pub struct LoadedState {
     pub state: ServerDeploymentState,
     pub warnings: Vec<String>,
+    /// Exact remote bytes, before validation removes out-of-scope entries.
+    /// `None` means the state file does not exist.
+    pub(super) bytes: Option<Vec<u8>>,
 }
 
 /// A transport failure while fetching an authoritative state file. The
@@ -260,7 +263,11 @@ pub fn read_state(
         let state: ServerDeploymentState =
             serde_json::from_slice(&bytes).context("remote Gale deployment state is invalid")?;
         let state = state.validate(spec, &mut warnings)?;
-        return Ok(LoadedState { state, warnings });
+        return Ok(LoadedState {
+            state,
+            warnings,
+            bytes: Some(bytes),
+        });
     }
 
     Ok(LoadedState {
@@ -269,6 +276,7 @@ pub fn read_state(
             ..Default::default()
         },
         warnings,
+        bytes: None,
     })
 }
 

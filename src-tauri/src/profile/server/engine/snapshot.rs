@@ -1,5 +1,5 @@
 //! The remote snapshot the planner runs against, read over a pool of
-//! parallel read-only helper connections.
+//! parallel read-only connections, including the session connection.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -35,7 +35,7 @@ const MAX_CONFIG_READ: u64 = 1024 * 1024;
 /// helpers), each still subject to proactive renewal.
 pub(super) const MAX_SNAPSHOT_READERS: usize = 4;
 /// A helper login costs roughly as many round trips as verifying one or two
-/// files; only open one per this many desired payload files.
+/// files; size the pool against the larger of the desired and owned file sets.
 const FILES_PER_SNAPSHOT_READER: usize = 8;
 
 /// Gathers everything the planner needs to know about the remote: a fresh
@@ -72,12 +72,13 @@ pub(super) fn take_snapshot(
         // extra read-only connections run the LIST/RETR work in parallel.
         // State, lease, and mutation traffic stays on the authoritative
         // session connection.
-        let requested = (desired.len() / FILES_PER_SNAPSHOT_READER).min(MAX_SNAPSHOT_READERS);
+        let requested = (desired.len().max(session.state.files.len()) / FILES_PER_SNAPSHOT_READER)
+            .min(MAX_SNAPSHOT_READERS);
         let mut readers: Vec<Box<dyn RemoteReader + '_>> =
             open_snapshot_readers(session.ops.as_ref(), requested);
-        if readers.is_empty() {
-            readers.push(Box::new(ReadOnly(session.ops.as_mut())));
-        }
+        // The authoritative connection has no other work during the snapshot.
+        // Lend it through the same read-only interface without another login.
+        readers.push(Box::new(ReadOnly(session.ops.as_mut())));
 
         // List the payload tree level by level: every directory in a
         // level is listed in parallel, then its children form the next
@@ -94,9 +95,11 @@ pub(super) fn take_snapshot(
                 &frontier,
                 |reader, dir| {
                     let remote_dir = mapper.remote_path(dir);
-                    reader
-                        .list(&remote_dir)
-                        .with_context(|| format!("failed to inspect remote directory {remote_dir}"))
+                    with_reader_retry(reader, &remote_dir, "snapshot.list", |reader, path| {
+                        reader.list(path)
+                    })
+                    .map(|(entries, _)| entries)
+                    .with_context(|| format!("failed to inspect remote directory {remote_dir}"))
                 },
                 progress,
                 |progress, dir| progress.item(dir.to_string()),
@@ -420,21 +423,35 @@ fn verify_snapshot_payload(
     remote: &RemotePath,
     listed_size: u64,
 ) -> Result<PayloadVerification> {
-    match hash_snapshot_payload(reader, remote, listed_size) {
-        Ok(outcome) => Ok(outcome),
+    let (mut outcome, retried) =
+        with_reader_retry(reader, remote, "snapshot.payload", |reader, path| {
+            hash_snapshot_payload(reader, path, listed_size)
+        })?;
+    outcome.retried = retried;
+    Ok(outcome)
+}
+
+/// Directory listings and payload hashes are read-only. An interrupted
+/// transfer may leave its control channel unusable, so retry once on a new
+/// connection and propagate a second failure with the original error.
+fn with_reader_retry<T>(
+    reader: &mut dyn RemoteReader,
+    remote: &RemotePath,
+    phase: &'static str,
+    mut read: impl FnMut(&mut dyn RemoteReader, &RemotePath) -> Result<T>,
+) -> Result<(T, bool)> {
+    match read(reader, remote) {
+        Ok(outcome) => Ok((outcome, false)),
         Err(first) => {
-            warn!(phase = "snapshot.payload", path = %remote, error = %first, "remote read failed; reconnecting before retry");
+            warn!(phase, path = %remote, error = %first, "remote read failed; reconnecting before retry");
             reader.reconnect().with_context(|| {
-                format!("snapshot.payload: failed to reconnect after reading {remote}: {first}")
+                format!("{phase}: failed to reconnect after reading {remote}: {first}")
             })?;
-            hash_snapshot_payload(reader, remote, listed_size)
-                .map(|outcome| PayloadVerification {
-                    retried: true,
-                    ..outcome
-                })
+            read(reader, remote)
+                .map(|outcome| (outcome, true))
                 .with_context(|| {
                     format!(
-                        "snapshot.payload: read failed after reconnect for {remote}; first error: {first}"
+                        "{phase}: read failed after reconnect for {remote}; first error: {first}"
                     )
                 })
         }

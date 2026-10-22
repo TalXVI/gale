@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 pub(super) use self::restart::apply_restart_policy_reporting;
-pub use self::session::{Session, open_session};
+pub use self::session::{Session, connect_session, open_session};
 use self::{
     execute::execute,
     session::{persist_state, refresh_state},
@@ -142,10 +142,11 @@ pub struct Preview {
     pub warnings: Vec<String>,
 }
 
-/// Snapshots the remote and computes the plan. The snapshot is taken under
-/// the deployment lease so the observed state cannot shift mid-read; when
-/// another executor holds the lease the plan is still computed (unlocked,
-/// advisory only) and the holder is reported through `busy`.
+/// Snapshots the remote and computes the plan without writing to the
+/// server. A preview is advisory: Deploy takes the lease, snapshots again,
+/// and refuses an approval whose plan no longer matches, including after
+/// state written by a concurrent deployment. A lease that would make the
+/// deployment wait is reported through `busy`.
 pub fn preview_with_progress(
     session: &mut Session,
     publication: &FetchedPublication,
@@ -156,21 +157,12 @@ pub fn preview_with_progress(
     progress: &mut ProgressReporter,
 ) -> Result<Preview> {
     progress.phase(SyncPhase::CheckingLease);
-    let (held, busy) = match session.acquire_lease(meta, false) {
-        Ok(lease) => (Some(lease), None),
-        Err(err) => {
-            let busy = err.downcast::<lease::LeaseBusy>()?;
-            info!(phase = "preview.busy", owner = ?busy.record.as_ref().map(|record| &record.owner), stale = busy.stale, "preview found an existing deployment lease; taking a read-only snapshot");
-            (None, Some(busy))
-        }
-    };
-
-    let snapshot = take_snapshot(session, publication, desired, selection, progress);
-    if let Some(lease) = held {
-        lease.release(session.ops.as_mut());
+    let busy = session.probe_lease(meta)?;
+    if let Some(busy) = &busy {
+        info!(phase = "preview.busy", owner = ?busy.record.as_ref().map(|record| &record.owner), stale = busy.stale, "preview found an existing deployment lease");
     }
 
-    let snapshot = snapshot?;
+    let snapshot = take_snapshot(session, publication, desired, selection, progress)?;
     progress.phase(SyncPhase::BuildingPlan);
     let plan = plan::build_plan(
         publication,
@@ -263,7 +255,7 @@ async fn with_blocking_session<T: Send + 'static>(
             moved.phase(SyncPhase::Connecting);
             let ops = connect()?;
             moved.phase(SyncPhase::ReadingState);
-            work(open_session(ops, &spec, base)?, &mut moved)
+            work(connect_session(ops, &spec, base)?, &mut moved)
         })();
         (result, moved)
     })
@@ -293,6 +285,7 @@ pub async fn deploy(
 ) -> Result<DeploymentResult> {
     let heartbeat = connect.clone();
     let final_meta = meta.clone();
+    let restart_may_follow = host.can_restart() && policy != RestartPolicy::Manual;
     let (session, deployment) = with_blocking_session(
         connect,
         spec,
@@ -309,6 +302,7 @@ pub async fn deploy(
                 &meta,
                 expected_plan_hash.as_deref(),
                 force,
+                restart_may_follow,
                 progress,
             )?;
             Ok((session, deployment))
@@ -481,6 +475,9 @@ pub async fn resume_deferred_restart(
 ///
 /// `force` breaks a *stale foreign* lease, the documented recovery once
 /// the old executor is confirmed stopped. Live foreign leases always win.
+///
+/// `restart_may_follow` says whether the caller's restart policy and host
+/// can restart the server after the file phase.
 #[allow(clippy::too_many_arguments)]
 pub fn deploy_with_progress(
     session: &mut Session,
@@ -492,6 +489,7 @@ pub fn deploy_with_progress(
     meta: &OperationMeta,
     expected_plan_hash: Option<&str>,
     force: bool,
+    restart_may_follow: bool,
     progress: &mut ProgressReporter,
 ) -> Result<Deployment> {
     progress.phase(SyncPhase::CheckingLease);
@@ -553,19 +551,23 @@ pub fn deploy_with_progress(
     }
 
     // Persist the deployment state after the file phase, before the caller
-    // decides on a restart. A crash here still leaves correct ownership and
-    // revision records. Both guards fail closed: losing the lease or seeing
-    // a newer remote state aborts the operation.
-    progress.phase(SyncPhase::PersistingState);
-    if let Err(error) = ensure_ownership(&lease, session).and_then(|_| persist_state(session)) {
-        return Err(abort(
-            session,
-            lease,
-            meta,
-            &plan,
-            error,
-            "failed to persist remote deployment state after file changes",
-        ));
+    // restarts the server. A crash during the restart still leaves correct
+    // ownership and revision records. Both guards fail closed: losing the
+    // lease or seeing a newer remote state aborts before the restart. When
+    // no restart can follow, `finish` runs the same guards and persists the
+    // same records next, so writing them here first would repeat the work.
+    if restart_may_follow && session.state.restart_required {
+        progress.phase(SyncPhase::PersistingState);
+        if let Err(error) = ensure_ownership(&lease, session).and_then(|_| persist_state(session)) {
+            return Err(abort(
+                session,
+                lease,
+                meta,
+                &plan,
+                error,
+                "failed to persist remote deployment state after file changes",
+            ));
+        }
     }
 
     Ok(Deployment {

@@ -1085,6 +1085,7 @@ pub async fn read_profile(id: &str, app: &AppHandle) -> Result<SyncProfileMetada
 /// The canonical published state of a sync profile, validated and
 /// normalized. This is the exact artifact subscriber clients consume
 /// through `pull_profile` and dedicated servers deploy from.
+#[derive(Clone)]
 pub struct FetchedPublication {
     /// Remote `updated_at`, identifying this exact publication revision.
     pub revision: DateTime<Utc>,
@@ -1111,11 +1112,48 @@ pub fn publication_from_archive(
     })
 }
 
+/// The last validated publication. A Preview and the Deploy that follows
+/// it usually fetch the same revision, so an unchanged revision reuses the
+/// validated artifact instead of downloading and validating it again.
+pub(crate) struct PublicationCache(std::sync::Mutex<Option<(String, FetchedPublication)>>);
+
+impl PublicationCache {
+    pub(crate) const fn new() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
+
+    /// The publication `metadata` describes, downloading its archive only
+    /// when the profile or its `updated_at` revision differs from the cache.
+    pub(crate) async fn get_or_fetch<F>(
+        &self,
+        metadata: &SyncProfileMetadata,
+        download: impl FnOnce() -> F,
+    ) -> Result<FetchedPublication>
+    where
+        F: Future<Output = Result<Vec<u8>>>,
+    {
+        if let Some((id, cached)) = &*self.0.lock().unwrap()
+            && *id == metadata.id
+            && cached.revision == metadata.updated_at
+        {
+            return Ok(cached.clone());
+        }
+        let bytes = download().await?;
+        let publication = publication_from_archive(metadata, &bytes)
+            .context("canonical publication failed validation")?;
+        *self.0.lock().unwrap() = Some((metadata.id.clone(), publication.clone()));
+        Ok(publication)
+    }
+}
+
+static PUBLICATIONS: PublicationCache = PublicationCache::new();
+
 /// Fetches the canonical publication for `id` from the sync service.
 pub async fn fetch_publication(id: &str, app: &AppHandle) -> Result<FetchedPublication> {
     let metadata = read_profile(id, app).await?;
-    let bytes = download_profile_bytes(id, app).await?;
-    publication_from_archive(&metadata, &bytes)
+    PUBLICATIONS
+        .get_or_fetch(&metadata, || download_profile_bytes(id, app))
+        .await
 }
 
 async fn get_owned_profiles(app: &AppHandle) -> Result<Vec<ListedSyncProfile>> {

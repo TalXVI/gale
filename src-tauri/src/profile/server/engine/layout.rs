@@ -21,6 +21,9 @@ impl RemoteMapper {
     pub(super) fn remote_path(&self, deploy: &DeployPath) -> RemotePathBuf {
         match self.layout {
             RemoteLayout::Standard => self.base.join(deploy),
+            RemoteLayout::MirrorRoot if deploy == self.spec.mirror_root.as_path() => {
+                self.base.clone()
+            }
             RemoteLayout::MirrorRoot => self
                 .spec
                 .strip_mirror_root(deploy)

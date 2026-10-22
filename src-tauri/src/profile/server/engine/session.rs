@@ -35,8 +35,34 @@ pub struct Session {
     pub warnings: Vec<String>,
 }
 
-/// Everything [`open_session`] needs besides a connection.
+/// Opens a session and reads the deployment state and any live lease, for
+/// callers that report the server's status.
 pub fn open_session(
+    ops: Box<dyn RemoteOps>,
+    spec: &DeploymentSpec,
+    base: RemotePathBuf,
+) -> Result<Session> {
+    let mut session = connect_session(ops, spec, base)?;
+    refresh_state(&mut session)?;
+    let lease_file = spec.lease_dir.join(state::LEASE_FILE_NAME)?;
+    session.lease = lease::read_lease(
+        session.ops.as_mut(),
+        &session.mapper.remote_path(&lease_file),
+    )?;
+
+    info!(
+        layout = ?session.layout,
+        host_managed = session.host_managed,
+        state_files = session.state.files.len(),
+        "opened remote deployment session"
+    );
+    Ok(session)
+}
+
+/// Opens a session without reading deployment state or the lease. For
+/// operations that check the lease and call [`refresh_state`] themselves
+/// before using either, so neither is read twice.
+pub fn connect_session(
     mut ops: Box<dyn RemoteOps>,
     spec: &DeploymentSpec,
     base: RemotePathBuf,
@@ -48,40 +74,32 @@ pub fn open_session(
     );
 
     let layout = detect_layout(ops.as_mut(), spec, &base)?;
-    let mapper = RemoteMapper {
-        spec: spec.clone(),
-        base,
-        layout,
-    };
-
-    let LoadedState { state, warnings } = read_authoritative_state(ops.as_mut(), &mapper)?;
-
-    let host_managed = detect_host_managed(ops.as_mut(), &mapper, &state)?;
-    let lease_file = spec.lease_dir.join(state::LEASE_FILE_NAME)?;
-    let lease = lease::read_lease(ops.as_mut(), &mapper.remote_path(&lease_file))?;
-
-    info!(
-        ?layout,
-        host_managed,
-        state_files = state.files.len(),
-        "opened remote deployment session"
-    );
-
-    let base_seq = state.operation_seq;
-
     Ok(Session {
         ops,
-        mapper,
+        mapper: RemoteMapper {
+            spec: spec.clone(),
+            base,
+            layout,
+        },
         layout,
-        host_managed,
-        state,
-        base_seq,
-        lease,
-        warnings,
+        host_managed: layout == RemoteLayout::MirrorRoot,
+        state: ServerDeploymentState::default(),
+        base_seq: 0,
+        lease: None,
+        warnings: Vec::new(),
     })
 }
 
 impl Session {
+    /// Reads, without claiming, a lease that would make a deployment wait.
+    pub(super) fn probe_lease(&mut self, meta: &OperationMeta) -> Result<Option<lease::LeaseBusy>> {
+        lease::probe(
+            self.ops.as_mut(),
+            &self.mapper.remote_path(&self.mapper.spec.lease_dir),
+            &meta.owner,
+        )
+    }
+
     pub(super) fn acquire_lease(&mut self, meta: &OperationMeta, force: bool) -> Result<Lease> {
         lease::acquire(
             self.ops.as_mut(),
@@ -94,13 +112,19 @@ impl Session {
     }
 }
 
-/// Re-reads the authoritative deployment state from the remote. Called
-/// under the deployment lease so planning, policy updates, and the
-/// persistence sequence guard all work on fresh state rather than what
-/// was loaded when the session opened.
+/// Reads the authoritative deployment state from the remote and the
+/// loader ownership that depends on it. Operations call this under the
+/// deployment lease so planning, policy updates, and the persistence
+/// sequence guard all work on fresh state.
 pub(super) fn refresh_state(session: &mut Session) -> Result<()> {
-    let LoadedState { state, warnings } =
-        read_authoritative_state(session.ops.as_mut(), &session.mapper)?;
+    let LoadedState {
+        state, warnings, ..
+    } = read_authoritative_state(session.ops.as_mut(), &session.mapper)?;
+    // The probe follows the state read on the same connection, which a
+    // host may close after that transfer. It is read-only, so retry it.
+    session.host_managed = with_retry(session, |session| {
+        detect_host_managed(session.ops.as_mut(), &session.mapper, &state)
+    })?;
     session.base_seq = state.operation_seq;
     session.state = state;
     for warning in warnings {
@@ -159,6 +183,11 @@ pub(super) fn persist_state(session: &mut Session) -> Result<()> {
     );
 
     let bytes = state::serialize(&session.state)?;
+    // Keep the sequence check above even when there is nothing to write.
+    // Compare raw bytes so validation cannot conceal records needing cleanup.
+    if remote.bytes.as_deref() == Some(bytes.as_slice()) {
+        return Ok(());
+    }
 
     if let Some(parent) = session.mapper.spec.state_path.parent() {
         let remote = session.mapper.remote_path(&parent);
